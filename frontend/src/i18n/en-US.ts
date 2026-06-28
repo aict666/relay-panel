@@ -456,4 +456,16 @@ export const enUS: Dict = {
   passwordResetSuccess: 'Password reset',
   // v0.4.11 PR3: shared group indicator
   shared: 'shared',
+  // v1.0.4: user groups
+  userGroups: 'User Permission Groups',
+  addUserGroup: 'New Permission Group',
+  editUserGroup: 'Edit Permission Group',
+  allowAllGroups: 'Allow All Groups',
+  assignDeviceGroups: 'Assign Device Groups',
+  assignDeviceGroupsHint: 'Users in this group can only use selected inbound groups. Skip this restriction with "Allow All Groups".',
+  allowedInboundGroups: 'Allowed Inbound Groups',
+  selectDeviceGroups: 'Select device groups',
+  yes: 'Yes',
+  no: 'No',
+  remark: 'Remark',
 };

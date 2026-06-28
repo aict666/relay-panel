@@ -220,6 +220,25 @@ CREATE TABLE IF NOT EXISTS app_settings (
     registration_allowed_plan_ids TEXT NOT NULL DEFAULT '[1]'
 );
 
+-- v1.0.4: user permission groups.
+CREATE TABLE IF NOT EXISTS user_groups (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    remark TEXT NOT NULL DEFAULT '',
+    allow_all_groups BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
+);
+
+CREATE TABLE IF NOT EXISTS user_group_device_groups (
+    user_group_id BIGINT NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+    device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_group_id, device_group_id)
+);
+
+INSERT INTO user_groups (id, name, remark, allow_all_groups)
+VALUES (1, 'default', 'Default group — all device groups allowed', TRUE)
+ON CONFLICT (id) DO NOTHING;
+
 -- Record the baseline schema revision. ON CONFLICT DO NOTHING keeps re-runs
 -- idempotent and never downgrades a database that later migrations advanced.
 INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING;
@@ -228,7 +247,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 12;
+pub const PG_SCHEMA_VERSION: i32 = 13;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -765,6 +784,50 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
         tracing::info!("PG migration 12: added registration_allowed_plan_ids to app_settings");
+    }
+
+    // ── Revision 13: v1.0.4 user permission groups ──
+    if current < 13 {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS user_groups (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                remark TEXT NOT NULL DEFAULT '',
+                allow_all_groups BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
+            )",
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS user_group_device_groups (
+                user_group_id BIGINT NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+                device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_group_id, device_group_id)
+            )",
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO user_groups (id, name, remark, allow_all_groups) \
+             VALUES (1, 'default', 'Default group — all device groups allowed', TRUE) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query("UPDATE users SET group_id = 1 WHERE group_id IS NULL")
+            .execute(pool)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (13) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+        tracing::info!("PG migration 13: user permission groups tables created");
     }
 
     Ok(())

@@ -8,6 +8,7 @@ mod password;
 mod profiles;
 mod rules;
 mod settings;
+mod user_groups;
 mod users;
 
 pub use groups::*;
@@ -15,6 +16,7 @@ pub use password::*;
 pub use profiles::*;
 pub use rules::*;
 pub use settings::*;
+pub use user_groups::*;
 pub use users::*;
 
 /// A user WITHOUT the password hash — for API responses. Never expose the

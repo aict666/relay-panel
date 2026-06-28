@@ -19,6 +19,7 @@ mod stats;
 #[cfg(test)]
 mod tests;
 mod traffic;
+mod user_groups;
 mod users;
 
 pub struct SqliteRepository {

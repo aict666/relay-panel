@@ -455,6 +455,18 @@ export const zhCN = {
   passwordResetSuccess: '密码已重置',
   // v0.4.11 PR3: shared group indicator
   shared: '共享',
+  // v1.0.4: user groups
+  userGroups: '用户权限组',
+  addUserGroup: '新建权限组',
+  editUserGroup: '编辑权限组',
+  allowAllGroups: '允许所有分组',
+  assignDeviceGroups: '分配设备分组',
+  assignDeviceGroupsHint: '该权限组下的用户只能使用选中的入口分组。选择"允许所有分组"可跳过此限制。',
+  allowedInboundGroups: '允许的入口分组',
+  selectDeviceGroups: '选择设备分组',
+  yes: '是',
+  no: '否',
+  remark: '备注',
 };
 
 export type Dict = typeof zhCN;

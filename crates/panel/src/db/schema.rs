@@ -196,6 +196,26 @@ CREATE TABLE IF NOT EXISTS app_settings (
     default_registration_plan_id INTEGER NOT NULL DEFAULT 1 REFERENCES plans(id),
     registration_allowed_plan_ids TEXT NOT NULL DEFAULT '[1]'
 );
+
+-- v1.0.4: user permission groups — control which device groups a user can use.
+CREATE TABLE IF NOT EXISTS user_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    remark TEXT NOT NULL DEFAULT '',
+    allow_all_groups INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS user_group_device_groups (
+    user_group_id INTEGER NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+    device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_group_id, device_group_id)
+);
+
+-- Seed the default user group (allow_all_groups=true) so existing users
+-- retain unrestricted access after upgrade.
+INSERT OR IGNORE INTO user_groups (id, name, remark, allow_all_groups)
+VALUES (1, 'default', 'Default group — all device groups allowed', 1);
 "#;
 
 /// Run schema migrations for existing databases (v0.1.0/v0.1.1 → v0.1.2).
@@ -1108,6 +1128,51 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .execute(pool)
     .await?;
     tracing::info!("Migration 29: added registration_allowed_plan_ids to app_settings");
+
+    // ── Migration 30: v1.0.4 user permission groups ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            remark TEXT NOT NULL DEFAULT '',
+            allow_all_groups INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_group_device_groups (
+            user_group_id INTEGER NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+            device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (user_group_id, device_group_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO user_groups (id, name, remark, allow_all_groups) \
+         VALUES (1, 'default', 'Default group — all device groups allowed', 1)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Migrate existing users to the default group, but only if the
+    // `group_id` column exists (defensive for test schemas that may not
+    // have it; real DBs always have it from baseline SCHEMA_SQL).
+    let has_group_id: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'group_id'")
+            .fetch_one(pool)
+            .await?;
+    if has_group_id.0 > 0 {
+        sqlx::query("UPDATE users SET group_id = 1 WHERE group_id IS NULL")
+            .execute(pool)
+            .await?;
+    }
+
+    tracing::info!("Migration 30: user permission groups tables created");
 
     Ok(())
 }

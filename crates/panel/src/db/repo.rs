@@ -25,7 +25,7 @@
 use async_trait::async_trait;
 use relay_shared::models::{
     DeviceGroup, ForwardRule, ForwardRuleTarget, Plan, SharedGroupSummary, Statistic,
-    TunnelProfile, User,
+    TunnelProfile, User, UserGroup,
 };
 use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
 use serde::Serialize;
@@ -402,6 +402,44 @@ pub trait GroupRepository: Send + Sync {
     async fn delete_groups_by_uid(&self, uid: i64) -> Result<u64, DbError>;
 }
 
+// ── v1.0.4: User Permission Groups ──
+
+#[async_trait]
+pub trait UserGroupRepository: Send + Sync {
+    async fn list_user_groups(&self) -> Result<Vec<UserGroup>, DbError>;
+    async fn find_user_group_by_id(&self, id: i64) -> Result<Option<UserGroup>, DbError>;
+    async fn insert_user_group(
+        &self,
+        name: &str,
+        remark: &str,
+        allow_all_groups: bool,
+    ) -> Result<i64, DbError>;
+    async fn update_user_group(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        remark: Option<&str>,
+        allow_all_groups: Option<bool>,
+    ) -> Result<u64, DbError>;
+    async fn delete_user_group(&self, id: i64) -> Result<u64, DbError>;
+    /// Count how many users belong to this group (delete protection).
+    async fn count_users_in_group(&self, group_id: i64) -> Result<i64, DbError>;
+    /// List device group IDs assigned to this user group.
+    async fn list_user_group_device_groups(&self, user_group_id: i64) -> Result<Vec<i64>, DbError>;
+    /// Replace the device group assignments for a user group (clear + re-insert).
+    async fn set_user_group_device_groups(
+        &self,
+        user_group_id: i64,
+        device_group_ids: &[i64],
+    ) -> Result<(), DbError>;
+    /// List device group IDs the user is authorized to use, based on their
+    /// user group. Returns empty if no group assigned. Returns ALL groups
+    /// if the group has allow_all_groups=true (caller-side filter).
+    async fn authorized_device_group_ids(&self, user_id: i64) -> Result<Vec<i64>, DbError>;
+    /// Check whether the user's permission group allows all groups.
+    async fn user_group_allows_all(&self, user_id: i64) -> Result<bool, DbError>;
+}
+
 // ── Tunnel Profile ──
 
 #[async_trait]
@@ -615,6 +653,7 @@ pub trait Repository:
     UserRepository
     + RuleRepository
     + GroupRepository
+    + UserGroupRepository
     + TunnelProfileRepository
     + TrafficRepository
     + KvsRepository

@@ -33,24 +33,48 @@ where
     })
 }
 
-/// GET /groups/shared — admin-owned inbound groups a regular user may attach
-/// rules to.
-///
-/// Regular users (non-admin): all admin-owned `group_type='in'` groups.
-/// Admin users: empty list (admins manage groups directly).
-///
-/// A DB error returns code 500 (not an empty success), so the frontend can
-/// distinguish "load failed" from "no lines available".
+/// v1.0.4: filtered by the user's permission group. If the user's group
+/// has allow_all_groups, all admin-owned inbound groups are returned
+/// (existing behavior). Otherwise, only the groups explicitly assigned
+/// to the user's permission group are returned.
 pub async fn list_shared_groups(
     user: AuthUser,
     State(state): State<AppState>,
 ) -> Json<ApiResponse<Vec<SharedGroupSummary>>> {
-    match state.db.list_shared_groups(user.user_id, user.admin).await {
-        Ok(groups) => Json(ApiResponse::success(groups)),
+    // Admins get empty list (they manage groups directly).
+    if user.admin {
+        return Json(ApiResponse::success(Vec::new()));
+    }
+
+    // Check if the user's group allows all groups.
+    let allows_all = state
+        .db
+        .user_group_allows_all(user.user_id)
+        .await
+        .unwrap_or(false);
+
+    let all_groups = match state.db.list_shared_groups(user.user_id, false).await {
+        Ok(groups) => groups,
         Err(e) => {
             tracing::error!("list_shared_groups: db error: {}", e);
-            db_error()
+            return db_error();
         }
+    };
+
+    if allows_all {
+        Json(ApiResponse::success(all_groups))
+    } else {
+        // Filter to only groups assigned to the user's permission group.
+        let authorized = state
+            .db
+            .authorized_device_group_ids(user.user_id)
+            .await
+            .unwrap_or_default();
+        let filtered: Vec<_> = all_groups
+            .into_iter()
+            .filter(|g| authorized.contains(&g.id))
+            .collect();
+        Json(ApiResponse::success(filtered))
     }
 }
 
