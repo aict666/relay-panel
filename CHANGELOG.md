@@ -5,6 +5,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.0.5] - 2026-06-29
+
+### Fixed
+
+- **Device-group node list crashed the page.** Expanding a device group threw
+  `K.slice is not a function` and blanked the screen. The node-list ID column
+  had no `dataIndex`, so antd handed the whole row object to `render()` instead
+  of the `node_id` string. Now bound to `dataIndex: "node_id"`.
+- **Default user-group remark mojibake.** The seeded default group's remark
+  rendered as `Default group â?? all device groups allowed` on PostgreSQL
+  connections whose `client_encoding` wasn't UTF-8, because the seed used an
+  em dash (U+2014). Replaced with an ASCII hyphen across all four seeds (SQLite
+  + PG, schema + migration); SQLite Migration 31 / PG revision 14 normalizes the
+  remark on existing databases.
+- **PG migration for the remark fix never ran.** `PG_SCHEMA_VERSION` was still
+  13, so the early `current >= PG_SCHEMA_VERSION` guard skipped the new
+  revision-14 UPDATE. Bumped to 14 so the migration executes and the baseline
+  seed assertion passes.
+- **TCP egress failures were undiagnosable on multi-NIC nodes.** `handle_tcp_connection`
+  collapsed every per-target failure into a flat "no target available",
+  discarding the real cause. Each attempt now preserves its classified outbound
+  error (DNS / timeout / connection refused / source-bind), and the final
+  log/error joins all per-target reasons.
+
+### Changed
+
+- **Node installer surfaces the dual-stack / egress env vars.** The generated
+  `relay-node.env` now carries commented examples for `LISTEN_IPV4` /
+  `LISTEN_IPV6` and `OUTBOUND_INTERFACE` / `OUTBOUND_BIND_IPV4` (illustrative
+  IPs only, never defaults), so multi-NIC operators can discover them at install
+  time. Defaults unchanged: dual-stack listen, system-routed egress, no source
+  bind.
+
+---
+
 ## [1.0.4] - 2026-06-26
 
 ### Fixed
