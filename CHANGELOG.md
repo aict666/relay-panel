@@ -5,6 +5,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.0.6] - 2026-06-29
+
+### Fixed
+
+- **Rule export always returns a JSON array.** Single-rule exports previously
+  emitted a bare object `{…}` instead of a one-element array `[{…}]`, making
+  the exported JSON incompatible with the import box (which expects the array
+  form `[{"dest":[…],"listen_port":…,"name":"…"}]`). Export now always wraps
+  the result in an array, so copy-paste round-trips work regardless of the
+  number of rules selected.
+- **Imported rules were attributed to the admin instead of the target user.**
+  When an admin opened a user's rule list via `/rules?owner_uid=X` and used
+  the bulk-import feature, the created rules were owned by the admin account.
+  The `owner_uid` parameter is now forwarded in the import POST request,
+  matching the behaviour of the manual "add rule" form.
+
+---
+
 ## [1.0.5] - 2026-06-29
 
 ### Fixed
