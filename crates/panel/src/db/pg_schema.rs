@@ -239,6 +239,14 @@ INSERT INTO user_groups (id, name, remark, allow_all_groups)
 VALUES (1, 'default', 'Default group — all device groups allowed', TRUE)
 ON CONFLICT (id) DO NOTHING;
 
+-- v1.0.4: the explicit id=1 INSERT above does NOT advance the BIGSERIAL
+-- sequence, so the next admin-created group would also try id=1 and hit a
+-- duplicate-key error. Bump the sequence past the highest existing id.
+SELECT setval(
+    pg_get_serial_sequence('user_groups', 'id'),
+    GREATEST((SELECT MAX(id) FROM user_groups), 1)
+);
+
 -- Record the baseline schema revision. ON CONFLICT DO NOTHING keeps re-runs
 -- idempotent and never downgrades a database that later migrations advanced.
 INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING;
@@ -814,6 +822,15 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
             "INSERT INTO user_groups (id, name, remark, allow_all_groups) \
              VALUES (1, 'default', 'Default group — all device groups allowed', TRUE) \
              ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+
+        // v1.0.4: advance the BIGSERIAL sequence past the explicit id=1 insert
+        // so admin-created groups don't collide with the default group's id.
+        sqlx::query(
+            "SELECT setval(pg_get_serial_sequence('user_groups', 'id'), \
+             GREATEST((SELECT MAX(id) FROM user_groups), 1))",
         )
         .execute(pool)
         .await?;

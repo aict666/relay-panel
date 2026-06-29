@@ -440,6 +440,25 @@ pub trait UserGroupRepository: Send + Sync {
     async fn authorized_device_group_ids(&self, user_id: i64) -> Result<Vec<i64>, DbError>;
     /// Check whether the user's permission group allows all groups.
     async fn user_group_allows_all(&self, user_id: i64) -> Result<bool, DbError>;
+    /// v1.0.4: pause all of `user_id`'s rules whose device_group_in is NOT in
+    /// `allowed_group_ids` (the user lost authorization for that group). Rules
+    /// are paused, never deleted, so an admin can re-authorize and resume them.
+    /// An empty `allowed_group_ids` pauses ALL the user's rules. Returns the
+    /// number of rules newly paused (0 = nothing to do, skip node broadcast).
+    async fn pause_rules_outside_groups(
+        &self,
+        user_id: i64,
+        allowed_group_ids: &[i64],
+    ) -> Result<u64, DbError>;
+    /// v1.0.4: list the (non-admin) user IDs assigned to a permission group.
+    /// Used to re-evaluate rule authorization when the group's device-group
+    /// allowlist changes.
+    async fn list_user_ids_in_group(&self, user_group_id: i64) -> Result<Vec<i64>, DbError>;
+    /// v1.0.4: whether the user is subject to device-group restriction —
+    /// i.e. has a non-null permission group with allow_all_groups = false.
+    /// Legacy users (group_id NULL) and allow-all groups return false, so the
+    /// rule API skips the allowlist check and defers to normal validation.
+    async fn is_user_restricted(&self, user_id: i64) -> Result<bool, DbError>;
 }
 
 // ── Tunnel Profile ──

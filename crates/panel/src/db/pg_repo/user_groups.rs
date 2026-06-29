@@ -196,4 +196,57 @@ impl UserGroupRepository for PgRepository {
         .await?;
         Ok(row.map(|(a,)| a).unwrap_or(false))
     }
+
+    async fn pause_rules_outside_groups(
+        &self,
+        user_id: i64,
+        allowed_group_ids: &[i64],
+    ) -> Result<u64, DbError> {
+        if allowed_group_ids.is_empty() {
+            let r = sqlx::query(
+                "UPDATE forward_rules SET paused = TRUE WHERE uid = $1 AND paused = FALSE",
+            )
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+            return Ok(r.rows_affected());
+        }
+        // $1 = user_id; $2.. = allowed group ids.
+        let placeholders = (0..allowed_group_ids.len())
+            .map(|i| format!("${}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE forward_rules SET paused = TRUE \
+             WHERE uid = $1 AND paused = FALSE AND device_group_in NOT IN ({})",
+            placeholders
+        );
+        let mut q = sqlx::query(&sql).bind(user_id);
+        for gid in allowed_group_ids {
+            q = q.bind(gid);
+        }
+        let r = q.execute(&self.pool).await?;
+        Ok(r.rows_affected())
+    }
+
+    async fn list_user_ids_in_group(&self, user_group_id: i64) -> Result<Vec<i64>, DbError> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM users WHERE group_id = $1 AND admin = FALSE ORDER BY id",
+        )
+        .bind(user_group_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn is_user_restricted(&self, user_id: i64) -> Result<bool, DbError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT ug.allow_all_groups FROM user_groups ug \
+             JOIN users u ON u.group_id = ug.id WHERE u.id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(matches!(row, Some((false,))))
+    }
 }

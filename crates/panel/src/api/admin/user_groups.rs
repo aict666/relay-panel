@@ -166,15 +166,63 @@ pub async fn set_user_group_device_groups(
     Path(id): Path<i64>,
     Json(req): Json<SetUserGroupDeviceGroupsRequest>,
 ) -> Json<ApiResponse<()>> {
-    match state
+    if let Err(e) = state
         .db
         .set_user_group_device_groups(id, &req.device_group_ids)
         .await
     {
-        Ok(()) => Json(ApiResponse::success(())),
+        tracing::error!("set_user_group_device_groups {}: {}", id, e);
+        return Json(err(500, "database error"));
+    }
+
+    // v1.0.4: the group's device-group allowlist changed. Re-evaluate every
+    // user in this group and pause any rules whose inbound group is no longer
+    // authorized (rules are kept + paused, so an admin can re-authorize later).
+    let user_ids = match state.db.list_user_ids_in_group(id).await {
+        Ok(ids) => ids,
         Err(e) => {
-            tracing::error!("set_user_group_device_groups {}: {}", id, e);
-            Json(err(500, "database error"))
+            tracing::error!(
+                "set_user_group_device_groups {}: list users failed: {}",
+                id,
+                e
+            );
+            return Json(err(500, "database error"));
+        }
+    };
+    let mut paused_total = 0u64;
+    for uid in user_ids {
+        let allowed = match state.db.authorized_device_group_ids(uid).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(
+                    "set_user_group_device_groups: authz lookup uid={} failed: {}",
+                    uid,
+                    e
+                );
+                continue;
+            }
+        };
+        match state.db.pause_rules_outside_groups(uid, &allowed).await {
+            Ok(n) => paused_total += n,
+            Err(e) => {
+                tracing::error!(
+                    "set_user_group_device_groups: pause uid={} failed: {}",
+                    uid,
+                    e
+                );
+            }
         }
     }
+    if paused_total > 0 {
+        tracing::warn!(
+            "user group {}: device-group change paused {} rule(s) across its users",
+            id,
+            paused_total
+        );
+        state
+            .node_connections
+            .broadcast_all(r#"{"type":"config_changed"}"#)
+            .await;
+    }
+    Json(ApiResponse::success(()))
 }
