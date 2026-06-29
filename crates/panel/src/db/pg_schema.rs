@@ -236,7 +236,7 @@ CREATE TABLE IF NOT EXISTS user_group_device_groups (
 );
 
 INSERT INTO user_groups (id, name, remark, allow_all_groups)
-VALUES (1, 'default', 'Default group — all device groups allowed', TRUE)
+VALUES (1, 'default', 'Default group - all device groups allowed', TRUE)
 ON CONFLICT (id) DO NOTHING;
 
 -- v1.0.4: the explicit id=1 INSERT above does NOT advance the BIGSERIAL
@@ -820,7 +820,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
 
         sqlx::query(
             "INSERT INTO user_groups (id, name, remark, allow_all_groups) \
-             VALUES (1, 'default', 'Default group — all device groups allowed', TRUE) \
+             VALUES (1, 'default', 'Default group - all device groups allowed', TRUE) \
              ON CONFLICT (id) DO NOTHING",
         )
         .execute(pool)
@@ -845,6 +845,22 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
         tracing::info!("PG migration 13: user permission groups tables created");
+    }
+
+    // ── Revision 14: v1.0.5 fix em-dash encoding in default user_group remark ──
+    if current < 14 {
+        sqlx::query(
+            "UPDATE user_groups SET remark = 'Default group - all device groups allowed' \
+             WHERE id = 1 AND remark != 'Default group - all device groups allowed'",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (14) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+        tracing::info!("PG migration 14: default user_group remark normalized to ASCII");
     }
 
     Ok(())
