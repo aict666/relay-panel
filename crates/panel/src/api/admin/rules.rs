@@ -39,6 +39,20 @@ pub async fn create_rule(
     State(state): State<AppState>,
     Json(req): Json<CreateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
+    // v1.0.4: non-admin users can only create rules on device groups they are authorized to use.
+    if !user.admin && req.device_group_in != 0 {
+        let allowed = state
+            .db
+            .authorized_device_group_ids(user.user_id)
+            .await
+            .unwrap_or_default();
+        if !allowed.is_empty() && !allowed.contains(&req.device_group_in) {
+            return Json(err(
+                403,
+                "device_group_in is not in your allowed device groups",
+            ));
+        }
+    }
     match crate::service::rules::create_rule(state.db.as_ref(), user.user_id, user.admin, &req)
         .await
     {
@@ -71,6 +85,22 @@ pub async fn update_rule(
     Json(req): Json<UpdateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
     let scope = user.resource_scope();
+    // v1.0.4: non-admin users can only switch to device groups they are authorized for.
+    if !user.admin {
+        if let Some(dgi) = req.device_group_in {
+            let allowed = state
+                .db
+                .authorized_device_group_ids(user.user_id)
+                .await
+                .unwrap_or_default();
+            if !allowed.is_empty() && !allowed.contains(&dgi) {
+                return Json(err(
+                    403,
+                    "device_group_in is not in your allowed device groups",
+                ));
+            }
+        }
+    }
     match crate::service::rules::update_rule(state.db.as_ref(), id, &scope, &req).await {
         Ok(()) => {
             state

@@ -328,9 +328,7 @@ const IMPORT_DEFAULTS = {
     }
     if (results.length === 0) { message.error(t('importInvalidFormat')); return; }
     setImportResults(results);
-    if (results.some(r => r.startsWith('✅'))) {
-      setImportOpen(false); setImportText(''); setImportGroupId(undefined); load();
-    }
+    load(); // refresh rules in background
   };
   const handleUpdate = async (values: {
     name?: string; listen_port?: number; protocol?: string;

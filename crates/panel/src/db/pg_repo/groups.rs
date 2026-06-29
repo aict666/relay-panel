@@ -222,7 +222,7 @@ impl GroupRepository for PgRepository {
     async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError> {
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM forward_rules \
-             WHERE device_group_in = $1 OR device_group_out = $1",
+             WHERE device_group_in = $1 OR device_group_out = $1 OR fallback_group = $1",
         )
         .bind(id)
         .fetch_one(&self.pool)

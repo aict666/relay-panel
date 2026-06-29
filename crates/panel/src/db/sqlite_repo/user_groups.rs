@@ -128,6 +128,19 @@ impl UserGroupRepository for SqliteRepository {
     }
 
     async fn authorized_device_group_ids(&self, user_id: i64) -> Result<Vec<i64>, DbError> {
+        // v1.0.4: legacy users with group_id=null get full access.
+        let has_group: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ? AND group_id IS NOT NULL")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
+        if has_group.0 == 0 {
+            let all: Vec<(i64,)> =
+                sqlx::query_as("SELECT id FROM device_groups WHERE group_type = 'in' ORDER BY id")
+                    .fetch_all(&self.pool)
+                    .await?;
+            return Ok(all.into_iter().map(|(id,)| id).collect());
+        }
         // Allow all if the user's group has allow_all_groups=true.
         let allows_all = self.user_group_allows_all(user_id).await?;
         if allows_all {

@@ -47,11 +47,13 @@ pub async fn list_shared_groups(
     }
 
     // Check if the user's group allows all groups.
+    // v1.0.4: if the user has no permission group (group_id=null, legacy),
+    // fall back to showing all admin-owned inbound groups.
     let allows_all = state
         .db
         .user_group_allows_all(user.user_id)
         .await
-        .unwrap_or(false);
+        .unwrap_or(true); // default to allow-all when group is null
 
     let all_groups = match state.db.list_shared_groups(user.user_id, false).await {
         Ok(groups) => groups,
@@ -105,6 +107,30 @@ pub async fn list_shared_node_summary(
                 return db_error();
             }
         };
+
+    // v1.0.4: filter by user permission group (same logic as list_shared_groups).
+    let groups = if user.admin {
+        groups
+    } else {
+        let allows_all = state
+            .db
+            .user_group_allows_all(user.user_id)
+            .await
+            .unwrap_or(true);
+        if allows_all {
+            groups
+        } else {
+            let authorized = state
+                .db
+                .authorized_device_group_ids(user.user_id)
+                .await
+                .unwrap_or_default();
+            groups
+                .into_iter()
+                .filter(|g| authorized.contains(&g.id))
+                .collect()
+        }
+    };
 
     if groups.is_empty() {
         return Json(ApiResponse::success(vec![]));

@@ -9,6 +9,7 @@ import {
   LogoutOutlined,
   LockOutlined,
   SettingOutlined,
+  TeamOutlined,
 } from '@ant-design/icons';
 import { useI18n } from '../i18n/context';
 import api from '../api/client';
@@ -38,6 +39,7 @@ export default function MainLayout() {
   ];
   const adminOnlyItems = [
     { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
+    { key: '/user-groups', icon: <TeamOutlined />, label: t('userGroups') },
     { key: '/users', icon: <UserOutlined />, label: t('users') },
     { key: '/settings', icon: <SettingOutlined />, label: t('systemSettings') },
   ];
