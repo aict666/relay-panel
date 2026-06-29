@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,6 +16,7 @@ pub async fn start_tcp_listener(
     counter: Arc<TrafficCounter>,
     connections: Arc<ConnectionTracker>,
     rule_id: i64,
+    source_ipv4: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(listen_addr).await?;
     tracing::info!("TCP listening on {} (rule {})", listen_addr, rule_id);
@@ -47,6 +48,7 @@ pub async fn start_tcp_listener(
                         rate_limit,
                         counter,
                         rule_id,
+                        source_ipv4,
                     )
                     .await
                     {
@@ -102,6 +104,7 @@ async fn handle_tcp_connection(
     rate_limit: RateLimit,
     counter: Arc<TrafficCounter>,
     rule_id: i64,
+    source_ipv4: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // v0.4.6: pick targets per the rule's load-balancing strategy. The selector
     // returns the ordered indices to attempt; we connect to the first reachable.
@@ -110,7 +113,12 @@ async fn handle_tcp_connection(
         let Some(target) = targets.get(idx) else {
             continue;
         };
-        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(target)).await {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            super::outbound::tcp_connect(target, source_ipv4, 5),
+        )
+        .await
+        {
             Ok(Ok(stream)) => {
                 selector.report(idx, true);
                 outbound = Some(stream);

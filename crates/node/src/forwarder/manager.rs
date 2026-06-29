@@ -95,6 +95,11 @@ pub struct ForwarderManager {
     /// v0.4.1: shared TLS acceptor for tls_simple listeners (supports hot-reload
     /// via cert_reloader). None = no cert configured (tls_simple rules skipped).
     tls_acceptor: Option<super::cert_reloader::SharedTlsAcceptor>,
+    /// v1.0.5: dual-stack listen addresses from env.
+    listen_ipv4: String,
+    listen_ipv6: String,
+    /// v1.0.5: resolved outbound source IPv4 (None = auto-route).
+    source_ipv4: Option<std::net::Ipv4Addr>,
 }
 
 impl ForwarderManager {
@@ -105,7 +110,22 @@ impl ForwarderManager {
             connections,
             listener_errors: Arc::new(Mutex::new(Vec::new())),
             tls_acceptor: None,
+            listen_ipv4: "0.0.0.0".into(),
+            listen_ipv6: "::".into(),
+            source_ipv4: None,
         }
+    }
+
+    /// v1.0.5: configure dual-stack listen and outbound source.
+    pub fn set_network_config(&mut self, cfg: &crate::config::NodeConfig) {
+        self.listen_ipv4 = cfg.listen_ipv4.clone();
+        self.listen_ipv6 = cfg.listen_ipv6.clone();
+        self.source_ipv4 = crate::forwarder::outbound::init_outbound(
+            &crate::forwarder::outbound::OutboundConfig {
+                bind_ipv4: cfg.outbound_bind_ipv4.clone(),
+                interface: cfg.outbound_interface.clone(),
+            },
+        );
     }
 
     /// Drain the accumulated listener errors (called by the status reporter so
@@ -287,9 +307,17 @@ impl ForwarderManager {
                 }
             }
 
-            let addr: SocketAddr = format!("0.0.0.0:{}", listener.port)
+            // v1.0.5: dual-stack listen — bind both IPv4 and IPv6.
+            let addr_v4: SocketAddr = format!("{}:{}", self.listen_ipv4, listener.port)
                 .parse()
-                .expect("Invalid listen address");
+                .unwrap_or_else(|_| format!("0.0.0.0:{}", listener.port).parse().unwrap());
+            let addr_v6: Option<SocketAddr> = if self.listen_ipv6.is_empty() {
+                None
+            } else {
+                format!("{}:{}", self.listen_ipv6, listener.port)
+                    .parse()
+                    .ok()
+            };
             let targets = listener.targets.clone();
             // v0.4.6: one selector per listener, shared across all of its
             // connections/sessions so a round-robin cursor advances globally.
@@ -311,6 +339,7 @@ impl ForwarderManager {
             let rule_id = listener.rule_id;
             let ws_path = listener.ws_path.clone();
             let errors = self.listener_errors.clone();
+            let src_ipv4 = self.source_ipv4;
             let proto_str = match listener.protocol {
                 Protocol::Tcp => "tcp",
                 Protocol::Udp => "udp",
@@ -348,50 +377,131 @@ impl ForwarderManager {
                 continue;
             }
 
-            let handle = match (listener.protocol, listener.node_transport) {
-                (Protocol::Tcp, NodeTransport::Raw) => tokio::spawn(async move {
-                    if let Err(e) = tcp::start_tcp_listener(
-                        addr,
-                        targets,
-                        selector,
-                        rate_limit,
-                        counter,
-                        connections,
-                        rule_id,
-                    )
-                    .await
-                    {
-                        tracing::error!("TCP listener on {} failed: {}", port, e);
-                        errors.lock().await.push(ListenerError {
-                            port,
-                            protocol: proto_str.clone(),
-                            error: e.to_string(),
-                        });
-                    }
-                }),
-                (Protocol::Udp, NodeTransport::Raw) => tokio::spawn(async move {
-                    if let Err(e) = udp::start_udp_listener(
-                        addr,
-                        targets,
-                        selector,
-                        rate_limit,
-                        counter,
-                        connections,
-                        rule_id,
-                    )
-                    .await
-                    {
-                        tracing::error!("UDP listener on {} failed: {}", port, e);
-                        errors.lock().await.push(ListenerError {
-                            port,
-                            protocol: proto_str.clone(),
-                            error: e.to_string(),
-                        });
-                    }
-                }),
+            let handle: tokio::task::JoinHandle<()> = match (
+                listener.protocol,
+                listener.node_transport,
+            ) {
+                // v1.0.5: TCP — spawn both IPv4 and IPv6 listeners independently.
+                (Protocol::Tcp, NodeTransport::Raw) => {
+                    let a4 = addr_v4;
+                    let a6 = addr_v6;
+                    let tgt = targets.clone();
+                    let sel = selector.clone();
+                    let rl = rate_limit.clone();
+                    let ctr = counter.clone();
+                    let cn = connections.clone();
+                    let rid = rule_id;
+                    let ipv4_src = src_ipv4;
+                    let errs = errors.clone();
+                    let pstr = proto_str.clone();
+                    tokio::spawn(async move {
+                        let v4 = tokio::spawn(tcp::start_tcp_listener(
+                            a4,
+                            tgt.clone(),
+                            sel.clone(),
+                            rl.clone(),
+                            ctr.clone(),
+                            cn.clone(),
+                            rid,
+                            ipv4_src,
+                        ));
+                        let v6 = if let Some(addr6) = a6 {
+                            Some(tokio::spawn(tcp::start_tcp_listener(
+                                addr6, tgt, sel, rl, ctr, cn, rid, ipv4_src,
+                            )))
+                        } else {
+                            tracing::info!("TCP {}: IPv6 disabled (LISTEN_IPV6 empty)", port);
+                            None
+                        };
+                        // Report errors from either listener.
+                        let mut failed = 0u8;
+                        match v4.await {
+                            Ok(Err(e)) => {
+                                errs.lock().await.push(ListenerError {
+                                    port,
+                                    protocol: pstr.clone(),
+                                    error: e.to_string(),
+                                });
+                                failed += 1;
+                            }
+                            _ => {}
+                        }
+                        if let Some(v6h) = v6 {
+                            match v6h.await {
+                                Ok(Err(e)) => {
+                                    errs.lock().await.push(ListenerError {
+                                        port,
+                                        protocol: pstr.clone(),
+                                        error: format!("IPv6: {}", e),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    })
+                }
+                // v1.0.5: UDP — spawn both IPv4 and IPv6 independently.
+                (Protocol::Udp, NodeTransport::Raw) => {
+                    let a4 = addr_v4;
+                    let a6 = addr_v6;
+                    let tgt = targets.clone();
+                    let sel = selector.clone();
+                    let rl = rate_limit.clone();
+                    let ctr = counter.clone();
+                    let cn = connections.clone();
+                    let rid = rule_id;
+                    let ipv4_src = src_ipv4;
+                    let errs = errors.clone();
+                    let pstr = proto_str.clone();
+                    tokio::spawn(async move {
+                        let v4 = tokio::spawn(udp::start_udp_listener(
+                            a4,
+                            tgt.clone(),
+                            sel.clone(),
+                            rl.clone(),
+                            ctr.clone(),
+                            cn.clone(),
+                            rid,
+                            ipv4_src,
+                        ));
+                        let v6 = if let Some(addr6) = a6 {
+                            Some(tokio::spawn(udp::start_udp_listener(
+                                addr6, tgt, sel, rl, ctr, cn, rid, ipv4_src,
+                            )))
+                        } else {
+                            tracing::info!("UDP {}: IPv6 disabled (LISTEN_IPV6 empty)", port);
+                            None
+                        };
+                        let mut failed = 0u8;
+                        match v4.await {
+                            Ok(Err(e)) => {
+                                errs.lock().await.push(ListenerError {
+                                    port,
+                                    protocol: pstr.clone(),
+                                    error: e.to_string(),
+                                });
+                                failed += 1;
+                            }
+                            _ => {}
+                        }
+                        if let Some(v6h) = v6 {
+                            match v6h.await {
+                                Ok(Err(e)) => {
+                                    errs.lock().await.push(ListenerError {
+                                        port,
+                                        protocol: pstr.clone(),
+                                        error: format!("IPv6: {}", e),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    })
+                }
+                // WS and TLS use IPv4 only (unchanged).
                 (Protocol::Tcp, NodeTransport::Ws) => tokio::spawn(async move {
                     if let Err(e) = ws::start_ws_listener(
-                        addr,
+                        addr_v4,
                         targets,
                         selector,
                         rate_limit,
@@ -420,7 +530,7 @@ impl ForwarderManager {
                     };
                     tokio::spawn(async move {
                         if let Err(e) = tls::start_tls_listener(
-                            addr,
+                            addr_v4,
                             targets,
                             selector,
                             rate_limit,

@@ -121,6 +121,8 @@ async fn run() {
     let counter = Arc::new(TrafficCounter::new());
     let connections = Arc::new(ConnectionTracker::new());
     let mut manager_inner = ForwarderManager::new(counter.clone(), connections.clone());
+    // v1.0.5: configure dual-stack listen and outbound source IP.
+    manager_inner.set_network_config(&config);
 
     // v0.4.1: load TLS certificate + start hot-reloader for tls_simple listeners.
     // CertReloader ALWAYS starts the poll task, even if the initial load fails

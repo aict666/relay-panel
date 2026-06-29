@@ -17,7 +17,7 @@
 // "connections" column reflect real UDP activity instead of always 0.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -47,6 +47,7 @@ pub async fn start_udp_listener(
     counter: Arc<TrafficCounter>,
     connections: Arc<ConnectionTracker>,
     rule_id: i64,
+    source_ipv4: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if targets.is_empty() {
         tracing::warn!("UDP listener on {}: no targets configured", listen_addr);
@@ -156,7 +157,7 @@ pub async fn start_udp_listener(
                 s.outbound.clone()
             } else {
                 // New session: bind an ephemeral outbound socket and connect to target
-                let outbound = match UdpSocket::bind("0.0.0.0:0").await {
+                let outbound = match super::outbound::udp_outbound_socket(source_ipv4).await {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!("UDP port {}: failed to bind outbound: {}", port, e);
