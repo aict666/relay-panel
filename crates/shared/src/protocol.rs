@@ -105,6 +105,12 @@ pub struct UpdateUserRequest {
     /// Cannot ban admin users (the handler rejects it).
     #[serde(default)]
     pub banned: Option<bool>,
+    /// v1.0.8: suspend / unsuspend the user. true = forwarding gated off via
+    /// list_active_for_config (login still allowed; no token_version bump).
+    /// Cannot suspend admin users (the handler rejects it). Buying a plan does
+    /// NOT auto-clear suspension.
+    #[serde(default)]
+    pub suspended: Option<bool>,
     /// v1.0.7: set the user's device-group authorization directly. `Some(list)`
     /// replaces the user's explicit device-group assignments. Ignored when
     /// `all_device_groups` is Some(true).
@@ -844,6 +850,58 @@ pub struct UpdateGroupRequest {
     /// v1.0.8: billing rate. Range 0.1..=100 (validated at the handler).
     #[serde(default)]
     pub rate: Option<f64>,
+}
+
+// === Admin API — Plans (v1.0.8) ===
+/// Create a plan. price is a decimal string (canonicalized via parse_balance).
+/// plan_type 'data' = traffic-quota plan, 'time' = time-limited (duration_days).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreatePlanRequest {
+    pub name: String,
+    pub max_rules: i32,
+    pub traffic: i64,
+    pub price: String,
+    /// 'data' or 'time'. Defaults to 'data' when omitted.
+    #[serde(default = "default_plan_type")]
+    pub plan_type: String,
+    /// Validity in days (0 = unlimited). Required > 0 for time plans.
+    #[serde(default)]
+    pub duration_days: i32,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub reset_traffic: bool,
+    #[serde(default)]
+    pub description: String,
+}
+
+fn default_plan_type() -> String {
+    "data".to_string()
+}
+
+/// Update a plan. All fields optional.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdatePlanRequest {
+    pub name: Option<String>,
+    pub max_rules: Option<i32>,
+    pub traffic: Option<i64>,
+    pub price: Option<String>,
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    #[serde(default)]
+    pub duration_days: Option<i32>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub reset_traffic: Option<bool>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// v1.0.8: self-purchase body. plan_id must reference a visible (hidden=0) plan.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BuyPlanRequest {
+    pub plan_id: i64,
 }
 
 // === Admin API — Tunnel Profiles (v0.4.0) ===

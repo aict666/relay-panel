@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS plans (
     speed_limit INTEGER NOT NULL DEFAULT 0,
     ip_limit INTEGER NOT NULL DEFAULT 3,
     price TEXT NOT NULL DEFAULT '0',
+    -- v1.0.8: plan lifecycle + visibility (mirrors SQLite baseline + Migration 34).
+    plan_type TEXT NOT NULL DEFAULT 'data',
+    duration_days INTEGER NOT NULL DEFAULT 0,
+    hidden BOOLEAN NOT NULL DEFAULT FALSE,
+    reset_traffic BOOLEAN NOT NULL DEFAULT FALSE,
+    description TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
 );
 
@@ -56,7 +62,11 @@ CREATE TABLE IF NOT EXISTS users (
     -- (see schema.rs for the rationale). token_version is BIGINT to match the
     -- i64 the JWT carries.
     must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
-    token_version BIGINT NOT NULL DEFAULT 0
+    token_version BIGINT NOT NULL DEFAULT 0,
+    -- v1.0.8: plan expiry (TEXT 'YYYY-MM-DD HH:MM:SS' UTC, NULL = no expiry)
+    -- and admin suspension. Mirrors SQLite baseline + Migration 34.
+    plan_expire_at TEXT,
+    suspended BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS device_groups (
@@ -144,6 +154,17 @@ CREATE TABLE IF NOT EXISTS statistics (
     time TEXT NOT NULL,
     number BIGINT NOT NULL DEFAULT 0
 );
+
+-- v1.0.8: purchase history (mirrors SQLite baseline + Migration 34).
+CREATE TABLE IF NOT EXISTS orders (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id BIGINT,
+    plan_name TEXT NOT NULL,
+    price TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
+);
+CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
 
 CREATE TABLE IF NOT EXISTS kvs (
     key TEXT PRIMARY KEY,
@@ -241,7 +262,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 16;
+pub const PG_SCHEMA_VERSION: i32 = 17;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -919,6 +940,72 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
         tracing::info!("PG migration 16: device_groups.rate column present");
+    }
+
+    // ── Revision 17: v1.0.8 plan management + user suspension ──
+    // Mirrors SQLite Migration 34. Every ALTER uses ADD COLUMN IF NOT EXISTS
+    // and the table uses CREATE ... IF NOT EXISTS so a FRESH database (which
+    // already has all of these from PG_SCHEMA_SQL baseline) replays this arm as
+    // a no-op — the same IF-NOT-EXISTS discipline that prevents the mig15-style
+    // fresh-DB replay crash.
+    if current < 17 {
+        sqlx::query(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS plan_type TEXT NOT NULL DEFAULT 'data'",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS duration_days INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_traffic BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expire_at TEXT")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS orders (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                plan_id BIGINT,
+                plan_name TEXT NOT NULL,
+                price TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
+            )",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (17) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+        tracing::info!(
+            "PG migration 17: plans lifecycle cols + users suspension + orders table"
+        );
     }
 
     Ok(())

@@ -24,6 +24,10 @@ export interface User {
   admin: boolean;
   banned: boolean;
   created_at: string;
+  /** v1.0.8: plan expiry ('YYYY-MM-DD HH:MM:SS' UTC, null = no expiry). */
+  plan_expire_at?: string | null;
+  /** v1.0.8: admin suspension (login allowed; forwarding gated). */
+  suspended?: boolean;
 }
 
 export interface ForwardRuleTarget {
@@ -124,6 +128,26 @@ export interface Plan {
   /** @deprecated PLACEHOLDER — stored but never enforced. Do not surface in UI. */
   ip_limit: number;
   price: string;
+  /** v1.0.8: 'data' = traffic-quota plan, 'time' = time-limited plan. */
+  plan_type?: string;
+  /** v1.0.8: validity in days (0 = unlimited). */
+  duration_days?: number;
+  /** v1.0.8: hidden from the public list + not self-purchasable. */
+  hidden?: boolean;
+  /** v1.0.8: buying resets traffic_used to 0. */
+  reset_traffic?: boolean;
+  /** v1.0.8: free-form line shown under the plan name. */
+  description?: string;
+  created_at: string;
+}
+
+/** v1.0.8: a purchase order. plan_name + price are snapshots at buy time. */
+export interface Order {
+  id: number;
+  user_id: number;
+  plan_id: number | null;
+  plan_name: string;
+  price: string;
   created_at: string;
 }
 
@@ -216,6 +240,10 @@ export interface UserSelf {
   /** v0.4.10 PR4: when true the app redirects to the force-password-change
    *  page (only /user/me + /user/password are reachable until changed). */
   must_change_password: boolean;
+  /** v1.0.8: plan expiry (null = no expiry). */
+  plan_expire_at?: string | null;
+  /** v1.0.8: admin suspension (login allowed; forwarding gated). */
+  suspended?: boolean;
 }
 
 /** v0.4.10 PR4: admin password reset body (PUT /admin/users/{id}/password). */

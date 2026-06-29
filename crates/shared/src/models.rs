@@ -32,6 +32,14 @@ pub struct User {
     /// admin reset / ban to instantly revoke previously-issued tokens.
     #[serde(default)]
     pub token_version: i64,
+    /// v1.0.8: plan expiry (TEXT 'YYYY-MM-DD HH:MM:SS' UTC, NULL = no expiry).
+    #[serde(default)]
+    pub plan_expire_at: Option<String>,
+    /// v1.0.8: admin suspension. true = forwarding gated off via
+    /// list_active_for_config (login still allowed; no token_version bump).
+    /// Admins can never be suspended.
+    #[serde(default)]
+    pub suspended: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -237,6 +245,37 @@ pub struct Plan {
     pub traffic: i64,
     pub speed_limit: i32,
     pub ip_limit: i32,
+    pub price: String,
+    /// v1.0.8: 'data' = traffic-quota plan, 'time' = time-limited plan.
+    #[serde(default = "default_plan_type")]
+    pub plan_type: String,
+    /// v1.0.8: validity in days (0 = unlimited). Only meaningful for time plans.
+    #[serde(default)]
+    pub duration_days: i32,
+    /// v1.0.8: hidden from the public plan list + not self-purchasable.
+    #[serde(default)]
+    pub hidden: bool,
+    /// v1.0.8: buying resets traffic_used to 0.
+    #[serde(default)]
+    pub reset_traffic: bool,
+    /// v1.0.8: free-form line shown under the plan name in the shop.
+    #[serde(default)]
+    pub description: String,
+    pub created_at: String,
+}
+
+fn default_plan_type() -> String {
+    "data".to_string()
+}
+
+/// v1.0.8: a purchase order. plan_name + price are SNAPSHOTS at buy time so
+/// the history stays accurate after a plan is renamed/retired/deleted.
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Order {
+    pub id: i64,
+    pub user_id: i64,
+    pub plan_id: Option<i64>,
+    pub plan_name: String,
     pub price: String,
     pub created_at: String,
 }

@@ -15,6 +15,14 @@ impl PlanRepository for SqliteRepository {
         Ok(plans)
     }
 
+    async fn list_visible_plans(&self) -> Result<Vec<Plan>, DbError> {
+        let plans: Vec<Plan> =
+            sqlx::query_as("SELECT * FROM plans WHERE hidden = 0 ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(plans)
+    }
+
     async fn find_plan_name_by_id(&self, id: i64) -> Result<Option<String>, DbError> {
         let row: Option<(String,)> = sqlx::query_as("SELECT name FROM plans WHERE id = ?")
             .bind(id)
@@ -22,7 +30,268 @@ impl PlanRepository for SqliteRepository {
             .await?;
         Ok(row.map(|(n,)| n))
     }
+
+    async fn find_plan_by_id(&self, id: i64) -> Result<Option<Plan>, DbError> {
+        let plan: Option<Plan> = sqlx::query_as("SELECT * FROM plans WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(plan)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_plan(
+        &self,
+        name: &str,
+        max_rules: i32,
+        traffic: i64,
+        price: &str,
+        plan_type: &str,
+        duration_days: i32,
+        hidden: bool,
+        reset_traffic: bool,
+        description: &str,
+    ) -> Result<i64, DbError> {
+        // INSERT-then-last_insert_rowid (SQLite). speed_limit/ip_limit keep
+        // their defaults (placeholders, never enforced) — not exposed here.
+        let result = sqlx::query(
+            "INSERT INTO plans \
+             (name, max_rules, traffic, price, plan_type, duration_days, hidden, reset_traffic, description) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(max_rules)
+        .bind(traffic)
+        .bind(price)
+        .bind(plan_type)
+        .bind(duration_days)
+        .bind(hidden)
+        .bind(reset_traffic)
+        .bind(description)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_plan_fields(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        max_rules: Option<i32>,
+        traffic: Option<i64>,
+        price: Option<&str>,
+        plan_type: Option<&str>,
+        duration_days: Option<i32>,
+        hidden: Option<bool>,
+        reset_traffic: Option<bool>,
+        description: Option<&str>,
+    ) -> Result<u64, DbError> {
+        let mut sets: Vec<&str> = Vec::new();
+        if name.is_some() {
+            sets.push("name = ?");
+        }
+        if max_rules.is_some() {
+            sets.push("max_rules = ?");
+        }
+        if traffic.is_some() {
+            sets.push("traffic = ?");
+        }
+        if price.is_some() {
+            sets.push("price = ?");
+        }
+        if plan_type.is_some() {
+            sets.push("plan_type = ?");
+        }
+        if duration_days.is_some() {
+            sets.push("duration_days = ?");
+        }
+        if hidden.is_some() {
+            sets.push("hidden = ?");
+        }
+        if reset_traffic.is_some() {
+            sets.push("reset_traffic = ?");
+        }
+        if description.is_some() {
+            sets.push("description = ?");
+        }
+
+        if sets.is_empty() {
+            return Ok(0);
+        }
+
+        let sql = format!("UPDATE plans SET {} WHERE id = ?", sets.join(", "));
+        let mut q = sqlx::query(&sql);
+        if let Some(v) = name {
+            q = q.bind(v);
+        }
+        if let Some(v) = max_rules {
+            q = q.bind(v);
+        }
+        if let Some(v) = traffic {
+            q = q.bind(v);
+        }
+        if let Some(v) = price {
+            q = q.bind(v);
+        }
+        if let Some(v) = plan_type {
+            q = q.bind(v);
+        }
+        if let Some(v) = duration_days {
+            q = q.bind(v);
+        }
+        if let Some(v) = hidden {
+            q = q.bind(v);
+        }
+        if let Some(v) = reset_traffic {
+            q = q.bind(v);
+        }
+        if let Some(v) = description {
+            q = q.bind(v);
+        }
+        q = q.bind(id);
+
+        let result = q.execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn delete_plan(&self, id: i64) -> Result<u64, DbError> {
+        let result = sqlx::query("DELETE FROM plans WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn count_users_on_plan(&self, plan_id: i64) -> Result<i64, DbError> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE plan_id = ?")
+            .bind(plan_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    // v1.0.8: atomic plan purchase. SQLite serializes writers, so BEGIN IMMEDIATE
+    // acquires the write lock for the whole tx — a concurrent purchase blocks
+    // until this commits, then sees the post-deduction balance. No row-version
+    // dance needed (unlike PG's READ COMMITTED).
+    async fn buy_plan(
+        &self,
+        user_id: i64,
+        plan_id: i64,
+        plan_name: &str,
+        price_cents: i64,
+        traffic_to_add: i64,
+        plan_max_rules: i32,
+        duration_days: i32,
+        reset_traffic: bool,
+    ) -> Result<(), BuyPlanError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Read the user's current balance (canonical TEXT) + current expiry.
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT balance, plan_expire_at FROM users WHERE id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((balance_str, current_expire)) = row else {
+            let _ = tx.rollback().await;
+            // A missing user mid-purchase is a DB integrity issue, not a
+            // balance issue — surface as a 500.
+            return Err(BuyPlanError::Database(DbError::NotFound));
+        };
+
+        // Decimal math in integer cents (no floats). balance_to_cents returns
+        // None on a non-canonical string — treat that as a data-integrity fault
+        // and refuse the purchase (500) rather than mis-billing.
+        let balance_cents = relay_shared::money::balance_to_cents(&balance_str).ok_or_else(|| {
+            tracing::error!(
+                "buy_plan: user {} has non-canonical balance {:?}",
+                user_id,
+                balance_str
+            );
+            BuyPlanError::Database(DbError::NotFound)
+        })?;
+        if balance_cents < price_cents {
+            let _ = tx.rollback().await;
+            return Err(BuyPlanError::InsufficientBalance);
+        }
+        let new_balance = relay_shared::money::cents_to_balance(balance_cents - price_cents);
+
+        // Compute the new expiry. duration_days=0 → NULL (no expiry). Otherwise
+        // the new expiry = max(now, current) + duration_days, so renewals stack
+        // rather than being clipped to "now + days" when the user still has
+        // time left. Stored as 'YYYY-MM-DD HH:MM:SS' UTC (lexically comparable,
+        // same format as created_at). SQLite's datetime() does the civil-
+        // calendar math for us — the base is chosen via max() in SQL.
+        let new_expire: Option<String> = if duration_days <= 0 {
+            None
+        } else {
+            // base = max(now, current_expire). A NULL current_expire → now.
+            // datetime(base, '+N days') yields 'YYYY-MM-DD HH:MM:SS' UTC.
+            let row: (String,) = sqlx::query_as(
+                "SELECT datetime(MAX(datetime('now'), COALESCE(?, datetime('now'))), ? || ' days')",
+            )
+            .bind(&current_expire)
+            .bind(format!("+{}", duration_days))
+            .fetch_one(&mut *tx)
+            .await?;
+            Some(row.0)
+        };
+
+        // Apply the user update. traffic_limit += traffic_to_add (stacks on top
+        // of any remaining quota — the "购买=累加流量" contract). reset_traffic
+        // zeros traffic_used in the same UPDATE.
+        if reset_traffic {
+            sqlx::query(
+                "UPDATE users SET \
+                 balance = ?, traffic_limit = traffic_limit + ?, max_rules = ?, \
+                 plan_id = ?, plan_expire_at = ?, traffic_used = 0 \
+                 WHERE id = ?",
+            )
+            .bind(&new_balance)
+            .bind(traffic_to_add)
+            .bind(plan_max_rules)
+            .bind(plan_id)
+            .bind(&new_expire)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE users SET \
+                 balance = ?, traffic_limit = traffic_limit + ?, max_rules = ?, \
+                 plan_id = ?, plan_expire_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(&new_balance)
+            .bind(traffic_to_add)
+            .bind(plan_max_rules)
+            .bind(plan_id)
+            .bind(&new_expire)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Insert the order row (snapshots plan_name + the canonical price).
+        let price_str = relay_shared::money::cents_to_balance(price_cents);
+        sqlx::query(
+            "INSERT INTO orders (user_id, plan_id, plan_name, price) VALUES (?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(plan_id)
+        .bind(plan_name)
+        .bind(&price_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
 }
+
 
 // ── Helpers ──
 

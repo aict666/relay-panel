@@ -160,6 +160,7 @@ impl UserRepository for PgRepository {
         max_rules: Option<i32>,
         traffic_limit: Option<i64>,
         banned: Option<bool>,
+        suspended: Option<bool>,
     ) -> Result<u64, DbError> {
         // Build SET clause + bind values in the same field order as SQLite.
         // PG needs numbered placeholders; we accumulate binds in a Vec and
@@ -176,6 +177,10 @@ impl UserRepository for PgRepository {
         }
         if banned.is_some() {
             sets.push("banned = ");
+        }
+        // v1.0.8: suspension (no token_version bump — user stays signed in).
+        if suspended.is_some() {
+            sets.push("suspended = ");
         }
 
         if sets.is_empty() {
@@ -216,6 +221,9 @@ impl UserRepository for PgRepository {
             q = q.bind(v);
         }
         if let Some(v) = banned {
+            q = q.bind(v);
+        }
+        if let Some(v) = suspended {
             q = q.bind(v);
         }
         q = q.bind(id);

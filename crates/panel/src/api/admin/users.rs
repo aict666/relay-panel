@@ -147,6 +147,7 @@ pub async fn update_user(
         && req.max_rules.is_none()
         && req.traffic_limit.is_none()
         && req.banned.is_none()
+        && req.suspended.is_none()
         && req.all_device_groups.is_none()
         && req.device_group_ids.is_none()
     {
@@ -193,13 +194,28 @@ pub async fn update_user(
         }
     }
 
+    // v1.0.8: cannot suspend an admin user either (same privilege protection).
+    if req.suspended == Some(true) {
+        let is_admin = match state.db.is_admin(id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("update_user {}: is_admin lookup failed: {}", id, e);
+                return Json(err(500, "database error"));
+            }
+        };
+        if is_admin {
+            return Json(err(400, "Cannot suspend an admin user"));
+        }
+    }
+
     // v1.0.4: apply field updates only when field-update args are present
     // (a group_id-only request must NOT hit update_user_fields, whose all-None
     // UPDATE would return 0 rows and be misread as "User not found").
     let has_field_update = req.balance.is_some()
         || req.max_rules.is_some()
         || req.traffic_limit.is_some()
-        || req.banned.is_some();
+        || req.banned.is_some()
+        || req.suspended.is_some();
 
     if has_field_update {
         match state
@@ -210,6 +226,7 @@ pub async fn update_user(
                 req.max_rules,
                 req.traffic_limit,
                 req.banned,
+                req.suspended,
             )
             .await
         {
@@ -221,6 +238,14 @@ pub async fn update_user(
                         target_user_id = id,
                         actor_admin_id = _admin.user_id,
                         "destructive admin op"
+                    );
+                }
+                if let Some(suspended) = req.suspended {
+                    tracing::warn!(
+                        action = if suspended { "suspend_user" } else { "unsuspend_user" },
+                        target_user_id = id,
+                        actor_admin_id = _admin.user_id,
+                        "admin op"
                     );
                 }
             }

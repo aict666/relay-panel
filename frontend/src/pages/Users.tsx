@@ -102,6 +102,7 @@ export default function Users() {
       // DB stores bytes; show GB in the form.
       traffic_limit_gb: bytesToGb(u.traffic_limit),
       banned: u.banned,
+      suspended: !!u.suspended,
       all_device_groups: u.all_device_groups,
       device_group_ids: [],
     });
@@ -130,6 +131,7 @@ export default function Users() {
     const payload: Record<string, unknown> = {
       max_rules: values.max_rules,
       banned: values.banned,
+      suspended: values.suspended,
       // Convert GB back to the byte count the backend/DB expect.
       traffic_limit: gbToBytes(values.traffic_limit_gb),
     };
@@ -182,6 +184,17 @@ export default function Users() {
     load();
   };
 
+  // v1.0.8: suspend / unsuspend a user (non-admin only). Stops forwarding via
+  // the config gate WITHOUT bumping token_version (the user stays logged in).
+  const handleToggleSuspend = async (u: User) => {
+    const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/users/${u.id}`, {
+      suspended: !u.suspended,
+    });
+    if (res.code !== 0) { message.error(res.message); return; }
+    message.success(u.suspended ? t('userUnsuspended') : t('userSuspended'));
+    load();
+  };
+
   // v0.4.10 PR4: open the admin password-reset modal for a user.
   const openReset = (u: User) => {
     setResetting(u);
@@ -216,8 +229,13 @@ export default function Users() {
       render: (a: boolean) => a ? <Tag color="gold">{t('admin')}</Tag> : <Tag>{t('user')}</Tag>,
     },
     {
-      title: t('status'), dataIndex: 'banned', key: 'banned',
-      render: (b: boolean) => b ? <Tag color="red">{t('banned')}</Tag> : <Tag color="green">{t('active')}</Tag>,
+      // v1.0.8: three-state status — banned (red) > suspended (orange) > active (green).
+      title: t('status'), key: 'status',
+      render: (_: unknown, u: User) => {
+        if (u.banned) return <Tag color="red">{t('banned')}</Tag>;
+        if (u.suspended) return <Tag color="orange">{t('suspended')}</Tag>;
+        return <Tag color="green">{t('active')}</Tag>;
+      },
     },
     { title: t('balance'), dataIndex: 'balance', key: 'balance' },
     {
@@ -282,6 +300,11 @@ export default function Users() {
           </Popconfirm>
           {/* v0.4.10 PR4: reset password — only for non-admin users (an admin
               changes their own password via /account, never another admin's). */}
+          {isAdmin && !u.admin && (
+            <Popconfirm title={u.suspended ? t('unsuspendConfirm') : t('suspendConfirm')} onConfirm={() => handleToggleSuspend(u)}>
+              <Button size="small" type="text">{u.suspended ? t('unsuspend') : t('suspend')}</Button>
+            </Popconfirm>
+          )}
           {isAdmin && !u.admin && (
             <Button icon={<KeyOutlined />} size="small" type="text" onClick={() => openReset(u)}>{t('resetPassword')}</Button>
           )}
@@ -376,6 +399,10 @@ export default function Users() {
             <InputNumber min={0} step={1} style={{ width: '100%' }} addonAfter="GB" />
           </Form.Item>
           <Form.Item name="banned" label={t('banned')} valuePropName="checked">
+            <Switch disabled={!!editing?.admin} />
+          </Form.Item>
+          {/* v1.0.8: suspension toggle (admin can't be suspended). */}
+          <Form.Item name="suspended" label={t('suspended')} valuePropName="checked" tooltip={t('suspendedHint')}>
             <Switch disabled={!!editing?.admin} />
           </Form.Item>
           {!editing?.admin && (

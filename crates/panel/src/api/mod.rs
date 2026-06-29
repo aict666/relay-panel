@@ -46,6 +46,11 @@ pub fn routes() -> Router<AppState> {
         .route("/user/password", axum::routing::put(admin::change_password))
         // Any authenticated user can read their own account info (no password)
         .route("/user/me", axum::routing::get(admin::get_me))
+        // v1.0.8: self-service plan purchase + order history.
+        .route("/user/buy-plan", axum::routing::post(admin::buy_plan))
+        .route("/user/orders", axum::routing::get(admin::list_my_orders))
+        // v1.0.8: public plan list (hidden excluded) for the shop.
+        .route("/plans", axum::routing::get(admin::list_public_plans))
         // Admin
         .route(
             "/admin/users",
@@ -141,7 +146,15 @@ pub fn routes() -> Router<AppState> {
             "/admin/tunnel-profiles/{id}",
             axum::routing::put(admin::update_tunnel_profile).delete(admin::delete_tunnel_profile),
         )
-        .route("/admin/plans", axum::routing::get(admin::list_plans))
+        .route(
+            "/admin/plans",
+            axum::routing::get(admin::list_plans)
+                .post(admin::create_plan),
+        )
+        .route(
+            "/admin/plans/{id}",
+            axum::routing::put(admin::update_plan).delete(admin::delete_plan),
+        )
         // v0.4.10 PR3: admin-managed registration settings (read + update).
         .route(
             "/admin/settings/registration",

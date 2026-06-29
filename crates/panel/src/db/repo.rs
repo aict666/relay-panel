@@ -24,7 +24,7 @@
 
 use async_trait::async_trait;
 use relay_shared::models::{
-    DeviceGroup, ForwardRule, ForwardRuleTarget, Plan, SharedGroupSummary, Statistic,
+    DeviceGroup, ForwardRule, ForwardRuleTarget, Order, Plan, SharedGroupSummary, Statistic,
     TunnelProfile, User,
 };
 use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
@@ -157,6 +157,7 @@ pub trait UserRepository: Send + Sync {
         max_rules: Option<i32>,
         traffic_limit: Option<i64>,
         banned: Option<bool>,
+        suspended: Option<bool>,
     ) -> Result<u64, DbError>;
     /// Increment user traffic_used (called inside traffic batch tx).
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError>;
@@ -601,10 +602,97 @@ pub trait StatisticsRepository: Send + Sync {
 #[async_trait]
 pub trait PlanRepository: Send + Sync {
     async fn list_plans(&self) -> Result<Vec<Plan>, DbError>;
+    /// v1.0.8: plans visible to regular users for self-purchase (hidden = 0).
+    async fn list_visible_plans(&self) -> Result<Vec<Plan>, DbError>;
     /// Look up a plan's name by id. None = no such plan. Used by /user/me to
     /// project the user's plan_id into a human-readable plan_name without
     /// exposing other plan columns.
     async fn find_plan_name_by_id(&self, id: i64) -> Result<Option<String>, DbError>;
+    /// v1.0.8: fetch a full plan row by id (for purchase validation). None =
+    /// no such plan (or hidden, when buying — gated by the caller).
+    async fn find_plan_by_id(&self, id: i64) -> Result<Option<Plan>, DbError>;
+    /// v1.0.8: create a plan. Returns the new row's id.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_plan(
+        &self,
+        name: &str,
+        max_rules: i32,
+        traffic: i64,
+        price: &str,
+        plan_type: &str,
+        duration_days: i32,
+        hidden: bool,
+        reset_traffic: bool,
+        description: &str,
+    ) -> Result<i64, DbError>;
+    /// v1.0.8: update a plan's mutable fields. Returns rows affected (0 = not
+    /// found). speed_limit/ip_limit are intentionally NOT updatable here
+    /// (placeholders, never enforced) to keep the API surface minimal.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_plan_fields(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        max_rules: Option<i32>,
+        traffic: Option<i64>,
+        price: Option<&str>,
+        plan_type: Option<&str>,
+        duration_days: Option<i32>,
+        hidden: Option<bool>,
+        reset_traffic: Option<bool>,
+        description: Option<&str>,
+    ) -> Result<u64, DbError>;
+    /// v1.0.8: delete a plan. Returns rows affected (0 = not found).
+    async fn delete_plan(&self, id: i64) -> Result<u64, DbError>;
+    /// v1.0.8: count users whose plan_id points at this plan. Used as a
+    /// pre-delete safety check (count > 0 → 409).
+    async fn count_users_on_plan(&self, plan_id: i64) -> Result<i64, DbError>;
+
+    /// v1.0.8: atomically purchase a plan in ONE transaction (防双花):
+    ///   - lock + read the user's balance
+    ///   - refuse if balance < price_cents (returns `BuyPlanError::InsufficientBalance`)
+    ///   - balance -= price_cents, traffic_limit += traffic_to_add
+    ///   - max_rules = plan_max_rules, plan_id = plan_id
+    ///   - reset traffic_used to 0 when `reset_traffic`
+    ///   - plan_expire_at = max(now, current expiry) + duration_days (NULL when duration_days=0)
+    ///   - insert an orders row (snapshots plan_name + price)
+    /// All on the same tx handle so a concurrent purchase can't double-spend.
+    /// `price_cents` / `traffic_to_add` / `plan_max_rules` / `duration_days` are
+    /// resolved by the caller from the plan row (and re-checked hidden=0 there),
+    /// so this method trusts them and only owns the atomic money + bookkeeping.
+    #[allow(clippy::too_many_arguments)]
+    async fn buy_plan(
+        &self,
+        user_id: i64,
+        plan_id: i64,
+        plan_name: &str,
+        price_cents: i64,
+        traffic_to_add: i64,
+        plan_max_rules: i32,
+        duration_days: i32,
+        reset_traffic: bool,
+    ) -> Result<(), BuyPlanError>;
+}
+
+/// v1.0.8: errors from the atomic purchase transaction.
+#[derive(Debug)]
+pub enum BuyPlanError {
+    /// User balance < plan price. Caller → 400.
+    InsufficientBalance,
+    /// DB error. Caller → 500.
+    Database(DbError),
+}
+
+impl From<DbError> for BuyPlanError {
+    fn from(e: DbError) -> Self {
+        BuyPlanError::Database(e)
+    }
+}
+
+impl From<sqlx::Error> for BuyPlanError {
+    fn from(e: sqlx::Error) -> Self {
+        BuyPlanError::Database(DbError::from(e))
+    }
 }
 
 // ── App settings (registration config) ──
@@ -651,6 +739,22 @@ pub trait SettingsRepository: Send + Sync {
 
 // ── Aggregate ──
 
+/// v1.0.8: purchase-order history.
+#[async_trait]
+pub trait OrderRepository: Send + Sync {
+    /// List a user's orders, newest first.
+    async fn list_orders_by_user(&self, user_id: i64) -> Result<Vec<Order>, DbError>;
+    /// Insert an order row (snapshots plan_name + price). Used inside the
+    /// purchase transaction.
+    async fn insert_order(
+        &self,
+        user_id: i64,
+        plan_id: Option<i64>,
+        plan_name: &str,
+        price: &str,
+    ) -> Result<(), DbError>;
+}
+
 /// The aggregate repository trait. Handlers depend on `Arc<dyn Repository>`
 /// and get access to all domain-specific methods.
 #[async_trait]
@@ -665,6 +769,7 @@ pub trait Repository:
     + StatisticsRepository
     + PlanRepository
     + SettingsRepository
+    + OrderRepository
     + Send
     + Sync
 {

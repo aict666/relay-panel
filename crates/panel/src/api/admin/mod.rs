@@ -5,16 +5,20 @@ mod auth;
 mod groups;
 mod nodes;
 mod password;
+mod plans;
 mod profiles;
 mod rules;
 mod settings;
+mod shop;
 mod users;
 
 pub use groups::*;
 pub use password::*;
+pub use plans::*;
 pub use profiles::*;
 pub use rules::*;
 pub use settings::*;
+pub use shop::*;
 pub use users::*;
 
 /// A user WITHOUT the password hash — for API responses. Never expose the
@@ -37,6 +41,12 @@ pub struct UserPublic {
     pub admin: bool,
     pub banned: bool,
     pub created_at: String,
+    /// v1.0.8: plan expiry (NULL = no expiry).
+    #[serde(default)]
+    pub plan_expire_at: Option<String>,
+    /// v1.0.8: admin suspension.
+    #[serde(default)]
+    pub suspended: bool,
 }
 
 /// A user's view of THEIR OWN account (GET /user/me). Same non-password fields
@@ -68,6 +78,12 @@ pub struct UserSelf {
     /// change page (the user can only reach /user/me + /user/password until
     /// they change it). The DB column is the source of truth.
     pub must_change_password: bool,
+    /// v1.0.8: plan expiry (NULL = no expiry).
+    #[serde(default)]
+    pub plan_expire_at: Option<String>,
+    /// v1.0.8: admin suspension (login allowed; forwarding gated).
+    #[serde(default)]
+    pub suspended: bool,
 }
 
 /// Build an error ApiResponse. Accepts `&str` or `String` (or anything else

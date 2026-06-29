@@ -30,7 +30,13 @@ CREATE TABLE IF NOT EXISTS users (
     -- after created_at to match the column order Migration 26 produces on
     -- upgraded databases.
     must_change_password INTEGER NOT NULL DEFAULT 0,
-    token_version INTEGER NOT NULL DEFAULT 0
+    token_version INTEGER NOT NULL DEFAULT 0,
+    -- v1.0.8: plan expiry (TEXT 'YYYY-MM-DD HH:MM:SS' UTC, NULL = no expiry)
+    -- and admin suspension. suspended does NOT block login or bump
+    -- token_version (so the user stays signed in); it gates forwarding via
+    -- list_active_for_config. Admins can never be suspended.
+    plan_expire_at TEXT,
+    suspended INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS plans (
@@ -42,6 +48,17 @@ CREATE TABLE IF NOT EXISTS plans (
     speed_limit INTEGER NOT NULL DEFAULT 0,
     ip_limit INTEGER NOT NULL DEFAULT 3,
     price TEXT NOT NULL DEFAULT '0',
+    -- v1.0.8: plan lifecycle + visibility.
+    -- plan_type: 'data' = traffic quota, 'time' = time-limited (duration_days).
+    -- duration_days: 0 = unlimited (only meaningful for time plans).
+    -- hidden: 1 = hidden from the public plan list + not self-purchasable.
+    -- reset_traffic: 1 = buying resets traffic_used to 0.
+    -- description: free-form line shown under the plan name in the shop.
+    plan_type TEXT NOT NULL DEFAULT 'data',
+    duration_days INTEGER NOT NULL DEFAULT 0,
+    hidden INTEGER NOT NULL DEFAULT 0,
+    reset_traffic INTEGER NOT NULL DEFAULT 0,
+    description TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -160,6 +177,18 @@ CREATE TABLE IF NOT EXISTS statistics (
     time TEXT NOT NULL,
     number INTEGER NOT NULL DEFAULT 0
 );
+
+-- v1.0.8: purchase history. plan_name + price are SNAPSHOTS at buy time so
+-- the history stays accurate after a plan is later renamed/retired/deleted.
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id INTEGER,
+    plan_name TEXT NOT NULL,
+    price TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
 
 CREATE TABLE IF NOT EXISTS kvs (
     key TEXT PRIMARY KEY,
@@ -1229,6 +1258,44 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     add_column_if_missing(pool, "device_groups", "rate", "REAL NOT NULL DEFAULT 1.0").await?;
     tracing::info!("Migration 33: device_groups.rate column present");
 
+    // ── Migration 34: v1.0.8 plan management + user suspension ──
+    // Adds:
+    //   plans: plan_type / duration_days / hidden / reset_traffic / description
+    //   users: plan_expire_at (TEXT, NULL = no expiry) / suspended (0/1)
+    //   orders: purchase history (snapshots plan_name + price at buy time)
+    // Every column + the table use add_column_if_missing / IF NOT EXISTS so the
+    // arm is idempotent (re-runnable) and safe on a fresh-schema DB.
+    add_column_if_missing(pool, "plans", "plan_type", "TEXT NOT NULL DEFAULT 'data'").await?;
+    add_column_if_missing(pool, "plans", "duration_days", "INTEGER NOT NULL DEFAULT 0").await?;
+    add_column_if_missing(pool, "plans", "hidden", "INTEGER NOT NULL DEFAULT 0").await?;
+    add_column_if_missing(
+        pool,
+        "plans",
+        "reset_traffic",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(pool, "plans", "description", "TEXT NOT NULL DEFAULT ''").await?;
+    add_column_if_missing(pool, "users", "plan_expire_at", "TEXT").await?;
+    add_column_if_missing(pool, "users", "suspended", "INTEGER NOT NULL DEFAULT 0").await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            plan_id INTEGER,
+            plan_name TEXT NOT NULL,
+            price TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
+        .execute(pool)
+        .await?;
+    tracing::info!("Migration 34: plans lifecycle cols + users suspension + orders table");
+
     Ok(())
 }
 
@@ -1246,6 +1313,12 @@ async fn add_column_if_missing(
     type_def: &str,
 ) -> Result<(), sqlx::Error> {
     // pragma_table_info is parameterised by table name via the bound argument.
+    // A column count of 0 means EITHER the column is absent (the normal case
+    // → add it) OR the TABLE itself is absent (e.g. an ancient test DB that
+    // pre-dates the table). In the latter case there's nothing to ALTER — the
+    // table will be created elsewhere (SCHEMA_SQL on fresh boot) and the
+    // column ships with it. Skip rather than error so migrations stay
+    // idempotent on minimal test schemas.
     let count_sql = format!(
         "SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = ?",
         table
@@ -1256,6 +1329,16 @@ async fn add_column_if_missing(
         .await?;
 
     if exists.0 == 0 {
+        // Is the table itself present? If not, there's nothing to ALTER.
+        let table_present: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '{}'",
+            table
+        ))
+        .fetch_one(pool)
+        .await?;
+        if table_present.0 == 0 {
+            return Ok(());
+        }
         // NOTE: table/column/type_def are all compile-time literals from this
         // file — never user input — so the formatted SQL is safe from injection.
         let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, type_def);
