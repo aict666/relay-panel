@@ -51,13 +51,14 @@ impl PlanRepository for SqliteRepository {
         hidden: bool,
         reset_traffic: bool,
         description: &str,
+        grant_all_groups: bool,
     ) -> Result<i64, DbError> {
         // INSERT-then-last_insert_rowid (SQLite). speed_limit/ip_limit keep
         // their defaults (placeholders, never enforced) — not exposed here.
         let result = sqlx::query(
             "INSERT INTO plans \
-             (name, max_rules, traffic, price, plan_type, duration_days, hidden, reset_traffic, description) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (name, max_rules, traffic, price, plan_type, duration_days, hidden, reset_traffic, description, grant_all_groups) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(name)
         .bind(max_rules)
@@ -68,6 +69,7 @@ impl PlanRepository for SqliteRepository {
         .bind(hidden)
         .bind(reset_traffic)
         .bind(description)
+        .bind(grant_all_groups)
         .execute(&self.pool)
         .await?;
         Ok(result.last_insert_rowid())
@@ -86,6 +88,7 @@ impl PlanRepository for SqliteRepository {
         hidden: Option<bool>,
         reset_traffic: Option<bool>,
         description: Option<&str>,
+        grant_all_groups: Option<bool>,
     ) -> Result<u64, DbError> {
         let mut sets: Vec<&str> = Vec::new();
         if name.is_some() {
@@ -114,6 +117,9 @@ impl PlanRepository for SqliteRepository {
         }
         if description.is_some() {
             sets.push("description = ?");
+        }
+        if grant_all_groups.is_some() {
+            sets.push("grant_all_groups = ?");
         }
 
         if sets.is_empty() {
@@ -149,6 +155,9 @@ impl PlanRepository for SqliteRepository {
         if let Some(v) = description {
             q = q.bind(v);
         }
+        if let Some(v) = grant_all_groups {
+            q = q.bind(v);
+        }
         q = q.bind(id);
 
         let result = q.execute(&self.pool).await?;
@@ -171,10 +180,14 @@ impl PlanRepository for SqliteRepository {
         Ok(row.0)
     }
 
-    // v1.0.8: atomic plan purchase. SQLite serializes writers, so BEGIN IMMEDIATE
-    // acquires the write lock for the whole tx — a concurrent purchase blocks
-    // until this commits, then sees the post-deduction balance. No row-version
-    // dance needed (unlike PG's READ COMMITTED).
+    // v1.0.8: atomic plan purchase. This opens a DEFERRED transaction
+    // (pool.begin()); the write lock is acquired lazily on the first write
+    // (the UPDATE below), not at BEGIN. SQLite serializes writers, so under
+    // concurrent purchases the second writer either blocks briefly or fails
+    // with SQLITE_BUSY (the caller retries) — never a double-deduction,
+    // because the balance read + deduct + write all run inside this one tx
+    // against a consistent snapshot. (PG uses an explicit SELECT ... FOR
+    // UPDATE row lock instead; see the PG impl.)
     async fn buy_plan(
         &self,
         user_id: i64,
@@ -185,6 +198,8 @@ impl PlanRepository for SqliteRepository {
         plan_max_rules: i32,
         duration_days: i32,
         reset_traffic: bool,
+        grant_all_groups: bool,
+        device_group_ids: &[i64],
     ) -> Result<(), BuyPlanError> {
         let mut tx = self.pool.begin().await?;
 
@@ -287,6 +302,67 @@ impl PlanRepository for SqliteRepository {
         .execute(&mut *tx)
         .await?;
 
+        // v1.0.9: grant device-group authorization in the SAME tx. Two modes:
+        //   - grant_all_groups → set the user's all_device_groups flag (access
+        //     to EVERY inbound group). Admins are left alone (always all-allowed).
+        //   - else → APPEND the plan's device groups to user_device_groups.
+        //     INSERT OR IGNORE dedupes against existing grants and never removes
+        //     any (purchases only ever expand a user's access). Expiry does NOT
+        //     revoke these — that's the spec's "到期不撤授权".
+        if grant_all_groups {
+            sqlx::query("UPDATE users SET all_device_groups = 1 WHERE id = ? AND admin = 0")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            for dg_id in device_group_ids {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO user_device_groups (user_id, device_group_id) \
+                     VALUES (?, ?)",
+                )
+                .bind(user_id)
+                .bind(dg_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_plan_device_groups(&self, plan_id: i64) -> Result<Vec<i64>, DbError> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT device_group_id FROM plan_device_groups \
+             WHERE plan_id = ? ORDER BY device_group_id",
+        )
+        .bind(plan_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn set_plan_device_groups(
+        &self,
+        plan_id: i64,
+        device_group_ids: &[i64],
+    ) -> Result<(), DbError> {
+        // REPLACE the grant set (delete-then-insert, deduped via the PK).
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM plan_device_groups WHERE plan_id = ?")
+            .bind(plan_id)
+            .execute(&mut *tx)
+            .await?;
+        for dg_id in device_group_ids {
+            sqlx::query(
+                "INSERT OR IGNORE INTO plan_device_groups (plan_id, device_group_id) \
+                 VALUES (?, ?)",
+            )
+            .bind(plan_id)
+            .bind(dg_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }

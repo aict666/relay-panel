@@ -873,6 +873,12 @@ pub struct CreatePlanRequest {
     pub reset_traffic: bool,
     #[serde(default)]
     pub description: String,
+    /// v1.0.9: buying grants ALL inbound groups (sets all_device_groups).
+    #[serde(default)]
+    pub grant_all_groups: bool,
+    /// v1.0.9: device groups granted on purchase (when grant_all_groups=false).
+    #[serde(default)]
+    pub device_group_ids: Vec<i64>,
 }
 
 fn default_plan_type() -> String {
@@ -896,6 +902,12 @@ pub struct UpdatePlanRequest {
     pub reset_traffic: Option<bool>,
     #[serde(default)]
     pub description: Option<String>,
+    /// v1.0.9: grant ALL inbound groups on purchase.
+    #[serde(default)]
+    pub grant_all_groups: Option<bool>,
+    /// v1.0.9: REPLACE the plan's device-group grant set. None = leave as-is.
+    #[serde(default)]
+    pub device_group_ids: Option<Vec<i64>>,
 }
 
 /// v1.0.8: self-purchase body. plan_id must reference a visible (hidden=0) plan.

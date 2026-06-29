@@ -261,6 +261,11 @@ pub struct Plan {
     /// v1.0.8: free-form line shown under the plan name in the shop.
     #[serde(default)]
     pub description: String,
+    /// v1.0.9: when true, buying this plan grants access to ALL inbound groups
+    /// (sets the user's all_device_groups flag). When false, buying grants the
+    /// groups in plan_device_groups (appended to the user's existing set).
+    #[serde(default)]
+    pub grant_all_groups: bool,
     pub created_at: String,
 }
 

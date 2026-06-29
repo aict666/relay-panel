@@ -1,4 +1,5 @@
 use super::err;
+use super::PlanWithGroups;
 use crate::api::middleware::AuthUser;
 use crate::api::AppState;
 use crate::db::repo::BuyPlanError;
@@ -13,16 +14,38 @@ use relay_shared::protocol::*;
 // traffic onto their quota, sets max_rules / plan_id, computes a stacking
 // expiry, and records an order row — all in one transaction (防双花).
 
-/// GET /plans — public list of purchasable plans (hidden excluded).
+/// GET /plans — public list of purchasable plans (hidden excluded). v1.0.9:
+/// each plan carries its `device_group_ids` so the shop can show "包含线路".
 pub async fn list_public_plans(
     _user: AuthUser,
     State(state): State<AppState>,
-) -> Json<ApiResponse<Vec<Plan>>> {
-    let plans: Vec<Plan> = state.db.list_visible_plans().await.unwrap_or_else(|e| {
-        tracing::error!("list_public_plans: db error: {}", e);
-        Vec::new()
-    });
-    Json(ApiResponse::success(plans))
+) -> Json<ApiResponse<Vec<PlanWithGroups>>> {
+    let plans: Vec<Plan> = match state.db.list_visible_plans().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("list_public_plans: db error: {}", e);
+            return Json(ApiResponse::success(Vec::new()));
+        }
+    };
+    let mut out = Vec::with_capacity(plans.len());
+    for plan in plans {
+        // grant_all_groups plans grant everything — the explicit list is moot,
+        // so skip the lookup and return an empty list (the card shows "全部线路").
+        let device_group_ids = if plan.grant_all_groups {
+            Vec::new()
+        } else {
+            state.db.list_plan_device_groups(plan.id).await.unwrap_or_else(|e| {
+                tracing::error!(
+                    "list_public_plans: list_plan_device_groups({}) failed: {}",
+                    plan.id,
+                    e
+                );
+                Vec::new()
+            })
+        };
+        out.push(PlanWithGroups { plan, device_group_ids });
+    }
+    Json(ApiResponse::success(out))
 }
 
 /// POST /user/buy-plan — purchase a plan. Refuses hidden plans, out-of-range
@@ -75,6 +98,21 @@ pub async fn buy_plan(
         0
     };
 
+    // v1.0.9: resolve the plan's device-group grant set. Only used when
+    // grant_all_groups=false (buy_plan ignores the list otherwise), but fetch
+    // it unconditionally so the same call shape covers both modes.
+    let device_group_ids = if plan.grant_all_groups {
+        Vec::new()
+    } else {
+        match state.db.list_plan_device_groups(plan.id).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!("buy_plan {}: list_plan_device_groups failed: {}", plan.id, e);
+                return Json(err(500, "database error"));
+            }
+        }
+    };
+
     match state
         .db
         .buy_plan(
@@ -86,6 +124,8 @@ pub async fn buy_plan(
             plan.max_rules,
             duration_days,
             plan.reset_traffic,
+            plan.grant_all_groups,
+            &device_group_ids,
         )
         .await
     {

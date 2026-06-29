@@ -51,12 +51,13 @@ impl PlanRepository for PgRepository {
         hidden: bool,
         reset_traffic: bool,
         description: &str,
+        grant_all_groups: bool,
     ) -> Result<i64, DbError> {
         // RETURNING id (PG); speed_limit/ip_limit keep their defaults.
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO plans \
-             (name, max_rules, traffic, price, plan_type, duration_days, hidden, reset_traffic, description) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+             (name, max_rules, traffic, price, plan_type, duration_days, hidden, reset_traffic, description, grant_all_groups) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
         )
         .bind(name)
         .bind(max_rules)
@@ -67,6 +68,7 @@ impl PlanRepository for PgRepository {
         .bind(hidden)
         .bind(reset_traffic)
         .bind(description)
+        .bind(grant_all_groups)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
@@ -85,6 +87,7 @@ impl PlanRepository for PgRepository {
         hidden: Option<bool>,
         reset_traffic: Option<bool>,
         description: Option<&str>,
+        grant_all_groups: Option<bool>,
     ) -> Result<u64, DbError> {
         let mut sets: Vec<&str> = Vec::new();
         if name.is_some() {
@@ -113,6 +116,9 @@ impl PlanRepository for PgRepository {
         }
         if description.is_some() {
             sets.push("description = ");
+        }
+        if grant_all_groups.is_some() {
+            sets.push("grant_all_groups = ");
         }
 
         if sets.is_empty() {
@@ -163,6 +169,9 @@ impl PlanRepository for PgRepository {
         if let Some(v) = description {
             q = q.bind(v);
         }
+        if let Some(v) = grant_all_groups {
+            q = q.bind(v);
+        }
         q = q.bind(id);
 
         let result = q.execute(&self.pool).await?;
@@ -199,6 +208,8 @@ impl PlanRepository for PgRepository {
         plan_max_rules: i32,
         duration_days: i32,
         reset_traffic: bool,
+        grant_all_groups: bool,
+        device_group_ids: &[i64],
     ) -> Result<(), BuyPlanError> {
         let mut tx = self.pool.begin().await?;
 
@@ -293,6 +304,63 @@ impl PlanRepository for PgRepository {
         .execute(&mut *tx)
         .await?;
 
+        // v1.0.9: grant device-group authorization in the SAME tx (mirrors the
+        // SQLite impl). grant_all_groups → set all_device_groups (admins left
+        // alone). Else APPEND the plan's groups via ON CONFLICT DO NOTHING —
+        // dedupes, never removes. Expiry does NOT revoke these.
+        if grant_all_groups {
+            sqlx::query("UPDATE users SET all_device_groups = TRUE WHERE id = $1 AND admin = FALSE")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            for dg_id in device_group_ids {
+                sqlx::query(
+                    "INSERT INTO user_device_groups (user_id, device_group_id) \
+                     VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                )
+                .bind(user_id)
+                .bind(dg_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_plan_device_groups(&self, plan_id: i64) -> Result<Vec<i64>, DbError> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT device_group_id FROM plan_device_groups \
+             WHERE plan_id = $1 ORDER BY device_group_id",
+        )
+        .bind(plan_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn set_plan_device_groups(
+        &self,
+        plan_id: i64,
+        device_group_ids: &[i64],
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM plan_device_groups WHERE plan_id = $1")
+            .bind(plan_id)
+            .execute(&mut *tx)
+            .await?;
+        for dg_id in device_group_ids {
+            sqlx::query(
+                "INSERT INTO plan_device_groups (plan_id, device_group_id) \
+                 VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            )
+            .bind(plan_id)
+            .bind(dg_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }

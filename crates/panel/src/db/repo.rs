@@ -624,6 +624,7 @@ pub trait PlanRepository: Send + Sync {
         hidden: bool,
         reset_traffic: bool,
         description: &str,
+        grant_all_groups: bool,
     ) -> Result<i64, DbError>;
     /// v1.0.8: update a plan's mutable fields. Returns rows affected (0 = not
     /// found). speed_limit/ip_limit are intentionally NOT updatable here
@@ -641,12 +642,23 @@ pub trait PlanRepository: Send + Sync {
         hidden: Option<bool>,
         reset_traffic: Option<bool>,
         description: Option<&str>,
+        grant_all_groups: Option<bool>,
     ) -> Result<u64, DbError>;
     /// v1.0.8: delete a plan. Returns rows affected (0 = not found).
     async fn delete_plan(&self, id: i64) -> Result<u64, DbError>;
     /// v1.0.8: count users whose plan_id points at this plan. Used as a
     /// pre-delete safety check (count > 0 → 409).
     async fn count_users_on_plan(&self, plan_id: i64) -> Result<i64, DbError>;
+
+    /// v1.0.9: list the device-group ids this plan grants on purchase.
+    async fn list_plan_device_groups(&self, plan_id: i64) -> Result<Vec<i64>, DbError>;
+    /// v1.0.9: REPLACE the plan's grant set (delete-then-insert, deduped). Used
+    /// by the admin create/update plan handlers.
+    async fn set_plan_device_groups(
+        &self,
+        plan_id: i64,
+        device_group_ids: &[i64],
+    ) -> Result<(), DbError>;
 
     /// v1.0.8: atomically purchase a plan in ONE transaction (防双花):
     ///   - lock + read the user's balance
@@ -656,6 +668,9 @@ pub trait PlanRepository: Send + Sync {
     ///   - reset traffic_used to 0 when `reset_traffic`
     ///   - plan_expire_at = max(now, current expiry) + duration_days (NULL when duration_days=0)
     ///   - insert an orders row (snapshots plan_name + price)
+    ///   - v1.0.9: grant device groups in the SAME tx — when `grant_all_groups`
+    ///     set all_device_groups=1; else append the plan's `device_group_ids`
+    ///     to user_device_groups (deduped, never removing existing grants).
     /// All on the same tx handle so a concurrent purchase can't double-spend.
     /// `price_cents` / `traffic_to_add` / `plan_max_rules` / `duration_days` are
     /// resolved by the caller from the plan row (and re-checked hidden=0 there),
@@ -671,6 +686,8 @@ pub trait PlanRepository: Send + Sync {
         plan_max_rules: i32,
         duration_days: i32,
         reset_traffic: bool,
+        grant_all_groups: bool,
+        device_group_ids: &[i64],
     ) -> Result<(), BuyPlanError>;
 }
 

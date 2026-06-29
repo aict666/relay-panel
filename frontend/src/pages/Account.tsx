@@ -140,7 +140,7 @@ export default function Account() {
           {/* v1.0.8: traffic usage with a progress bar (used / limit). */}
           <Descriptions.Item label={t('accountTrafficUsed')}>
             {me.traffic_limit > 0 ? (
-              <Space direction="vertical" style={{ width: '100%' }}>
+              <Space direction="vertical" style={{ width: '100%', maxWidth: 360 }}>
                 <span>{formatBytes(me.traffic_used)} / {formatBytes(me.traffic_limit)}</span>
                 <Progress
                   percent={Math.min(100, Math.round((me.traffic_used / me.traffic_limit) * 100))}

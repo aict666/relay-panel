@@ -46,11 +46,6 @@ function payloadWithTargets<T extends Record<string, unknown>>(values: T & { tar
   };
 }
 
-/** Resolve the inbound group's connect_host for a rule. */
-function listenHostFor(rule: ForwardRule, groups: DeviceGroup[]): string {
-  return groups.find(g => g.id === rule.device_group_in)?.connect_host ?? '';
-}
-
 /** v1.0.4: simplified export format — only dest, listen_port, name.
  *  Enabled targets only. IPv6 wrapped as [addr]:port.
  *  v1.0.6: always emit a JSON array (even for a single rule) so the export
@@ -202,6 +197,19 @@ export default function Rules() {
   // v0.4.9: group lookup map for the "group name" column + filter. Memoized so
   // the column render + filter options share one derivation.
   const groupMap = useMemo(() => new Map(groups.map(g => [g.id, g])), [groups]);
+  // v1.0.8: group-name + listen-IP lookup for the rule columns. A regular user
+  // does NOT own the (admin-owned) device groups, so GET /groups returns none
+  // for them and the columns rendered "未知分组 / 未配置". Their AUTHORIZED
+  // groups come from /groups/shared (SharedGroupSummary, which carries name +
+  // connect_host) — merge both so name/IP resolve for admins and users alike.
+  const groupInfo = useMemo(() => {
+    const m = new Map<number, { name: string; connect_host: string }>();
+    for (const g of groups) m.set(g.id, { name: g.name, connect_host: g.connect_host });
+    for (const g of sharedGroups) {
+      if (!m.has(g.id)) m.set(g.id, { name: g.name, connect_host: g.connect_host });
+    }
+    return m;
+  }, [groups, sharedGroups]);
   // The rules actually shown: filtered by the selected inbound group, or all
   // when selectedGroup === null. Computed once so the table + count stay in sync.
   const visibleRules = useMemo(
@@ -477,7 +485,7 @@ const IMPORT_DEFAULTS = {
     {
       title: t('groupName'), key: 'group_name', width: 140, responsive: ['md' as const],
       render: (_: unknown, r: ForwardRule) => {
-        const g = groupMap.get(r.device_group_in);
+        const g = groupInfo.get(r.device_group_in);
         return g
           ? <Tag>{g.name}</Tag>
           : <Text type="secondary">{t('unknownGroup')} (#{r.device_group_in})</Text>;
@@ -487,7 +495,7 @@ const IMPORT_DEFAULTS = {
     {
       title: t('listenIp'), key: 'listen_ip', width: 160,
       render: (_: unknown, r: ForwardRule) => {
-        const host = listenHostFor(r, groups);
+        const host = groupInfo.get(r.device_group_in)?.connect_host ?? '';
         return host
           ? <span className="rp-mono">{host}</span>
           : <Text type="secondary">{t('notConfigured')}</Text>;

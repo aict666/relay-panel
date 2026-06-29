@@ -59,6 +59,10 @@ CREATE TABLE IF NOT EXISTS plans (
     hidden INTEGER NOT NULL DEFAULT 0,
     reset_traffic INTEGER NOT NULL DEFAULT 0,
     description TEXT NOT NULL DEFAULT '',
+    -- v1.0.9: when 1, buying this plan sets the user's all_device_groups flag
+    -- (access to EVERY inbound group). When 0, buying grants only the groups
+    -- in plan_device_groups (appended to the user's existing authorizations).
+    grant_all_groups INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -189,6 +193,15 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
+
+-- v1.0.9: plan ↔ device_group grant map. Buying a plan (with grant_all_groups=0)
+-- appends these groups to the user's user_device_groups. FK cascade so deleting
+-- a plan or device_group cleans up the mapping rows.
+CREATE TABLE IF NOT EXISTS plan_device_groups (
+    plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (plan_id, device_group_id)
+);
 
 CREATE TABLE IF NOT EXISTS kvs (
     key TEXT PRIMARY KEY,
@@ -1295,6 +1308,28 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         .execute(pool)
         .await?;
     tracing::info!("Migration 34: plans lifecycle cols + users suspension + orders table");
+
+    // ── Migration 35: v1.0.9 plan ↔ device-group grants ──
+    // Adds plans.grant_all_groups + the plan_device_groups map table. Buying a
+    // plan grants these device groups to the user (see buy_plan). Idempotent:
+    // add_column_if_missing + CREATE TABLE IF NOT EXISTS.
+    add_column_if_missing(
+        pool,
+        "plans",
+        "grant_all_groups",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS plan_device_groups (
+            plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+            device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (plan_id, device_group_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 35: plans.grant_all_groups + plan_device_groups table");
 
     Ok(())
 }

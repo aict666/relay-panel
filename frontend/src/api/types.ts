@@ -138,6 +138,11 @@ export interface Plan {
   reset_traffic?: boolean;
   /** v1.0.8: free-form line shown under the plan name. */
   description?: string;
+  /** v1.0.9: buying grants ALL inbound groups (sets all_device_groups). */
+  grant_all_groups?: boolean;
+  /** v1.0.9: device groups this plan grants on purchase (when not grant_all).
+   *  Populated by GET /admin/plans and the shop list; sent on create/update. */
+  device_group_ids?: number[];
   created_at: string;
 }
 
