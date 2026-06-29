@@ -105,9 +105,14 @@ pub struct UpdateUserRequest {
     /// Cannot ban admin users (the handler rejects it).
     #[serde(default)]
     pub banned: Option<bool>,
-    /// v1.0.4: assign user to a permission group.
+    /// v1.0.7: set the user's device-group authorization directly. `Some(list)`
+    /// replaces the user's explicit device-group assignments. Ignored when
+    /// `all_device_groups` is Some(true).
     #[serde(default)]
-    pub group_id: Option<i64>,
+    pub device_group_ids: Option<Vec<i64>>,
+    /// v1.0.7: when Some, sets the per-user "all device groups" flag.
+    #[serde(default)]
+    pub all_device_groups: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

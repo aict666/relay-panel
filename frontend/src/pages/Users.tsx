@@ -3,7 +3,7 @@ import { EditOutlined, ReloadOutlined, UndoOutlined, UserOutlined, PlusOutlined,
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, User } from '../api/types';
+import type { ApiEnvelope, User, DeviceGroup } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { useAuth } from '../auth/useAuth';
@@ -26,7 +26,10 @@ interface UserFormValues {
   // Edited in GB; converted to bytes before sending to the backend.
   traffic_limit_gb: number;
   banned: boolean;
-  group_id?: number | null;
+  // v1.0.7: per-user device-group authorization. all_device_groups short-
+  // circuits the explicit list (when on, the user may use every group).
+  all_device_groups: boolean;
+  device_group_ids: number[];
 }
 
 interface CreateUserFormValues {
@@ -51,8 +54,12 @@ export default function Users() {
   const [creating, setCreating] = useState(false);
   // v0.4.10 PR4: admin password reset state. resetting = the target user row.
   const [resetting, setResetting] = useState<User | null>(null);
-  const [userGroups, setUserGroups] = useState<{ id: number; name: string }[]>([]);
+  // v1.0.7: inbound device groups available to assign to a user.
+  const [deviceGroups, setDeviceGroups] = useState<DeviceGroup[]>([]);
   const [form] = Form.useForm<UserFormValues>();
+  // Watch the all-device-groups switch so the explicit multi-select can be
+  // disabled while it's on (the user already has access to everything).
+  const allDeviceGroups = Form.useWatch('all_device_groups', form);
   const [createForm] = Form.useForm<CreateUserFormValues>();
   const [resetForm] = Form.useForm<ResetFormValues>();
 
@@ -68,11 +75,11 @@ export default function Users() {
     try {
       const usersRes = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
       setUsers(usersRes.data || []);
-      // v1.0.4: load user permission groups for the group_id selector.
+      // v1.0.7: load inbound device groups for the per-user authorization editor.
       try {
-        const gRes = await api.get<unknown, ApiEnvelope<{ id: number; name: string }[]>>('/user-groups');
-        setUserGroups(gRes.data || []);
-      } catch { setUserGroups([]); }
+        const gRes = await api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups');
+        setDeviceGroups((gRes.data || []).filter(g => g.group_type === 'in'));
+      } catch { setDeviceGroups([]); }
     } finally { setLoading(false); }
   };
 
@@ -85,7 +92,7 @@ export default function Users() {
     load();
   };
 
-  const openEdit = (u: User) => {
+  const openEdit = async (u: User) => {
     setEditing(u);
     form.setFieldsValue({
       // InputNumber with stringMode wants a string. Existing rows already have
@@ -95,8 +102,22 @@ export default function Users() {
       // DB stores bytes; show GB in the form.
       traffic_limit_gb: bytesToGb(u.traffic_limit),
       banned: u.banned,
-      group_id: u.group_id,
+      all_device_groups: u.all_device_groups,
+      device_group_ids: [],
     });
+    // v1.0.7: preload the user's explicit device-group assignments for the
+    // multi-select. Admins are always all-allowed, so skip the fetch for them.
+    if (!u.admin) {
+      try {
+        const res = await api.get<unknown, ApiEnvelope<{ all_device_groups: boolean; device_group_ids: number[] }>>(`/admin/users/${u.id}/device-groups`);
+        if (res.data) {
+          form.setFieldsValue({
+            all_device_groups: res.data.all_device_groups,
+            device_group_ids: res.data.device_group_ids,
+          });
+        }
+      } catch { /* keep the optimistic defaults from the row */ }
+    }
   };
 
   const handleSave = async () => {
@@ -115,9 +136,14 @@ export default function Users() {
     if (balance !== '') {
       payload.balance = balance;
     }
-    // v1.0.4: send group_id if changed.
-    if (values.group_id !== editing.group_id) {
-      payload.group_id = values.group_id;
+    // v1.0.7: send the per-user device-group authorization. Admins are always
+    // all-allowed, so the editor hides these and we skip sending them.
+    if (!editing.admin) {
+      payload.all_device_groups = values.all_device_groups;
+      // When all_device_groups is on the explicit list is moot, but sending it
+      // is harmless (the backend ignores it for authorization). Send [] then so
+      // a later toggle-off starts clean.
+      payload.device_group_ids = values.all_device_groups ? [] : (values.device_group_ids || []);
     }
     setSaving(true);
     try {
@@ -195,10 +221,12 @@ export default function Users() {
     },
     { title: t('balance'), dataIndex: 'balance', key: 'balance' },
     {
-      title: t('userGroups'), dataIndex: 'group_id', key: 'group_id', width: 100,
-      render: (gid: number | null) => {
-        const g = userGroups.find(x => x.id === gid);
-        return g ? <Tag>{g.name}</Tag> : '-';
+      title: t('deviceGroupAccess'), dataIndex: 'all_device_groups', key: 'all_device_groups', width: 110,
+      render: (all: boolean, u: User) => {
+        if (u.admin) return <Tag color="gold">{t('accessAll')}</Tag>;
+        return all
+          ? <Tag color="green">{t('accessAll')}</Tag>
+          : <Tag color="blue">{t('accessLimited')}</Tag>;
       },
     },
     { title: t('maxRules'), dataIndex: 'max_rules', key: 'max_rules' },
@@ -351,11 +379,30 @@ export default function Users() {
             <Switch disabled={!!editing?.admin} />
           </Form.Item>
           {!editing?.admin && (
-            <Form.Item name="group_id" label={t('userGroups')}>
-              <Select allowClear placeholder={t('selectUserGroup')} style={{ width: '100%' }}>
-                {userGroups.map(g => <Select.Option key={g.id} value={g.id}>{g.name} (#{g.id})</Select.Option>)}
-              </Select>
-            </Form.Item>
+            <>
+              <Form.Item
+                name="all_device_groups"
+                label={t('allDeviceGroups')}
+                tooltip={t('allDeviceGroupsHint')}
+                valuePropName="checked"
+              >
+                <Switch />
+              </Form.Item>
+              <Form.Item
+                name="device_group_ids"
+                label={t('deviceGroups')}
+                tooltip={t('deviceGroupsHint')}
+              >
+                <Select
+                  mode="multiple"
+                  allowClear
+                  disabled={allDeviceGroups}
+                  placeholder={t('selectDeviceGroups')}
+                  style={{ width: '100%' }}
+                  options={deviceGroups.map(g => ({ value: g.id, label: `${g.name} (#${g.id})` }))}
+                />
+              </Form.Item>
+            </>
           )}
         </Form>
       </Modal>

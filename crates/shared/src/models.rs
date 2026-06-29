@@ -11,7 +11,12 @@ pub struct User {
     pub password: String,
     pub balance: String,
     pub plan_id: Option<i64>,
-    pub group_id: Option<i64>,
+    /// v1.0.7: replaces the old `group_id` permission-group link. When true the
+    /// user may use ALL device groups (admins are always treated as true). When
+    /// false the user is limited to the device groups in `user_device_groups`;
+    /// none assigned = cannot forward.
+    #[serde(default)]
+    pub all_device_groups: bool,
     pub max_rules: i32,
     pub speed_limit: i32,
     pub ip_limit: i32,
@@ -230,23 +235,6 @@ pub struct Plan {
     pub ip_limit: i32,
     pub price: String,
     pub created_at: String,
-}
-
-// ── v1.0.4: user permission groups ──
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct UserGroup {
-    pub id: i64,
-    pub name: String,
-    pub remark: String,
-    pub allow_all_groups: bool,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct UserGroupDeviceGroup {
-    pub user_group_id: i64,
-    pub device_group_id: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]

@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS users (
     password TEXT NOT NULL,
     balance TEXT NOT NULL DEFAULT '0',
     plan_id BIGINT REFERENCES plans(id),
-    group_id BIGINT,
+    -- v1.0.7: replaces group_id. TRUE = user may use ALL device groups; FALSE =
+    -- limited to user_device_groups (none = cannot forward). Admins always all.
+    all_device_groups BOOLEAN NOT NULL DEFAULT FALSE,
     max_rules INTEGER NOT NULL DEFAULT 5,
     speed_limit INTEGER NOT NULL DEFAULT 0,
     ip_limit INTEGER NOT NULL DEFAULT 3,
@@ -220,31 +222,11 @@ CREATE TABLE IF NOT EXISTS app_settings (
     registration_allowed_plan_ids TEXT NOT NULL DEFAULT '[1]'
 );
 
--- v1.0.4: user permission groups.
-CREATE TABLE IF NOT EXISTS user_groups (
-    id BIGSERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    remark TEXT NOT NULL DEFAULT '',
-    allow_all_groups BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
-);
-
-CREATE TABLE IF NOT EXISTS user_group_device_groups (
-    user_group_id BIGINT NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+-- v1.0.7: per-user device-group authorization (replaces the user_groups layer).
+CREATE TABLE IF NOT EXISTS user_device_groups (
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
-    PRIMARY KEY (user_group_id, device_group_id)
-);
-
-INSERT INTO user_groups (id, name, remark, allow_all_groups)
-VALUES (1, 'default', 'Default group - all device groups allowed', TRUE)
-ON CONFLICT (id) DO NOTHING;
-
--- v1.0.4: the explicit id=1 INSERT above does NOT advance the BIGSERIAL
--- sequence, so the next admin-created group would also try id=1 and hit a
--- duplicate-key error. Bump the sequence past the highest existing id.
-SELECT setval(
-    pg_get_serial_sequence('user_groups', 'id'),
-    GREATEST((SELECT MAX(id) FROM user_groups), 1)
+    PRIMARY KEY (user_id, device_group_id)
 );
 
 -- Record the baseline schema revision. ON CONFLICT DO NOTHING keeps re-runs
@@ -255,7 +237,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 14;
+pub const PG_SCHEMA_VERSION: i32 = 15;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -835,9 +817,20 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
-        sqlx::query("UPDATE users SET group_id = 1 WHERE group_id IS NULL")
-            .execute(pool)
-            .await?;
+        // v1.0.7: guard the legacy group_id backfill — on a FRESH DB the baseline
+        // schema no longer has users.group_id (it was replaced by
+        // all_device_groups), yet this arm still replays. Skip the UPDATE when the
+        // column is absent so fresh installs don't error here.
+        sqlx::query(
+            "DO $$ BEGIN \
+               IF EXISTS (SELECT 1 FROM information_schema.columns \
+                          WHERE table_name = 'users' AND column_name = 'group_id') THEN \
+                 UPDATE users SET group_id = 1 WHERE group_id IS NULL; \
+               END IF; \
+             END $$",
+        )
+        .execute(pool)
+        .await?;
 
         sqlx::query(
             "INSERT INTO schema_version (version) VALUES (13) ON CONFLICT (version) DO NOTHING",
@@ -861,6 +854,46 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
         tracing::info!("PG migration 14: default user_group remark normalized to ASCII");
+    }
+
+    // ── Revision 15: v1.0.7 drop the user_groups named-entity layer ──
+    // Mirrors SQLite Migration 32: per-user all_device_groups flag + direct
+    // user ↔ device_group link, no backfill (every non-admin starts unassigned;
+    // admins are always all-allowed in code). The dormant users.group_id column
+    // is left in place (unread) to avoid a risky table rewrite.
+    if current < 15 {
+        sqlx::query(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS all_device_groups BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS user_device_groups (
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_id, device_group_id)
+            )",
+        )
+        .execute(pool)
+        .await?;
+
+        // Drop the legacy named-entity tables (child first for the FK).
+        sqlx::query("DROP TABLE IF EXISTS user_group_device_groups")
+            .execute(pool)
+            .await?;
+        sqlx::query("DROP TABLE IF EXISTS user_groups")
+            .execute(pool)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (15) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+        tracing::info!(
+            "PG migration 15: user_groups layer replaced by user_device_groups + all_device_groups"
+        );
     }
 
     Ok(())

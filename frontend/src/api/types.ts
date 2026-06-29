@@ -12,7 +12,8 @@ export interface User {
   username: string;
   balance: string;
   plan_id: number | null;
-  group_id: number | null;
+  /** v1.0.7: replaces group_id. true = user may use all device groups. */
+  all_device_groups: boolean;
   max_rules: number;
   /** @deprecated PLACEHOLDER — stored but never enforced. Do not surface in UI. */
   speed_limit: number;

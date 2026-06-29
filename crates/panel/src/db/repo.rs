@@ -25,7 +25,7 @@
 use async_trait::async_trait;
 use relay_shared::models::{
     DeviceGroup, ForwardRule, ForwardRuleTarget, Plan, SharedGroupSummary, Statistic,
-    TunnelProfile, User, UserGroup,
+    TunnelProfile, User,
 };
 use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
 use serde::Serialize;
@@ -176,8 +176,6 @@ pub trait UserRepository: Send + Sync {
     async fn count_placeholder_admin_password(&self) -> Result<i64, DbError>;
     /// Replace placeholder admin password with a real hash (system boot).
     async fn replace_placeholder_admin_password(&self, hash: &str) -> Result<(), DbError>;
-    /// v1.0.4: assign a user to a permission group.
-    async fn set_user_group(&self, user_id: i64, group_id: Option<i64>) -> Result<u64, DbError>;
 }
 
 // ── Rule (forward_rules) ──
@@ -404,42 +402,30 @@ pub trait GroupRepository: Send + Sync {
     async fn delete_groups_by_uid(&self, uid: i64) -> Result<u64, DbError>;
 }
 
-// ── v1.0.4: User Permission Groups ──
+// ── v1.0.7: per-user device-group authorization ──
+// Replaces the v1.0.4 user-permission-group layer (user → named group →
+// device-group allowlist) with a direct user ↔ device_group link plus a
+// per-user `all_device_groups` flag. Admins are always treated as all-allowed.
 
 #[async_trait]
-pub trait UserGroupRepository: Send + Sync {
-    async fn list_user_groups(&self) -> Result<Vec<UserGroup>, DbError>;
-    async fn find_user_group_by_id(&self, id: i64) -> Result<Option<UserGroup>, DbError>;
-    async fn insert_user_group(
+pub trait DeviceGroupAuthRepository: Send + Sync {
+    /// List the device-group IDs explicitly assigned to this user (the raw
+    /// `user_device_groups` rows). Does NOT expand `all_device_groups`; use
+    /// `authorized_device_group_ids` for the effective set. For the admin UI.
+    async fn list_user_device_groups(&self, user_id: i64) -> Result<Vec<i64>, DbError>;
+    /// Replace a user's explicit device-group assignments (clear + re-insert).
+    async fn set_user_device_groups(
         &self,
-        name: &str,
-        remark: &str,
-        allow_all_groups: bool,
-    ) -> Result<i64, DbError>;
-    async fn update_user_group(
-        &self,
-        id: i64,
-        name: Option<&str>,
-        remark: Option<&str>,
-        allow_all_groups: Option<bool>,
-    ) -> Result<u64, DbError>;
-    async fn delete_user_group(&self, id: i64) -> Result<u64, DbError>;
-    /// Count how many users belong to this group (delete protection).
-    async fn count_users_in_group(&self, group_id: i64) -> Result<i64, DbError>;
-    /// List device group IDs assigned to this user group.
-    async fn list_user_group_device_groups(&self, user_group_id: i64) -> Result<Vec<i64>, DbError>;
-    /// Replace the device group assignments for a user group (clear + re-insert).
-    async fn set_user_group_device_groups(
-        &self,
-        user_group_id: i64,
+        user_id: i64,
         device_group_ids: &[i64],
     ) -> Result<(), DbError>;
-    /// List device group IDs the user is authorized to use, based on their
-    /// user group. Returns empty if no group assigned. Returns ALL groups
-    /// if the group has allow_all_groups=true (caller-side filter).
+    /// Set the per-user `all_device_groups` flag. Returns rows affected
+    /// (0 = user not found).
+    async fn set_user_all_device_groups(&self, user_id: i64, all: bool) -> Result<u64, DbError>;
+    /// Effective set of inbound ('in') device-group IDs the user may use:
+    /// admins and `all_device_groups` users get ALL 'in' groups; everyone else
+    /// gets only their explicit assignments. Empty = cannot forward.
     async fn authorized_device_group_ids(&self, user_id: i64) -> Result<Vec<i64>, DbError>;
-    /// Check whether the user's permission group allows all groups.
-    async fn user_group_allows_all(&self, user_id: i64) -> Result<bool, DbError>;
     /// v1.0.4: pause all of `user_id`'s rules whose device_group_in is NOT in
     /// `allowed_group_ids` (the user lost authorization for that group). Rules
     /// are paused, never deleted, so an admin can re-authorize and resume them.
@@ -450,25 +436,10 @@ pub trait UserGroupRepository: Send + Sync {
         user_id: i64,
         allowed_group_ids: &[i64],
     ) -> Result<u64, DbError>;
-    /// v1.0.4: list the (non-admin) user IDs assigned to a permission group.
-    /// Used to re-evaluate rule authorization when the group's device-group
-    /// allowlist changes.
-    async fn list_user_ids_in_group(&self, user_group_id: i64) -> Result<Vec<i64>, DbError>;
-    /// v1.0.4: whether the user is subject to device-group restriction —
-    /// i.e. has a non-null permission group with allow_all_groups = false.
-    /// Legacy users (group_id NULL) and allow-all groups return false, so the
-    /// rule API skips the allowlist check and defers to normal validation.
+    /// Whether the user is subject to device-group restriction — i.e. a
+    /// non-admin without `all_device_groups`. The rule API uses this to decide
+    /// whether to enforce the allowlist. Admins / all-device-groups users → false.
     async fn is_user_restricted(&self, user_id: i64) -> Result<bool, DbError>;
-    /// v1.0.4: atomic group update + re-evaluation. Updates the group row and
-    /// pauses every non-admin user's rules on now-unauthorized groups, all in
-    /// ONE transaction. If the pause step fails, the group update is rolled back.
-    async fn update_user_group_with_pause(
-        &self,
-        id: i64,
-        name: Option<&str>,
-        remark: Option<&str>,
-        allow_all_groups: bool,
-    ) -> Result<UserGroup, DbError>;
 }
 
 // ── Tunnel Profile ──
@@ -684,7 +655,7 @@ pub trait Repository:
     UserRepository
     + RuleRepository
     + GroupRepository
-    + UserGroupRepository
+    + DeviceGroupAuthRepository
     + TunnelProfileRepository
     + TrafficRepository
     + KvsRepository

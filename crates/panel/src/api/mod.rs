@@ -108,21 +108,13 @@ pub fn routes() -> Router<AppState> {
             "/groups/shared",
             axum::routing::get(groups::list_shared_groups),
         )
-        // v1.0.4: user permission groups
+        // v1.0.7: per-user device-group authorization (replaces user-groups).
+        // GET preloads a user's current assignment for the editor; updates go
+        // through PUT /users/{id} (update_user) carrying device_group_ids /
+        // all_device_groups.
         .route(
-            "/user-groups",
-            axum::routing::get(admin::list_user_groups).post(admin::create_user_group),
-        )
-        .route(
-            "/user-groups/{id}",
-            axum::routing::get(admin::get_user_group)
-                .put(admin::update_user_group)
-                .delete(admin::delete_user_group),
-        )
-        .route(
-            "/user-groups/{id}/device-groups",
-            axum::routing::get(admin::get_user_group_device_groups)
-                .put(admin::set_user_group_device_groups),
+            "/admin/users/{id}/device-groups",
+            axum::routing::get(admin::get_user_device_groups),
         )
         .route(
             "/nodes/shared",

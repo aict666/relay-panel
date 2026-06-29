@@ -5,7 +5,10 @@ CREATE TABLE IF NOT EXISTS users (
     password TEXT NOT NULL,
     balance TEXT NOT NULL DEFAULT '0',
     plan_id INTEGER REFERENCES plans(id),
-    group_id INTEGER,
+    -- v1.0.7: replaces group_id. 1 = user may use ALL device groups; 0 = limited
+    -- to the device groups in user_device_groups (none = cannot forward). Admins
+    -- are always treated as all-allowed regardless of this flag.
+    all_device_groups INTEGER NOT NULL DEFAULT 0,
     -- v0.3.0: SINGLE-TENANT. max_rules is advisory only (not enforced per-user;
     -- see the forward_rules.uid note above). Enforced only for the admin user
     -- (uid=1, max_rules=999) in practice.
@@ -197,25 +200,15 @@ CREATE TABLE IF NOT EXISTS app_settings (
     registration_allowed_plan_ids TEXT NOT NULL DEFAULT '[1]'
 );
 
--- v1.0.4: user permission groups — control which device groups a user can use.
-CREATE TABLE IF NOT EXISTS user_groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    remark TEXT NOT NULL DEFAULT '',
-    allow_all_groups INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS user_group_device_groups (
-    user_group_id INTEGER NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+-- v1.0.7: per-user device-group authorization. Replaces the user_groups /
+-- user_group_device_groups named-entity layer with a direct user ↔ device_group
+-- many-to-many. A user with all_device_groups=0 may only use the device groups
+-- listed here; no rows = cannot forward.
+CREATE TABLE IF NOT EXISTS user_device_groups (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
-    PRIMARY KEY (user_group_id, device_group_id)
+    PRIMARY KEY (user_id, device_group_id)
 );
-
--- Seed the default user group (allow_all_groups=true) so existing users
--- retain unrestricted access after upgrade.
-INSERT OR IGNORE INTO user_groups (id, name, remark, allow_all_groups)
-VALUES (1, 'default', 'Default group - all device groups allowed', 1);
 "#;
 
 /// Run schema migrations for existing databases (v0.1.0/v0.1.1 → v0.1.2).
@@ -1184,6 +1177,46 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .execute(pool)
     .await?;
     tracing::info!("Migration 31: default user_group remark normalized to ASCII");
+
+    // ── Migration 32: v1.0.7 drop the user_groups named-entity layer ──
+    // Replaces user_groups / user_group_device_groups (a user → named group →
+    // device-group allowlist chain) with a direct user ↔ device_group link plus
+    // a per-user `all_device_groups` flag. Per the refactor decision, existing
+    // authorizations are NOT backfilled: every non-admin starts unassigned
+    // (all_device_groups=0, no rows) and admins re-assign. Admins are always
+    // treated as all-allowed in code, so no flag flip is needed for them.
+    //
+    // The legacy `users.group_id` column is left in place (dormant, unread) —
+    // dropping it would require a full users-table rebuild, which is not worth
+    // the risk since nothing reads it anymore.
+    add_column_if_missing(
+        pool,
+        "users",
+        "all_device_groups",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_device_groups (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (user_id, device_group_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Drop the legacy named-entity tables (self-contained; FK-referenced only by
+    // each other, so dropping is safe and loses no still-used data).
+    sqlx::query("DROP TABLE IF EXISTS user_group_device_groups")
+        .execute(pool)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS user_groups")
+        .execute(pool)
+        .await?;
+
+    tracing::info!("Migration 32: user_groups layer replaced by user_device_groups + all_device_groups flag");
 
     Ok(())
 }
