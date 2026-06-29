@@ -8,9 +8,12 @@ use super::limiter::RateLimit;
 use super::selector::TargetSelector;
 use crate::reporter::{ConnectionTracker, TrafficCounter};
 
+/// v1.0.5: serve an ALREADY-BOUND TcpListener. Binding happens in the manager
+/// (synchronously, so errors surface immediately and per-family success is
+/// known). This function only runs the accept loop.
 #[allow(clippy::too_many_arguments)]
-pub async fn start_tcp_listener(
-    listen_addr: SocketAddr,
+pub async fn serve_tcp_listener(
+    listener: TcpListener,
     targets: Vec<String>,
     selector: Arc<TargetSelector>,
     rate_limit: RateLimit,
@@ -19,7 +22,9 @@ pub async fn start_tcp_listener(
     rule_id: i64,
     source_ipv4: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(listen_addr).await?;
+    let listen_addr = listener
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
     tracing::info!("TCP listening on {} (rule {})", listen_addr, rule_id);
 
     // v0.3.6: accept-loop resilience. A transient accept error (EMFILE,

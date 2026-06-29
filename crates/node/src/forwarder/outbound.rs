@@ -9,8 +9,9 @@
 //! 2. OUTBOUND_INTERFACE → resolve the NIC's IPv4 address.
 //! 3. Neither / OUTBOUND_INTERFACE=auto → system auto-route (no bind).
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use socket2::{Domain, Protocol as S2Protocol, Socket, Type};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 
 // ── errors ──
 
@@ -216,19 +217,75 @@ pub async fn udp_outbound_socket(
         .map_err(OutboundError::Bind)
 }
 
+// ── dual-stack listener binding ──
+
+/// Build a TCP listener bound to the given IP + port. For IPv6 addresses,
+/// sets IPV6_V6ONLY so the IPv6 socket does NOT also claim the IPv4 wildcard
+/// (which would make a separate 0.0.0.0 bind fail with EADDRINUSE on Linux,
+/// where bindv6only defaults to 0).
+///
+/// The address is constructed via SocketAddr::new — NEVER string-formatted —
+/// so "::" + port can never produce the broken ":::port" form.
+pub fn bind_tcp_listener(ip: IpAddr, port: u16) -> Result<TcpListener, OutboundError> {
+    let addr = SocketAddr::new(ip, port);
+    let domain = match ip {
+        IpAddr::V4(_) => Domain::IPV4,
+        IpAddr::V6(_) => Domain::IPV6,
+    };
+    let sock =
+        Socket::new(domain, Type::STREAM, Some(S2Protocol::TCP)).map_err(OutboundError::Bind)?;
+    if ip.is_ipv6() {
+        sock.set_only_v6(true).map_err(OutboundError::Bind)?;
+    }
+    sock.set_reuse_address(true).map_err(OutboundError::Bind)?;
+    sock.set_nonblocking(true).map_err(OutboundError::Bind)?;
+    sock.bind(&addr.into()).map_err(OutboundError::Bind)?;
+    sock.listen(1024).map_err(OutboundError::Bind)?;
+    let std_listener: std::net::TcpListener = sock.into();
+    TcpListener::from_std(std_listener).map_err(OutboundError::Bind)
+}
+
+/// Build a UDP socket bound to the given IP + port (for inbound listeners).
+/// IPv6 sockets get IPV6_V6ONLY for the same reason as TCP.
+pub fn bind_udp_socket(ip: IpAddr, port: u16) -> Result<UdpSocket, OutboundError> {
+    let addr = SocketAddr::new(ip, port);
+    let domain = match ip {
+        IpAddr::V4(_) => Domain::IPV4,
+        IpAddr::V6(_) => Domain::IPV6,
+    };
+    let sock =
+        Socket::new(domain, Type::DGRAM, Some(S2Protocol::UDP)).map_err(OutboundError::Bind)?;
+    if ip.is_ipv6() {
+        sock.set_only_v6(true).map_err(OutboundError::Bind)?;
+    }
+    sock.set_reuse_address(true).map_err(OutboundError::Bind)?;
+    sock.set_nonblocking(true).map_err(OutboundError::Bind)?;
+    sock.bind(&addr.into()).map_err(OutboundError::Bind)?;
+    let std_sock: std::net::UdpSocket = sock.into();
+    UdpSocket::from_std(std_sock).map_err(OutboundError::Bind)
+}
+
+/// Parse a listen address string ("0.0.0.0", "::", or empty) into an IpAddr.
+/// Returns None when the string is empty (family disabled).
+pub fn parse_listen_ip(s: &str) -> Option<IpAddr> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.parse::<IpAddr>().ok()
+}
+
 // ── init ──
 
 /// Called once at startup. Validates the outbound config and returns
-/// the resolved source IPv4 (or None for auto-route), emitting clear
-/// diagnostic logs.
-pub fn init_outbound(config: &OutboundConfig) -> Option<Ipv4Addr> {
-    match resolve_bind_ipv4(config) {
-        Ok(ip) => ip,
-        Err(e) => {
-            tracing::error!("outbound config error: {} — falling back to auto-route", e);
-            None
-        }
-    }
+/// the resolved source IPv4 (or None for auto-route).
+///
+/// v1.0.5 fix: a MISCONFIGURED outbound (invalid IP, missing interface,
+/// non-local IP) returns Err — the caller decides whether to abort. It does
+/// NOT silently fall back to auto-route, which could send traffic out the
+/// wrong NIC without the operator noticing.
+pub fn init_outbound(config: &OutboundConfig) -> Result<Option<Ipv4Addr>, OutboundError> {
+    resolve_bind_ipv4(config)
 }
 
 #[cfg(test)]
@@ -238,8 +295,7 @@ mod tests {
     #[test]
     fn auto_mode_no_bind() {
         let cfg = OutboundConfig::default();
-        // On test machines, interface="auto" means no bind.
-        let ip = init_outbound(&cfg);
+        let ip = init_outbound(&cfg).expect("auto must succeed");
         assert!(ip.is_none(), "auto should not bind");
     }
 
@@ -249,8 +305,8 @@ mod tests {
             bind_ipv4: Some("not-an-ip".into()),
             interface: "auto".into(),
         };
-        let ip = init_outbound(&cfg);
-        assert!(ip.is_none(), "invalid IP must fall back to auto-route");
+        // v1.0.5: invalid IP must ERROR, not silently fall back.
+        assert!(init_outbound(&cfg).is_err(), "invalid IP must be an error");
     }
 
     #[test]
@@ -260,7 +316,7 @@ mod tests {
             bind_ipv4: Some("127.0.0.1".into()),
             interface: "auto".into(),
         };
-        let ip = init_outbound(&cfg);
+        let ip = init_outbound(&cfg).expect("valid local IP must succeed");
         assert_eq!(ip, Some(Ipv4Addr::new(127, 0, 0, 1)));
     }
 
@@ -269,5 +325,61 @@ mod tests {
         let cfg = OutboundConfig::default();
         assert!(cfg.bind_ipv4.is_none());
         assert_eq!(cfg.interface, "auto");
+    }
+
+    // ── v1.0.5: dual-stack listen tests ──
+
+    #[test]
+    fn parse_listen_ip_handles_v4_v6_empty() {
+        assert_eq!(
+            parse_listen_ip("0.0.0.0"),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+        assert!(parse_listen_ip("::").is_some(), ":: must parse");
+        assert!(parse_listen_ip("::").unwrap().is_ipv6());
+        assert_eq!(parse_listen_ip(""), None, "empty = disabled");
+        assert_eq!(parse_listen_ip("  "), None, "whitespace = disabled");
+    }
+
+    #[tokio::test]
+    async fn tcp_binds_both_v4_and_v6_same_port() {
+        // Pick an ephemeral port by binding v4 to :0 first, then reuse the
+        // resolved port for both families on loopback.
+        let v4 = bind_tcp_listener(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let port = v4.local_addr().unwrap().port();
+        drop(v4);
+        // Now bind BOTH families to the same explicit port.
+        let v4 = bind_tcp_listener(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        let v6 = bind_tcp_listener(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
+        assert!(v4.is_ok(), "IPv4 bind must succeed: {:?}", v4.err());
+        assert!(
+            v6.is_ok(),
+            "IPv6 bind must succeed alongside IPv4 (V6ONLY): {:?}",
+            v6.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_binds_both_v4_and_v6_same_port() {
+        let v4 = bind_udp_socket(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let port = v4.local_addr().unwrap().port();
+        drop(v4);
+        let v4 = bind_udp_socket(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        let v6 = bind_udp_socket(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
+        assert!(v4.is_ok(), "UDP IPv4 bind must succeed: {:?}", v4.err());
+        assert!(
+            v6.is_ok(),
+            "UDP IPv6 bind must succeed alongside IPv4: {:?}",
+            v6.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_address_never_produces_triple_colon() {
+        // Regression: SocketAddr::new must never stringify to ":::port".
+        let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 33418);
+        let s = addr.to_string();
+        assert!(!s.contains(":::"), "got broken addr string: {}", s);
+        assert_eq!(s, "[::]:33418");
     }
 }

@@ -39,9 +39,12 @@ struct UdpSession {
     last_active: tokio::time::Instant,
 }
 
+/// v1.0.5: serve an ALREADY-BOUND UDP socket. Binding happens in the manager
+/// (synchronously, so errors surface immediately and per-family success is
+/// known). This function only runs the receive loop.
 #[allow(clippy::too_many_arguments)]
-pub async fn start_udp_listener(
-    listen_addr: SocketAddr,
+pub async fn serve_udp_listener(
+    inbound: Arc<UdpSocket>,
     targets: Vec<String>,
     selector: Arc<TargetSelector>,
     rate_limit: RateLimit,
@@ -50,11 +53,12 @@ pub async fn start_udp_listener(
     rule_id: i64,
     source_ipv4: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listen_addr = inbound
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
     if targets.is_empty() {
         tracing::warn!("UDP listener on {}: no targets configured", listen_addr);
     }
-
-    let inbound = Arc::new(UdpSocket::bind(listen_addr).await?);
     tracing::info!("UDP listening on {} (rule {})", listen_addr, rule_id);
 
     let port = listen_addr.port();
