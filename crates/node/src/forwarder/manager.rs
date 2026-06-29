@@ -95,10 +95,10 @@ pub struct ForwarderManager {
     /// v0.4.1: shared TLS acceptor for tls_simple listeners (supports hot-reload
     /// via cert_reloader). None = no cert configured (tls_simple rules skipped).
     tls_acceptor: Option<super::cert_reloader::SharedTlsAcceptor>,
-    /// v1.0.5: dual-stack listen addresses from env.
+    /// v1.0.4: dual-stack listen addresses from env.
     listen_ipv4: String,
     listen_ipv6: String,
-    /// v1.0.5: resolved outbound source IPv4 (None = auto-route).
+    /// v1.0.4: resolved outbound source IPv4 (None = auto-route).
     source_ipv4: Option<std::net::Ipv4Addr>,
 }
 
@@ -116,7 +116,7 @@ impl ForwarderManager {
         }
     }
 
-    /// v1.0.5: configure dual-stack listen and outbound source.
+    /// v1.0.4: configure dual-stack listen and outbound source.
     /// Returns Err on misconfigured outbound (invalid IP, missing interface,
     /// non-local IP) so the caller can abort instead of silently auto-routing
     /// out the wrong NIC.
@@ -314,7 +314,7 @@ impl ForwarderManager {
                 }
             }
 
-            // v1.0.5: dual-stack listen — parse IPs via IpAddr (NEVER string
+            // v1.0.4: dual-stack listen — parse IPs via IpAddr (NEVER string
             // concatenation, which produced ":::port" for IPv6). Empty string
             // = that family disabled.
             let ip_v4 = crate::forwarder::outbound::parse_listen_ip(&self.listen_ipv4);
@@ -382,7 +382,7 @@ impl ForwarderManager {
                 listener.protocol,
                 listener.node_transport,
             ) {
-                // v1.0.5: TCP — bind BOTH families synchronously (errors surface
+                // v1.0.4: TCP — bind BOTH families synchronously (errors surface
                 // now, per-family success known), then supervise both serve loops
                 // with select! so if either dies the task ends and the manager's
                 // dead-listener detection restarts it.
@@ -484,7 +484,7 @@ impl ForwarderManager {
                         }
                     })
                 }
-                // v1.0.5: UDP — bind BOTH families synchronously, supervise both
+                // v1.0.4: UDP — bind BOTH families synchronously, supervise both
                 // receive loops with select! (mirrors the TCP arm above).
                 (Protocol::Udp, NodeTransport::Raw) => {
                     use crate::forwarder::outbound::bind_udp_socket;

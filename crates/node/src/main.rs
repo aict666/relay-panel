@@ -121,7 +121,7 @@ async fn run() {
     let counter = Arc::new(TrafficCounter::new());
     let connections = Arc::new(ConnectionTracker::new());
     let mut manager_inner = ForwarderManager::new(counter.clone(), connections.clone());
-    // v1.0.5: configure dual-stack listen and outbound source IP. A
+    // v1.0.4: configure dual-stack listen and outbound source IP. A
     // misconfigured outbound (invalid IP, missing interface, non-local IP) is
     // a fatal startup error — we refuse to boot rather than silently routing
     // traffic out the wrong NIC.
