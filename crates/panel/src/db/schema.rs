@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS user_group_device_groups (
 -- Seed the default user group (allow_all_groups=true) so existing users
 -- retain unrestricted access after upgrade.
 INSERT OR IGNORE INTO user_groups (id, name, remark, allow_all_groups)
-VALUES (1, 'default', 'Default group — all device groups allowed', 1);
+VALUES (1, 'default', 'Default group - all device groups allowed', 1);
 "#;
 
 /// Run schema migrations for existing databases (v0.1.0/v0.1.1 → v0.1.2).
@@ -1154,7 +1154,7 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
 
     sqlx::query(
         "INSERT OR IGNORE INTO user_groups (id, name, remark, allow_all_groups) \
-         VALUES (1, 'default', 'Default group — all device groups allowed', 1)",
+         VALUES (1, 'default', 'Default group - all device groups allowed', 1)",
     )
     .execute(pool)
     .await?;
@@ -1173,6 +1173,17 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     }
 
     tracing::info!("Migration 30: user permission groups tables created");
+
+    // ── Migration 31: v1.0.5 fix em-dash encoding in default user_group remark ──
+    // The seed in Migration 30 used an em dash (U+2014) which is garbled on
+    // PostgreSQL connections with non-UTF-8 client_encoding. Replace with ASCII.
+    sqlx::query(
+        "UPDATE user_groups SET remark = 'Default group - all device groups allowed' \
+         WHERE id = 1 AND remark != 'Default group - all device groups allowed'",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 31: default user_group remark normalized to ASCII");
 
     Ok(())
 }

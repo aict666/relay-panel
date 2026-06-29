@@ -33,7 +33,10 @@
 - 📊 **Dashboard** — node status overview, traffic statistics, version update check
 - 📈 **Traffic & quotas** — per-rule and per-user tracking with configurable limits (rule count, bandwidth, traffic cap)
 - 📋 **Multi-plan registration** — admins configure allowed plans; users choose on sign-up
-- 👥 **User management** — manage any user's rules, reset traffic, reset password, ban/unban
+- 👥 **User permission groups** — admins create groups with allowed device groups; users access devices by group membership; unauthorized rules are automatically paused
+- 👤 **User management** — manage any user's rules, reset traffic, reset password, ban/unban
+- 🖥️ **Device group management** — expandable groups with node listings; node removal does not affect groups or rules
+- 🖱️ **Minimal rule import/export** — custom compact format, batch import with automatic node distribution
 - 🖥️ **Live node status** — CPU, memory, connections, version
 - 🌍 **Node region detection** — automatically identifies each node's country/region with flag display
 - 🗄️ **Dual database** — SQLite (default, zero-config) or PostgreSQL
