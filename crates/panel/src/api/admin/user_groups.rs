@@ -1,6 +1,7 @@
 use super::err;
 use crate::api::middleware::AdminOnly;
 use crate::api::AppState;
+use crate::db::error::DbError;
 use axum::{
     extract::{Path, State},
     Json,
@@ -123,32 +124,30 @@ pub async fn update_user_group(
             return Json(err(400, "name must not be empty"));
         }
     }
+    // v1.0.4: atomic group update + pause (single transaction).
+    // If the pause step fails, the group update is rolled back — no partial
+    // state. The old approach (update → then pause) was not truly fail-closed:
+    // the authorization change was already written to DB before pausing, so
+    // a pause failure left some rules still forwarding.
     match state
         .db
-        .update_user_group(
+        .update_user_group_with_pause(
             id,
             req.name.as_deref(),
             req.remark.as_deref(),
-            req.allow_all_groups,
+            req.allow_all_groups.unwrap_or(false),
         )
         .await
     {
-        Ok(0) => Json(err(404, "Not found")),
-        Ok(_) => {
-            // v1.0.4: flipping allow_all_groups true→false (or otherwise
-            // tightening access) can leave existing rules pointing at groups
-            // the users may no longer use. Re-evaluate + pause them. A failure
-            // here MUST surface as 500 — silently succeeding would leave
-            // unauthorized rules forwarding.
-            if let Err(e) = pause_unauthorized_rules_for_group(&state, id).await {
-                tracing::error!("update_user_group {}: pause re-eval failed: {}", id, e);
-                return Json(err(500, "group updated but rule re-evaluation failed"));
-            }
-            match state.db.find_user_group_by_id(id).await {
-                Ok(Some(g)) => Json(ApiResponse::success(g)),
-                _ => Json(err(500, "failed to read back updated group")),
-            }
+        Ok(g) => {
+            // Notify nodes (outside the transaction — DB is already committed).
+            state
+                .node_connections
+                .broadcast_all(r#"{"type":"config_changed"}"#)
+                .await;
+            Json(ApiResponse::success(g))
         }
+        Err(DbError::NotFound) => Json(err(404, "Not found")),
         Err(e) => {
             tracing::error!("update_user_group {}: {}", id, e);
             Json(err(500, "database error"))

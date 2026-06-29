@@ -459,6 +459,16 @@ pub trait UserGroupRepository: Send + Sync {
     /// Legacy users (group_id NULL) and allow-all groups return false, so the
     /// rule API skips the allowlist check and defers to normal validation.
     async fn is_user_restricted(&self, user_id: i64) -> Result<bool, DbError>;
+    /// v1.0.4: atomic group update + re-evaluation. Updates the group row and
+    /// pauses every non-admin user's rules on now-unauthorized groups, all in
+    /// ONE transaction. If the pause step fails, the group update is rolled back.
+    async fn update_user_group_with_pause(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        remark: Option<&str>,
+        allow_all_groups: bool,
+    ) -> Result<UserGroup, DbError>;
 }
 
 // ── Tunnel Profile ──

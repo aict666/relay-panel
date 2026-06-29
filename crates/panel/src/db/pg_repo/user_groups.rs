@@ -249,4 +249,122 @@ impl UserGroupRepository for PgRepository {
         .await?;
         Ok(matches!(row, Some((false,))))
     }
+
+    /// Atomic group update + re-evaluation (v1.0.4).
+    /// See sqlite_repo for details.
+    async fn update_user_group_with_pause(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        remark: Option<&str>,
+        allow_all_groups: bool,
+    ) -> Result<UserGroup, DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Update the group row.
+        let mut sets = Vec::new();
+        let mut idx = 0u32;
+        if let Some(n) = name {
+            sets.push((idx, format!("name = ${}", idx + 1), n.to_string()));
+            idx += 1;
+        }
+        if let Some(r) = remark {
+            sets.push((idx, format!("remark = ${}", idx + 1), r.to_string()));
+            idx += 1;
+        }
+        sets.push((
+            idx,
+            format!("allow_all_groups = ${}", idx + 1),
+            allow_all_groups.to_string(),
+        ));
+        let set_clause: Vec<_> = sets.iter().map(|(_, s, _)| s.as_str()).collect();
+        let sql = format!(
+            "UPDATE user_groups SET {} WHERE id = ${}",
+            set_clause.join(", "),
+            idx + 1
+        );
+        let mut q = sqlx::query(&sql);
+        for (_, _, v) in &sets {
+            q = q.bind(v);
+        }
+        q = q.bind(id);
+        let r = q.execute(&mut *tx).await?;
+        if r.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+
+        // Pause rules for every non-admin user in this group.
+        let user_ids: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM users WHERE group_id = $1 AND admin = FALSE")
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut paused_total = 0u64;
+        for (uid,) in &user_ids {
+            let allowed: Vec<(i64,)> = sqlx::query_as(
+                "SELECT dg.id FROM device_groups dg \
+                 JOIN user_group_device_groups ugdg ON ugdg.device_group_id = dg.id \
+                 JOIN users u ON u.group_id = ugdg.user_group_id \
+                 WHERE u.id = $1 AND dg.group_type = 'in' \
+                 ORDER BY dg.id",
+            )
+            .bind(uid)
+            .fetch_all(&mut *tx)
+            .await?;
+            let allowed_ids: Vec<i64> = allowed.into_iter().map(|(id,)| id).collect();
+
+            if allowed_ids.is_empty() {
+                let r = sqlx::query(
+                    "UPDATE forward_rules SET paused = TRUE WHERE uid = $1 AND paused = FALSE",
+                )
+                .bind(uid)
+                .execute(&mut *tx)
+                .await?;
+                paused_total += r.rows_affected();
+            } else {
+                let placeholders: Vec<String> = (0..allowed_ids.len())
+                    .map(|i| format!("${}", i + 2))
+                    .collect();
+                let sql = format!(
+                    "UPDATE forward_rules SET paused = TRUE \
+                     WHERE uid = $1 AND paused = FALSE AND device_group_in NOT IN ({})",
+                    placeholders.join(", ")
+                );
+                let mut q = sqlx::query(&sql).bind(uid);
+                for gid in &allowed_ids {
+                    q = q.bind(gid);
+                }
+                let r = q.execute(&mut *tx).await?;
+                paused_total += r.rows_affected();
+            }
+        }
+        if paused_total > 0 {
+            tracing::warn!(
+                "user group {}: authorization change paused {} rule(s) across its users",
+                id,
+                paused_total
+            );
+        }
+
+        tx.commit().await?;
+
+        // Read back the group.
+        let row: Option<(i64, String, String, bool, String)> = sqlx::query_as(
+            "SELECT id, name, COALESCE(remark, ''), allow_all_groups, created_at \
+             FROM user_groups WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row
+            .map(|(id, name, remark, allow_all, created_at)| UserGroup {
+                id,
+                name,
+                remark,
+                allow_all_groups: allow_all,
+                created_at,
+            })
+            .ok_or(DbError::NotFound)?)
+    }
 }

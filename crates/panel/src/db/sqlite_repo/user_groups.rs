@@ -77,6 +77,129 @@ impl UserGroupRepository for SqliteRepository {
         Ok(r.rows_affected())
     }
 
+    /// Atomic group update + re-evaluation (v1.0.4).
+    /// Updates the group row and pauses every non-admin user's rules on
+    /// now-unauthorized groups, all in ONE transaction. If the pause step
+    /// fails, the group update is rolled back so the authorization state
+    /// is NOT partially changed.
+    async fn update_user_group_with_pause(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        remark: Option<&str>,
+        allow_all_groups: bool,
+    ) -> Result<UserGroup, DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Update the group row.
+        let mut sets = Vec::new();
+        if let Some(n) = name {
+            sets.push(("name", n.to_string()));
+        }
+        if let Some(r) = remark {
+            sets.push(("remark", r.to_string()));
+        }
+        sets.push((
+            "allow_all_groups",
+            if allow_all_groups {
+                "1".into()
+            } else {
+                "0".into()
+            },
+        ));
+        let set_clause = sets
+            .iter()
+            .map(|(col, _)| format!("{} = ?", col))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("UPDATE user_groups SET {} WHERE id = ?", set_clause);
+        let mut q = sqlx::query(&sql);
+        for (_, val) in &sets {
+            q = q.bind(val);
+        }
+        q = q.bind(id);
+        let r = q.execute(&mut *tx).await?;
+        if r.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+
+        // Pause rules for every non-admin user in this group.
+        let user_ids: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM users WHERE group_id = ? AND admin = 0")
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut paused_total = 0u64;
+        for (uid,) in &user_ids {
+            let allowed: Vec<(i64,)> = sqlx::query_as(
+                "SELECT dg.id FROM device_groups dg \
+                 JOIN user_group_device_groups ugdg ON ugdg.device_group_id = dg.id \
+                 JOIN users u ON u.group_id = ugdg.user_group_id \
+                 WHERE u.id = ? AND dg.group_type = 'in' \
+                 ORDER BY dg.id",
+            )
+            .bind(uid)
+            .fetch_all(&mut *tx)
+            .await?;
+            let allowed_ids: Vec<i64> = allowed.into_iter().map(|(id,)| id).collect();
+
+            if allowed_ids.is_empty() {
+                let r =
+                    sqlx::query("UPDATE forward_rules SET paused = 1 WHERE uid = ? AND paused = 0")
+                        .bind(uid)
+                        .execute(&mut *tx)
+                        .await?;
+                paused_total += r.rows_affected();
+            } else {
+                let placeholders = vec!["?"; allowed_ids.len()].join(", ");
+                let sql = format!(
+                    "UPDATE forward_rules SET paused = 1 \
+                     WHERE uid = ? AND paused = 0 AND device_group_in NOT IN ({})",
+                    placeholders
+                );
+                let mut q = sqlx::query(&sql).bind(uid);
+                for gid in &allowed_ids {
+                    q = q.bind(gid);
+                }
+                let r = q.execute(&mut *tx).await?;
+                paused_total += r.rows_affected();
+            }
+        }
+        if paused_total > 0 {
+            tracing::warn!(
+                "user group {}: authorization change paused {} rule(s) across its users",
+                id,
+                paused_total
+            );
+        }
+
+        tx.commit().await?;
+
+        // Notify nodes (outside the transaction — safe since the DB is already
+        // committed).
+        // Note: we don't have access to AppState here, so the broadcast is
+        // handled by the API layer after this call returns.
+
+        // Read back the group.
+        let row: Option<(i64, String, String, bool, String)> = sqlx::query_as(
+            "SELECT id, name, COALESCE(remark, ''), allow_all_groups, created_at \
+             FROM user_groups WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row
+            .map(|(id, name, remark, allow_all, created_at)| UserGroup {
+                id,
+                name,
+                remark,
+                allow_all_groups: allow_all,
+                created_at,
+            })
+            .ok_or(DbError::NotFound)?)
+    }
+
     async fn delete_user_group(&self, id: i64) -> Result<u64, DbError> {
         let r = sqlx::query("DELETE FROM user_groups WHERE id = ?")
             .bind(id)
