@@ -123,9 +123,10 @@ export const enUS: Dict = {
   exportImport: 'Import/Export',
   exported: 'Exported',
   import: 'Import',
-  importHint: 'Paste exported JSON here. Each rule gets a new auto-assigned port.',
+  importHint: 'Paste simplified rule JSON. Format: [{"dest":["ip:port"],"listen_port":port,"name":"name"}]',
   importInvalidJson: 'Invalid JSON. Please check and retry.',
-  importInvalidFormat: 'Invalid format: missing rules array.',
+  importInvalidFormat: 'Invalid format. Expected an object or array of objects.',
+  selectInboundGroup: 'Select inbound group',
   importResult: 'Import done: {ok} succeeded, {fail} failed.',
   owner: 'Owner',
   ownerHint: 'Leave empty to create for yourself. (Admin only — a non-admin value is ignored.)',
@@ -195,6 +196,13 @@ export const enUS: Dict = {
   failedCreateGroup: 'Failed to create group',
   tokenCopied: 'Token copied',
   groupHelpText: 'Each group has a node token. Run relay-node with NODE_TOKEN=<token> to enroll a forwarding node.',
+  nodes: 'Nodes',
+  nodesInGroup: 'Nodes in this group',
+  noNodesInGroup: 'No nodes in this group.',
+  addNode: 'Add node',
+  groupInUse: 'This group is still referenced by rules. Please migrate them first.',
+  failedDeleteGroup: 'Failed to delete group.',
+  // v1.0.4 end
 
   // Users page
   banned: 'banned',
@@ -449,4 +457,16 @@ export const enUS: Dict = {
   passwordResetSuccess: 'Password reset',
   // v0.4.11 PR3: shared group indicator
   shared: 'shared',
+  // v1.0.4: user groups
+  userGroups: 'User Permission Groups',
+  addUserGroup: 'New Permission Group',
+  editUserGroup: 'Edit Permission Group',
+  allowAllGroups: 'Allow All Groups',
+  assignDeviceGroups: 'Assign Device Groups',
+  assignDeviceGroupsHint: 'Users in this group can only use selected inbound groups. Skip this restriction with "Allow All Groups".',
+  allowedInboundGroups: 'Allowed Inbound Groups',
+  selectDeviceGroups: 'Select device groups',
+  yes: 'Yes',
+  no: 'No',
+  remark: 'Remark',
 };

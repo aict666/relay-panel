@@ -139,11 +139,14 @@ pub async fn update_user(
     Path(id): Path<i64>,
     Json(req): Json<UpdateUserRequest>,
 ) -> Json<ApiResponse<()>> {
+    // v1.0.4: group_id is handled ALONGSIDE the other fields (not early-return,
+    // which dropped any balance/quota/banned submitted in the same request).
     // All fields optional — if nothing provided, bail early.
     if req.balance.is_none()
         && req.max_rules.is_none()
         && req.traffic_limit.is_none()
         && req.banned.is_none()
+        && req.group_id.is_none()
     {
         return Json(err(400, "No fields to update"));
     }
@@ -188,39 +191,90 @@ pub async fn update_user(
         }
     }
 
-    // Repository builds the dynamic UPDATE from the present fields.
-    match state
-        .db
-        .update_user_fields(
-            id,
-            canonical_balance.as_deref(),
-            req.max_rules,
-            req.traffic_limit,
-            req.banned,
-        )
-        .await
-    {
-        Ok(0) => Json(err(404, "User not found")),
-        Ok(_) => {
-            if let Some(banned) = req.banned {
-                tracing::warn!(
-                    action = if banned { "ban_user" } else { "unban_user" },
-                    target_user_id = id,
-                    actor_admin_id = _admin.user_id,
-                    "destructive admin op"
-                );
+    // v1.0.4: apply field updates only when field-update args are present
+    // (a group_id-only request must NOT hit update_user_fields, whose all-None
+    // UPDATE would return 0 rows and be misread as "User not found").
+    let has_field_update = req.balance.is_some()
+        || req.max_rules.is_some()
+        || req.traffic_limit.is_some()
+        || req.banned.is_some();
+
+    if has_field_update {
+        match state
+            .db
+            .update_user_fields(
+                id,
+                canonical_balance.as_deref(),
+                req.max_rules,
+                req.traffic_limit,
+                req.banned,
+            )
+            .await
+        {
+            Ok(0) => return Json(err(404, "User not found")),
+            Ok(_) => {
+                if let Some(banned) = req.banned {
+                    tracing::warn!(
+                        action = if banned { "ban_user" } else { "unban_user" },
+                        target_user_id = id,
+                        actor_admin_id = _admin.user_id,
+                        "destructive admin op"
+                    );
+                }
             }
-            // If the user was banned/unbanned, nodes need a config refresh so
-            // their rules stop/start forwarding (get_config filters banned).
-            state
-                .node_connections
-                .broadcast_all(r#"{"type":"config_changed"}"#)
-                .await;
-            Json(ApiResponse::success(()))
-        }
-        Err(e) => {
-            tracing::error!("update_user {}: update_user_fields failed: {}", id, e);
-            Json(err(500, "database error"))
+            Err(e) => {
+                tracing::error!("update_user {}: update_user_fields failed: {}", id, e);
+                return Json(err(500, "database error"));
+            }
         }
     }
+
+    // v1.0.4: group_id change is applied here (alongside the field updates
+    // above, not as an early return). After re-assigning the permission group,
+    // pause any of the user's rules whose inbound group is no longer authorized
+    // — the rules + their data are kept so an admin can re-authorize and resume.
+    if let Some(gid) = req.group_id {
+        match state.db.set_user_group(id, Some(gid)).await {
+            Ok(0) => return Json(err(404, "User not found or is admin")),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("update_user {}: set_user_group failed: {}", id, e);
+                return Json(err(500, "database error"));
+            }
+        }
+        // Pause rules outside the user's NEW authorization.
+        let allowed = match state.db.authorized_device_group_ids(id).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("update_user {}: authz lookup for pause failed: {}", id, e);
+                return Json(err(500, "database error"));
+            }
+        };
+        match state.db.pause_rules_outside_groups(id, &allowed).await {
+            Ok(n) if n > 0 => {
+                tracing::warn!(
+                    "update_user {}: paused {} rule(s) outside new authorization",
+                    id,
+                    n
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(
+                    "update_user {}: pause_rules_outside_groups failed: {}",
+                    id,
+                    e
+                );
+                return Json(err(500, "database error"));
+            }
+        }
+    }
+
+    // A field update (ban) or a group change (pause) both alter what nodes
+    // should forward, so refresh node config once at the end.
+    state
+        .node_connections
+        .broadcast_all(r#"{"type":"config_changed"}"#)
+        .await;
+    Json(ApiResponse::success(()))
 }

@@ -39,6 +39,35 @@ pub async fn create_rule(
     State(state): State<AppState>,
     Json(req): Json<CreateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
+    // v1.0.4: non-admin users with a RESTRICTED permission group (group set +
+    // allow_all_groups=false) can only create rules on authorized device
+    // groups. An empty authorized list means "no groups allowed" → deny. Legacy
+    // (group_id NULL) and allow-all users skip this and defer to the service
+    // layer's normal group validation. A DB error returns 500.
+    if !user.admin {
+        let restricted = match state.db.is_user_restricted(user.user_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("create_rule: restriction lookup failed: {}", e);
+                return Json(err(500, "database error"));
+            }
+        };
+        if restricted {
+            let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!("create_rule: authz lookup failed: {}", e);
+                    return Json(err(500, "database error"));
+                }
+            };
+            if !allowed.contains(&req.device_group_in) {
+                return Json(err(
+                    403,
+                    "device_group_in is not in your allowed device groups",
+                ));
+            }
+        }
+    }
     match crate::service::rules::create_rule(state.db.as_ref(), user.user_id, user.admin, &req)
         .await
     {
@@ -71,6 +100,34 @@ pub async fn update_rule(
     Json(req): Json<UpdateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
     let scope = user.resource_scope();
+    // v1.0.4: restricted non-admin users can only switch to authorized device
+    // groups. Legacy/allow-all users skip this. DB error → 500.
+    if !user.admin {
+        if let Some(dgi) = req.device_group_in {
+            let restricted = match state.db.is_user_restricted(user.user_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("update_rule: restriction lookup failed: {}", e);
+                    return Json(err(500, "database error"));
+                }
+            };
+            if restricted {
+                let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!("update_rule: authz lookup failed: {}", e);
+                        return Json(err(500, "database error"));
+                    }
+                };
+                if !allowed.contains(&dgi) {
+                    return Json(err(
+                        403,
+                        "device_group_in is not in your allowed device groups",
+                    ));
+                }
+            }
+        }
+    }
     match crate::service::rules::update_rule(state.db.as_ref(), id, &scope, &req).await {
         Ok(()) => {
             state

@@ -203,6 +203,28 @@ impl GroupRepository for SqliteRepository {
         Ok(result.rows_affected())
     }
 
+    async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError> {
+        // Check if fallback_group column exists (defensive: test schemas may not have it).
+        let has_fallback: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pragma_table_info('forward_rules') WHERE name = 'fallback_group'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let sql = if has_fallback.0 > 0 {
+            "SELECT COUNT(*) FROM forward_rules \
+             WHERE device_group_in = ? OR device_group_out = ? OR fallback_group = ?"
+        } else {
+            "SELECT COUNT(*) FROM forward_rules \
+             WHERE device_group_in = ? OR device_group_out = ?"
+        };
+        let mut q = sqlx::query_as(sql).bind(id).bind(id);
+        if has_fallback.0 > 0 {
+            q = q.bind(id);
+        }
+        let row: (i64,) = q.fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
     async fn delete_group(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError> {
         let result = match scope.owner_id() {
             None => sqlx::query("DELETE FROM device_groups WHERE id = ?").bind(id),

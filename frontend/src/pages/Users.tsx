@@ -1,4 +1,4 @@
-import { Table, Button, Tag, Popconfirm, message, Progress, Tooltip, Modal, Form, Input, InputNumber, Switch, Space } from 'antd';
+import { Table, Button, Tag, Popconfirm, message, Progress, Tooltip, Modal, Form, Input, InputNumber, Switch, Space, Select } from 'antd';
 import { EditOutlined, ReloadOutlined, UndoOutlined, UserOutlined, PlusOutlined, KeyOutlined, ApiOutlined } from '@ant-design/icons';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -26,6 +26,7 @@ interface UserFormValues {
   // Edited in GB; converted to bytes before sending to the backend.
   traffic_limit_gb: number;
   banned: boolean;
+  group_id?: number | null;
 }
 
 interface CreateUserFormValues {
@@ -50,6 +51,7 @@ export default function Users() {
   const [creating, setCreating] = useState(false);
   // v0.4.10 PR4: admin password reset state. resetting = the target user row.
   const [resetting, setResetting] = useState<User | null>(null);
+  const [userGroups, setUserGroups] = useState<{ id: number; name: string }[]>([]);
   const [form] = Form.useForm<UserFormValues>();
   const [createForm] = Form.useForm<CreateUserFormValues>();
   const [resetForm] = Form.useForm<ResetFormValues>();
@@ -64,8 +66,13 @@ export default function Users() {
   const load = async () => {
     setLoading(true);
     try {
-      const res = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
-      setUsers(res.data || []);
+      const usersRes = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
+      setUsers(usersRes.data || []);
+      // v1.0.4: load user permission groups for the group_id selector.
+      try {
+        const gRes = await api.get<unknown, ApiEnvelope<{ id: number; name: string }[]>>('/user-groups');
+        setUserGroups(gRes.data || []);
+      } catch { setUserGroups([]); }
     } finally { setLoading(false); }
   };
 
@@ -88,6 +95,7 @@ export default function Users() {
       // DB stores bytes; show GB in the form.
       traffic_limit_gb: bytesToGb(u.traffic_limit),
       banned: u.banned,
+      group_id: u.group_id,
     });
   };
 
@@ -106,6 +114,10 @@ export default function Users() {
     };
     if (balance !== '') {
       payload.balance = balance;
+    }
+    // v1.0.4: send group_id if changed.
+    if (values.group_id !== editing.group_id) {
+      payload.group_id = values.group_id;
     }
     setSaving(true);
     try {
@@ -182,6 +194,13 @@ export default function Users() {
       render: (b: boolean) => b ? <Tag color="red">{t('banned')}</Tag> : <Tag color="green">{t('active')}</Tag>,
     },
     { title: t('balance'), dataIndex: 'balance', key: 'balance' },
+    {
+      title: t('userGroups'), dataIndex: 'group_id', key: 'group_id', width: 100,
+      render: (gid: number | null) => {
+        const g = userGroups.find(x => x.id === gid);
+        return g ? <Tag>{g.name}</Tag> : '-';
+      },
+    },
     { title: t('maxRules'), dataIndex: 'max_rules', key: 'max_rules' },
     {
       title: t('trafficUsed'), key: 'traffic', width: 200,
@@ -331,6 +350,13 @@ export default function Users() {
           <Form.Item name="banned" label={t('banned')} valuePropName="checked">
             <Switch disabled={!!editing?.admin} />
           </Form.Item>
+          {!editing?.admin && (
+            <Form.Item name="group_id" label={t('userGroups')}>
+              <Select allowClear placeholder={t('selectDeviceGroups')} style={{ width: '100%' }}>
+                {userGroups.map(g => <Select.Option key={g.id} value={g.id}>{g.name} (#{g.id})</Select.Option>)}
+              </Select>
+            </Form.Item>
+          )}
         </Form>
       </Modal>
 

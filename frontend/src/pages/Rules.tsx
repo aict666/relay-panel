@@ -51,32 +51,19 @@ function listenHostFor(rule: ForwardRule, groups: DeviceGroup[]): string {
   return groups.find(g => g.id === rule.device_group_in)?.connect_host ?? '';
 }
 
-/** Build the export JSON payload for one or more rules. Excludes traffic, id
- *  is kept as `ref_id` for reference only (NOT used on import). */
+/** v1.0.4: simplified export format — only dest, listen_port, name.
+ *  Enabled targets only. IPv6 wrapped as [addr]:port. */
 function buildExportJSON(rules: ForwardRule[]): string {
-  return JSON.stringify({
-    version: 1,
-    type: 'relaypanel-rules-export',
-    exported_at: new Date().toISOString(),
-    rules: rules.map(r => ({
-      name: r.name,
-      listen_port: r.listen_port,
-      protocol: r.protocol,
-      public_transport: r.public_transport ?? 'raw',
-      ws_path: r.ws_path ?? undefined,
-      forward_mode: r.forward_mode,
-      route_mode: r.route_mode ?? r.forward_mode ?? 'direct',
-      device_group_in: r.device_group_in,
-      device_group_out: r.device_group_out,
-      target_addr: r.target_addr,
-      target_port: r.target_port,
-      targets: ruleTargets(r),
-      load_balance_strategy: r.load_balance_strategy ?? 'first',
-      upload_limit_mbps: r.upload_limit_mbps ?? 0,
-      download_limit_mbps: r.download_limit_mbps ?? 0,
-      tunnel_profile_id: r.tunnel_profile_id ?? null,
-    })),
-  }, null, 2);
+  const simplified = rules.map(r => {
+    const targets = ruleTargets(r).filter(t => t.enabled);
+    const dest = targets.map(t => {
+      const h = t.host.trim();
+      const isV6 = h.includes(':') && !h.startsWith('[');
+      return isV6 ? `[${h}]:${t.port}` : `${h}:${t.port}`;
+    });
+    return { dest, listen_port: r.listen_port, name: r.name };
+  });
+  return JSON.stringify(rules.length === 1 ? simplified[0] : simplified, null, 2);
 }
 
 /** Trigger a browser download of a text file. */
@@ -111,6 +98,8 @@ export default function Rules() {
   const [editOpen, setEditOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState('');
+  const [importGroupId, setImportGroupId] = useState<number | undefined>(undefined);
+  const [importResults, setImportResults] = useState<string[]>([]);
   const [editing, setEditing] = useState<ForwardRule | null>(null);
   const [loading, setLoading] = useState(false);
   const [createForm] = Form.useForm();
@@ -276,55 +265,71 @@ export default function Rules() {
     message.success(t('exported'));
   };
 
-  /** Import rules from pasted JSON. Creates each rule via POST /rules. */
+  /** v1.0.4: validate a single import entry. Returns error string or null. */
+function validateImportEntry(e: { name?: string; listen_port?: number; dest?: string[] }): string | null {
+  if (!e.name || e.name.trim() === '') return 'name is required';
+  if (e.listen_port == null || e.listen_port < 1 || e.listen_port > 65535) return 'listen_port must be 1-65535';
+  if (!e.dest || e.dest.length === 0) return 'dest must not be empty';
+  for (const d of e.dest) {
+    const m = d.match(/^(\[.+?\]|[^:]+):(\d+)$/);
+    if (!m) return `invalid dest format: ${d}`;
+    const host = m[1].replace(/^\[|\]$/g, '');
+    const port = parseInt(m[2], 10);
+    if (!host || port < 1 || port > 65535) return `invalid host/port in ${d}`;
+  }
+  return null;
+}
+
+const IMPORT_DEFAULTS = {
+  protocol: 'tcp_udp' as const,
+  public_transport: 'raw' as const,
+  forward_mode: 'direct' as const,
+  route_mode: 'direct' as const,
+  load_balance_strategy: 'first' as const,
+  upload_limit_mbps: 0,
+  download_limit_mbps: 0,
+};
   const handleImport = async () => {
-    let parsed: { rules: Array<{ name: string; listen_port?: number; protocol: string; device_group_in?: number; target_addr?: string; target_port?: number; targets?: RuleTargetInput[]; load_balance_strategy?: string; upload_limit_mbps?: number; download_limit_mbps?: number; }> };
-    try {
-      parsed = JSON.parse(importText);
-    } catch {
-      message.error(t('importInvalidJson'));
+    if (!importGroupId) {
+      message.error(t('selectInboundGroup'));
       return;
     }
-    if (!parsed.rules || !Array.isArray(parsed.rules)) {
-      message.error(t('importInvalidFormat'));
-      return;
+    let parsed: unknown;
+    try { parsed = JSON.parse(importText); } catch {
+      message.error(t('importInvalidJson')); return;
     }
-    let ok = 0;
-    let fail = 0;
-    for (const r of parsed.rules) {
+    const entries = Array.isArray(parsed) ? parsed : [parsed];
+    if (entries.length === 0 || typeof entries[0] !== 'object') {
+      message.error(t('importInvalidFormat')); return;
+    }
+    const results: string[] = [];
+    for (const e of entries) {
+      const err = validateImportEntry(e as { name?: string; listen_port?: number; dest?: string[] });
+      if (err) { results.push(`❌ ${(e as { name?: string }).name || '?'}: ${err}`); continue; }
+      const entry = e as { name: string; listen_port: number; dest: string[] };
+      const targets = entry.dest.map(d => {
+        const m = d.match(/^(\[.+?\]|[^:]+):(\d+)$/)!;
+        return { host: m[1].replace(/^\[|\]$/g, ''), port: parseInt(m[2], 10), enabled: true };
+      });
+      const first = targets[0];
       try {
-        const targets = formTargets(r);
-        if (targets.length < 1) {
-          fail++;
-          continue;
-        }
-        const first = targets[0];
         const res = await api.post<unknown, ApiEnvelope<null>>('/rules', {
-          name: r.name,
-          listen_port: null, // always auto-assign on import to avoid conflicts
-          protocol: r.protocol,
-          public_transport: 'raw',
-          tunnel_profile_id: null,
-          forward_mode: 'direct',
-          route_mode: 'direct',
-          device_group_out: null,
-          device_group_in: r.device_group_in,
+          name: entry.name,
+          listen_port: entry.listen_port,
+          ...IMPORT_DEFAULTS,
+          device_group_in: importGroupId,
           target_addr: first.host,
           target_port: first.port,
           targets,
-          load_balance_strategy: r.load_balance_strategy ?? 'first',
-          upload_limit_mbps: r.upload_limit_mbps ?? 0,
-          download_limit_mbps: r.download_limit_mbps ?? 0,
         });
-        if (res.code === 0) ok++; else fail++;
-      } catch { fail++; }
+        if (res.code === 0) results.push(`✅ ${entry.name}:${entry.listen_port}`);
+        else results.push(`❌ ${entry.name}: ${res.message}`);
+      } catch { results.push(`❌ ${entry.name}: network error`); }
     }
-    message.success(t('importResult').replace('{ok}', String(ok)).replace('{fail}', String(fail)));
-    setImportOpen(false);
-    setImportText('');
-    load();
+    if (results.length === 0) { message.error(t('importInvalidFormat')); return; }
+    setImportResults(results);
+    load(); // refresh rules in background
   };
-
   const handleUpdate = async (values: {
     name?: string; listen_port?: number; protocol?: string;
     device_group_in?: number;
@@ -538,7 +543,7 @@ export default function Rules() {
   };
 
   const renderTargetsEditor = () => (
-    <Form.List name="targets" initialValue={[]}>
+    <Form.List name="targets" initialValue={[{ host: '', port: undefined as unknown as number, enabled: true }]}>
       {(fields, { add, remove, move }) => (
         <Space direction="vertical" style={{ width: '100%' }}>
           <Text strong>{t('targets')}</Text>
@@ -767,16 +772,30 @@ export default function Rules() {
         </Form>
       </Modal>
 
-      <Modal title={t('import')} open={importOpen} onCancel={() => setImportOpen(false)} onOk={handleImport} okText={t('import')} cancelText={t('cancel')} width={600}>
-        <Alert type="info" showIcon style={{ marginBottom: 12 }}
-          message={t('importHint')}
-        />
-        <TextArea
-          value={importText}
-          onChange={e => setImportText(e.target.value)}
-          rows={12}
-          placeholder='{"version":1,"type":"relaypanel-rules-export","rules":[...]}'
-        />
+      <Modal title={t('import')} open={importOpen} onCancel={() => { setImportOpen(false); setImportText(''); setImportResults([]); }}
+        onOk={importResults.length > 0 ? undefined : handleImport}
+        okText={importResults.length > 0 ? t('close') : t('import')}
+        cancelText={t('cancel')} width={600}
+        footer={importResults.length > 0 ? <Button onClick={() => { setImportOpen(false); setImportText(''); setImportResults([]); }}>{t('close')}</Button> : undefined}
+      >
+        {importResults.length === 0 ? (
+          <>
+            <Form.Item label={t('selectInboundGroup')}>
+              <Select value={importGroupId} onChange={setImportGroupId}
+                options={(isAdmin ? groups.filter(g => g.group_type === 'in') : sharedGroups)
+                  .map(g => ({ value: g.id, label: `${g.name} (#${g.id})` }))}
+                placeholder={t('selectDeviceGroups')} style={{ width: '100%' }} />
+            </Form.Item>
+            <Alert type="info" showIcon style={{ marginBottom: 12 }}
+              message={t('importHint')} />
+            <TextArea value={importText} onChange={e => setImportText(e.target.value)}
+              rows={10} placeholder='[{"dest":["1.2.3.4:8080"],"listen_port":38446,"name":"SK5"}]' />
+          </>
+        ) : (
+          <div style={{ maxHeight: 300, overflowY: 'auto' }}>
+            {importResults.map((r, i) => <div key={i} style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 13, lineHeight: 1.8 }}>{r}</div>)}
+          </div>
+        )}
       </Modal>
 
       {/* v0.4.8: rule diagnosis modal — three sections: ingress node, target

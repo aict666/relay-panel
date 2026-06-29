@@ -8,6 +8,7 @@ mod password;
 mod profiles;
 mod rules;
 mod settings;
+mod user_groups;
 mod users;
 
 pub use groups::*;
@@ -15,6 +16,7 @@ pub use password::*;
 pub use profiles::*;
 pub use rules::*;
 pub use settings::*;
+pub use user_groups::*;
 pub use users::*;
 
 /// A user WITHOUT the password hash — for API responses. Never expose the
@@ -82,6 +84,7 @@ fn err<T: Serialize, S: Into<String>>(code: i32, msg: S) -> ApiResponse<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::user_groups::{update_user_group, UpdateUserGroupRequest};
     use super::{change_password, reset_user_password, ResetPasswordRequest};
     use super::{
         create_group, create_rule, create_user, delete_group, delete_rule, delete_user, err,
@@ -224,6 +227,7 @@ mod tests {
                 max_rules: Some(42),
                 traffic_limit: Some(1024),
                 banned: Some(true),
+                ..Default::default()
             }),
         )
         .await;
@@ -714,6 +718,63 @@ mod tests {
         .await;
     }
 
+    // ── v1.0.4: group delete safety ──
+
+    /// Group with rules referencing it returns 409, not 200.
+    #[tokio::test]
+    async fn delete_group_with_rules_returns_409() {
+        let (state, pool) = test_state().await;
+        // Create a group and a rule that references it.
+        add_group(&pool, 10, 1, "test-in").await;
+        add_rule(&pool, 100, 1, 10, 20000, 0).await;
+
+        let Json(resp) =
+            super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(10)).await;
+        assert_eq!(resp.code, 409, "group with rules must be rejected");
+        assert!(
+            resp.message.contains("条规则"),
+            "message must include rule count"
+        );
+    }
+
+    /// An empty group can be deleted successfully.
+    #[tokio::test]
+    async fn delete_empty_group_succeeds() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 20, 1, "empty-in").await;
+
+        let Json(resp) =
+            super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(20)).await;
+        assert_eq!(
+            resp.code, 0,
+            "empty group must be deletable: {}",
+            resp.message
+        );
+    }
+
+    /// v1.0.4: count_rules_by_group detects rule references correctly.
+    #[tokio::test]
+    async fn count_rules_by_group_detects_rule_references() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 30, 1, "node-group").await;
+        add_rule(&pool, 300, 1, 30, 20001, 0).await;
+
+        let count = state.db.count_rules_by_group(30).await.unwrap();
+        assert_eq!(count, 1, "group 30 should have 1 rule referencing it");
+
+        // After deleting the rule, the group is free.
+        state
+            .db
+            .delete_rule(300, &crate::db::repo::ResourceScope::All)
+            .await
+            .unwrap();
+        let count2 = state.db.count_rules_by_group(30).await.unwrap();
+        assert_eq!(
+            count2, 0,
+            "after rule deletion, group should have 0 references"
+        );
+    }
+
     #[tokio::test]
     async fn delete_group_nonexistent_returns_404_no_broadcast() {
         let (state, _pool) = test_state().await;
@@ -1146,6 +1207,209 @@ mod tests {
         )
         .await;
         assert_eq!(resp.code, 0, "{}", resp.message);
+    }
+
+    // ── v1.0.4 regression: permission-group enforcement (review blockers) ──
+
+    /// Assign a user to a restricted permission group (allow_all_groups=false)
+    /// with an explicit device-group allowlist.
+    async fn add_restricted_group(pool: &SqlitePool, ug_id: i64, allowed: &[i64]) {
+        sqlx::query(
+            "INSERT INTO user_groups (id, name, remark, allow_all_groups) VALUES (?, ?, '', 0)",
+        )
+        .bind(ug_id)
+        .bind(format!("ug-{ug_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+        for gid in allowed {
+            sqlx::query(
+                "INSERT INTO user_group_device_groups (user_group_id, device_group_id) VALUES (?, ?)",
+            )
+            .bind(ug_id)
+            .bind(gid)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn set_user_group_id(pool: &SqlitePool, uid: i64, ug_id: i64) {
+        sqlx::query("UPDATE users SET group_id = ? WHERE id = ?")
+            .bind(ug_id)
+            .bind(uid)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// REGRESSION: a user whose permission group authorizes group 1 must NOT be
+    /// able to create a rule on group 2 (the bug allowed it).
+    #[tokio::test]
+    async fn create_rule_rejects_group_outside_user_authorization() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "admin-in-1").await;
+        add_group(&pool, 2, 1, "admin-in-2").await;
+        // Alice's group authorizes ONLY device group 1.
+        add_restricted_group(&pool, 10, &[1]).await;
+        set_user_group_id(&pool, 2, 10).await;
+
+        // Group 1 → allowed.
+        let Json(ok) = create_rule(
+            auth(2, false),
+            State(state.clone()),
+            Json(rule_req("r1", 20001, 1, None)),
+        )
+        .await;
+        assert_eq!(ok.code, 0, "group 1 must be allowed: {}", ok.message);
+
+        // Group 2 → forbidden (403).
+        let Json(deny) = create_rule(
+            auth(2, false),
+            State(state.clone()),
+            Json(rule_req("r2", 20002, 2, None)),
+        )
+        .await;
+        assert_eq!(
+            deny.code, 403,
+            "group 2 must be rejected (permission bypass)"
+        );
+    }
+
+    /// REGRESSION: an empty authorized list means NO access → deny (the bug
+    /// treated empty as "allow all").
+    #[tokio::test]
+    async fn create_rule_empty_authorization_denies_all() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "admin-in-1").await;
+        // Alice's group authorizes NOTHING.
+        add_restricted_group(&pool, 10, &[]).await;
+        set_user_group_id(&pool, 2, 10).await;
+
+        let Json(deny) = create_rule(
+            auth(2, false),
+            State(state.clone()),
+            Json(rule_req("r", 20001, 1, None)),
+        )
+        .await;
+        assert_eq!(deny.code, 403, "empty authorization must deny, not allow");
+    }
+
+    /// REGRESSION: removing a device group from a user's authorization pauses
+    /// the user's existing rules on that group (kept, not deleted).
+    #[tokio::test]
+    async fn changing_user_group_pauses_unauthorized_rules() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "admin-in-1").await;
+        add_group(&pool, 2, 1, "admin-in-2").await;
+        add_restricted_group(&pool, 10, &[1, 2]).await; // initially both allowed
+        add_restricted_group(&pool, 11, &[1]).await; // only group 1
+        set_user_group_id(&pool, 2, 10).await;
+        // Alice has a rule on group 2.
+        add_rule(&pool, 100, 2, 2, 20002, 0).await;
+
+        // Move Alice to group 11 (which no longer authorizes group 2).
+        let Json(resp) = update_user(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(2),
+            Json(UpdateUserRequest {
+                group_id: Some(11),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 0, "{}", resp.message);
+
+        // Rule 100 (on group 2) must now be paused, NOT deleted.
+        let row: (i64, bool) =
+            sqlx::query_as("SELECT id, paused FROM forward_rules WHERE id = 100")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.1, "rule on now-unauthorized group must be paused");
+    }
+
+    /// REGRESSION (review round 2): flipping a permission group from
+    /// allow_all_groups=true to false must pause the group members' rules on
+    /// groups that are no longer authorized — via the update_user_group
+    /// endpoint, not just set_user_group_device_groups.
+    #[tokio::test]
+    async fn flipping_group_to_restricted_pauses_unauthorized_rules() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "admin-in-1").await;
+        add_group(&pool, 2, 1, "admin-in-2").await;
+        // Group 10 initially allows ALL groups.
+        sqlx::query(
+            "INSERT INTO user_groups (id, name, remark, allow_all_groups) VALUES (10, 'ug-10', '', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        set_user_group_id(&pool, 2, 10).await;
+        // Alice has a rule on group 2 (allowed while allow_all=true).
+        add_rule(&pool, 100, 2, 2, 20002, 0).await;
+
+        // Admin flips the group to restricted (allow_all_groups=false). With no
+        // explicit device-group allowlist, ALL of Alice's rules become
+        // unauthorized and must be paused.
+        let Json(resp) = update_user_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(10),
+            Json(UpdateUserGroupRequest {
+                allow_all_groups: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 0, "{}", resp.message);
+
+        let row: (i64, bool) =
+            sqlx::query_as("SELECT id, paused FROM forward_rules WHERE id = 100")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            row.1,
+            "rule must be paused after group flipped to restricted (allow_all=false)"
+        );
+    }
+
+    /// REGRESSION: updating group_id together with balance/quota must apply ALL
+    /// fields (the bug early-returned after group_id, dropping the rest).
+    #[tokio::test]
+    async fn update_user_applies_group_id_and_other_fields_together() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_restricted_group(&pool, 10, &[]).await;
+
+        let Json(resp) = update_user(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(2),
+            Json(UpdateUserRequest {
+                group_id: Some(10),
+                max_rules: Some(99),
+                balance: Some("50.00".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 0, "{}", resp.message);
+
+        let row: (i64, i64, String) =
+            sqlx::query_as("SELECT group_id, max_rules, balance FROM users WHERE id = 2")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 10, "group_id must be set");
+        assert_eq!(row.1, 99, "max_rules must ALSO be applied (not dropped)");
+        assert_eq!(row.2, "50.00", "balance must ALSO be applied (not dropped)");
     }
 
     /// v0.4.12 PR1: a regular user's OWN historical inbound group is NOT a valid

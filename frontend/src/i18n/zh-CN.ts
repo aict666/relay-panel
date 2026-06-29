@@ -122,9 +122,10 @@ export const zhCN = {
   exportImport: '导入/导出',
   exported: '已导出',
   import: '导入',
-  importHint: '粘贴导出的 JSON，每条规则会自动分配新端口。注意：导入时需选择入口分组。',
-  importInvalidJson: 'JSON 格式错误，请检查后重试。',
-  importInvalidFormat: 'JSON 格式不正确：缺少 rules 数组。',
+  importHint: '粘贴极简规则 JSON。格式：[{"dest":["ip:端口"],"listen_port":端口,"name":"名称"}]',
+  importInvalidJson: 'JSON 解析失败，请检查格式。',
+  importInvalidFormat: '格式不正确。需要对象或对象数组。',
+  selectInboundGroup: '选择入口分组',
   importResult: '导入完成：成功 {ok} 条，失败 {fail} 条。',
   owner: '归属用户',
   ownerHint: '留空则归属自己。（仅管理员有效，非管理员的值会被忽略。）',
@@ -194,6 +195,13 @@ export const zhCN = {
   failedCreateGroup: '创建分组失败',
   tokenCopied: '令牌已复制',
   groupHelpText: '每个分组有一个节点令牌。运行 relay-node 并设置 NODE_TOKEN=<令牌> 即可注册转发节点。',
+  nodes: '节点',
+  nodesInGroup: '该分组中的节点',
+  noNodesInGroup: '暂无节点加入该分组.',
+  addNode: '添加节点',
+  groupInUse: '该分组仍被规则使用，请先迁移规则。',
+  failedDeleteGroup: '删除分组失败。',
+  // v1.0.4 end
 
   // Users page
   banned: '已封禁',
@@ -448,6 +456,18 @@ export const zhCN = {
   passwordResetSuccess: '密码已重置',
   // v0.4.11 PR3: shared group indicator
   shared: '共享',
+  // v1.0.4: user groups
+  userGroups: '用户权限组',
+  addUserGroup: '新建权限组',
+  editUserGroup: '编辑权限组',
+  allowAllGroups: '允许所有分组',
+  assignDeviceGroups: '分配设备分组',
+  assignDeviceGroupsHint: '该权限组下的用户只能使用选中的入口分组。选择"允许所有分组"可跳过此限制。',
+  allowedInboundGroups: '允许的入口分组',
+  selectDeviceGroups: '选择设备分组',
+  yes: '是',
+  no: '否',
+  remark: '备注',
 };
 
 export type Dict = typeof zhCN;

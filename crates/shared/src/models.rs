@@ -232,6 +232,23 @@ pub struct Plan {
     pub created_at: String,
 }
 
+// ── v1.0.4: user permission groups ──
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UserGroup {
+    pub id: i64,
+    pub name: String,
+    pub remark: String,
+    pub allow_all_groups: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UserGroupDeviceGroup {
+    pub user_group_id: i64,
+    pub device_group_id: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Statistic {
     pub id: i64,
