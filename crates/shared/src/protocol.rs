@@ -105,6 +105,9 @@ pub struct UpdateUserRequest {
     /// Cannot ban admin users (the handler rejects it).
     #[serde(default)]
     pub banned: Option<bool>,
+    /// v1.0.4: assign user to a permission group.
+    #[serde(default)]
+    pub group_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

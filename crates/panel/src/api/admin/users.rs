@@ -144,6 +144,7 @@ pub async fn update_user(
         && req.max_rules.is_none()
         && req.traffic_limit.is_none()
         && req.banned.is_none()
+        && req.group_id.is_none()
     {
         return Json(err(400, "No fields to update"));
     }
@@ -216,6 +217,12 @@ pub async fn update_user(
                 .node_connections
                 .broadcast_all(r#"{"type":"config_changed"}"#)
                 .await;
+            // v1.0.4: handle group_id separately (simple single-field update).
+            if let Some(gid) = req.group_id {
+                if let Err(e) = state.db.set_user_group(id, Some(gid)).await {
+                    tracing::error!("update_user {}: set_user_group failed: {}", id, e);
+                }
+            }
             Json(ApiResponse::success(()))
         }
         Err(e) => {

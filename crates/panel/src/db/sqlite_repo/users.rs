@@ -305,4 +305,23 @@ impl UserRepository for SqliteRepository {
         .await?;
         Ok(())
     }
+
+    async fn set_user_group(&self, user_id: i64, group_id: Option<i64>) -> Result<u64, DbError> {
+        let r = match group_id {
+            Some(gid) => {
+                sqlx::query("UPDATE users SET group_id = ? WHERE id = ? AND admin = 0")
+                    .bind(gid)
+                    .bind(user_id)
+                    .execute(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query("UPDATE users SET group_id = NULL WHERE id = ? AND admin = 0")
+                    .bind(user_id)
+                    .execute(&self.pool)
+                    .await?
+            }
+        };
+        Ok(r.rows_affected())
+    }
 }

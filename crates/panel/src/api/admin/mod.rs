@@ -226,6 +226,7 @@ mod tests {
                 max_rules: Some(42),
                 traffic_limit: Some(1024),
                 banned: Some(true),
+                ..Default::default()
             }),
         )
         .await;

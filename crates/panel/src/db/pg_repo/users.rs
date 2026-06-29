@@ -316,4 +316,23 @@ impl UserRepository for PgRepository {
         .await?;
         Ok(())
     }
+
+    async fn set_user_group(&self, user_id: i64, group_id: Option<i64>) -> Result<u64, DbError> {
+        let r = match group_id {
+            Some(gid) => {
+                sqlx::query("UPDATE users SET group_id = $1 WHERE id = $2 AND admin = FALSE")
+                    .bind(gid)
+                    .bind(user_id)
+                    .execute(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query("UPDATE users SET group_id = NULL WHERE id = $1 AND admin = FALSE")
+                    .bind(user_id)
+                    .execute(&self.pool)
+                    .await?
+            }
+        };
+        Ok(r.rows_affected())
+    }
 }

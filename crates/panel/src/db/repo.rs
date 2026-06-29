@@ -176,6 +176,8 @@ pub trait UserRepository: Send + Sync {
     async fn count_placeholder_admin_password(&self) -> Result<i64, DbError>;
     /// Replace placeholder admin password with a real hash (system boot).
     async fn replace_placeholder_admin_password(&self, hash: &str) -> Result<(), DbError>;
+    /// v1.0.4: assign a user to a permission group.
+    async fn set_user_group(&self, user_id: i64, group_id: Option<i64>) -> Result<u64, DbError>;
 }
 
 // ── Rule (forward_rules) ──
