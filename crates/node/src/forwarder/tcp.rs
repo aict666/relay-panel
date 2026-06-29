@@ -8,7 +8,7 @@ use super::limiter::RateLimit;
 use super::selector::TargetSelector;
 use crate::reporter::{ConnectionTracker, TrafficCounter};
 
-/// v1.0.5: serve an ALREADY-BOUND TcpListener. Binding happens in the manager
+/// v1.0.4: serve an ALREADY-BOUND TcpListener. Binding happens in the manager
 /// (synchronously, so errors surface immediately and per-family success is
 /// known). This function only runs the accept loop.
 #[allow(clippy::too_many_arguments)]

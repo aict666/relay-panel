@@ -39,7 +39,7 @@ struct UdpSession {
     last_active: tokio::time::Instant,
 }
 
-/// v1.0.5: serve an ALREADY-BOUND UDP socket. Binding happens in the manager
+/// v1.0.4: serve an ALREADY-BOUND UDP socket. Binding happens in the manager
 /// (synchronously, so errors surface immediately and per-family success is
 /// known). This function only runs the receive loop.
 #[allow(clippy::too_many_arguments)]

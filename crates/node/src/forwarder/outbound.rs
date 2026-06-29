@@ -1,4 +1,4 @@
-//! v1.0.5: IPv4 outbound source-address binding for multi-NIC servers.
+//! v1.0.4: IPv4 outbound source-address binding for multi-NIC servers.
 //!
 //! Servers with separate NICs for IPv6 ingress and IPv4 egress need the
 //! outbound TCP/UDP connection to originate from a specific IPv4 address.
@@ -99,7 +99,7 @@ fn resolve_bind_ipv4(config: &OutboundConfig) -> Result<Option<Ipv4Addr>, Outbou
 
 // ── platform helpers ──
 
-/// v1.0.5: verify an IPv4 address actually belongs to this host by trying to
+/// v1.0.4: verify an IPv4 address actually belongs to this host by trying to
 /// bind a UDP socket to it. A non-local address fails with EADDRNOTAVAIL.
 /// This is cross-platform and needs no external commands — the kernel is the
 /// authority on which addresses are local. Used at startup so a typo'd or
@@ -281,7 +281,7 @@ pub fn parse_listen_ip(s: &str) -> Option<IpAddr> {
 /// Called once at startup. Validates the outbound config and returns
 /// the resolved source IPv4 (or None for auto-route).
 ///
-/// v1.0.5 fix: a MISCONFIGURED outbound (invalid IP, missing interface,
+/// v1.0.4 fix: a MISCONFIGURED outbound (invalid IP, missing interface,
 /// non-local IP) returns Err — the caller decides whether to abort. It does
 /// NOT silently fall back to auto-route, which could send traffic out the
 /// wrong NIC without the operator noticing.
@@ -306,7 +306,7 @@ mod tests {
             bind_ipv4: Some("not-an-ip".into()),
             interface: "auto".into(),
         };
-        // v1.0.5: invalid IP must ERROR, not silently fall back.
+        // v1.0.4: invalid IP must ERROR, not silently fall back.
         assert!(init_outbound(&cfg).is_err(), "invalid IP must be an error");
     }
 
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(cfg.interface, "auto");
     }
 
-    // ── v1.0.5: dual-stack listen tests ──
+    // ── v1.0.4: dual-stack listen tests ──
 
     #[test]
     fn parse_listen_ip_handles_v4_v6_empty() {

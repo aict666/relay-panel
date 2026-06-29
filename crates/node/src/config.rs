@@ -11,13 +11,13 @@ pub struct NodeConfig {
     pub tls_key_path: Option<String>,
     /// v0.4.6: NIC for traffic stats. "auto" = auto-detect default route.
     pub network_interface: String,
-    /// v1.0.5: IPv4 listen address. Empty = disabled. Default "0.0.0.0".
+    /// v1.0.4: IPv4 listen address. Empty = disabled. Default "0.0.0.0".
     pub listen_ipv4: String,
-    /// v1.0.5: IPv6 listen address. Empty = disabled. Default "::".
+    /// v1.0.4: IPv6 listen address. Empty = disabled. Default "::".
     pub listen_ipv6: String,
-    /// v1.0.5: NIC for outbound IPv4 egress. "auto" = system routing.
+    /// v1.0.4: NIC for outbound IPv4 egress. "auto" = system routing.
     pub outbound_interface: String,
-    /// v1.0.5: Exact IPv4 source for outbound connections.
+    /// v1.0.4: Exact IPv4 source for outbound connections.
     pub outbound_bind_ipv4: Option<String>,
 }
 
@@ -43,7 +43,7 @@ impl NodeConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "auto".to_string()),
-            // v1.0.5: distinguish UNSET (use default, backward compatible) from
+            // v1.0.4: distinguish UNSET (use default, backward compatible) from
             // EXPLICITLY EMPTY (LISTEN_IPV6= → disable that family). std::env::var
             // returns Err only when unset; Ok("") when set to empty.
             listen_ipv4: match std::env::var("LISTEN_IPV4") {
