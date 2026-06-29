@@ -10,6 +10,35 @@ use relay_shared::protocol::*;
 
 use serde::Deserialize;
 
+/// v1.0.4: re-evaluate every (non-admin) user in a permission group and pause
+/// rules whose inbound group is no longer authorized. Rules are kept + paused
+/// so an admin can re-authorize and resume. Returns the number of rules paused,
+/// or Err on ANY database failure (the caller must surface it as 500 rather
+/// than reporting success while rules keep forwarding).
+async fn pause_unauthorized_rules_for_group(
+    state: &AppState,
+    user_group_id: i64,
+) -> Result<u64, crate::db::error::DbError> {
+    let user_ids = state.db.list_user_ids_in_group(user_group_id).await?;
+    let mut paused_total = 0u64;
+    for uid in user_ids {
+        let allowed = state.db.authorized_device_group_ids(uid).await?;
+        paused_total += state.db.pause_rules_outside_groups(uid, &allowed).await?;
+    }
+    if paused_total > 0 {
+        tracing::warn!(
+            "user group {}: authorization change paused {} rule(s) across its users",
+            user_group_id,
+            paused_total
+        );
+        state
+            .node_connections
+            .broadcast_all(r#"{"type":"config_changed"}"#)
+            .await;
+    }
+    Ok(paused_total)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateUserGroupRequest {
     pub name: String,
@@ -105,10 +134,21 @@ pub async fn update_user_group(
         .await
     {
         Ok(0) => Json(err(404, "Not found")),
-        Ok(_) => match state.db.find_user_group_by_id(id).await {
-            Ok(Some(g)) => Json(ApiResponse::success(g)),
-            _ => Json(err(500, "failed to read back updated group")),
-        },
+        Ok(_) => {
+            // v1.0.4: flipping allow_all_groups true→false (or otherwise
+            // tightening access) can leave existing rules pointing at groups
+            // the users may no longer use. Re-evaluate + pause them. A failure
+            // here MUST surface as 500 — silently succeeding would leave
+            // unauthorized rules forwarding.
+            if let Err(e) = pause_unauthorized_rules_for_group(&state, id).await {
+                tracing::error!("update_user_group {}: pause re-eval failed: {}", id, e);
+                return Json(err(500, "group updated but rule re-evaluation failed"));
+            }
+            match state.db.find_user_group_by_id(id).await {
+                Ok(Some(g)) => Json(ApiResponse::success(g)),
+                _ => Json(err(500, "failed to read back updated group")),
+            }
+        }
         Err(e) => {
             tracing::error!("update_user_group {}: {}", id, e);
             Json(err(500, "database error"))
@@ -176,53 +216,19 @@ pub async fn set_user_group_device_groups(
     }
 
     // v1.0.4: the group's device-group allowlist changed. Re-evaluate every
-    // user in this group and pause any rules whose inbound group is no longer
-    // authorized (rules are kept + paused, so an admin can re-authorize later).
-    let user_ids = match state.db.list_user_ids_in_group(id).await {
-        Ok(ids) => ids,
-        Err(e) => {
-            tracing::error!(
-                "set_user_group_device_groups {}: list users failed: {}",
-                id,
-                e
-            );
-            return Json(err(500, "database error"));
-        }
-    };
-    let mut paused_total = 0u64;
-    for uid in user_ids {
-        let allowed = match state.db.authorized_device_group_ids(uid).await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(
-                    "set_user_group_device_groups: authz lookup uid={} failed: {}",
-                    uid,
-                    e
-                );
-                continue;
-            }
-        };
-        match state.db.pause_rules_outside_groups(uid, &allowed).await {
-            Ok(n) => paused_total += n,
-            Err(e) => {
-                tracing::error!(
-                    "set_user_group_device_groups: pause uid={} failed: {}",
-                    uid,
-                    e
-                );
-            }
-        }
-    }
-    if paused_total > 0 {
-        tracing::warn!(
-            "user group {}: device-group change paused {} rule(s) across its users",
+    // user in this group and pause rules whose inbound group is no longer
+    // authorized. A failure here MUST surface as 500 — reporting success while
+    // a pause failed would leave unauthorized rules forwarding.
+    if let Err(e) = pause_unauthorized_rules_for_group(&state, id).await {
+        tracing::error!(
+            "set_user_group_device_groups {}: pause re-eval failed: {}",
             id,
-            paused_total
+            e
         );
-        state
-            .node_connections
-            .broadcast_all(r#"{"type":"config_changed"}"#)
-            .await;
+        return Json(err(
+            500,
+            "allowlist saved but rule re-evaluation failed — some rules may still be active",
+        ));
     }
     Json(ApiResponse::success(()))
 }

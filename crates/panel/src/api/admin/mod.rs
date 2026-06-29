@@ -84,6 +84,7 @@ fn err<T: Serialize, S: Into<String>>(code: i32, msg: S) -> ApiResponse<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::user_groups::{update_user_group, UpdateUserGroupRequest};
     use super::{change_password, reset_user_password, ResetPasswordRequest};
     use super::{
         create_group, create_rule, create_user, delete_group, delete_rule, delete_user, err,
@@ -1330,6 +1331,53 @@ mod tests {
                 .await
                 .unwrap();
         assert!(row.1, "rule on now-unauthorized group must be paused");
+    }
+
+    /// REGRESSION (review round 2): flipping a permission group from
+    /// allow_all_groups=true to false must pause the group members' rules on
+    /// groups that are no longer authorized — via the update_user_group
+    /// endpoint, not just set_user_group_device_groups.
+    #[tokio::test]
+    async fn flipping_group_to_restricted_pauses_unauthorized_rules() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "admin-in-1").await;
+        add_group(&pool, 2, 1, "admin-in-2").await;
+        // Group 10 initially allows ALL groups.
+        sqlx::query(
+            "INSERT INTO user_groups (id, name, remark, allow_all_groups) VALUES (10, 'ug-10', '', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        set_user_group_id(&pool, 2, 10).await;
+        // Alice has a rule on group 2 (allowed while allow_all=true).
+        add_rule(&pool, 100, 2, 2, 20002, 0).await;
+
+        // Admin flips the group to restricted (allow_all_groups=false). With no
+        // explicit device-group allowlist, ALL of Alice's rules become
+        // unauthorized and must be paused.
+        let Json(resp) = update_user_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(10),
+            Json(UpdateUserGroupRequest {
+                allow_all_groups: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 0, "{}", resp.message);
+
+        let row: (i64, bool) =
+            sqlx::query_as("SELECT id, paused FROM forward_rules WHERE id = 100")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            row.1,
+            "rule must be paused after group flipped to restricted (allow_all=false)"
+        );
     }
 
     /// REGRESSION: updating group_id together with balance/quota must apply ALL
