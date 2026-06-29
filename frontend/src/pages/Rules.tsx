@@ -52,7 +52,9 @@ function listenHostFor(rule: ForwardRule, groups: DeviceGroup[]): string {
 }
 
 /** v1.0.4: simplified export format — only dest, listen_port, name.
- *  Enabled targets only. IPv6 wrapped as [addr]:port. */
+ *  Enabled targets only. IPv6 wrapped as [addr]:port.
+ *  v1.0.6: always emit a JSON array (even for a single rule) so the export
+ *  round-trips into the import box, which documents the `[{...}]` array form. */
 function buildExportJSON(rules: ForwardRule[]): string {
   const simplified = rules.map(r => {
     const targets = ruleTargets(r).filter(t => t.enabled);
@@ -63,7 +65,7 @@ function buildExportJSON(rules: ForwardRule[]): string {
     });
     return { dest, listen_port: r.listen_port, name: r.name };
   });
-  return JSON.stringify(rules.length === 1 ? simplified[0] : simplified, null, 2);
+  return JSON.stringify(simplified, null, 2);
 }
 
 /** Trigger a browser download of a text file. */
@@ -321,6 +323,9 @@ const IMPORT_DEFAULTS = {
           target_addr: first.host,
           target_port: first.port,
           targets,
+          // v1.0.6: attribute to the target user when an admin imports via the
+          // user-management entry (/rules?owner_uid=X); else owner = caller.
+          owner_uid: filterOwnerUid ?? undefined,
         });
         if (res.code === 0) results.push(`✅ ${entry.name}:${entry.listen_port}`);
         else results.push(`❌ ${entry.name}: ${res.message}`);
