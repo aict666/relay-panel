@@ -159,7 +159,7 @@ pub trait UserRepository: Send + Sync {
         banned: Option<bool>,
         suspended: Option<bool>,
     ) -> Result<u64, DbError>;
-    /// v1.0.10: admin directly sets a user's plan association + expiry WITHOUT
+    /// v1.0.7: admin directly sets a user's plan association + expiry WITHOUT
     /// charging (the "edit user plan" panel uses this for removing a plan — both
     /// NULL — and for adjusting the expiry). Unconditionally writes both columns;
     /// the caller composes the pair (e.g. keep plan_id, change expiry). Skips

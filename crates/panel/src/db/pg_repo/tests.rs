@@ -3131,7 +3131,7 @@ async fn pg_migration_does_not_pause_cross_owner_shared_inbound_rules() {
     cleanup(&db).await;
 }
 
-// ── v1.0.10: admin directly edits a user's plan association + expiry ──
+// ── v1.0.7: admin directly edits a user's plan association + expiry ──
 
 #[tokio::test]
 async fn pg_admin_set_user_plan_clears_and_adjusts_expiry() {

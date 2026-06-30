@@ -916,14 +916,14 @@ pub struct BuyPlanRequest {
     pub plan_id: i64,
 }
 
-/// v1.0.10: admin assigns a plan to a user, charging the user's balance (same
+/// v1.0.7: admin assigns a plan to a user, charging the user's balance (same
 /// rules as a self-purchase). Hidden plans are allowed here.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdminBuyPlanRequest {
     pub plan_id: i64,
 }
 
-/// v1.0.10: admin edits a user's plan association + expiry WITHOUT charging.
+/// v1.0.7: admin edits a user's plan association + expiry WITHOUT charging.
 /// `clear = true` removes the plan entirely (plan_id + plan_expire_at → NULL).
 /// `clear = false` keeps the user's current plan_id and sets the expiry, where
 /// `plan_expire_at = None` means "never expires".
