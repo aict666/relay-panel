@@ -364,7 +364,7 @@ pub async fn get_user_device_groups(
     }))
 }
 
-// === v1.0.10: admin manages a user's plan ===
+// === v1.0.7: admin manages a user's plan ===
 
 /// POST /admin/users/{id}/buy-plan — admin assigns a plan to a user, charging
 /// the user's balance per the normal purchase rules (same atomic transaction as
@@ -500,25 +500,63 @@ pub async fn admin_set_user_plan(
     };
 
     match state.db.admin_set_user_plan(id, plan_id, expire).await {
-        Ok(0) => Json(err(404, "User not found (or is an admin)")),
-        Ok(_) => {
-            tracing::info!(
-                action = "admin_set_user_plan",
-                target_user_id = id,
-                actor_admin_id = _admin.user_id,
-                "admin edited user plan (clear={})",
-                req.clear
-            );
-            // Expiry feeds list_active_for_config — refresh node configs.
-            state
-                .node_connections
-                .broadcast_all(r#"{"type":"config_changed"}"#)
-                .await;
-            Json(ApiResponse::success(()))
-        }
+        Ok(0) => return Json(err(404, "User not found (or is an admin)")),
+        Ok(_) => {}
         Err(e) => {
             tracing::error!("admin_set_user_plan {}: db error: {}", id, e);
-            Json(err(500, "database error"))
+            return Json(err(500, "database error"));
         }
     }
+
+    // v1.0.7: removing the plan also REVOKES device-group authorization — the
+    // user returns to a bare account with no usable lines. Without this, the
+    // grants from the old plan (device-group auth is "only ever expands") would
+    // linger after the plan is gone and stack with the next purchase. Clear the
+    // all-groups flag + explicit assignments, then pause any rules that now
+    // reference an unauthorized group (data kept; resumes when re-authorized).
+    if req.clear {
+        if let Err(e) = state.db.set_user_all_device_groups(id, false).await {
+            tracing::error!(
+                "admin_set_user_plan {}: clear all_device_groups failed: {}",
+                id,
+                e
+            );
+            return Json(err(500, "database error"));
+        }
+        if let Err(e) = state.db.set_user_device_groups(id, &[]).await {
+            tracing::error!(
+                "admin_set_user_plan {}: clear device groups failed: {}",
+                id,
+                e
+            );
+            return Json(err(500, "database error"));
+        }
+        // Allowed set is now empty → pause ALL of the user's active rules.
+        match state.db.pause_rules_outside_groups(id, &[]).await {
+            Ok(n) if n > 0 => tracing::warn!(
+                "admin_set_user_plan {}: paused {} rule(s) after plan removal",
+                id,
+                n
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("admin_set_user_plan {}: pause rules failed: {}", id, e);
+                return Json(err(500, "database error"));
+            }
+        }
+    }
+
+    tracing::info!(
+        action = "admin_set_user_plan",
+        target_user_id = id,
+        actor_admin_id = _admin.user_id,
+        "admin edited user plan (clear={})",
+        req.clear
+    );
+    // Expiry / authorization changes feed list_active_for_config — refresh nodes.
+    state
+        .node_connections
+        .broadcast_all(r#"{"type":"config_changed"}"#)
+        .await;
+    Json(ApiResponse::success(()))
 }

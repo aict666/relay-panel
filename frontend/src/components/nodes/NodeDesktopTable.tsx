@@ -23,7 +23,7 @@ export function NodeDesktopTable({ rows, panelProtocol, currentVersion, t, openD
 
   const columns = [
     {
-      title: t('status'), key: 'status', width: 100, fixed: 'left' as const,
+      title: t('status'), key: 'status', width: 84, fixed: 'left' as const,
       render: (_: unknown, r: NodeDisplayRow) => {
         const v = r.config_protocol_version;
         if (v != null && panelProtocol > 0 && v !== panelProtocol) {
@@ -33,7 +33,7 @@ export function NodeDesktopTable({ rows, panelProtocol, currentVersion, t, openD
       },
     },
     {
-      title: t('network'), key: 'network', width: 220,
+      title: t('network'), key: 'network', width: 300,
       render: (_: unknown, r: NodeDisplayRow) => <NetworkCell row={r} t={t} />,
     },
     {
@@ -50,7 +50,7 @@ export function NodeDesktopTable({ rows, panelProtocol, currentVersion, t, openD
       render: (v: number) => <span className="rp-mono">{v || 0}</span>,
     },
     {
-      title: 'CPU', key: 'cpu', width: 100,
+      title: 'CPU', key: 'cpu', width: 84,
       render: (_: unknown, r: NodeDisplayRow) => <NodeResourceBar value={r.cpu} tooltip={`CPU: ${formatPercent(r.cpu)}`} />,
     },
     {

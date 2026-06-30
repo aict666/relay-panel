@@ -59,10 +59,9 @@ export default function Users() {
   const [resetting, setResetting] = useState<User | null>(null);
   // v1.0.7: inbound device groups available to assign to a user.
   const [deviceGroups, setDeviceGroups] = useState<DeviceGroup[]>([]);
-  // v1.0.10: admin "edit user plan" panel state. planEditing = the target row;
+  // v1.0.7: admin "edit user plan" panel state. planEditing = the target row;
   // plans = the catalog (for the assign dropdown); planChoice = the selected
   // plan to buy; planExpire = the expiry being edited (treated as UTC).
-  const [planEditing, setPlanEditing] = useState<User | null>(null);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [planChoice, setPlanChoice] = useState<number | undefined>(undefined);
   const [planExpire, setPlanExpire] = useState<Dayjs | null>(null);
@@ -91,7 +90,7 @@ export default function Users() {
         const gRes = await api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups');
         setDeviceGroups((gRes.data || []).filter(g => g.group_type === 'in'));
       } catch { setDeviceGroups([]); }
-      // v1.0.10: load the plan catalog for the "edit user plan" assign dropdown.
+      // v1.0.7: load the plan catalog for the "edit user plan" assign dropdown.
       try {
         const pRes = await api.get<unknown, ApiEnvelope<Plan[]>>('/admin/plans');
         setPlans(pRes.data || []);
@@ -103,37 +102,31 @@ export default function Users() {
   const planName = (id: number | null): string =>
     id == null ? t('noPlan') : (plans.find(p => p.id === id)?.name ?? `#${id}`);
 
-  const openPlan = (u: User) => {
-    setPlanEditing(u);
-    setPlanChoice(undefined);
-    // plan_expire_at is stored as a UTC 'YYYY-MM-DD HH:mm:ss' string; parse it
-    // as-is into the picker (we treat the displayed value as UTC end-to-end).
-    setPlanExpire(u.plan_expire_at ? dayjs(u.plan_expire_at) : null);
-  };
-
-  // Admin assigns a plan to the user, charging their balance (POST buy-plan).
+  // v1.0.10: plan management is embedded in the edit-user modal, so these act on
+  // the `editing` user. Admin assigns a plan, charging the user's balance.
   const handleBuyPlanForUser = async () => {
-    if (!planEditing || planChoice == null) return;
+    if (!editing || planChoice == null) return;
     setPlanBusy(true);
     try {
-      const res = await api.post<unknown, ApiEnvelope<null>>(`/admin/users/${planEditing.id}/buy-plan`, { plan_id: planChoice });
+      const res = await api.post<unknown, ApiEnvelope<null>>(`/admin/users/${editing.id}/buy-plan`, { plan_id: planChoice });
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('planAssigned'));
-      setPlanEditing(null);
+      setEditing(null);
       load();
     } finally { setPlanBusy(false); }
   };
 
   // Edit the plan association/expiry without charging. clear=true removes the
-  // plan; otherwise keep plan_id and set the expiry (null = never expires).
+  // plan (and revokes device-group authorization on the backend); otherwise
+  // keep plan_id and set the expiry (null = never expires).
   const handleSetUserPlan = async (clear: boolean, expire: string | null) => {
-    if (!planEditing) return;
+    if (!editing) return;
     setPlanBusy(true);
     try {
-      const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/users/${planEditing.id}/plan`, { clear, plan_expire_at: expire });
+      const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/users/${editing.id}/plan`, { clear, plan_expire_at: expire });
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('userUpdated'));
-      setPlanEditing(null);
+      setEditing(null);
       load();
     } finally { setPlanBusy(false); }
   };
@@ -149,6 +142,9 @@ export default function Users() {
 
   const openEdit = async (u: User) => {
     setEditing(u);
+    // v1.0.10: preload the embedded plan panel (assign choice + expiry picker).
+    setPlanChoice(undefined);
+    setPlanExpire(u.plan_expire_at ? dayjs(u.plan_expire_at) : null);
     form.setFieldsValue({
       // InputNumber with stringMode wants a string. Existing rows already have
       // a canonical TEXT-form value (e.g. "12.30"); pass it through unchanged.
@@ -346,17 +342,10 @@ export default function Users() {
       ),
     },
     {
-      title: t('action'), key: 'action', width: 250,
+      title: t('action'), key: 'action', width: 210,
       render: (_: unknown, u: User) => (
         <Space size="small">
           <Button icon={<EditOutlined />} size="small" type="text" onClick={() => openEdit(u)}>{t('edit')}</Button>
-          {/* v1.0.10: edit user plan (assign / change expiry / remove). Admins
-              can't hold a plan, so the entry is hidden for them. */}
-          {isAdmin && !u.admin && (
-            <Tooltip title={t('editUserPlan')}>
-              <Button icon={<ShoppingOutlined />} size="small" type="text" onClick={() => openPlan(u)} />
-            </Tooltip>
-          )}
           <Popconfirm title={t('resetTrafficConfirm')} onConfirm={() => handleResetTraffic(u.id)}>
             <Button icon={<UndoOutlined />} size="small" type="text">{t('resetTraffic')}</Button>
           </Popconfirm>
@@ -392,69 +381,6 @@ export default function Users() {
         </Space>
       </div>
       <Table dataSource={users} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} />
-
-      {/* v1.0.10: edit-user-plan panel — assign a plan (charges balance),
-          adjust the expiry, or remove the plan. */}
-      <Modal
-        title={planEditing ? `${t('editUserPlan')}: ${planEditing.username}` : t('editUserPlan')}
-        open={!!planEditing}
-        onCancel={() => setPlanEditing(null)}
-        footer={null}
-        width={540}
-      >
-        {planEditing && (
-          <div>
-            <p style={{ marginTop: 0 }}>
-              <strong>{t('currentPlan')}:</strong> {planName(planEditing.plan_id)}
-              <span style={{ marginLeft: 16 }}>
-                <strong>{t('planExpiry')}:</strong> {planEditing.plan_expire_at || t('neverExpires')}
-              </span>
-            </p>
-
-            <Divider style={{ margin: '12px 0' }} />
-
-            <div style={{ marginBottom: 4 }}><strong>{t('assignPlan')}</strong></div>
-            <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>{t('assignPlanHint')}</div>
-            <Space.Compact style={{ width: '100%' }}>
-              <Select
-                style={{ flex: 1 }}
-                placeholder={t('selectPlan')}
-                value={planChoice}
-                onChange={setPlanChoice}
-                options={plans.map(p => ({
-                  value: p.id,
-                  label: `${p.name} · ${p.price} · ${p.plan_type === 'time' ? `${p.duration_days}${t('days')}` : t('planTypeData')}`,
-                }))}
-              />
-              <Button type="primary" loading={planBusy} disabled={planChoice == null} onClick={handleBuyPlanForUser}>
-                {t('assignAndCharge')}
-              </Button>
-            </Space.Compact>
-
-            <Divider style={{ margin: '12px 0' }} />
-
-            <div style={{ marginBottom: 8 }}>
-              <strong>{t('editExpiry')}</strong>
-              <span style={{ color: '#999', fontSize: 12, marginLeft: 6 }}>(UTC)</span>
-            </div>
-            <Space wrap>
-              <DatePicker showTime value={planExpire} onChange={setPlanExpire} placeholder={t('neverExpires')} />
-              <Button loading={planBusy} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
-                {t('saveExpiry')}
-              </Button>
-              <Button loading={planBusy} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
-                {t('setNeverExpires')}
-              </Button>
-            </Space>
-
-            <Divider style={{ margin: '12px 0' }} />
-
-            <Popconfirm title={t('removePlanConfirm')} onConfirm={() => handleSetUserPlan(true, null)}>
-              <Button danger loading={planBusy}>{t('removePlan')}</Button>
-            </Popconfirm>
-          </div>
-        )}
-      </Modal>
 
       <Modal
         title={editing ? `${t('editUser')}: ${editing.username}` : t('editUser')}
@@ -513,7 +439,7 @@ export default function Users() {
             label={t('maxRules')}
             rules={[{ type: 'number', min: 0, max: 100000, message: t('maxRulesRange') }]}
           >
-            <InputNumber min={0} max={100000} style={{ width: '100%' }} />
+            <InputNumber min={0} max={100000} style={{ width: 200 }} />
           </Form.Item>
           <Form.Item
             name="traffic_limit_gb"
@@ -557,6 +483,64 @@ export default function Users() {
             </>
           )}
         </Form>
+
+        {/* v1.0.10: plan management embedded in the edit-user modal (non-admin
+            only). Assign a plan (charges balance), adjust expiry, or remove the
+            plan. These act outside the form and refresh the list on success. */}
+        {editing && !editing.admin && (
+          <>
+            <Divider style={{ margin: '8px 0 16px' }} />
+            <div style={{ marginBottom: 8 }}>
+              <strong><ShoppingOutlined /> {t('editUserPlan')}</strong>
+            </div>
+            <p style={{ marginTop: 0 }}>
+              <strong>{t('currentPlan')}:</strong> {planName(editing.plan_id)}
+              <span style={{ marginLeft: 16 }}>
+                <strong>{t('planExpiry')}:</strong> {editing.plan_expire_at || t('neverExpires')}
+              </span>
+            </p>
+
+            <div style={{ marginBottom: 4 }}><strong>{t('assignPlan')}</strong></div>
+            <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>{t('assignPlanHint')}</div>
+            <Space.Compact style={{ width: '100%' }}>
+              <Select
+                style={{ flex: 1 }}
+                placeholder={t('selectPlan')}
+                value={planChoice}
+                onChange={setPlanChoice}
+                options={plans.map(p => ({
+                  value: p.id,
+                  label: `${p.name} · ${p.price} · ${p.plan_type === 'time' ? `${p.duration_days}${t('days')}` : t('planTypeData')}`,
+                }))}
+              />
+              <Button type="primary" loading={planBusy} disabled={planChoice == null} onClick={handleBuyPlanForUser}>
+                {t('assignAndCharge')}
+              </Button>
+            </Space.Compact>
+
+            <Divider style={{ margin: '12px 0' }} />
+
+            <div style={{ marginBottom: 8 }}>
+              <strong>{t('editExpiry')}</strong>
+              <span style={{ color: '#999', fontSize: 12, marginLeft: 6 }}>(UTC)</span>
+            </div>
+            <Space wrap>
+              <DatePicker showTime value={planExpire} onChange={setPlanExpire} placeholder={t('neverExpires')} />
+              <Button loading={planBusy} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
+                {t('saveExpiry')}
+              </Button>
+              <Button loading={planBusy} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
+                {t('setNeverExpires')}
+              </Button>
+            </Space>
+
+            <Divider style={{ margin: '12px 0' }} />
+
+            <Popconfirm title={t('removePlanConfirm')} onConfirm={() => handleSetUserPlan(true, null)}>
+              <Button danger loading={planBusy}>{t('removePlan')}</Button>
+            </Popconfirm>
+          </>
+        )}
       </Modal>
 
       <Modal
