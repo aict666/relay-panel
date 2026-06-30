@@ -2415,6 +2415,695 @@ async fn pg_traffic_batch_single_entry_overflow_rejects_and_rolls_back() {
     cleanup(&db).await;
 }
 
+// ── v1.0.8: device-group rate billing ──
+
+async fn seed_group_with_rate(db: &PgRepository, gid: i64, rate: f64) {
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid, rate) \
+         VALUES ($1, 'gin', 'in', $2, $3, $4)",
+    )
+    .bind(gid)
+    .bind(format!("tok-{gid}"))
+    .bind(alice)
+    .bind(rate)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'r100', $1, 20000, $2, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .bind(gid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pg_traffic_batch_rate_2_charges_user_double_rule_stays_real() {
+    let Some(db) = repo("traf_rate2").await else {
+        return;
+    };
+    seed_group_with_rate(&db, 50, 2.0).await;
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[TrafficEntry {
+                rule_id: 100,
+                upload: 1000,
+                download: 2000,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results[0], TrafficEntryResult::Ok));
+
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t.0, 3000);
+    let user_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(user_t.0, 6000);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_traffic_batch_rate_1_is_unchanged_billing() {
+    let Some(db) = repo("traf_rate1").await else {
+        return;
+    };
+    seed_group_with_rate(&db, 51, 1.0).await;
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+
+    let results = db
+        .apply_traffic_batch(
+            51,
+            &[TrafficEntry {
+                rule_id: 100,
+                upload: 1000,
+                download: 2000,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(results[0], TrafficEntryResult::Ok));
+
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t.0, 3000);
+    assert_eq!(user_t.0, 3000);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_traffic_batch_rate_1_5_rounds_correctly() {
+    let Some(db) = repo("traf_rate1_5").await else {
+        return;
+    };
+    seed_group_with_rate(&db, 52, 1.5).await;
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+
+    let results = db
+        .apply_traffic_batch(
+            52,
+            &[TrafficEntry {
+                rule_id: 100,
+                upload: 1000,
+                download: 2000,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(results[0], TrafficEntryResult::Ok));
+
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t.0, 3000);
+    assert_eq!(user_t.0, 4500);
+
+    db.apply_traffic_batch(
+        52,
+        &[TrafficEntry {
+            rule_id: 100,
+            upload: 1,
+            download: 1,
+        }],
+    )
+    .await
+    .unwrap();
+    let rule_t2: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_t2: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t2.0, 3002);
+    assert_eq!(user_t2.0, 4503);
+    cleanup(&db).await;
+}
+
+// ── v1.0.8: suspension + expiry gating ──
+
+async fn seed_active_rule(db: &PgRepository) -> i64 {
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', $1)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES ('r', $1, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    alice
+}
+
+#[tokio::test]
+async fn pg_suspended_user_rule_is_filtered_and_resumes_on_unsuspend() {
+    let Some(db) = repo("susp_filter").await else {
+        return;
+    };
+    let alice = seed_active_rule(&db).await;
+    assert_eq!(db.list_active_for_config(50).await.unwrap().len(), 1);
+
+    sqlx::query("UPDATE users SET suspended = TRUE WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_active_for_config(50).await.unwrap().len(),
+        0,
+        "suspended user's rule must be filtered (PG)"
+    );
+
+    sqlx::query("UPDATE users SET suspended = FALSE WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_active_for_config(50).await.unwrap().len(),
+        1,
+        "rule must reappear after unsuspend (PG)"
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_expired_plan_rule_is_filtered_and_resumes_after_renewal() {
+    let Some(db) = repo("expiry_filter").await else {
+        return;
+    };
+    let alice = seed_active_rule(&db).await;
+    sqlx::query("UPDATE users SET plan_expire_at = '2000-01-01 00:00:00' WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_active_for_config(50).await.unwrap().len(),
+        0,
+        "expired-plan user's rule must be filtered (PG)"
+    );
+
+    sqlx::query("UPDATE users SET plan_expire_at = '2099-01-01 00:00:00' WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_active_for_config(50).await.unwrap().len(),
+        1,
+        "rule must reappear after renewal (PG)"
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_null_plan_expire_at_is_no_expiry() {
+    let Some(db) = repo("null_expiry").await else {
+        return;
+    };
+    let alice = seed_active_rule(&db).await;
+    sqlx::query("UPDATE users SET plan_expire_at = NULL WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db.list_active_for_config(50).await.unwrap().len(), 1);
+    cleanup(&db).await;
+}
+
+// ── v1.0.8: plan purchase (buy_plan) ──
+
+async fn seed_buyer_and_plan(
+    db: &PgRepository,
+    balance: &str,
+    plan_traffic: i64,
+    plan_price: &str,
+    duration_days: i32,
+    reset_traffic: bool,
+) -> (i64, i64) {
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query("UPDATE users SET balance = $1 WHERE id = $2")
+        .bind(balance)
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let pid = db
+        .insert_plan(
+            "p1",
+            10,
+            plan_traffic,
+            plan_price,
+            if duration_days > 0 { "time" } else { "data" },
+            duration_days,
+            false,
+            reset_traffic,
+            "desc",
+            false,
+        )
+        .await
+        .unwrap();
+    (alice, pid)
+}
+
+#[tokio::test]
+async fn pg_buy_plan_stacks_traffic_and_charges_balance() {
+    let Some(db) = repo("buy_stack").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1_000_000, "30.00", 0, false).await;
+    sqlx::query("UPDATE users SET traffic_limit = 500 WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    db.buy_plan(alice, pid, "p1", 3000, 1_000_000, 10, 0, false, false, &[])
+        .await
+        .unwrap();
+
+    let (balance, traffic_limit, max_rules, plan_id): (String, i64, i32, Option<i64>) =
+        sqlx::query_as(
+            "SELECT balance, traffic_limit, max_rules, plan_id FROM users WHERE id = $1",
+        )
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(balance, "70");
+    assert_eq!(
+        traffic_limit, 1_000_500,
+        "traffic must stack on existing quota (PG)"
+    );
+    assert_eq!(max_rules, 10);
+    assert_eq!(plan_id, Some(pid));
+
+    let orders: Vec<relay_shared::models::Order> = db.list_orders_by_user(alice).await.unwrap();
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].plan_name, "p1");
+    assert_eq!(orders[0].price, "30");
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_buy_plan_reset_traffic_zeros_usage() {
+    let Some(db) = repo("buy_reset").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1_000_000, "10.00", 0, true).await;
+    sqlx::query("UPDATE users SET traffic_used = 9999 WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    db.buy_plan(alice, pid, "p1", 1000, 1_000_000, 10, 0, true, false, &[])
+        .await
+        .unwrap();
+
+    let used: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(used.0, 0, "reset_traffic must zero traffic_used (PG)");
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_buy_plan_insufficient_balance_is_rejected_and_rolls_back() {
+    let Some(db) = repo("buy_insuf").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "5.00", 1_000_000, "30.00", 0, false).await;
+    sqlx::query("UPDATE users SET plan_id = NULL WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let err = db
+        .buy_plan(alice, pid, "p1", 3000, 1_000_000, 10, 0, false, false, &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BuyPlanError::InsufficientBalance));
+
+    let (balance, plan_id): (String, Option<i64>) =
+        sqlx::query_as("SELECT balance, plan_id FROM users WHERE id = $1")
+            .bind(alice)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        balance, "5.00",
+        "balance must be untouched on rollback (PG)"
+    );
+    assert_eq!(plan_id, None);
+    let orders: Vec<relay_shared::models::Order> = db.list_orders_by_user(alice).await.unwrap();
+    assert_eq!(orders.len(), 0, "no order row on insufficient balance (PG)");
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_buy_plan_time_plan_sets_future_expiry() {
+    let Some(db) = repo("buy_time").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 0, "5.00", 30, false).await;
+
+    db.buy_plan(alice, pid, "p1", 500, 0, 10, 30, false, false, &[])
+        .await
+        .unwrap();
+
+    let expire: (Option<String>,) =
+        sqlx::query_as("SELECT plan_expire_at::text FROM users WHERE id = $1")
+            .bind(alice)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let exp = expire.0.expect("time plan must set an expiry (PG)");
+    let now: (String,) = sqlx::query_as("SELECT NOW()::text")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        exp > now.0,
+        "expiry must be in the future (PG): {exp} <= {}",
+        now.0
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_buy_plan_renewal_stacks_expiry_from_current_end() {
+    let Some(db) = repo("buy_renew").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 0, "5.00", 30, false).await;
+    sqlx::query("UPDATE users SET plan_expire_at = '2099-12-31 00:00:00' WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    db.buy_plan(alice, pid, "p1", 500, 0, 10, 30, false, false, &[])
+        .await
+        .unwrap();
+
+    let expire: (Option<String>,) =
+        sqlx::query_as("SELECT plan_expire_at::text FROM users WHERE id = $1")
+            .bind(alice)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let expire = expire.0.expect("renewal must keep an expiry (PG)");
+    assert!(
+        expire.starts_with("2100-"),
+        "renewal must stack from current expiry (PG), got {expire}"
+    );
+    cleanup(&db).await;
+}
+
+// ── v1.0.8: plan CRUD ──
+
+#[tokio::test]
+async fn pg_plan_crud_round_trip_and_delete_blocked_when_in_use() {
+    let Some(db) = repo("plan_crud").await else {
+        return;
+    };
+    let pid = db
+        .insert_plan("p1", 10, 1_000, "5.00", "data", 0, false, false, "d", false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.update_plan_fields(
+            pid,
+            Some("p1-renamed"),
+            Some(20),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let p = db.find_plan_by_id(pid).await.unwrap().unwrap();
+    assert_eq!(p.name, "p1-renamed");
+    assert_eq!(p.max_rules, 20);
+
+    let visible_before = db.list_visible_plans().await.unwrap().len();
+    db.update_plan_fields(
+        pid,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(true),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.list_visible_plans().await.unwrap().len(),
+        visible_before - 1
+    );
+    assert!(db.list_plans().await.unwrap().iter().any(|p| p.id == pid));
+
+    assert_eq!(db.count_users_on_plan(pid).await.unwrap(), 0);
+    assert_eq!(db.delete_plan(pid).await.unwrap(), 1);
+    assert!(db.find_plan_by_id(pid).await.unwrap().is_none());
+
+    let pid2 = db
+        .insert_plan("p2", 5, 0, "0", "data", 0, false, false, "", false)
+        .await
+        .unwrap();
+    db.insert_user("bob", "h", 1).await.unwrap();
+    let bob = db.find_by_username("bob").await.unwrap().unwrap().id;
+    sqlx::query("UPDATE users SET plan_id = $1 WHERE id = $2")
+        .bind(pid2)
+        .bind(bob)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db.count_users_on_plan(pid2).await.unwrap(), 1);
+    cleanup(&db).await;
+}
+
+// ── v1.0.9: plan ↔ device-group grants + purchase authorization ──
+
+async fn seed_device_group(db: &PgRepository, gid: i64, uid: i64) {
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES ($1, 'g', 'in', $2, $3)",
+    )
+    .bind(gid)
+    .bind(format!("tok-dg-{gid}"))
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pg_plan_device_groups_round_trip_and_replace() {
+    let Some(db) = repo("plan_dg_rtrip").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
+    seed_device_group(&db, 50, alice).await;
+    seed_device_group(&db, 51, alice).await;
+    seed_device_group(&db, 52, alice).await;
+
+    db.set_plan_device_groups(pid, &[50, 51]).await.unwrap();
+    assert_eq!(db.list_plan_device_groups(pid).await.unwrap(), vec![50, 51]);
+
+    db.set_plan_device_groups(pid, &[52]).await.unwrap();
+    assert_eq!(db.list_plan_device_groups(pid).await.unwrap(), vec![52]);
+
+    db.set_plan_device_groups(pid, &[50, 50, 51]).await.unwrap();
+    assert_eq!(db.list_plan_device_groups(pid).await.unwrap(), vec![50, 51]);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_buy_plan_appends_device_groups_dedup_without_removing_existing() {
+    let Some(db) = repo("buy_dg_dedup").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
+    seed_device_group(&db, 50, alice).await;
+    seed_device_group(&db, 51, alice).await;
+    db.set_user_device_groups(alice, &[50]).await.unwrap();
+    db.set_plan_device_groups(pid, &[50, 51]).await.unwrap();
+
+    db.buy_plan(alice, pid, "p1", 500, 1000, 10, 0, false, false, &[50, 51])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.list_user_device_groups(alice).await.unwrap(),
+        vec![50, 51]
+    );
+    let all: (bool,) = sqlx::query_as("SELECT all_device_groups FROM users WHERE id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(!all.0);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_buy_plan_grant_all_sets_flag() {
+    let Some(db) = repo("buy_grant_all").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
+
+    db.buy_plan(alice, pid, "p1", 500, 1000, 10, 0, false, true, &[])
+        .await
+        .unwrap();
+
+    let all: (bool,) = sqlx::query_as("SELECT all_device_groups FROM users WHERE id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        all.0,
+        "grant_all_groups must set the all_device_groups flag (PG)"
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_multi_plan_grants_stack() {
+    let Some(db) = repo("multi_plan_stack").await else {
+        return;
+    };
+    let (alice, pid_a) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
+    seed_device_group(&db, 50, alice).await;
+    seed_device_group(&db, 51, alice).await;
+    let pid_b = db
+        .insert_plan("pB", 10, 1000, "5.00", "data", 0, false, false, "", false)
+        .await
+        .unwrap();
+    db.set_plan_device_groups(pid_a, &[50]).await.unwrap();
+    db.set_plan_device_groups(pid_b, &[51]).await.unwrap();
+
+    db.buy_plan(alice, pid_a, "pA", 500, 1000, 10, 0, false, false, &[50])
+        .await
+        .unwrap();
+    db.buy_plan(alice, pid_b, "pB", 500, 1000, 10, 0, false, false, &[51])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.list_user_device_groups(alice).await.unwrap(),
+        vec![50, 51]
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_delete_plan_cascades_grant_rows() {
+    let Some(db) = repo("del_plan_cascade").await else {
+        return;
+    };
+    let pid = db
+        .insert_plan("p1", 10, 1000, "5.00", "data", 0, false, false, "", false)
+        .await
+        .unwrap();
+    seed_device_group(&db, 50, 1).await;
+    db.set_plan_device_groups(pid, &[50]).await.unwrap();
+    assert_eq!(db.list_plan_device_groups(pid).await.unwrap(), vec![50]);
+
+    db.delete_plan(pid).await.unwrap();
+    assert!(db.list_plan_device_groups(pid).await.unwrap().is_empty());
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_expiry_does_not_revoke_granted_groups() {
+    let Some(db) = repo("expiry_no_revoke").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 0, "5.00", 30, false).await;
+    seed_device_group(&db, 50, alice).await;
+    db.set_plan_device_groups(pid, &[50]).await.unwrap();
+
+    db.buy_plan(alice, pid, "p1", 500, 0, 10, 30, false, false, &[50])
+        .await
+        .unwrap();
+    assert_eq!(db.list_user_device_groups(alice).await.unwrap(), vec![50]);
+
+    sqlx::query("UPDATE users SET plan_expire_at = '2000-01-01 00:00:00' WHERE id = $1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_user_device_groups(alice).await.unwrap(),
+        vec![50],
+        "expiry must not revoke granted device groups (PG)"
+    );
+    cleanup(&db).await;
+}
+
 /// v0.4.11 PR3: Migration does NOT pause cross-owner shared inbound rules.
 #[tokio::test]
 async fn pg_migration_does_not_pause_cross_owner_shared_inbound_rules() {
