@@ -90,11 +90,12 @@ impl DeviceGroupAuthRepository for PgRepository {
     ) -> Result<u64, DbError> {
         // Empty allowed list → pause ALL of the user's currently-active rules.
         if allowed_group_ids.is_empty() {
-            let r =
-                sqlx::query("UPDATE forward_rules SET paused = TRUE WHERE uid = $1 AND paused = FALSE")
-                    .bind(user_id)
-                    .execute(&self.pool)
-                    .await?;
+            let r = sqlx::query(
+                "UPDATE forward_rules SET paused = TRUE WHERE uid = $1 AND paused = FALSE",
+            )
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
             return Ok(r.rows_affected());
         }
         // Build "device_group_in NOT IN ($2, $3, ...)" with bound params.

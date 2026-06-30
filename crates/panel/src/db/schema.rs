@@ -1262,7 +1262,9 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         .execute(pool)
         .await?;
 
-    tracing::info!("Migration 32: user_groups layer replaced by user_device_groups + all_device_groups flag");
+    tracing::info!(
+        "Migration 32: user_groups layer replaced by user_device_groups + all_device_groups flag"
+    );
 
     // ── Migration 33: v1.0.8 device-group traffic billing rate ──
     // Adds device_groups.rate (REAL NOT NULL DEFAULT 1.0). Real bytes stay on
@@ -1281,13 +1283,7 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     add_column_if_missing(pool, "plans", "plan_type", "TEXT NOT NULL DEFAULT 'data'").await?;
     add_column_if_missing(pool, "plans", "duration_days", "INTEGER NOT NULL DEFAULT 0").await?;
     add_column_if_missing(pool, "plans", "hidden", "INTEGER NOT NULL DEFAULT 0").await?;
-    add_column_if_missing(
-        pool,
-        "plans",
-        "reset_traffic",
-        "INTEGER NOT NULL DEFAULT 0",
-    )
-    .await?;
+    add_column_if_missing(pool, "plans", "reset_traffic", "INTEGER NOT NULL DEFAULT 0").await?;
     add_column_if_missing(pool, "plans", "description", "TEXT NOT NULL DEFAULT ''").await?;
     add_column_if_missing(pool, "users", "plan_expire_at", "TEXT").await?;
     add_column_if_missing(pool, "users", "suspended", "INTEGER NOT NULL DEFAULT 0").await?;

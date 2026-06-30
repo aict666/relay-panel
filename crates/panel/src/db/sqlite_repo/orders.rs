@@ -26,15 +26,13 @@ impl OrderRepository for SqliteRepository {
         plan_name: &str,
         price: &str,
     ) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO orders (user_id, plan_id, plan_name, price) VALUES (?, ?, ?, ?)",
-        )
-        .bind(user_id)
-        .bind(plan_id)
-        .bind(plan_name)
-        .bind(price)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT INTO orders (user_id, plan_id, plan_name, price) VALUES (?, ?, ?, ?)")
+            .bind(user_id)
+            .bind(plan_id)
+            .bind(plan_name)
+            .bind(price)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

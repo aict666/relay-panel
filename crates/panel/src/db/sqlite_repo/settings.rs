@@ -16,10 +16,9 @@ impl PlanRepository for SqliteRepository {
     }
 
     async fn list_visible_plans(&self) -> Result<Vec<Plan>, DbError> {
-        let plans: Vec<Plan> =
-            sqlx::query_as("SELECT * FROM plans WHERE hidden = 0 ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?;
+        let plans: Vec<Plan> = sqlx::query_as("SELECT * FROM plans WHERE hidden = 0 ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
         Ok(plans)
     }
 
@@ -204,12 +203,11 @@ impl PlanRepository for SqliteRepository {
         let mut tx = self.pool.begin().await?;
 
         // Read the user's current balance (canonical TEXT) + current expiry.
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT balance, plan_expire_at FROM users WHERE id = ?",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT balance, plan_expire_at FROM users WHERE id = ?")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some((balance_str, current_expire)) = row else {
             let _ = tx.rollback().await;
             // A missing user mid-purchase is a DB integrity issue, not a
@@ -220,14 +218,15 @@ impl PlanRepository for SqliteRepository {
         // Decimal math in integer cents (no floats). balance_to_cents returns
         // None on a non-canonical string — treat that as a data-integrity fault
         // and refuse the purchase (500) rather than mis-billing.
-        let balance_cents = relay_shared::money::balance_to_cents(&balance_str).ok_or_else(|| {
-            tracing::error!(
-                "buy_plan: user {} has non-canonical balance {:?}",
-                user_id,
-                balance_str
-            );
-            BuyPlanError::Database(DbError::NotFound)
-        })?;
+        let balance_cents =
+            relay_shared::money::balance_to_cents(&balance_str).ok_or_else(|| {
+                tracing::error!(
+                    "buy_plan: user {} has non-canonical balance {:?}",
+                    user_id,
+                    balance_str
+                );
+                BuyPlanError::Database(DbError::NotFound)
+            })?;
         if balance_cents < price_cents {
             let _ = tx.rollback().await;
             return Err(BuyPlanError::InsufficientBalance);
@@ -292,15 +291,13 @@ impl PlanRepository for SqliteRepository {
 
         // Insert the order row (snapshots plan_name + the canonical price).
         let price_str = relay_shared::money::cents_to_balance(price_cents);
-        sqlx::query(
-            "INSERT INTO orders (user_id, plan_id, plan_name, price) VALUES (?, ?, ?, ?)",
-        )
-        .bind(user_id)
-        .bind(plan_id)
-        .bind(plan_name)
-        .bind(&price_str)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO orders (user_id, plan_id, plan_name, price) VALUES (?, ?, ?, ?)")
+            .bind(user_id)
+            .bind(plan_id)
+            .bind(plan_name)
+            .bind(&price_str)
+            .execute(&mut *tx)
+            .await?;
 
         // v1.0.9: grant device-group authorization in the SAME tx. Two modes:
         //   - grant_all_groups → set the user's all_device_groups flag (access
@@ -367,7 +364,6 @@ impl PlanRepository for SqliteRepository {
         Ok(())
     }
 }
-
 
 // ── Helpers ──
 

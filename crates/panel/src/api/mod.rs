@@ -148,8 +148,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/admin/plans",
-            axum::routing::get(admin::list_plans)
-                .post(admin::create_plan),
+            axum::routing::get(admin::list_plans).post(admin::create_plan),
         )
         .route(
             "/admin/plans/{id}",

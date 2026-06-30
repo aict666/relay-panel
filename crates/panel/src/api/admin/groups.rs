@@ -35,12 +35,7 @@ pub async fn create_group(
     let rate = match req.rate {
         Some(r) => match validate_rate(r) {
             Some(v) => v,
-            None => {
-                return Json(err(
-                    400,
-                    "rate must be between 0.1 and 100",
-                ))
-            }
+            None => return Json(err(400, "rate must be between 0.1 and 100")),
         },
         None => RATE_DEFAULT,
     };

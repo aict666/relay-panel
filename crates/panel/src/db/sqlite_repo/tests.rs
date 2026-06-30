@@ -2728,7 +2728,10 @@ async fn buy_plan_stacks_traffic_and_charges_balance() {
             .await
             .unwrap();
     assert_eq!(balance, "70");
-    assert_eq!(traffic_limit, 1_000_500, "traffic must stack on existing quota");
+    assert_eq!(
+        traffic_limit, 1_000_500,
+        "traffic must stack on existing quota"
+    );
     assert_eq!(max_rules, 10);
     assert_eq!(plan_id, Some(pid));
 
@@ -2803,12 +2806,11 @@ async fn buy_plan_time_plan_sets_future_expiry() {
         .await
         .unwrap();
 
-    let expire: (Option<String>,) =
-        sqlx::query_as("SELECT plan_expire_at FROM users WHERE id = ?")
-            .bind(alice)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+    let expire: (Option<String>,) = sqlx::query_as("SELECT plan_expire_at FROM users WHERE id = ?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
     let exp = expire.0.expect("time plan must set an expiry");
     let now = sqlx::query_as::<_, (String,)>("SELECT datetime('now')")
         .fetch_one(&db.pool)
@@ -2836,12 +2838,11 @@ async fn buy_plan_renewal_stacks_expiry_from_current_end() {
         .await
         .unwrap();
 
-    let expire: (Option<String>,) =
-        sqlx::query_as("SELECT plan_expire_at FROM users WHERE id = ?")
-            .bind(alice)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+    let expire: (Option<String>,) = sqlx::query_as("SELECT plan_expire_at FROM users WHERE id = ?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
     let expire = expire.0.expect("renewal must keep an expiry");
     // 2099-12-31 + 30 days = 2100-01-30. If it had clipped to now+30, it would
     // be ~2026. The exact arithmetic is SQLite's datetime(), so assert the
@@ -2888,10 +2889,25 @@ async fn plan_crud_round_trip_and_delete_blocked_when_in_use() {
     // list_visible_plans excludes hidden. The baseline seeds a 'free' plan
     // (hidden=0), so the visible count drops by exactly one when we hide ours.
     let visible_before = db.list_visible_plans().await.unwrap().len();
-    db.update_plan_fields(pid, None, None, None, None, None, None, Some(true), None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(db.list_visible_plans().await.unwrap().len(), visible_before - 1);
+    db.update_plan_fields(
+        pid,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(true),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.list_visible_plans().await.unwrap().len(),
+        visible_before - 1
+    );
     // list_plans (admin, includes hidden) still has ours + the seed.
     assert!(db.list_plans().await.unwrap().iter().any(|p| p.id == pid));
 
@@ -2969,7 +2985,10 @@ async fn buy_plan_appends_device_groups_dedup_without_removing_existing() {
         .unwrap();
 
     // Result: {50, 51} — 50 not duplicated, the pre-existing 50 kept.
-    assert_eq!(db.list_user_device_groups(alice).await.unwrap(), vec![50, 51]);
+    assert_eq!(
+        db.list_user_device_groups(alice).await.unwrap(),
+        vec![50, 51]
+    );
     // The all-groups flag is NOT set for a per-group grant.
     let all: (bool,) = sqlx::query_as("SELECT all_device_groups FROM users WHERE id = ?")
         .bind(alice)
@@ -2994,7 +3013,10 @@ async fn buy_plan_grant_all_sets_flag() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert!(all.0, "grant_all_groups must set the all_device_groups flag");
+    assert!(
+        all.0,
+        "grant_all_groups must set the all_device_groups flag"
+    );
 }
 
 #[tokio::test]
@@ -3019,7 +3041,10 @@ async fn multi_plan_grants_stack() {
         .unwrap();
 
     // Buying two plans stacks their grants.
-    assert_eq!(db.list_user_device_groups(alice).await.unwrap(), vec![50, 51]);
+    assert_eq!(
+        db.list_user_device_groups(alice).await.unwrap(),
+        vec![50, 51]
+    );
 }
 
 #[tokio::test]

@@ -315,5 +315,4 @@ impl UserRepository for SqliteRepository {
         .await?;
         Ok(())
     }
-
 }

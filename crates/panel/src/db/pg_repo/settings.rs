@@ -214,25 +214,25 @@ impl PlanRepository for PgRepository {
         let mut tx = self.pool.begin().await?;
 
         // FOR UPDATE locks the user row for the tx's duration.
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT balance, plan_expire_at FROM users WHERE id = $1 FOR UPDATE",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT balance, plan_expire_at FROM users WHERE id = $1 FOR UPDATE")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some((balance_str, current_expire)) = row else {
             let _ = tx.rollback().await;
             return Err(BuyPlanError::Database(DbError::NotFound));
         };
 
-        let balance_cents = relay_shared::money::balance_to_cents(&balance_str).ok_or_else(|| {
-            tracing::error!(
-                "buy_plan: user {} has non-canonical balance {:?}",
-                user_id,
-                balance_str
-            );
-            BuyPlanError::Database(DbError::NotFound)
-        })?;
+        let balance_cents =
+            relay_shared::money::balance_to_cents(&balance_str).ok_or_else(|| {
+                tracing::error!(
+                    "buy_plan: user {} has non-canonical balance {:?}",
+                    user_id,
+                    balance_str
+                );
+                BuyPlanError::Database(DbError::NotFound)
+            })?;
         if balance_cents < price_cents {
             let _ = tx.rollback().await;
             return Err(BuyPlanError::InsufficientBalance);
@@ -309,10 +309,12 @@ impl PlanRepository for PgRepository {
         // alone). Else APPEND the plan's groups via ON CONFLICT DO NOTHING —
         // dedupes, never removes. Expiry does NOT revoke these.
         if grant_all_groups {
-            sqlx::query("UPDATE users SET all_device_groups = TRUE WHERE id = $1 AND admin = FALSE")
-                .bind(user_id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE users SET all_device_groups = TRUE WHERE id = $1 AND admin = FALSE",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
         } else {
             for dg_id in device_group_ids {
                 sqlx::query(

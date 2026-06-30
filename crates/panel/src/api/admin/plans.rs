@@ -103,10 +103,17 @@ pub async fn list_plans(
             .list_plan_device_groups(plan.id)
             .await
             .unwrap_or_else(|e| {
-                tracing::error!("list_plans: list_plan_device_groups({}) failed: {}", plan.id, e);
+                tracing::error!(
+                    "list_plans: list_plan_device_groups({}) failed: {}",
+                    plan.id,
+                    e
+                );
                 Vec::new()
             });
-        out.push(PlanWithGroups { plan, device_group_ids });
+        out.push(PlanWithGroups {
+            plan,
+            device_group_ids,
+        });
     }
     Json(ApiResponse::success(out))
 }
@@ -157,7 +164,11 @@ pub async fn create_plan(
     // the admin later flips grant_all off. Failure here would leave a plan with
     // no grants — log + 500 so the admin retries rather than silently shipping
     // a plan that grants nothing.
-    if let Err(e) = state.db.set_plan_device_groups(id, &req.device_group_ids).await {
+    if let Err(e) = state
+        .db
+        .set_plan_device_groups(id, &req.device_group_ids)
+        .await
+    {
         tracing::error!("create_plan {}: set_plan_device_groups failed: {}", id, e);
         return Json(err(500, "database error"));
     }
@@ -218,9 +229,7 @@ pub async fn update_plan(
             // existing row's duration_days is > 0 before flipping.
             match state.db.find_plan_by_id(id).await {
                 Ok(Some(p)) if p.duration_days > 0 => {}
-                Ok(Some(_)) => {
-                    return Json(err(400, "duration_days must be > 0 for time plans"))
-                }
+                Ok(Some(_)) => return Json(err(400, "duration_days must be > 0 for time plans")),
                 Ok(None) => return Json(err(404, "Plan not found")),
                 Err(e) => {
                     tracing::error!("update_plan {}: lookup failed: {}", id, e);

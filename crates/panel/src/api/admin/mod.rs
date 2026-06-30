@@ -1243,14 +1243,12 @@ mod tests {
             .await
             .unwrap();
         for gid in allowed {
-            sqlx::query(
-                "INSERT INTO user_device_groups (user_id, device_group_id) VALUES (?, ?)",
-            )
-            .bind(uid)
-            .bind(gid)
-            .execute(pool)
-            .await
-            .unwrap();
+            sqlx::query("INSERT INTO user_device_groups (user_id, device_group_id) VALUES (?, ?)")
+                .bind(uid)
+                .bind(gid)
+                .execute(pool)
+                .await
+                .unwrap();
         }
     }
 

@@ -242,7 +242,11 @@ pub async fn update_user(
                 }
                 if let Some(suspended) = req.suspended {
                     tracing::warn!(
-                        action = if suspended { "suspend_user" } else { "unsuspend_user" },
+                        action = if suspended {
+                            "suspend_user"
+                        } else {
+                            "unsuspend_user"
+                        },
                         target_user_id = id,
                         actor_admin_id = _admin.user_id,
                         "admin op"
@@ -265,7 +269,11 @@ pub async fn update_user(
     let authz_changed = req.all_device_groups.is_some() || req.device_group_ids.is_some();
     if let Some(all) = req.all_device_groups {
         if let Err(e) = state.db.set_user_all_device_groups(id, all).await {
-            tracing::error!("update_user {}: set_user_all_device_groups failed: {}", id, e);
+            tracing::error!(
+                "update_user {}: set_user_all_device_groups failed: {}",
+                id,
+                e
+            );
             return Json(err(500, "database error"));
         }
     }
@@ -331,16 +339,15 @@ pub async fn get_user_device_groups(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<UserDeviceGroups>> {
-    let all_device_groups = match crate::db::repo::UserRepository::find_by_id(state.db.as_ref(), id)
-        .await
-    {
-        Ok(Some(u)) => u.all_device_groups,
-        Ok(None) => return Json(err(404, "User not found")),
-        Err(e) => {
-            tracing::error!("get_user_device_groups {}: find_by_id failed: {}", id, e);
-            return Json(err(500, "database error"));
-        }
-    };
+    let all_device_groups =
+        match crate::db::repo::UserRepository::find_by_id(state.db.as_ref(), id).await {
+            Ok(Some(u)) => u.all_device_groups,
+            Ok(None) => return Json(err(404, "User not found")),
+            Err(e) => {
+                tracing::error!("get_user_device_groups {}: find_by_id failed: {}", id, e);
+                return Json(err(500, "database error"));
+            }
+        };
     let device_group_ids = match state.db.list_user_device_groups(id).await {
         Ok(ids) => ids,
         Err(e) => {

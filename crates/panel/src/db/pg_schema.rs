@@ -1012,9 +1012,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         )
         .execute(pool)
         .await?;
-        tracing::info!(
-            "PG migration 17: plans lifecycle cols + users suspension + orders table"
-        );
+        tracing::info!("PG migration 17: plans lifecycle cols + users suspension + orders table");
     }
 
     // ── Revision 18: v1.0.9 plan ↔ device-group grants ──

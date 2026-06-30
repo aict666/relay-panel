@@ -324,5 +324,4 @@ impl UserRepository for PgRepository {
         .await?;
         Ok(())
     }
-
 }

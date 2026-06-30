@@ -139,7 +139,8 @@ pub fn balance_to_cents(s: &str) -> Option<i64> {
     if int_part.len() > 1 && int_part.starts_with('0') {
         return None;
     }
-    if int_part.bytes().any(|b| !b.is_ascii_digit()) || frac_part.bytes().any(|b| !b.is_ascii_digit())
+    if int_part.bytes().any(|b| !b.is_ascii_digit())
+        || frac_part.bytes().any(|b| !b.is_ascii_digit())
     {
         return None;
     }

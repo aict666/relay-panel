@@ -34,16 +34,23 @@ pub async fn list_public_plans(
         let device_group_ids = if plan.grant_all_groups {
             Vec::new()
         } else {
-            state.db.list_plan_device_groups(plan.id).await.unwrap_or_else(|e| {
-                tracing::error!(
-                    "list_public_plans: list_plan_device_groups({}) failed: {}",
-                    plan.id,
-                    e
-                );
-                Vec::new()
-            })
+            state
+                .db
+                .list_plan_device_groups(plan.id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(
+                        "list_public_plans: list_plan_device_groups({}) failed: {}",
+                        plan.id,
+                        e
+                    );
+                    Vec::new()
+                })
         };
-        out.push(PlanWithGroups { plan, device_group_ids });
+        out.push(PlanWithGroups {
+            plan,
+            device_group_ids,
+        });
     }
     Json(ApiResponse::success(out))
 }
@@ -107,7 +114,11 @@ pub async fn buy_plan(
         match state.db.list_plan_device_groups(plan.id).await {
             Ok(ids) => ids,
             Err(e) => {
-                tracing::error!("buy_plan {}: list_plan_device_groups failed: {}", plan.id, e);
+                tracing::error!(
+                    "buy_plan {}: list_plan_device_groups failed: {}",
+                    plan.id,
+                    e
+                );
                 return Json(err(500, "database error"));
             }
         }
