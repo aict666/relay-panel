@@ -154,7 +154,7 @@ export const zhCN = {
   lbFailover: '故障转移',
   rateLimits: '限速',
   rateLimitsHint: '规则级上限，所有连接共享（0 = 不限）。每台节点独立执行。',
-  rateLimitsTooltip: '上行 = 客户端 → 目标（用户上传）；下行 = 目标 → 客户端（用户下载）。单位 Mbps，0 表示不限速。',
+  rateLimitsTooltip: '上行 = 用户上传（客户端 → 目标）；下行 = 用户下载（目标 → 客户端）。单位 Mbps，0 = 不限速。\n\n• 所有连接共享：这是规则级总带宽，该规则下所有 TCP 连接 / UDP 会话共用，不是每条连接单独限速。\n• 每台节点独立执行：规则下发到多个节点时，每台节点各自按此上限运行，不跨节点合并。例如下行设 100，规则在 3 个节点上，每个节点都可跑到 100。',
   uploadLimit: '上行',
   downloadLimit: '下行',
   transportProfile: '传输模板',
@@ -222,7 +222,7 @@ export const zhCN = {
   editUser: '编辑用户',
   userUpdated: '用户已更新',
   addUser: '新增用户',
-  // v1.0.10: admin edit-user-plan panel
+  // v1.0.7: admin edit-user-plan panel
   editUserPlan: '编辑用户套餐',
   currentPlan: '当前套餐',
   noPlan: '无套餐',
@@ -491,6 +491,11 @@ export const zhCN = {
   batchExport: '批量导出',
   batchDeleteConfirm: '确定删除选中的 {count} 条规则？此操作不可撤销。',
   batchDeleteSuccess: '已删除 {count} 条规则',
+  batchResume: '批量启动',
+  batchPause: '批量暂停',
+  batchResumeSuccess: '已启动 {count} 条规则',
+  batchPauseSuccess: '已暂停 {count} 条规则',
+  batchPartial: '成功 {ok} 条，失败 {fail} 条（无权限的线路无法启动）',
   selectedCount: '已选 {count} 条',
 
   // ── v1.0.8: plans + shop + suspension ──
