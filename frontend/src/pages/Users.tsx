@@ -26,6 +26,8 @@ interface UserFormValues {
   // Edited in GB; converted to bytes before sending to the backend.
   traffic_limit_gb: number;
   banned: boolean;
+  // v1.0.8: admin suspension (forwarding gated; login still allowed).
+  suspended: boolean;
   // v1.0.7: per-user device-group authorization. all_device_groups short-
   // circuits the explicit list (when on, the user may use every group).
   all_device_groups: boolean;
