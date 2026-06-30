@@ -155,7 +155,7 @@ export const enUS: Dict = {
   lbFailover: 'Failover',
   rateLimits: 'Rate Limits',
   rateLimitsHint: 'Per-rule cap shared across all connections (0 = unlimited). Each node enforces it independently.',
-  rateLimitsTooltip: 'Upload = client → target (data the user sends); Download = target → client (data the user receives). In Mbps; 0 means unlimited.',
+  rateLimitsTooltip: 'Upload = client → target (data the user sends); Download = target → client (data the user receives). In Mbps; 0 = unlimited.\n\n• Shared across all connections: this is a per-rule total bandwidth — every TCP connection / UDP session under this rule shares it, not a per-connection cap.\n• Enforced per node: when the rule is deployed to multiple nodes, each node runs at this cap independently, not merged across nodes. E.g. download = 100 with the rule on 3 nodes → each node can reach 100.',
   uploadLimit: 'Upload',
   downloadLimit: 'Download',
   transportProfile: 'Transport Template',
@@ -223,7 +223,7 @@ export const enUS: Dict = {
   editUser: 'Edit User',
   userUpdated: 'User updated',
   addUser: 'Add User',
-  // v1.0.10: admin edit-user-plan panel
+  // v1.0.7: admin edit-user-plan panel
   editUserPlan: 'Edit User Plan',
   currentPlan: 'Current plan',
   noPlan: 'No plan',
@@ -492,6 +492,11 @@ export const enUS: Dict = {
   batchExport: 'Batch Export',
   batchDeleteConfirm: 'Delete {count} selected rules? This cannot be undone.',
   batchDeleteSuccess: 'Deleted {count} rules',
+  batchResume: 'Batch Resume',
+  batchPause: 'Batch Pause',
+  batchResumeSuccess: 'Resumed {count} rules',
+  batchPauseSuccess: 'Paused {count} rules',
+  batchPartial: '{ok} succeeded, {fail} failed (unauthorized lines can\'t be resumed)',
   selectedCount: '{count} selected',
 
   // ── v1.0.8: plans + shop + suspension ──

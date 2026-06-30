@@ -3095,7 +3095,7 @@ async fn expiry_does_not_revoke_granted_groups() {
     );
 }
 
-// ── v1.0.10: admin directly edits a user's plan association + expiry ──
+// ── v1.0.7: admin directly edits a user's plan association + expiry ──
 
 #[tokio::test]
 async fn admin_set_user_plan_clears_and_adjusts_expiry() {

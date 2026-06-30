@@ -49,7 +49,10 @@ function payloadWithTargets<T extends Record<string, unknown>>(values: T & { tar
 /** v1.0.4: simplified export format — only dest, listen_port, name.
  *  Enabled targets only. IPv6 wrapped as [addr]:port.
  *  v1.0.6: always emit a JSON array (even for a single rule) so the export
- *  round-trips into the import box, which documents the `[{...}]` array form. */
+ *  round-trips into the import box, which documents the `[{...}]` array form.
+ *  v1.0.10: emit COMPACT single-line JSON (no pretty-printing) so the export is
+ *  exactly the one-line `[{"dest":[...],"listen_port":...,"name":"..."}]` shape
+ *  shown in the import hint — ready to copy-paste straight back in. */
 function buildExportJSON(rules: ForwardRule[]): string {
   const simplified = rules.map(r => {
     const targets = ruleTargets(r).filter(t => t.enabled);
@@ -60,7 +63,7 @@ function buildExportJSON(rules: ForwardRule[]): string {
     });
     return { dest, listen_port: r.listen_port, name: r.name };
   });
-  return JSON.stringify(simplified, null, 2);
+  return JSON.stringify(simplified);
 }
 
 /** Trigger a browser download of a text file. */
@@ -291,12 +294,6 @@ export default function Rules() {
     setCreateOpen(true);
   };
 
-  /** Export a single rule as JSON download. */
-  const handleExportOne = (r: ForwardRule) => {
-    downloadText(`rule-${r.name}-${r.id}.json`, buildExportJSON([r]));
-    message.success(t('exported'));
-  };
-
   /** Export all rules as JSON download. */
   const handleExportAll = () => {
     downloadText(`relaypanel-rules-${new Date().toISOString().slice(0, 10)}.json`, buildExportJSON(rules));
@@ -438,6 +435,30 @@ const IMPORT_DEFAULTS = {
     load();
   };
 
+  /** v1.0.7: batch pause/resume. Each rule goes through PUT /rules/{id}
+   *  {paused}. Resume can be rejected per-rule (403) when the rule points at a
+   *  device group the user is no longer authorized for, so we tally ok/fail
+   *  instead of assuming success. */
+  const handleBatchSetPaused = async (paused: boolean) => {
+    const ids = selectedRowKeys as number[];
+    if (ids.length === 0) return;
+    const results = await Promise.all(ids.map(async id => {
+      try {
+        const res = await api.put<unknown, ApiEnvelope<null>>(`/rules/${id}`, { paused });
+        return res.code === 0;
+      } catch { return false; }
+    }));
+    const ok = results.filter(Boolean).length;
+    const fail = results.length - ok;
+    if (fail === 0) {
+      message.success((paused ? t('batchPauseSuccess') : t('batchResumeSuccess')).replace('{count}', String(ok)));
+    } else {
+      message.warning(t('batchPartial').replace('{ok}', String(ok)).replace('{fail}', String(fail)));
+    }
+    setSelectedRowKeys([]);
+    load();
+  };
+
   /** v0.4.8: run a diagnosis for a rule. The panel fans the probe out to the
    *  rule's inbound-group nodes over WS and waits up to 8s for results. */
   const handleDiagnose = async (r: ForwardRule) => {
@@ -551,7 +572,6 @@ const IMPORT_DEFAULTS = {
           </Button>
           <Button size="small" type="text" icon={<EditOutlined />} onClick={() => handleEdit(r)}>{t('edit')}</Button>
           <Button size="small" type="text" icon={<CopyOutlined />} onClick={() => handleCopy(r)}>{t('copy')}</Button>
-          <Button size="small" type="text" icon={<DownloadOutlined />} onClick={() => handleExportOne(r)}>{t('export')}</Button>
           {/* v0.4.9: diagnosis is TCP-only — disable for pure-UDP rules. */}
           <Button size="small" type="text" icon={<MedicineBoxOutlined />} disabled={r.protocol === 'udp'} onClick={() => handleDiagnose(r)} title={r.protocol === 'udp' ? t('diagnoseUdpUnsupported') : t('diagnose')}>{t('diagnose')}</Button>
           <Popconfirm title={t('deleteRuleConfirm')} onConfirm={() => handleDelete(r.id)}>
@@ -592,7 +612,10 @@ const IMPORT_DEFAULTS = {
 
   const hostForForm = (gid?: number) => {
     if (!gid) return '';
-    return groups.find(g => g.id === gid)?.connect_host ?? '';
+    // v1.0.10: a regular user doesn't own the admin device groups, so `groups`
+    // is empty for them — resolve the connect host from the merged groupInfo
+    // (which also folds in their authorized shared groups) instead.
+    return groupInfo.get(gid)?.connect_host ?? '';
   };
   const renderHostHint = (gid?: number) => {
     const host = hostForForm(gid);
@@ -686,6 +709,16 @@ const IMPORT_DEFAULTS = {
           {selectedRowKeys.length > 0 && (
             <Button icon={<DownloadOutlined />} onClick={handleExportSelected}>
               {t('batchExport')} ({selectedRowKeys.length})
+            </Button>
+          )}
+          {selectedRowKeys.length > 0 && (
+            <Button icon={<PlayCircleOutlined />} onClick={() => handleBatchSetPaused(false)}>
+              {t('batchResume')} ({selectedRowKeys.length})
+            </Button>
+          )}
+          {selectedRowKeys.length > 0 && (
+            <Button icon={<PauseCircleOutlined />} onClick={() => handleBatchSetPaused(true)}>
+              {t('batchPause')} ({selectedRowKeys.length})
             </Button>
           )}
           {selectedRowKeys.length > 0 && (
@@ -786,12 +819,12 @@ const IMPORT_DEFAULTS = {
                   }
                 />
                 <Form.Item
-                  label={<span>{t('rateLimits')} <Tooltip title={t('rateLimitsTooltip')}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
+                  label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
                   extra={t('rateLimitsHint')}
                 >
-                  <Space>
-                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: 200 }} placeholder="0" /></Form.Item>
-                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: 200 }} placeholder="0" /></Form.Item>
+                  <Space direction="vertical" style={{ width: '100%' }}>
+                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
                   </Space>
                 </Form.Item>
               </>),
@@ -846,12 +879,12 @@ const IMPORT_DEFAULTS = {
                   }
                 />
                 <Form.Item
-                  label={<span>{t('rateLimits')} <Tooltip title={t('rateLimitsTooltip')}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
+                  label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
                   extra={t('rateLimitsHint')}
                 >
-                  <Space>
-                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: 200 }} placeholder="0" /></Form.Item>
-                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: 200 }} placeholder="0" /></Form.Item>
+                  <Space direction="vertical" style={{ width: '100%' }}>
+                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
                   </Space>
                 </Form.Item>
               </>),

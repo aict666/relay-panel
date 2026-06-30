@@ -128,6 +128,45 @@ pub async fn update_rule(
             }
         }
     }
+    // v1.0.7: resuming a rule (paused → false) is ALSO gated on authorization.
+    // A restricted user whose plan was removed has their rules auto-paused; they
+    // must not be able to re-enable a rule pointing at a now-unauthorized group
+    // by sending only {paused:false} — the device_group_in check above is
+    // skipped when that field is absent. Only needed when not switching groups
+    // in the same request (that path is already covered above).
+    if !user.admin && req.paused == Some(false) && req.device_group_in.is_none() {
+        let restricted = match state.db.is_user_restricted(user.user_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("update_rule: restriction lookup failed: {}", e);
+                return Json(err(500, "database error"));
+            }
+        };
+        if restricted {
+            match state.db.find_rule_by_id(id, &scope).await {
+                Ok(Some(rule)) => {
+                    let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::error!("update_rule: authz lookup failed: {}", e);
+                            return Json(err(500, "database error"));
+                        }
+                    };
+                    if !allowed.contains(&rule.device_group_in) {
+                        return Json(err(
+                            403,
+                            "cannot resume a rule on a device group you are not authorized for",
+                        ));
+                    }
+                }
+                Ok(None) => return Json(err(404, "Rule not found")),
+                Err(e) => {
+                    tracing::error!("update_rule: rule lookup failed: {}", e);
+                    return Json(err(500, "database error"));
+                }
+            }
+        }
+    }
     match crate::service::rules::update_rule(state.db.as_ref(), id, &scope, &req).await {
         Ok(()) => {
             state
