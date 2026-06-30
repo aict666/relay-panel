@@ -133,7 +133,11 @@ async fn shared_groups_carries_hidden_flag_and_still_lists_hidden() {
     // Regular user: BOTH groups are listed; the hidden one carries hidden=true
     // so the node-status path can drop it while the rule dropdown keeps it.
     let shared = db.list_shared_groups(2, false).await.unwrap();
-    assert_eq!(shared.len(), 2, "hidden group must STILL be listed for rules");
+    assert_eq!(
+        shared.len(),
+        2,
+        "hidden group must STILL be listed for rules"
+    );
     assert!(shared.iter().any(|g| g.id == 11 && g.hidden));
     assert!(shared.iter().any(|g| g.id == 10 && !g.hidden));
 
@@ -953,9 +957,18 @@ async fn rule_list_active_for_config_filters_banned_paused_overquota() {
 #[tokio::test]
 async fn group_insert_then_find_by_token_round_trip() {
     let db = repo().await;
-    db.insert_group("gin", "in", "tok-abc", 1, "1.2.3.4", "20000-30000", 1.0, false)
-        .await
-        .unwrap();
+    db.insert_group(
+        "gin",
+        "in",
+        "tok-abc",
+        1,
+        "1.2.3.4",
+        "20000-30000",
+        1.0,
+        false,
+    )
+    .await
+    .unwrap();
     let g = db.find_by_token("tok-abc").await.unwrap().unwrap();
     assert_eq!(g.name, "gin");
     assert_eq!(g.group_type, "in");

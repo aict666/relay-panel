@@ -860,9 +860,18 @@ async fn pg_group_insert_then_find_by_token_round_trip() {
     let Some(db) = repo("group_rt").await else {
         return;
     };
-    db.insert_group("gin", "in", "tok-abc", 1, "1.2.3.4", "20000-30000", 1.0, false)
-        .await
-        .unwrap();
+    db.insert_group(
+        "gin",
+        "in",
+        "tok-abc",
+        1,
+        "1.2.3.4",
+        "20000-30000",
+        1.0,
+        false,
+    )
+    .await
+    .unwrap();
     let g = db.find_by_token("tok-abc").await.unwrap().unwrap();
     assert_eq!(g.name, "gin");
     assert_eq!(g.group_type, "in");
@@ -2212,7 +2221,11 @@ async fn pg_shared_groups_carries_hidden_flag_and_still_lists_hidden() {
 
     // Regular user: BOTH groups listed; the hidden one carries hidden=true.
     let shared = db.list_shared_groups(2, false).await.unwrap();
-    assert_eq!(shared.len(), 2, "hidden group must STILL be listed for rules (PG)");
+    assert_eq!(
+        shared.len(),
+        2,
+        "hidden group must STILL be listed for rules (PG)"
+    );
     assert!(shared.iter().any(|g| g.id == 11 && g.hidden));
     assert!(shared.iter().any(|g| g.id == 10 && !g.hidden));
 

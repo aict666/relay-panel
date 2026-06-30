@@ -1335,7 +1335,13 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     // Hides a group from regular users' shared views (node status / available
     // lines) without affecting admins. Idempotent: add_column_if_missing.
     // Default 0 keeps every existing group visible.
-    add_column_if_missing(pool, "device_groups", "hidden", "INTEGER NOT NULL DEFAULT 0").await?;
+    add_column_if_missing(
+        pool,
+        "device_groups",
+        "hidden",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     tracing::info!("Migration 36: device_groups.hidden column present");
 
     Ok(())
