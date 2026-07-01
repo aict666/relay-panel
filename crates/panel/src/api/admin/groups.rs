@@ -35,7 +35,7 @@ pub async fn create_group(
     let rate = match req.rate {
         Some(r) => match validate_rate(r) {
             Some(v) => v,
-            None => return Json(err(400, "rate must be between 0.1 and 100")),
+            None => return Json(err(400, "倍率必须在 0.1 到 100 之间")),
         },
         None => RATE_DEFAULT,
     };
@@ -55,7 +55,7 @@ pub async fn create_group(
         Err(CreateGroupError::FetchFailed) => Json(err(500, "Failed to fetch created group")),
         Err(CreateGroupError::Database(e)) => {
             tracing::error!("create_group: db error: {}", e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -76,7 +76,7 @@ pub async fn rotate_group_token(
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<RotatedToken>> {
     match crate::service::groups::rotate_group_token(state.db.as_ref(), id).await {
-        Ok(None) => Json(err(404, "Group not found")),
+        Ok(None) => Json(err(404, "分组不存在")),
         Ok(Some(new_token)) => {
             // v0.3.9: tear down every live WS connection for this group BEFORE
             // broadcasting. The old token just became invalid, but sockets that
@@ -107,7 +107,7 @@ pub async fn rotate_group_token(
                 id,
                 e
             );
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -122,7 +122,7 @@ pub async fn update_group(
     let rate = match req.rate {
         Some(r) => match validate_rate(r) {
             Some(v) => Some(v),
-            None => return Json(err(400, "rate must be between 0.1 and 100")),
+            None => return Json(err(400, "倍率必须在 0.1 到 100 之间")),
         },
         None => None,
     };
@@ -145,12 +145,12 @@ pub async fn update_group(
                 .await;
             Json(ApiResponse::success(()))
         }
-        Err(UpdateGroupError::NoFields) => Json(err(400, "No fields to update")),
+        Err(UpdateGroupError::NoFields) => Json(err(400, "无需要更新的字段")),
         // v0.3.6: 0 rows = group id didn't exist. 404 + no broadcast.
         Err(UpdateGroupError::NotFound) => Json(err(404, "Group not found")),
         Err(UpdateGroupError::Database(e)) => {
             tracing::error!("update_group {}: update_group_fields failed: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -161,7 +161,7 @@ pub async fn delete_group(
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
     match crate::service::groups::delete_group(state.db.as_ref(), id).await {
-        Ok(false) => Json(err(404, "Not found")),
+        Ok(false) => Json(err(404, "分组不存在")),
         Ok(true) => {
             tracing::warn!(
                 action = "delete_group",
@@ -191,7 +191,7 @@ pub async fn delete_group(
                 ));
             }
             tracing::error!("delete_group {}: delete_group failed: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }

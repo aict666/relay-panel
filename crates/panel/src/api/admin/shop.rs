@@ -66,20 +66,20 @@ pub async fn buy_plan(
     // Hidden plans are not self-purchasable even if the caller knows the id.
     let plan = match state.db.find_plan_by_id(req.plan_id).await {
         Ok(Some(p)) => p,
-        Ok(None) => return Json(err(404, "Plan not found")),
+        Ok(None) => return Json(err(404, "套餐不存在")),
         Err(e) => {
             tracing::error!("buy_plan {}: plan lookup failed: {}", req.plan_id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     if plan.hidden {
         // Don't reveal existence — same 404 as a missing plan.
-        return Json(err(404, "Plan not found"));
+        return Json(err(404, "套餐不存在"));
     }
     // A time plan must have a positive duration (the CRUD layer enforces this
     // too, but a pre-existing bad row shouldn't crash the purchase).
     if plan.plan_type == "time" && plan.duration_days <= 0 {
-        return Json(err(400, "This plan has no valid duration"));
+        return Json(err(400, "该套餐无有效时长"));
     }
 
     // Decimal money: compare + deduct in integer cents (no floats). price is
@@ -93,7 +93,7 @@ pub async fn buy_plan(
                 plan.id,
                 plan.price
             );
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
 
@@ -119,9 +119,28 @@ pub async fn buy_plan(
                     plan.id,
                     e
                 );
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         }
+    };
+
+    // v1.0.8: compute the new authorized set that will drive pause_rules_outside
+    // _groups inside buy_plan. grant_all_groups → all inbound groups (nothing
+    // paused), else the plan's own groups.
+    let new_authorized_group_ids: Vec<i64> = if plan.grant_all_groups {
+        match state.db.list_all_inbound_group_ids().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(
+                    "buy_plan {}: list_all_inbound_group_ids failed: {}",
+                    plan.id,
+                    e
+                );
+                return Json(err(500, "数据库错误"));
+            }
+        }
+    } else {
+        device_group_ids.clone()
     };
 
     match state
@@ -137,6 +156,7 @@ pub async fn buy_plan(
             plan.reset_traffic,
             plan.grant_all_groups,
             &device_group_ids,
+            &new_authorized_group_ids,
         )
         .await
     {
@@ -153,7 +173,7 @@ pub async fn buy_plan(
         Err(BuyPlanError::InsufficientBalance) => Json(err(400, "余额不足")),
         Err(BuyPlanError::Database(e)) => {
             tracing::error!("buy_plan {}: db error: {}", plan.id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -167,7 +187,7 @@ pub async fn list_my_orders(
         Ok(o) => o,
         Err(e) => {
             tracing::error!("list_my_orders {}: db error: {}", user.user_id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     Json(ApiResponse::success(orders))
