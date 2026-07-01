@@ -17,7 +17,7 @@ pub async fn get_registration_settings(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("get_registration_settings: db error: {}", e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         };
     Json(ApiResponse::success(settings))
@@ -41,25 +41,23 @@ pub async fn update_registration_settings(
         Ok(settings) => Json(ApiResponse::success(settings)),
         Err(e) => {
             let (code, msg): (i32, String) = match e {
-                RegistrationSettingsError::DefaultPlanMissing => {
-                    (400, "default plan does not exist".into())
-                }
+                RegistrationSettingsError::DefaultPlanMissing => (400, "默认套餐不存在".into()),
                 RegistrationSettingsError::AllowedPlansEmpty => {
-                    (400, "allowed_plan_ids must not be empty".into())
+                    (400, "允许注册的套餐列表不能为空".into())
                 }
                 RegistrationSettingsError::DefaultPlanNotInAllowed => {
-                    (400, "default_plan_id must be in allowed_plan_ids".into())
+                    (400, "默认套餐必须在允许注册的套餐列表中".into())
                 }
                 RegistrationSettingsError::AllowedPlanNotFound(id) => {
                     tracing::error!(
                         "update_registration_settings: allowed plan {} does not exist",
                         id
                     );
-                    (400, format!("plan {} does not exist", id))
+                    (400, format!("套餐 {} 不存在", id))
                 }
                 RegistrationSettingsError::Database(e) => {
                     tracing::error!("update_registration_settings: db error: {}", e);
-                    (500, "database error".into())
+                    (500, "数据库错误".into())
                 }
             };
             Json(err(code, msg))

@@ -2769,9 +2769,21 @@ async fn pg_buy_plan_stacks_traffic_and_charges_balance() {
         .await
         .unwrap();
 
-    db.buy_plan(alice, pid, "p1", 3000, 1_000_000, 10, 0, false, false, &[])
-        .await
-        .unwrap();
+    db.buy_plan(
+        alice,
+        pid,
+        "p1",
+        3000,
+        1_000_000,
+        10,
+        0,
+        false,
+        false,
+        &[],
+        &[],
+    )
+    .await
+    .unwrap();
 
     let (balance, traffic_limit, max_rules, plan_id): (String, i64, i32, Option<i64>) =
         sqlx::query_as(
@@ -2808,9 +2820,21 @@ async fn pg_buy_plan_reset_traffic_zeros_usage() {
         .await
         .unwrap();
 
-    db.buy_plan(alice, pid, "p1", 1000, 1_000_000, 10, 0, true, false, &[])
-        .await
-        .unwrap();
+    db.buy_plan(
+        alice,
+        pid,
+        "p1",
+        1000,
+        1_000_000,
+        10,
+        0,
+        true,
+        false,
+        &[],
+        &[],
+    )
+    .await
+    .unwrap();
 
     let used: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = $1")
         .bind(alice)
@@ -2834,7 +2858,19 @@ async fn pg_buy_plan_insufficient_balance_is_rejected_and_rolls_back() {
         .unwrap();
 
     let err = db
-        .buy_plan(alice, pid, "p1", 3000, 1_000_000, 10, 0, false, false, &[])
+        .buy_plan(
+            alice,
+            pid,
+            "p1",
+            3000,
+            1_000_000,
+            10,
+            0,
+            false,
+            false,
+            &[],
+            &[],
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, BuyPlanError::InsufficientBalance));
@@ -2862,7 +2898,7 @@ async fn pg_buy_plan_time_plan_sets_future_expiry() {
     };
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 0, "5.00", 30, false).await;
 
-    db.buy_plan(alice, pid, "p1", 500, 0, 10, 30, false, false, &[])
+    db.buy_plan(alice, pid, "p1", 500, 0, 10, 30, false, false, &[], &[])
         .await
         .unwrap();
 
@@ -2897,7 +2933,7 @@ async fn pg_buy_plan_renewal_stacks_expiry_from_current_end() {
         .await
         .unwrap();
 
-    db.buy_plan(alice, pid, "p1", 500, 0, 10, 30, false, false, &[])
+    db.buy_plan(alice, pid, "p1", 500, 0, 10, 30, false, false, &[], &[])
         .await
         .unwrap();
 
@@ -3027,8 +3063,11 @@ async fn pg_plan_device_groups_round_trip_and_replace() {
     cleanup(&db).await;
 }
 
+/// v1.0.8: purchase REPLACES authorization, so a group the user already had
+/// that ALSO appears in the new plan's grant set must end up exactly once
+/// (mirrors the SQLite test).
 #[tokio::test]
-async fn pg_buy_plan_appends_device_groups_dedup_without_removing_existing() {
+async fn pg_buy_plan_new_authorized_set_has_no_duplicate_groups() {
     let Some(db) = repo("buy_dg_dedup").await else {
         return;
     };
@@ -3038,9 +3077,21 @@ async fn pg_buy_plan_appends_device_groups_dedup_without_removing_existing() {
     db.set_user_device_groups(alice, &[50]).await.unwrap();
     db.set_plan_device_groups(pid, &[50, 51]).await.unwrap();
 
-    db.buy_plan(alice, pid, "p1", 500, 1000, 10, 0, false, false, &[50, 51])
-        .await
-        .unwrap();
+    db.buy_plan(
+        alice,
+        pid,
+        "p1",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[50, 51],
+        &[50, 51],
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         db.list_user_device_groups(alice).await.unwrap(),
@@ -3055,6 +3106,65 @@ async fn pg_buy_plan_appends_device_groups_dedup_without_removing_existing() {
     cleanup(&db).await;
 }
 
+/// v1.0.8: purchase REPLACES authorization — old groups are cleared. If the
+/// user previously had groups not in the new plan, those are removed and
+/// rules bound to them are paused. Mirrors the SQLite test.
+#[tokio::test]
+async fn pg_buy_plan_replaces_authorization_clears_old_groups() {
+    let Some(db) = repo("buy_replaces_auth").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
+    seed_device_group(&db, 50, alice).await;
+    seed_device_group(&db, 51, alice).await;
+    seed_device_group(&db, 52, alice).await;
+    // Alice previously had groups 50 and 51.
+    db.set_user_device_groups(alice, &[50, 51]).await.unwrap();
+    // Plan grants only group 52.
+    db.set_plan_device_groups(pid, &[52]).await.unwrap();
+
+    // Create a rule bound to group 50 (will be paused after purchase).
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port, paused) \
+         VALUES (100, 'r100', $1, 20000, 50, '127.0.0.1', 80, FALSE)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // v1.0.8: new_authorized = {52} (the plan's grants).
+    db.buy_plan(
+        alice,
+        pid,
+        "p1",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[52],
+        &[52],
+    )
+    .await
+    .unwrap();
+
+    // Result: {52} — old groups 50, 51 are cleared.
+    assert_eq!(db.list_user_device_groups(alice).await.unwrap(), vec![52]);
+    // The rule bound to group 50 is now paused.
+    let paused: (bool,) = sqlx::query_as("SELECT paused FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        paused.0,
+        "rule bound to removed group should be paused (PG)"
+    );
+    cleanup(&db).await;
+}
+
 #[tokio::test]
 async fn pg_buy_plan_grant_all_sets_flag() {
     let Some(db) = repo("buy_grant_all").await else {
@@ -3062,7 +3172,7 @@ async fn pg_buy_plan_grant_all_sets_flag() {
     };
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
 
-    db.buy_plan(alice, pid, "p1", 500, 1000, 10, 0, false, true, &[])
+    db.buy_plan(alice, pid, "p1", 500, 1000, 10, 0, false, true, &[], &[])
         .await
         .unwrap();
 
@@ -3078,8 +3188,11 @@ async fn pg_buy_plan_grant_all_sets_flag() {
     cleanup(&db).await;
 }
 
+/// v1.0.8: REPLACE semantics — buying a second (different) plan replaces the
+/// first plan's authorization rather than stacking it. Mirrors the SQLite
+/// test.
 #[tokio::test]
-async fn pg_multi_plan_grants_stack() {
+async fn pg_second_plan_purchase_replaces_first_plan_groups() {
     let Some(db) = repo("multi_plan_stack").await else {
         return;
     };
@@ -3093,17 +3206,38 @@ async fn pg_multi_plan_grants_stack() {
     db.set_plan_device_groups(pid_a, &[50]).await.unwrap();
     db.set_plan_device_groups(pid_b, &[51]).await.unwrap();
 
-    db.buy_plan(alice, pid_a, "pA", 500, 1000, 10, 0, false, false, &[50])
-        .await
-        .unwrap();
-    db.buy_plan(alice, pid_b, "pB", 500, 1000, 10, 0, false, false, &[51])
-        .await
-        .unwrap();
+    db.buy_plan(
+        alice,
+        pid_a,
+        "pA",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[50],
+        &[50],
+    )
+    .await
+    .unwrap();
+    db.buy_plan(
+        alice,
+        pid_b,
+        "pB",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[51],
+        &[51],
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(
-        db.list_user_device_groups(alice).await.unwrap(),
-        vec![50, 51]
-    );
+    assert_eq!(db.list_user_device_groups(alice).await.unwrap(), vec![51]);
     cleanup(&db).await;
 }
 
@@ -3134,7 +3268,7 @@ async fn pg_expiry_does_not_revoke_granted_groups() {
     seed_device_group(&db, 50, alice).await;
     db.set_plan_device_groups(pid, &[50]).await.unwrap();
 
-    db.buy_plan(alice, pid, "p1", 500, 0, 10, 30, false, false, &[50])
+    db.buy_plan(alice, pid, "p1", 500, 0, 10, 30, false, false, &[50], &[50])
         .await
         .unwrap();
     assert_eq!(db.list_user_device_groups(alice).await.unwrap(), vec![50]);

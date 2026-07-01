@@ -210,6 +210,9 @@ impl PlanRepository for PgRepository {
         reset_traffic: bool,
         grant_all_groups: bool,
         device_group_ids: &[i64],
+        // v1.0.8: the NEW authorized group set AFTER purchase. Used inside the
+        // transaction to pause rules outside this set (replacement semantics).
+        new_authorized_group_ids: &[i64],
     ) -> Result<(), BuyPlanError> {
         let mut tx = self.pool.begin().await?;
 
@@ -304,10 +307,9 @@ impl PlanRepository for PgRepository {
         .execute(&mut *tx)
         .await?;
 
-        // v1.0.9: grant device-group authorization in the SAME tx (mirrors the
-        // SQLite impl). grant_all_groups → set all_device_groups (admins left
-        // alone). Else APPEND the plan's groups via ON CONFLICT DO NOTHING —
-        // dedupes, never removes. Expiry does NOT revoke these.
+        // v1.0.8: grant device-group authorization in the SAME tx (mirrors the
+        // SQLite impl). Purchase REPLACES the user's authorization — old grants
+        // are cleared so rules bound to groups no longer in the plan are paused.
         if grant_all_groups {
             sqlx::query(
                 "UPDATE users SET all_device_groups = TRUE WHERE id = $1 AND admin = FALSE",
@@ -316,16 +318,56 @@ impl PlanRepository for PgRepository {
             .execute(&mut *tx)
             .await?;
         } else {
+            // REPLACE semantics: clear old assignments, then insert the plan's.
+            sqlx::query("DELETE FROM user_device_groups WHERE user_id = $1")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
             for dg_id in device_group_ids {
                 sqlx::query(
-                    "INSERT INTO user_device_groups (user_id, device_group_id) \
-                     VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    "INSERT INTO user_device_groups (user_id, device_group_id) VALUES ($1, $2)",
                 )
                 .bind(user_id)
                 .bind(dg_id)
                 .execute(&mut *tx)
                 .await?;
             }
+        }
+
+        // Pause rules outside the new authorization (same logic as SQLite).
+        // Inline the pause logic inside the transaction (using &mut *tx) to
+        // avoid acquiring a separate pool connection while the transaction is
+        // still open — that would risk a pool-exhaustion deadlock.
+        let n = if new_authorized_group_ids.is_empty() {
+            let r = sqlx::query(
+                "UPDATE forward_rules SET paused = TRUE WHERE uid = $1 AND paused = FALSE",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            r.rows_affected()
+        } else {
+            let placeholders = (1..=new_authorized_group_ids.len())
+                .map(|i| format!("${}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE forward_rules SET paused = TRUE \
+                 WHERE uid = $1 AND paused = FALSE AND device_group_in NOT IN ({})",
+                placeholders
+            );
+            let mut q = sqlx::query(&sql).bind(user_id);
+            for gid in new_authorized_group_ids {
+                q = q.bind(gid);
+            }
+            let r = q.execute(&mut *tx).await?;
+            r.rows_affected()
+        };
+        if n > 0 {
+            tracing::warn!(
+                "buy_plan: user {} purchased plan {}, {} rule(s) paused due to authorization change",
+                user_id, plan_id, n
+            );
         }
 
         tx.commit().await?;

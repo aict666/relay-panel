@@ -267,4 +267,12 @@ impl GroupRepository for SqliteRepository {
             .await?;
         Ok(result.rows_affected())
     }
+
+    async fn list_all_inbound_group_ids(&self) -> Result<Vec<i64>, DbError> {
+        let rows: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM device_groups WHERE group_type = 'in' ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
 }

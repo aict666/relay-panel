@@ -418,6 +418,11 @@ pub trait GroupRepository: Send + Sync {
     async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError>;
     async fn delete_group(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
     async fn delete_groups_by_uid(&self, uid: i64) -> Result<u64, DbError>;
+    /// v1.0.8: list all inbound device groups (group_type = 'in'). Used by the
+    /// purchase flow to compute the authorized set when grant_all_groups=true
+    /// — in that mode the user gains access to every inbound group, so rules
+    /// bound to inbound groups are NOT paused.
+    async fn list_all_inbound_group_ids(&self) -> Result<Vec<i64>, DbError>;
 }
 
 // ── v1.0.7: per-user device-group authorization ──
@@ -702,6 +707,11 @@ pub trait PlanRepository: Send + Sync {
         reset_traffic: bool,
         grant_all_groups: bool,
         device_group_ids: &[i64],
+        // v1.0.8: the NEW authorized group set AFTER purchase. Used inside the
+        // transaction to pause rules outside this set (replacement semantics).
+        // Computed by the caller: all inbound groups if grant_all_groups, else
+        // device_group_ids (the plan's grants).
+        new_authorized_group_ids: &[i64],
     ) -> Result<(), BuyPlanError>;
 }
 

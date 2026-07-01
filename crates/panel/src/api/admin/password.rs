@@ -39,21 +39,21 @@ pub async fn reset_user_password(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("reset_user_password {}: exists lookup failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     if !exists {
-        return Json(err(404, "User not found"));
+        return Json(err(404, "用户不存在"));
     }
     let target_is_admin = match state.db.is_admin(id).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("reset_user_password {}: is_admin lookup failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     if target_is_admin && id != admin.user_id {
-        return Json(err(403, "Cannot reset another admin's password"));
+        return Json(err(403, "无法重置其他管理员的密码"));
     }
 
     let new_hash = match hash_password(&req.new_password) {
@@ -66,7 +66,7 @@ pub async fn reset_user_password(
         .admin_reset_password(id, &new_hash, req.must_change_password)
         .await
     {
-        Ok(0) => Json(err(404, "User not found")),
+        Ok(0) => Json(err(404, "用户不存在")),
         Ok(_) => {
             // Audit: actor + target + must_change flag. NEVER log the password
             // or its hash.
@@ -85,7 +85,7 @@ pub async fn reset_user_password(
                 id,
                 e
             );
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -104,11 +104,11 @@ pub async fn reset_user_traffic(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("reset_user_traffic {}: exists lookup failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     if !exists {
-        return Json(err(404, "User not found"));
+        return Json(err(404, "用户不存在"));
     }
 
     // Atomic: both updates in one transaction inside the repository. If either
@@ -126,7 +126,7 @@ pub async fn reset_user_traffic(
         }
         Err(e) => {
             tracing::error!("reset_user_traffic {}: reset_traffic failed: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -160,7 +160,7 @@ pub async fn get_me(user: AuthUser, State(state): State<AppState>) -> Json<ApiRe
         Ok(None) => {
             return Json(ApiResponse {
                 code: 404,
-                message: "User not found".into(),
+                message: "用户不存在".into(),
                 data: None,
             })
         }
@@ -168,7 +168,7 @@ pub async fn get_me(user: AuthUser, State(state): State<AppState>) -> Json<ApiRe
             tracing::error!("get_me {}: find_by_id failed: {}", user.user_id, e);
             return Json(ApiResponse {
                 code: 500,
-                message: "database error".into(),
+                message: "数据库错误".into(),
                 data: None,
             });
         }
@@ -196,7 +196,7 @@ pub async fn get_me(user: AuthUser, State(state): State<AppState>) -> Json<ApiRe
                 );
                 return Json(ApiResponse {
                     code: 500,
-                    message: "database error".into(),
+                    message: "数据库错误".into(),
                     data: None,
                 });
             }
@@ -243,14 +243,14 @@ pub async fn change_password(
     // Fetch the user's current password hash
     let current_hash = match state.db.find_password_by_id(user.user_id).await {
         Ok(Some(h)) => h,
-        Ok(None) => return Json(err(404, "User not found")),
+        Ok(None) => return Json(err(404, "用户不存在")),
         Err(e) => {
             tracing::error!(
                 "change_password {}: find_password_by_id failed: {}",
                 user.user_id,
                 e
             );
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
 
@@ -282,7 +282,7 @@ pub async fn change_password(
                 user.user_id,
                 e
             );
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
