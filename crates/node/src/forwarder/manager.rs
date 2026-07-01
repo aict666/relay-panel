@@ -1301,8 +1301,24 @@ mod tests {
         let connections = Arc::new(ConnectionTracker::new());
         let mut mgr = ForwarderManager::new(counter.clone(), connections.clone());
 
+        // v1.0.8: use a port not shared with any other test in this file.
+        // `cargo test` runs #[tokio::test] fns in parallel by default, and this
+        // test previously hardcoded port 40001 — the SAME port used by
+        // `raw_tcp_and_udp_are_scheduled`, `tcp_udp_to_tcp_does_not_prune_
+        // surviving_rule_counter`, and `dead_listener_prunes_counter_when_
+        // rule_removed`. When two of those tests overlapped in time, one lost
+        // the OS-level bind race on 40001 for BOTH the v4 and v6 listener, hit
+        // the "no listener bound on port" branch, and never inserted a
+        // `self.listeners` entry at all. The `mgr.listeners.get(&key)` below
+        // then found nothing, silently skipping the abort/prune path entirely
+        // — so the manually-primed counter entry for rule 1 was never touched
+        // and the final assertion failed. This was the actual flake (not a
+        // timing issue with is_finished(), despite what an earlier fix here
+        // assumed) — confirmed by port collision, not the spin loop below.
+        // Fix: give each of the 4 tests its own port (40001/40003/40004/40005).
+        //
         // Apply a config with one rule.
-        mgr.apply_config(&one_rule(40001, Protocol::Tcp, NodeTransport::Raw))
+        mgr.apply_config(&one_rule(40003, Protocol::Tcp, NodeTransport::Raw))
             .await;
         // Simulate traffic: accumulate bytes for rule 1.
         counter.add(1, 100, 50).await;
@@ -1313,13 +1329,11 @@ mod tests {
         // checks is_finished() and won't be detected as dead.
         //
         // abort() only REQUESTS cancellation; the task isn't actually finished
-        // until the runtime polls it once more. On a busy CI runner the gap
-        // between abort() and the task settling made apply_config's
-        // is_finished() check race (it saw the task as still alive, skipped the
-        // dead-listener path, and the counter was never pruned → flaky FAIL).
-        // Spin on is_finished(), yielding so the runtime drives the cancelled
-        // task to completion, before applying the empty config.
-        let key = (40001, Protocol::Tcp, NodeTransport::Raw);
+        // until the runtime polls it once more. Spin on is_finished(), yielding
+        // so the runtime drives the cancelled task to completion, before
+        // applying the empty config. (This spin is still correct defensive
+        // practice even though it wasn't the source of the observed flake.)
+        let key = (40003, Protocol::Tcp, NodeTransport::Raw);
         if let Some(m) = mgr.listeners.get(&key) {
             m.handle.abort();
             while !m.handle.is_finished() {
@@ -1341,6 +1355,10 @@ mod tests {
     /// When a tcp_udp rule is changed to tcp-only (one listener removed), the
     /// remaining listener's counter must NOT be pruned — only the deleted
     /// listener is gone, but the rule itself still exists.
+    ///
+    /// v1.0.8: uses port 40004, dedicated to this test — see the port-collision
+    /// note in `deleted_rule_prunes_traffic_counter` above for why every test
+    /// in this file needs its own port.
     #[tokio::test]
     async fn tcp_udp_to_tcp_does_not_prune_surviving_rule_counter() {
         let counter = Arc::new(TrafficCounter::new());
@@ -1352,7 +1370,7 @@ mod tests {
             listeners: vec![
                 ListenerConfig {
                     rule_id: 1,
-                    port: 40001,
+                    port: 40004,
                     protocol: Protocol::Tcp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
@@ -1363,7 +1381,7 @@ mod tests {
                 },
                 ListenerConfig {
                     rule_id: 1,
-                    port: 40001,
+                    port: 40004,
                     protocol: Protocol::Udp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
@@ -1382,7 +1400,7 @@ mod tests {
         let tcp_cfg = NodeConfigResponse {
             listeners: vec![ListenerConfig {
                 rule_id: 1,
-                port: 40001,
+                port: 40004,
                 protocol: Protocol::Tcp,
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
@@ -1403,6 +1421,9 @@ mod tests {
 
     /// A dead listener whose rule was also removed from the config must have
     /// its counter pruned, same as a normally-stopped listener.
+    ///
+    /// v1.0.8: uses port 40005, dedicated to this test — see the port-collision
+    /// note in `deleted_rule_prunes_traffic_counter` above.
     #[tokio::test]
     async fn dead_listener_prunes_counter_when_rule_removed() {
         let counter = Arc::new(TrafficCounter::new());
@@ -1410,12 +1431,12 @@ mod tests {
         let mut mgr = ForwarderManager::new(counter.clone(), connections.clone());
 
         // Apply config with rule 1.
-        mgr.apply_config(&one_rule(40001, Protocol::Tcp, NodeTransport::Raw))
+        mgr.apply_config(&one_rule(40005, Protocol::Tcp, NodeTransport::Raw))
             .await;
         counter.add(1, 50, 25).await;
 
         // Simulate a dead listener: abort its JoinHandle so is_finished() is true.
-        let key = (40001, Protocol::Tcp, NodeTransport::Raw);
+        let key = (40005, Protocol::Tcp, NodeTransport::Raw);
         if let Some(m) = mgr.listeners.get(&key) {
             m.handle.abort();
             // Briefly wait for the abort to propagate.

@@ -199,6 +199,11 @@ impl PlanRepository for SqliteRepository {
         reset_traffic: bool,
         grant_all_groups: bool,
         device_group_ids: &[i64],
+        // v1.0.8: the NEW authorized group set AFTER purchase. Used inside the
+        // transaction to pause rules outside this set (replacement semantics).
+        // Computed by the caller: all inbound groups if grant_all_groups, else
+        // device_group_ids (the plan's grants).
+        new_authorized_group_ids: &[i64],
     ) -> Result<(), BuyPlanError> {
         let mut tx = self.pool.begin().await?;
 
@@ -299,22 +304,40 @@ impl PlanRepository for SqliteRepository {
             .execute(&mut *tx)
             .await?;
 
-        // v1.0.9: grant device-group authorization in the SAME tx. Two modes:
-        //   - grant_all_groups → set the user's all_device_groups flag (access
-        //     to EVERY inbound group). Admins are left alone (always all-allowed).
-        //   - else → APPEND the plan's device groups to user_device_groups.
-        //     INSERT OR IGNORE dedupes against existing grants and never removes
-        //     any (purchases only ever expand a user's access). Expiry does NOT
-        //     revoke these — that's the spec's "到期不撤授权".
+        // v1.0.8: grant device-group authorization in the SAME tx. Purchase
+        // REPLACES the user's authorization — BOTH dimensions are reset so the
+        // user is left with EXACTLY the new plan's grant, nothing lingering:
+        //   - grant_all_groups → set all_device_groups=1 AND clear the explicit
+        //     user_device_groups rows (redundant under the flag; clearing them
+        //     avoids stale grants resurfacing if the user later downgrades).
+        //   - else → clear all_device_groups=0 AND replace user_device_groups
+        //     with the plan's set. Resetting the flag is the fix for the
+        //     grant-all → per-group downgrade case: without it the user kept
+        //     all_device_groups=1 and stayed effectively unrestricted.
+        // The caller's new_authorized_group_ids drives the rule-pause below.
         if grant_all_groups {
             sqlx::query("UPDATE users SET all_device_groups = 1 WHERE id = ? AND admin = 0")
                 .bind(user_id)
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query("DELETE FROM user_device_groups WHERE user_id = ?")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
         } else {
+            // REPLACE semantics: reset the all-groups flag, clear old explicit
+            // assignments, then insert the plan's.
+            sqlx::query("UPDATE users SET all_device_groups = 0 WHERE id = ? AND admin = 0")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM user_device_groups WHERE user_id = ?")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
             for dg_id in device_group_ids {
                 sqlx::query(
-                    "INSERT OR IGNORE INTO user_device_groups (user_id, device_group_id) \
+                    "INSERT INTO user_device_groups (user_id, device_group_id) \
                      VALUES (?, ?)",
                 )
                 .bind(user_id)
@@ -322,6 +345,41 @@ impl PlanRepository for SqliteRepository {
                 .execute(&mut *tx)
                 .await?;
             }
+        }
+
+        // Pause rules outside the new authorization. This is the key change from
+        // the old append-only behavior: a new purchase can revoke access to
+        // groups the user previously had, and those rules stop forwarding.
+        // When grant_all_groups=true, new_authorized = all inbound groups, so
+        // no rules are paused (the user still has full access).
+        // Inline the pause logic inside the transaction (using &mut *tx) to
+        // avoid acquiring a separate pool connection while the transaction is
+        // still open — that would risk a pool-exhaustion deadlock.
+        let n = if new_authorized_group_ids.is_empty() {
+            let r = sqlx::query("UPDATE forward_rules SET paused = 1 WHERE uid = ? AND paused = 0")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+            r.rows_affected()
+        } else {
+            let placeholders = vec!["?"; new_authorized_group_ids.len()].join(", ");
+            let sql = format!(
+                "UPDATE forward_rules SET paused = 1 \
+                 WHERE uid = ? AND paused = 0 AND device_group_in NOT IN ({})",
+                placeholders
+            );
+            let mut q = sqlx::query(&sql).bind(user_id);
+            for gid in new_authorized_group_ids {
+                q = q.bind(gid);
+            }
+            let r = q.execute(&mut *tx).await?;
+            r.rows_affected()
+        };
+        if n > 0 {
+            tracing::warn!(
+                "buy_plan: user {} purchased plan {}, {} rule(s) paused due to authorization change",
+                user_id, plan_id, n
+            );
         }
 
         tx.commit().await?;

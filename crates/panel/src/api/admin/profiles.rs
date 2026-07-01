@@ -74,14 +74,14 @@ pub async fn create_tunnel_profile(
                 .await;
             Json(ApiResponse::success(p))
         }
-        Err(CreateProfileError::EmptyName) => Json(err(400, "name must not be empty")),
+        Err(CreateProfileError::EmptyName) => Json(err(400, "名称不能为空")),
         Err(CreateProfileError::InvalidTransport) => {
-            Json(err(400, "transport must be one of: ws, tls_simple"))
+            Json(err(400, "传输协议必须是以下之一: ws, tls_simple"))
         }
-        Err(CreateProfileError::FetchFailed) => Json(err(500, "Failed to fetch created profile")),
+        Err(CreateProfileError::FetchFailed) => Json(err(500, "获取创建的模板失败")),
         Err(CreateProfileError::Database(e)) => {
             tracing::error!("create_tunnel_profile: db error: {}", e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -111,12 +111,10 @@ pub async fn update_tunnel_profile(
                 .await;
             Json(ApiResponse::success(()))
         }
-        Err(UpdateProfileError::NotFound) => Json(err(404, "Profile not found")),
-        Err(UpdateProfileError::BuiltinReadOnly) => {
-            Json(err(400, "Builtin profiles cannot be edited"))
-        }
+        Err(UpdateProfileError::NotFound) => Json(err(404, "模板不存在")),
+        Err(UpdateProfileError::BuiltinReadOnly) => Json(err(400, "内置模板不可编辑")),
         Err(UpdateProfileError::InvalidTransport) => {
-            Json(err(400, "transport must be one of: ws, tls_simple"))
+            Json(err(400, "传输协议必须是以下之一: ws, tls_simple"))
         }
         // v0.4.8 fix: a transport change must stay compatible with every rule
         // already bound to this profile — surface a concrete count + protocol so
@@ -130,10 +128,10 @@ pub async fn update_tunnel_profile(
                 ),
             ))
         }
-        Err(UpdateProfileError::NoFields) => Json(err(400, "No fields to update")),
+        Err(UpdateProfileError::NoFields) => Json(err(400, "无需要更新的字段")),
         Err(UpdateProfileError::Database(e)) => {
             tracing::error!("update_tunnel_profile {}: db error: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -156,10 +154,8 @@ pub async fn delete_tunnel_profile(
                 .await;
             Json(ApiResponse::success(()))
         }
-        Err(DeleteProfileError::NotFound) => Json(err(404, "Profile not found")),
-        Err(DeleteProfileError::BuiltinReadOnly) => {
-            Json(err(400, "Builtin profiles cannot be deleted"))
-        }
+        Err(DeleteProfileError::NotFound) => Json(err(404, "模板不存在")),
+        Err(DeleteProfileError::BuiltinReadOnly) => Json(err(400, "内置模板不可删除")),
         // HTTP 200 + body code (same convention as other err() returns) so the
         // frontend's res.code path surfaces the message.
         Err(DeleteProfileError::InUse(usage)) => {
@@ -167,7 +163,7 @@ pub async fn delete_tunnel_profile(
         }
         Err(DeleteProfileError::Database(e)) => {
             tracing::error!("delete_tunnel_profile {}: db error: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
