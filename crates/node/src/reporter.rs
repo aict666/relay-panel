@@ -178,8 +178,13 @@ impl ConnectionTracker {
             client_addr,
             rule_id,
         };
+        // v1.0.9: do NOT prune here. udp_touch runs on EVERY datagram (both
+        // directions); a full-table `retain` scan per packet is O(sessions) per
+        // packet and dominates cost on busy links. Expiry is handled by the
+        // periodic sweeper (udp_prune_expired, called from the UDP listener's
+        // cleanup interval) and by current(); the map just holds a few stale
+        // entries between sweeps, which is harmless.
         let mut map = self.udp.lock().await;
-        prune_expired_locked(&mut map);
         use std::collections::hash_map::Entry;
         match map.entry(key) {
             Entry::Occupied(mut e) => {

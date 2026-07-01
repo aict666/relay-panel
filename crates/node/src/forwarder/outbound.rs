@@ -217,18 +217,32 @@ async fn tcp_connect_bound(target: &str, src: Ipv4Addr) -> Result<TcpStream, Out
 
 // ── UDP ──
 
+/// v1.0.9: requested UDP socket buffer size (bytes) for both send and receive.
+/// Absorbs bursts / high packet rates so the kernel drops fewer datagrams. The
+/// OS clamps this to net.core.{r,w}mem_max, so requesting more than the cap is
+/// harmless (best-effort — a failure to set never fails the bind).
+const UDP_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 /// Bind a UDP socket for outbound traffic. When `source_ipv4` is set,
 /// binds to `{src}:0`; otherwise binds to `0.0.0.0:0` (system auto).
 pub async fn udp_outbound_socket(
     source_ipv4: Option<Ipv4Addr>,
 ) -> Result<UdpSocket, OutboundError> {
-    let bind_addr = match source_ipv4 {
+    let bind_addr: SocketAddr = match source_ipv4 {
         Some(src) => SocketAddr::V4(SocketAddrV4::new(src, 0)),
         None => "0.0.0.0:0".parse().unwrap(),
     };
-    UdpSocket::bind(bind_addr)
-        .await
-        .map_err(OutboundError::Bind)
+    // v1.0.9: build via socket2 so we can enlarge the send/recv buffers before
+    // the socket goes live. (IPv4 outbound only — unchanged from the previous
+    // 0.0.0.0/src bind.)
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(S2Protocol::UDP))
+        .map_err(OutboundError::Bind)?;
+    sock.set_nonblocking(true).map_err(OutboundError::Bind)?;
+    let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER_BYTES);
+    let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER_BYTES);
+    sock.bind(&bind_addr.into()).map_err(OutboundError::Bind)?;
+    let std_sock: std::net::UdpSocket = sock.into();
+    UdpSocket::from_std(std_sock).map_err(OutboundError::Bind)
 }
 
 // ── dual-stack listener binding ──
@@ -274,6 +288,9 @@ pub fn bind_udp_socket(ip: IpAddr, port: u16) -> Result<UdpSocket, OutboundError
     }
     sock.set_reuse_address(true).map_err(OutboundError::Bind)?;
     sock.set_nonblocking(true).map_err(OutboundError::Bind)?;
+    // v1.0.9: enlarge inbound UDP buffers to absorb bursts (best-effort).
+    let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER_BYTES);
+    let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER_BYTES);
     sock.bind(&addr.into()).map_err(OutboundError::Bind)?;
     let std_sock: std::net::UdpSocket = sock.into();
     UdpSocket::from_std(std_sock).map_err(OutboundError::Bind)
