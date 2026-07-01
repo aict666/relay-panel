@@ -88,17 +88,23 @@ impl DeviceGroupAuthRepository for SqliteRepository {
         allowed_group_ids: &[i64],
     ) -> Result<u64, DbError> {
         // Empty allowed list → pause ALL of the user's currently-active rules.
+        // v1.0.8: auto_paused=1 marks this as a SYSTEM pause (vs. a human using
+        // the on/off switch), so a later re-authorization can safely auto-resume
+        // it.
         if allowed_group_ids.is_empty() {
-            let r = sqlx::query("UPDATE forward_rules SET paused = 1 WHERE uid = ? AND paused = 0")
-                .bind(user_id)
-                .execute(&self.pool)
-                .await?;
+            let r = sqlx::query(
+                "UPDATE forward_rules SET paused = 1, auto_paused = 1 \
+                 WHERE uid = ? AND paused = 0",
+            )
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
             return Ok(r.rows_affected());
         }
         // Build "device_group_in NOT IN (?, ?, ...)" with bound params.
         let placeholders = vec!["?"; allowed_group_ids.len()].join(", ");
         let sql = format!(
-            "UPDATE forward_rules SET paused = 1 \
+            "UPDATE forward_rules SET paused = 1, auto_paused = 1 \
              WHERE uid = ? AND paused = 0 AND device_group_in NOT IN ({})",
             placeholders
         );

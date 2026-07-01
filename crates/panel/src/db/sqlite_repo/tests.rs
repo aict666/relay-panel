@@ -3202,6 +3202,218 @@ async fn buy_plan_grant_all_then_per_group_resets_all_flag() {
     assert_eq!(db.list_user_device_groups(alice).await.unwrap(), vec![52]);
 }
 
+/// v1.0.8: re-buying a plan that re-grants a group must auto-resume a rule
+/// this system previously auto-paused on that group (not just fix the
+/// authorization set) — otherwise the user pays for the line again but it
+/// stays dark until someone manually clicks resume.
+#[tokio::test]
+async fn buy_plan_resumes_auto_paused_rules_when_group_reauthorized() {
+    let db = repo().await;
+    let (alice, pid_a) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
+    seed_device_group(&db, 50, alice).await;
+    seed_device_group(&db, 51, alice).await;
+    let pid_b = db
+        .insert_plan("pB", 10, 1000, "5.00", "data", 0, false, false, "", false)
+        .await
+        .unwrap();
+    db.set_plan_device_groups(pid_a, &[50]).await.unwrap();
+    db.set_plan_device_groups(pid_b, &[51]).await.unwrap();
+
+    // 1) Buy plan A (grants 50) — rule on group 50 is unpaused.
+    sqlx::query(
+        "INSERT INTO forward_rules (id, name, uid, listen_port, device_group_in, \
+         target_addr, target_port, paused) VALUES (200, 'r200', ?, 20000, 50, '127.0.0.1', 80, 0)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.buy_plan(
+        alice,
+        pid_a,
+        "pA",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[50],
+        &[50],
+    )
+    .await
+    .unwrap();
+
+    // 2) Buy plan B (grants only 51) — REPLACE revokes group 50, so buy_plan
+    // itself auto-pauses rule 200 (auto_paused=1).
+    db.buy_plan(
+        alice,
+        pid_b,
+        "pB",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[51],
+        &[51],
+    )
+    .await
+    .unwrap();
+    let (paused, auto_paused): (bool, bool) =
+        sqlx::query_as("SELECT paused, auto_paused FROM forward_rules WHERE id = 200")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(paused && auto_paused, "buy_plan must auto-pause rule 200");
+
+    // 3) Buy plan A again (re-grants 50) — the rule must AUTO-RESUME.
+    db.buy_plan(
+        alice,
+        pid_a,
+        "pA",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[50],
+        &[50],
+    )
+    .await
+    .unwrap();
+    let (paused, auto_paused): (bool, bool) =
+        sqlx::query_as("SELECT paused, auto_paused FROM forward_rules WHERE id = 200")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(
+        !paused && !auto_paused,
+        "re-authorizing group 50 must auto-resume the rule buy_plan itself paused"
+    );
+}
+
+/// v1.0.8: a rule the user paused THEMSELVES (via the on/off switch, which
+/// clears auto_paused) must NOT be silently revived by a later purchase, even
+/// if that purchase happens to re-grant the rule's group. Only rules the
+/// SYSTEM paused (auto_paused=1) are eligible for buy_plan's auto-resume.
+#[tokio::test]
+async fn buy_plan_does_not_resume_manually_paused_rules() {
+    let db = repo().await;
+    let (alice, pid_a) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
+    seed_device_group(&db, 50, alice).await;
+    seed_device_group(&db, 51, alice).await;
+    let pid_b = db
+        .insert_plan("pB", 10, 1000, "5.00", "data", 0, false, false, "", false)
+        .await
+        .unwrap();
+    db.set_plan_device_groups(pid_a, &[50]).await.unwrap();
+    db.set_plan_device_groups(pid_b, &[51]).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO forward_rules (id, name, uid, listen_port, device_group_in, \
+         target_addr, target_port, paused) VALUES (201, 'r201', ?, 20001, 50, '127.0.0.1', 80, 0)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.buy_plan(
+        alice,
+        pid_a,
+        "pA",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[50],
+        &[50],
+    )
+    .await
+    .unwrap();
+
+    // buy_plan B auto-pauses rule 201 (group 50 revoked).
+    db.buy_plan(
+        alice,
+        pid_b,
+        "pB",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[51],
+        &[51],
+    )
+    .await
+    .unwrap();
+
+    // The user explicitly re-confirms the pause via the on/off switch
+    // (update_rule_fields) — this clears auto_paused, marking it as a HUMAN
+    // decision regardless of the rule already being paused.
+    let scope = crate::db::repo::ResourceScope::All;
+    db.update_rule_fields(
+        201,
+        &scope,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(true),
+    )
+    .await
+    .unwrap();
+    let (_, auto_paused): (bool, bool) =
+        sqlx::query_as("SELECT paused, auto_paused FROM forward_rules WHERE id = 201")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(
+        !auto_paused,
+        "an explicit paused write must clear auto_paused"
+    );
+
+    // Buy plan A again (re-grants 50) — the rule must STAY paused, since it is
+    // no longer flagged as a system pause.
+    db.buy_plan(
+        alice,
+        pid_a,
+        "pA",
+        500,
+        1000,
+        10,
+        0,
+        false,
+        false,
+        &[50],
+        &[50],
+    )
+    .await
+    .unwrap();
+    let (paused,): (bool,) = sqlx::query_as("SELECT paused FROM forward_rules WHERE id = 201")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        paused,
+        "a manually-paused rule must NOT be auto-resumed by a later purchase"
+    );
+}
+
 #[tokio::test]
 async fn buy_plan_grant_all_sets_flag() {
     let db = repo().await;

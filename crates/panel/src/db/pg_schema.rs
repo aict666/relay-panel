@@ -113,6 +113,11 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     name TEXT NOT NULL,
     uid BIGINT NOT NULL REFERENCES users(id),
     paused BOOLEAN NOT NULL DEFAULT FALSE,
+    -- v1.0.8: 1 = system-auto-paused (buy_plan / plan removal revoking
+    -- authorization), 0 = human-paused or never paused. Mirrors SQLite
+    -- Migration 37. Lets a later re-authorization safely auto-resume only the
+    -- rules IT paused.
+    auto_paused BOOLEAN NOT NULL DEFAULT FALSE,
     listen_port INTEGER NOT NULL,
     protocol TEXT NOT NULL DEFAULT 'tcp',
     public_transport TEXT NOT NULL DEFAULT 'raw',
@@ -273,7 +278,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 19;
+pub const PG_SCHEMA_VERSION: i32 = 20;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1059,6 +1064,23 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
         tracing::info!("PG migration 19: device_groups.hidden column present");
+    }
+
+    // ── Revision 20: v1.0.8 forward_rules.auto_paused ──
+    // Mirrors SQLite Migration 37. ADD COLUMN IF NOT EXISTS so a FRESH database
+    // (which already has auto_paused from the baseline) replays this as a no-op.
+    if current < 20 {
+        sqlx::query(
+            "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS auto_paused BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (20) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+        tracing::info!("PG migration 20: forward_rules.auto_paused column present");
     }
 
     Ok(())

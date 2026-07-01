@@ -355,16 +355,21 @@ impl PlanRepository for SqliteRepository {
         // Inline the pause logic inside the transaction (using &mut *tx) to
         // avoid acquiring a separate pool connection while the transaction is
         // still open — that would risk a pool-exhaustion deadlock.
+        // v1.0.8: auto_paused=1 marks these as SYSTEM pauses (see the resume
+        // step below and the column doc on forward_rules.auto_paused).
         let n = if new_authorized_group_ids.is_empty() {
-            let r = sqlx::query("UPDATE forward_rules SET paused = 1 WHERE uid = ? AND paused = 0")
-                .bind(user_id)
-                .execute(&mut *tx)
-                .await?;
+            let r = sqlx::query(
+                "UPDATE forward_rules SET paused = 1, auto_paused = 1 \
+                 WHERE uid = ? AND paused = 0",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
             r.rows_affected()
         } else {
             let placeholders = vec!["?"; new_authorized_group_ids.len()].join(", ");
             let sql = format!(
-                "UPDATE forward_rules SET paused = 1 \
+                "UPDATE forward_rules SET paused = 1, auto_paused = 1 \
                  WHERE uid = ? AND paused = 0 AND device_group_in NOT IN ({})",
                 placeholders
             );
@@ -380,6 +385,33 @@ impl PlanRepository for SqliteRepository {
                 "buy_plan: user {} purchased plan {}, {} rule(s) paused due to authorization change",
                 user_id, plan_id, n
             );
+        }
+
+        // v1.0.8: symmetric auto-resume — a rule this system previously paused
+        // (auto_paused=1) whose group is back in the new authorized set gets
+        // un-paused here. A rule the user paused THEMSELVES (auto_paused=0,
+        // e.g. via the on/off switch) is deliberately left alone even if its
+        // group is authorized again — buying a plan must never silently revive
+        // a rule the user turned off on purpose.
+        if !new_authorized_group_ids.is_empty() {
+            let placeholders = vec!["?"; new_authorized_group_ids.len()].join(", ");
+            let sql = format!(
+                "UPDATE forward_rules SET paused = 0, auto_paused = 0 \
+                 WHERE uid = ? AND paused = 1 AND auto_paused = 1 \
+                 AND device_group_in IN ({})",
+                placeholders
+            );
+            let mut q = sqlx::query(&sql).bind(user_id);
+            for gid in new_authorized_group_ids {
+                q = q.bind(gid);
+            }
+            let resumed = q.execute(&mut *tx).await?.rows_affected();
+            if resumed > 0 {
+                tracing::info!(
+                    "buy_plan: user {} purchased plan {}, {} previously auto-paused rule(s) resumed",
+                    user_id, plan_id, resumed
+                );
+            }
         }
 
         tx.commit().await?;

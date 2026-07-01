@@ -458,6 +458,11 @@ impl RuleRepository for PgRepository {
         }
         if paused.is_some() {
             sets.push("paused = ");
+            // v1.0.8: an explicit paused write is always a human action (the
+            // on/off switch, batch pause/resume) — clear auto_paused so a later
+            // buy_plan re-authorization doesn't treat this rule as something IT
+            // needs to reconcile.
+            sets.push("auto_paused = ");
         }
 
         if sets.is_empty() {
@@ -528,6 +533,7 @@ impl RuleRepository for PgRepository {
         }
         if let Some(v) = paused {
             q = q.bind(v);
+            q = q.bind(false); // auto_paused reset
         }
         q = q.bind(id);
         if let Some(uid) = scope.owner_id() {

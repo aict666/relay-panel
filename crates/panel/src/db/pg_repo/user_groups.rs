@@ -89,9 +89,13 @@ impl DeviceGroupAuthRepository for PgRepository {
         allowed_group_ids: &[i64],
     ) -> Result<u64, DbError> {
         // Empty allowed list → pause ALL of the user's currently-active rules.
+        // v1.0.8: auto_paused=TRUE marks this as a SYSTEM pause (vs. a human
+        // using the on/off switch), so a later re-authorization can safely
+        // auto-resume it.
         if allowed_group_ids.is_empty() {
             let r = sqlx::query(
-                "UPDATE forward_rules SET paused = TRUE WHERE uid = $1 AND paused = FALSE",
+                "UPDATE forward_rules SET paused = TRUE, auto_paused = TRUE \
+                 WHERE uid = $1 AND paused = FALSE",
             )
             .bind(user_id)
             .execute(&self.pool)
@@ -104,7 +108,7 @@ impl DeviceGroupAuthRepository for PgRepository {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "UPDATE forward_rules SET paused = TRUE \
+            "UPDATE forward_rules SET paused = TRUE, auto_paused = TRUE \
              WHERE uid = $1 AND paused = FALSE AND device_group_in NOT IN ({})",
             placeholders
         );

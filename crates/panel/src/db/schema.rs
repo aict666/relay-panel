@@ -124,6 +124,15 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     -- then max_rules / uid are effectively advisory, not enforced per-user.
     uid INTEGER NOT NULL REFERENCES users(id),
     paused INTEGER NOT NULL DEFAULT 0,
+    -- v1.0.8: 1 = this rule was paused BY THE SYSTEM (buy_plan / plan removal
+    -- revoking device-group authorization), 0 = paused by an explicit human
+    -- action (the on/off switch, batch pause/resume) or never paused. Lets a
+    -- later re-authorization (buying a plan that re-grants the group) safely
+    -- auto-resume ONLY the rules IT paused, without reviving a rule the user
+    -- deliberately turned off for unrelated reasons. Any explicit `paused`
+    -- write via update_rule_fields resets this to 0 — a human touching the
+    -- switch always overrides system bookkeeping.
+    auto_paused INTEGER NOT NULL DEFAULT 0,
     listen_port INTEGER NOT NULL,
     protocol TEXT NOT NULL DEFAULT 'tcp',
     -- v0.4.0: three orthogonal fields replace the overloaded entry_transport.
@@ -1346,6 +1355,21 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     )
     .await?;
     tracing::info!("Migration 36: device_groups.hidden column present");
+
+    // ── Migration 37: v1.0.8 forward_rules.auto_paused ──
+    // Distinguishes system-auto-paused (buy_plan / plan removal revoking
+    // authorization) from human-paused (the on/off switch), so a later
+    // re-authorization can safely auto-resume only rules it paused itself.
+    // Default 0 keeps every existing paused rule as "human paused" (no
+    // surprise auto-resume for pre-existing rows).
+    add_column_if_missing(
+        pool,
+        "forward_rules",
+        "auto_paused",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    tracing::info!("Migration 37: forward_rules.auto_paused column present");
 
     Ok(())
 }
