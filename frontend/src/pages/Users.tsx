@@ -1,10 +1,10 @@
-import { Table, Button, Tag, Popconfirm, message, Progress, Tooltip, Modal, Form, Input, InputNumber, Switch, Space, Select, DatePicker, Divider, Alert } from 'antd';
+import { Table, Button, Tag, Popconfirm, message, Progress, Tooltip, Modal, Form, Input, InputNumber, Switch, Space, Select, DatePicker, Divider } from 'antd';
 import { EditOutlined, ReloadOutlined, UndoOutlined, UserOutlined, PlusOutlined, KeyOutlined, ApiOutlined, ShoppingOutlined } from '@ant-design/icons';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import dayjs, { type Dayjs } from 'dayjs';
 import api from '../api/client';
-import type { ApiEnvelope, User, DeviceGroup, Plan } from '../api/types';
+import type { ApiEnvelope, User, Plan } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { useAuth } from '../auth/useAuth';
@@ -57,8 +57,6 @@ export default function Users() {
   const [creating, setCreating] = useState(false);
   // v0.4.10 PR4: admin password reset state. resetting = the target user row.
   const [resetting, setResetting] = useState<User | null>(null);
-  // v1.0.7: inbound device groups available to assign to a user.
-  const [deviceGroups, setDeviceGroups] = useState<DeviceGroup[]>([]);
   // v1.0.7: admin "edit user plan" panel state. planEditing = the target row;
   // plans = the catalog (for the assign dropdown); planChoice = the selected
   // plan to buy; planExpire = the expiry being edited (treated as UTC).
@@ -67,9 +65,6 @@ export default function Users() {
   const [planExpire, setPlanExpire] = useState<Dayjs | null>(null);
   const [planBusy, setPlanBusy] = useState(false);
   const [form] = Form.useForm<UserFormValues>();
-  // Watch the all-device-groups switch so the explicit multi-select can be
-  // disabled while it's on (the user already has access to everything).
-  const allDeviceGroups = Form.useWatch('all_device_groups', form);
   const [createForm] = Form.useForm<CreateUserFormValues>();
   const [resetForm] = Form.useForm<ResetFormValues>();
 
@@ -85,11 +80,6 @@ export default function Users() {
     try {
       const usersRes = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
       setUsers(usersRes.data || []);
-      // v1.0.7: load inbound device groups for the per-user authorization editor.
-      try {
-        const gRes = await api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups');
-        setDeviceGroups((gRes.data || []).filter(g => g.group_type === 'in'));
-      } catch { setDeviceGroups([]); }
       // v1.0.7: load the plan catalog for the "edit user plan" assign dropdown.
       try {
         const pRes = await api.get<unknown, ApiEnvelope<Plan[]>>('/admin/plans');
@@ -101,6 +91,14 @@ export default function Users() {
   // Resolve a plan id → display name (falls back to #id, or "no plan" for null).
   const planName = (id: number | null): string =>
     id == null ? t('noPlan') : (plans.find(p => p.id === id)?.name ?? `#${id}`);
+
+  // v1.0.8: the editing user's current plan, and two flags that gate the plan
+  // panel: only a TIME plan has a meaningful expiry (data plans are "unlimited
+  // duration", so the expiry editor is disabled), and "remove plan" only makes
+  // sense when the user actually has a plan.
+  const editingPlan = editing ? plans.find(p => p.id === editing.plan_id) : undefined;
+  const isTimePlan = editingPlan?.plan_type === 'time';
+  const hasPlan = editing?.plan_id != null;
 
   // v1.0.7: plan management is embedded in the edit-user modal, so these act on
   // the `editing` user. Admin assigns a plan, charging the user's balance.
@@ -154,22 +152,7 @@ export default function Users() {
       traffic_limit_gb: bytesToGb(u.traffic_limit),
       banned: u.banned,
       suspended: !!u.suspended,
-      all_device_groups: u.all_device_groups,
-      device_group_ids: [],
     });
-    // v1.0.7: preload the user's explicit device-group assignments for the
-    // multi-select. Admins are always all-allowed, so skip the fetch for them.
-    if (!u.admin) {
-      try {
-        const res = await api.get<unknown, ApiEnvelope<{ all_device_groups: boolean; device_group_ids: number[] }>>(`/admin/users/${u.id}/device-groups`);
-        if (res.data) {
-          form.setFieldsValue({
-            all_device_groups: res.data.all_device_groups,
-            device_group_ids: res.data.device_group_ids,
-          });
-        }
-      } catch { /* keep the optimistic defaults from the row */ }
-    }
   };
 
   const handleSave = async () => {
@@ -189,21 +172,10 @@ export default function Users() {
     if (balance !== '') {
       payload.balance = balance;
     }
-    // v1.0.7: send the per-user device-group authorization. Admins are always
-    // all-allowed, so the editor hides these and we skip sending them.
-    // v1.0.8: a plan-holding user's groups are owned by the plan (buy_plan
-    // REPLACEs them); the fields are disabled in the form for these users, but
-    // we ALSO skip sending them here — the form always carries a value for
-    // every field regardless of whether the disabled control was touched, and
-    // sending it would let a routine balance/max_rules save silently re-run
-    // the group write for no reason.
-    if (!editing.admin && !editing.plan_id) {
-      payload.all_device_groups = values.all_device_groups;
-      // When all_device_groups is on the explicit list is moot, but sending it
-      // is harmless (the backend ignores it for authorization). Send [] then so
-      // a later toggle-off starts clean.
-      payload.device_group_ids = values.all_device_groups ? [] : (values.device_group_ids || []);
-    }
+    // v1.0.8: device-group authorization is owned entirely by the user's plan
+    // (buy_plan REPLACEs it). The manual controls were removed from this modal,
+    // so this save never touches all_device_groups / device_group_ids — those
+    // change only when a plan is assigned/removed.
     setSaving(true);
     try {
       const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/users/${editing.id}`, payload);
@@ -462,46 +434,11 @@ export default function Users() {
           <Form.Item name="suspended" label={t('suspended')} valuePropName="checked" tooltip={t('suspendedHint')}>
             <Switch disabled={!!editing?.admin} />
           </Form.Item>
-          {!editing?.admin && (
-            <>
-              {/* v1.0.8: a plan now owns device-group authorization end to end
-                  (buy_plan REPLACEs it, auto-pauses/resumes affected rules).
-                  Letting the manual selector below ALSO write user_device_groups
-                  created a silent last-write-wins conflict with whichever the
-                  admin touched second. Lock the manual controls whenever the
-                  user has a plan — remove the plan first to hand-manage groups. */}
-              {!!editing?.plan_id && (
-                <Alert
-                  type="info"
-                  showIcon
-                  message={t('deviceGroupsManagedByPlan')}
-                  style={{ marginBottom: 12 }}
-                />
-              )}
-              <Form.Item
-                name="all_device_groups"
-                label={t('allDeviceGroups')}
-                tooltip={t('allDeviceGroupsHint')}
-                valuePropName="checked"
-              >
-                <Switch disabled={!!editing?.plan_id} />
-              </Form.Item>
-              <Form.Item
-                name="device_group_ids"
-                label={t('deviceGroups')}
-                tooltip={t('deviceGroupsHint')}
-              >
-                <Select
-                  mode="multiple"
-                  allowClear
-                  disabled={allDeviceGroups || !!editing?.plan_id}
-                  placeholder={t('selectDeviceGroups')}
-                  style={{ width: '100%' }}
-                  options={deviceGroups.map(g => ({ value: g.id, label: `${g.name} (#${g.id})` }))}
-                />
-              </Form.Item>
-            </>
-          )}
+          {/* v1.0.8: the manual device-group controls (allow-all switch +
+              multi-select) were removed — device-group authorization is owned
+              entirely by the user's plan (assign/remove a plan in the panel
+              below). This avoids the two-way conflict where a manual edit and a
+              plan purchase silently overwrote each other. */}
         </Form>
 
         {/* v1.0.7: plan management embedded in the edit-user modal (non-admin
@@ -544,20 +481,27 @@ export default function Users() {
               <strong>{t('editExpiry')}</strong>
               <span style={{ color: '#999', fontSize: 12, marginLeft: 6 }}>(UTC)</span>
             </div>
+            {/* v1.0.8: only TIME plans have an expiry. For a data (unlimited-
+                duration) plan or no plan, the expiry editor is disabled. */}
+            {!isTimePlan && (
+              <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>{t('expiryOnlyForTimePlan')}</div>
+            )}
             <Space wrap>
-              <DatePicker showTime value={planExpire} onChange={setPlanExpire} placeholder={t('neverExpires')} />
-              <Button loading={planBusy} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
+              <DatePicker showTime disabled={!isTimePlan} value={planExpire} onChange={setPlanExpire} placeholder={t('neverExpires')} />
+              <Button loading={planBusy} disabled={!isTimePlan} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
                 {t('saveExpiry')}
               </Button>
-              <Button loading={planBusy} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
+              <Button loading={planBusy} disabled={!isTimePlan} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
                 {t('setNeverExpires')}
               </Button>
             </Space>
 
             <Divider style={{ margin: '12px 0' }} />
 
-            <Popconfirm title={t('removePlanConfirm')} onConfirm={() => handleSetUserPlan(true, null)}>
-              <Button danger loading={planBusy}>{t('removePlan')}</Button>
+            {/* v1.0.8: "remove plan" is only enabled when the user actually has
+                a plan — you can't remove what isn't there. */}
+            <Popconfirm title={t('removePlanConfirm')} disabled={!hasPlan} onConfirm={() => handleSetUserPlan(true, null)}>
+              <Button danger loading={planBusy} disabled={!hasPlan}>{t('removePlan')}</Button>
             </Popconfirm>
           </>
         )}
