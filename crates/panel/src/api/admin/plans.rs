@@ -40,35 +40,35 @@ fn validate_plan_fields(
     if let Some(n) = name {
         let trimmed = n.trim();
         if name_required && trimmed.is_empty() {
-            return Err("name must not be empty".into());
+            return Err("名称不能为空".into());
         }
         if trimmed.len() > 100 {
-            return Err("name must be at most 100 characters".into());
+            return Err("名称不能超过100个字符".into());
         }
     }
     if let Some(mr) = max_rules {
         if !(0..=100_000).contains(&mr) {
-            return Err("max_rules must be between 0 and 100000".into());
+            return Err("max_rules 必须在 0 到 100000 之间".into());
         }
     }
     if let Some(t) = traffic {
         if t < 0 {
-            return Err("traffic must be non-negative".into());
+            return Err("流量必须为非负数".into());
         }
     }
     if let Some(pt) = plan_type {
         if pt != "data" && pt != "time" {
-            return Err("plan_type must be 'data' or 'time'".into());
+            return Err("套餐类型必须是 data 或 time".into());
         }
     }
     if let Some(dd) = duration_days {
         if dd < 0 {
-            return Err("duration_days must be non-negative".into());
+            return Err("时长天数必须为非负数".into());
         }
         // A time plan with duration_days=0 makes no sense; reject it at write
         // time so the shop never offers an instantly-expiring plan.
         if plan_type == Some("time") && dd == 0 {
-            return Err("duration_days must be > 0 for time plans".into());
+            return Err("限时套餐的时长天数必须大于 0".into());
         }
     }
     // price is a decimal string — canonicalize via the balance parser (same
@@ -155,7 +155,7 @@ pub async fn create_plan(
         Ok(id) => id,
         Err(e) => {
             tracing::error!("create_plan: db error: {}", e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
 
@@ -170,7 +170,7 @@ pub async fn create_plan(
         .await
     {
         tracing::error!("create_plan {}: set_plan_device_groups failed: {}", id, e);
-        return Json(err(500, "database error"));
+        return Json(err(500, "数据库错误"));
     }
 
     Json(ApiResponse::success(id))
@@ -194,7 +194,7 @@ pub async fn update_plan(
         && req.grant_all_groups.is_none()
         && req.device_group_ids.is_none()
     {
-        return Json(err(400, "No fields to update"));
+        return Json(err(400, "无需要更新的字段"));
     }
 
     // v1.0.8: when plan_type is being changed to 'time' in this same request,
@@ -222,18 +222,18 @@ pub async fn update_plan(
     // duration_days untouched (None) by reading the existing row.
     if let Some("time") = effective_plan_type {
         if req.duration_days == Some(0) {
-            return Json(err(400, "duration_days must be > 0 for time plans"));
+            return Json(err(400, "限时套餐的时长天数必须大于 0"));
         }
         if req.duration_days.is_none() {
             // Caller set plan_type=time without duration_days — verify the
             // existing row's duration_days is > 0 before flipping.
             match state.db.find_plan_by_id(id).await {
                 Ok(Some(p)) if p.duration_days > 0 => {}
-                Ok(Some(_)) => return Json(err(400, "duration_days must be > 0 for time plans")),
-                Ok(None) => return Json(err(404, "Plan not found")),
+                Ok(Some(_)) => return Json(err(400, "限时套餐的时长天数必须大于 0")),
+                Ok(None) => return Json(err(404, "套餐不存在")),
                 Err(e) => {
                     tracing::error!("update_plan {}: lookup failed: {}", id, e);
-                    return Json(err(500, "database error"));
+                    return Json(err(500, "数据库错误"));
                 }
             }
         }
@@ -273,21 +273,21 @@ pub async fn update_plan(
             )
             .await
         {
-            Ok(0) => return Json(err(404, "Plan not found")),
+            Ok(0) => return Json(err(404, "套餐不存在")),
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("update_plan {}: db error: {}", id, e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         }
     } else {
         // Only a grant-set change: confirm the plan exists so we still 404.
         match state.db.find_plan_by_id(id).await {
             Ok(Some(_)) => {}
-            Ok(None) => return Json(err(404, "Plan not found")),
+            Ok(None) => return Json(err(404, "套餐不存在")),
             Err(e) => {
                 tracing::error!("update_plan {}: existence check failed: {}", id, e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         }
     }
@@ -297,7 +297,7 @@ pub async fn update_plan(
     if let Some(ref ids) = req.device_group_ids {
         if let Err(e) = state.db.set_plan_device_groups(id, ids).await {
             tracing::error!("update_plan {}: set_plan_device_groups failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     }
 
@@ -319,7 +319,7 @@ pub async fn delete_plan(
         Ok(n) => n,
         Err(e) => {
             tracing::error!("delete_plan {}: count_users_on_plan failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     if in_use > 0 {
@@ -330,11 +330,11 @@ pub async fn delete_plan(
     }
 
     match state.db.delete_plan(id).await {
-        Ok(0) => Json(err(404, "Plan not found")),
+        Ok(0) => Json(err(404, "套餐不存在")),
         Ok(_) => Json(ApiResponse::success(())),
         Err(e) => {
             tracing::error!("delete_plan {}: db error: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }

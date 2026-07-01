@@ -49,7 +49,7 @@ pub async fn create_rule(
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("create_rule: restriction lookup failed: {}", e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         };
         if restricted {
@@ -57,14 +57,11 @@ pub async fn create_rule(
                 Ok(a) => a,
                 Err(e) => {
                     tracing::error!("create_rule: authz lookup failed: {}", e);
-                    return Json(err(500, "database error"));
+                    return Json(err(500, "数据库错误"));
                 }
             };
             if !allowed.contains(&req.device_group_in) {
-                return Json(err(
-                    403,
-                    "device_group_in is not in your allowed device groups",
-                ));
+                return Json(err(403, "device_group_in 不在您允许的分组列表中"));
             }
         }
     }
@@ -81,14 +78,11 @@ pub async fn create_rule(
         Err(CreateRuleError::BadRequest(msg)) => Json(err(400, msg)),
         Err(CreateRuleError::PortConflict(port)) => Json(err(
             409,
-            format!(
-                "listen_port {} is already in use on this inbound group",
-                port
-            ),
+            format!("监听端口 {} 在此入口分组上已被占用", port),
         )),
         Err(CreateRuleError::Database(e)) => {
             tracing::error!("create_rule: service failed: {}", e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -108,7 +102,7 @@ pub async fn update_rule(
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("update_rule: restriction lookup failed: {}", e);
-                    return Json(err(500, "database error"));
+                    return Json(err(500, "数据库错误"));
                 }
             };
             if restricted {
@@ -116,7 +110,7 @@ pub async fn update_rule(
                     Ok(a) => a,
                     Err(e) => {
                         tracing::error!("update_rule: authz lookup failed: {}", e);
-                        return Json(err(500, "database error"));
+                        return Json(err(500, "数据库错误"));
                     }
                 };
                 if !allowed.contains(&dgi) {
@@ -139,7 +133,7 @@ pub async fn update_rule(
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("update_rule: restriction lookup failed: {}", e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         };
         if restricted {
@@ -149,7 +143,7 @@ pub async fn update_rule(
                         Ok(a) => a,
                         Err(e) => {
                             tracing::error!("update_rule: authz lookup failed: {}", e);
-                            return Json(err(500, "database error"));
+                            return Json(err(500, "数据库错误"));
                         }
                     };
                     if !allowed.contains(&rule.device_group_in) {
@@ -159,10 +153,10 @@ pub async fn update_rule(
                         ));
                     }
                 }
-                Ok(None) => return Json(err(404, "Rule not found")),
+                Ok(None) => return Json(err(404, "规则不存在")),
                 Err(e) => {
                     tracing::error!("update_rule: rule lookup failed: {}", e);
-                    return Json(err(500, "database error"));
+                    return Json(err(500, "数据库错误"));
                 }
             }
         }
@@ -176,15 +170,12 @@ pub async fn update_rule(
             Json(ApiResponse::success(()))
         }
         Err(UpdateRuleError::BadRequest(msg)) => Json(err(400, msg)),
-        Err(UpdateRuleError::NotFound) => Json(err(404, "Rule not found")),
-        Err(UpdateRuleError::PortConflict) => Json(err(
-            409,
-            "listen_port is already in use on this inbound group",
-        )),
+        Err(UpdateRuleError::NotFound) => Json(err(404, "规则不存在")),
+        Err(UpdateRuleError::PortConflict) => Json(err(409, "监听端口在此入口分组上已被占用")),
         Err(UpdateRuleError::Internal(msg)) => Json(err(500, msg)),
         Err(UpdateRuleError::Database(e)) => {
             tracing::error!("update_rule {}: service failed: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -201,7 +192,7 @@ pub async fn delete_rule(
     match crate::service::groups::delete_rule(state.db.as_ref(), id, &scope).await {
         // v0.3.6: nothing existed at that id. Return 404 and do NOT broadcast
         // config_changed — a no-op delete shouldn't trigger a node re-fetch.
-        Ok(false) => Json(err(404, "Not found")),
+        Ok(false) => Json(err(404, "规则不存在")),
         Ok(true) => {
             tracing::warn!(
                 action = "delete_rule",
@@ -218,7 +209,7 @@ pub async fn delete_rule(
         }
         Err(e) => {
             tracing::error!("delete_rule {}: delete_rule failed: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }

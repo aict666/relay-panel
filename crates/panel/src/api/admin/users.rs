@@ -56,13 +56,13 @@ pub async fn create_user(
             "Username must be 1-64 chars, ASCII letters/digits/underscore only",
         )),
         Err(CreateUserError::Password(PasswordValidationError::TooShort)) => {
-            Json(err(400, "Password must be at least 8 characters"))
+            Json(err(400, "密码至少8个字符"))
         }
         Err(CreateUserError::Password(PasswordValidationError::TooLong)) => {
-            Json(err(400, "Password must be at most 72 bytes"))
+            Json(err(400, "密码最多72字节"))
         }
         Err(CreateUserError::Hash(e)) => Json(err(500, format!("Failed to hash password: {}", e))),
-        Err(CreateUserError::DuplicateUsername) => Json(err(409, "Username already exists")),
+        Err(CreateUserError::DuplicateUsername) => Json(err(409, "用户名已存在")),
         Err(CreateUserError::DefaultPlanMissing) => {
             tracing::error!("create_user: default plan 1 is missing; no user created");
             Json(err(
@@ -72,7 +72,7 @@ pub async fn create_user(
         }
         Err(CreateUserError::Database(e)) => {
             tracing::error!("create_user: insert failed for {:?}: {}", req.username, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -89,7 +89,7 @@ pub async fn delete_user(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("delete_user {}: is_admin lookup failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     // Also need to confirm the row exists (is_admin returns false for both
@@ -98,14 +98,11 @@ pub async fn delete_user(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("delete_user {}: exists lookup failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     if !exists || is_admin {
-        return Json(err(
-            404,
-            "User not found (or is an admin and cannot be deleted)",
-        ));
+        return Json(err(404, "用户不存在（或为管理员，无法删除）"));
     }
 
     // Atomic cascade delete: removes the user's rules, tunnel_profiles and
@@ -113,10 +110,7 @@ pub async fn delete_user(
     // admin guard baked in. Returns 0 (and rolls back) if the target is an admin
     // or no longer exists — so we never leave a half-deleted account.
     match state.db.delete_user_cascade(id).await {
-        Ok(0) => Json(err(
-            404,
-            "User not found (or is an admin and cannot be deleted)",
-        )),
+        Ok(0) => Json(err(404, "用户不存在（或为管理员，无法删除）")),
         Ok(_) => {
             tracing::warn!(
                 action = "delete_user",
@@ -128,7 +122,7 @@ pub async fn delete_user(
         }
         Err(e) => {
             tracing::error!("delete_user {}: cascade delete failed: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -154,18 +148,18 @@ pub async fn update_user(
         && req.all_device_groups.is_none()
         && req.device_group_ids.is_none()
     {
-        return Json(err(400, "No fields to update"));
+        return Json(err(400, "无需要更新的字段"));
     }
 
     // Clamp numeric inputs to sane ranges (prevent overflow / absurd values).
     if let Some(mr) = req.max_rules {
         if !(0..=100_000).contains(&mr) {
-            return Json(err(400, "max_rules must be between 0 and 100000"));
+            return Json(err(400, "max_rules 必须在 0 到 100000 之间"));
         }
     }
     if let Some(tl) = req.traffic_limit {
         if tl < 0 {
-            return Json(err(400, "traffic_limit must be non-negative"));
+            return Json(err(400, "流量限制必须为非负数"));
         }
     }
 
@@ -189,11 +183,11 @@ pub async fn update_user(
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("update_user {}: is_admin lookup failed: {}", id, e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         };
         if is_admin {
-            return Json(err(400, "Cannot ban an admin user"));
+            return Json(err(400, "无法封禁管理员用户"));
         }
     }
 
@@ -203,11 +197,11 @@ pub async fn update_user(
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("update_user {}: is_admin lookup failed: {}", id, e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         };
         if is_admin {
-            return Json(err(400, "Cannot suspend an admin user"));
+            return Json(err(400, "无法暂停管理员用户"));
         }
     }
 
@@ -233,7 +227,7 @@ pub async fn update_user(
             )
             .await
         {
-            Ok(0) => return Json(err(404, "User not found")),
+            Ok(0) => return Json(err(404, "用户不存在")),
             Ok(_) => {
                 if let Some(banned) = req.banned {
                     tracing::warn!(
@@ -258,7 +252,7 @@ pub async fn update_user(
             }
             Err(e) => {
                 tracing::error!("update_user {}: update_user_fields failed: {}", id, e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         }
     }
@@ -277,13 +271,13 @@ pub async fn update_user(
                 id,
                 e
             );
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     }
     if let Some(ref ids) = req.device_group_ids {
         if let Err(e) = state.db.set_user_device_groups(id, ids).await {
             tracing::error!("update_user {}: set_user_device_groups failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     }
     if authz_changed {
@@ -292,7 +286,7 @@ pub async fn update_user(
             Ok(a) => a,
             Err(e) => {
                 tracing::error!("update_user {}: authz lookup for pause failed: {}", id, e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         };
         match state.db.pause_rules_outside_groups(id, &allowed).await {
@@ -310,7 +304,7 @@ pub async fn update_user(
                     id,
                     e
                 );
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         }
     }
@@ -345,17 +339,17 @@ pub async fn get_user_device_groups(
     let all_device_groups =
         match crate::db::repo::UserRepository::find_by_id(state.db.as_ref(), id).await {
             Ok(Some(u)) => u.all_device_groups,
-            Ok(None) => return Json(err(404, "User not found")),
+            Ok(None) => return Json(err(404, "用户不存在")),
             Err(e) => {
                 tracing::error!("get_user_device_groups {}: find_by_id failed: {}", id, e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         };
     let device_group_ids = match state.db.list_user_device_groups(id).await {
         Ok(ids) => ids,
         Err(e) => {
             tracing::error!("get_user_device_groups {}: list failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     Json(ApiResponse::success(UserDeviceGroups {
@@ -379,25 +373,25 @@ pub async fn admin_buy_plan_for_user(
 ) -> Json<ApiResponse<()>> {
     // Target must exist and be a non-admin.
     match crate::db::repo::UserRepository::find_by_id(state.db.as_ref(), id).await {
-        Ok(Some(u)) if u.admin => return Json(err(400, "Cannot assign a plan to an admin user")),
+        Ok(Some(u)) if u.admin => return Json(err(400, "无法给管理员用户分配套餐")),
         Ok(Some(_)) => {}
-        Ok(None) => return Json(err(404, "User not found")),
+        Ok(None) => return Json(err(404, "用户不存在")),
         Err(e) => {
             tracing::error!("admin_buy_plan_for_user {}: find_by_id failed: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     }
 
     let plan = match state.db.find_plan_by_id(req.plan_id).await {
         Ok(Some(p)) => p,
-        Ok(None) => return Json(err(404, "Plan not found")),
+        Ok(None) => return Json(err(404, "套餐不存在")),
         Err(e) => {
             tracing::error!("admin_buy_plan_for_user: plan lookup failed: {}", e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
     if plan.plan_type == "time" && plan.duration_days <= 0 {
-        return Json(err(400, "This plan has no valid duration"));
+        return Json(err(400, "该套餐无有效时长"));
     }
 
     let price_cents = match relay_shared::money::balance_to_cents(&plan.price) {
@@ -408,7 +402,7 @@ pub async fn admin_buy_plan_for_user(
                 plan.id,
                 plan.price
             );
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     };
 
@@ -428,9 +422,26 @@ pub async fn admin_buy_plan_for_user(
                     "admin_buy_plan_for_user: list_plan_device_groups failed: {}",
                     e
                 );
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         }
+    };
+
+    // v1.0.8: compute the new authorized set (mirrors shop.rs buy_plan).
+    let new_authorized_group_ids: Vec<i64> = if plan.grant_all_groups {
+        match state.db.list_all_inbound_group_ids().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(
+                    "admin_buy_plan_for_user {}: list_all_inbound_group_ids failed: {}",
+                    id,
+                    e
+                );
+                return Json(err(500, "数据库错误"));
+            }
+        }
+    } else {
+        device_group_ids.clone()
     };
 
     match state
@@ -446,6 +457,7 @@ pub async fn admin_buy_plan_for_user(
             plan.reset_traffic,
             plan.grant_all_groups,
             &device_group_ids,
+            &new_authorized_group_ids,
         )
         .await
     {
@@ -466,7 +478,7 @@ pub async fn admin_buy_plan_for_user(
         Err(BuyPlanError::InsufficientBalance) => Json(err(400, "余额不足")),
         Err(BuyPlanError::Database(e)) => {
             tracing::error!("admin_buy_plan_for_user {}: db error: {}", id, e);
-            Json(err(500, "database error"))
+            Json(err(500, "数据库错误"))
         }
     }
 }
@@ -489,22 +501,22 @@ pub async fn admin_set_user_plan(
         (None, None)
     } else {
         match crate::db::repo::UserRepository::find_by_id(state.db.as_ref(), id).await {
-            Ok(Some(u)) if u.admin => return Json(err(400, "Cannot edit an admin user's plan")),
+            Ok(Some(u)) if u.admin => return Json(err(400, "无法修改管理员用户的套餐")),
             Ok(Some(u)) => (u.plan_id, req.plan_expire_at.clone()),
-            Ok(None) => return Json(err(404, "User not found")),
+            Ok(None) => return Json(err(404, "用户不存在")),
             Err(e) => {
                 tracing::error!("admin_set_user_plan {}: find_by_id failed: {}", id, e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         }
     };
 
     match state.db.admin_set_user_plan(id, plan_id, expire).await {
-        Ok(0) => return Json(err(404, "User not found (or is an admin)")),
+        Ok(0) => return Json(err(404, "用户不存在（或为管理员）")),
         Ok(_) => {}
         Err(e) => {
             tracing::error!("admin_set_user_plan {}: db error: {}", id, e);
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
     }
 
@@ -521,7 +533,7 @@ pub async fn admin_set_user_plan(
                 id,
                 e
             );
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
         if let Err(e) = state.db.set_user_device_groups(id, &[]).await {
             tracing::error!(
@@ -529,7 +541,7 @@ pub async fn admin_set_user_plan(
                 id,
                 e
             );
-            return Json(err(500, "database error"));
+            return Json(err(500, "数据库错误"));
         }
         // Allowed set is now empty → pause ALL of the user's active rules.
         match state.db.pause_rules_outside_groups(id, &[]).await {
@@ -541,7 +553,7 @@ pub async fn admin_set_user_plan(
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("admin_set_user_plan {}: pause rules failed: {}", id, e);
-                return Json(err(500, "database error"));
+                return Json(err(500, "数据库错误"));
             }
         }
     }

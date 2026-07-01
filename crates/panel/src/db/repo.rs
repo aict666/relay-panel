@@ -418,6 +418,11 @@ pub trait GroupRepository: Send + Sync {
     async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError>;
     async fn delete_group(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
     async fn delete_groups_by_uid(&self, uid: i64) -> Result<u64, DbError>;
+    /// v1.0.8: list all inbound device groups (group_type = 'in'). Used by the
+    /// purchase flow to compute the authorized set when grant_all_groups=true
+    /// — in that mode the user gains access to every inbound group, so rules
+    /// bound to inbound groups are NOT paused.
+    async fn list_all_inbound_group_ids(&self) -> Result<Vec<i64>, DbError>;
 }
 
 // ── v1.0.7: per-user device-group authorization ──
@@ -682,9 +687,11 @@ pub trait PlanRepository: Send + Sync {
     ///   - reset traffic_used to 0 when `reset_traffic`
     ///   - plan_expire_at = max(now, current expiry) + duration_days (NULL when duration_days=0)
     ///   - insert an orders row (snapshots plan_name + price)
-    ///   - v1.0.9: grant device groups in the SAME tx — when `grant_all_groups`
-    ///     set all_device_groups=1; else append the plan's `device_group_ids`
-    ///     to user_device_groups (deduped, never removing existing grants).
+    ///   - v1.0.9: grant device groups in the SAME tx. v1.0.8: purchase REPLACES
+    ///     authorization — when `grant_all_groups` set all_device_groups=1 (and
+    ///     clear explicit rows); else reset all_device_groups=0 and replace
+    ///     user_device_groups with the plan's `device_group_ids`. Rules bound to
+    ///     groups outside `new_authorized_group_ids` are paused in the same tx.
     /// All on the same tx handle so a concurrent purchase can't double-spend.
     /// `price_cents` / `traffic_to_add` / `plan_max_rules` / `duration_days` are
     /// resolved by the caller from the plan row (and re-checked hidden=0 there),
@@ -702,6 +709,11 @@ pub trait PlanRepository: Send + Sync {
         reset_traffic: bool,
         grant_all_groups: bool,
         device_group_ids: &[i64],
+        // v1.0.8: the NEW authorized group set AFTER purchase. Used inside the
+        // transaction to pause rules outside this set (replacement semantics).
+        // Computed by the caller: all inbound groups if grant_all_groups, else
+        // device_group_ids (the plan's grants).
+        new_authorized_group_ids: &[i64],
     ) -> Result<(), BuyPlanError>;
 }
 
