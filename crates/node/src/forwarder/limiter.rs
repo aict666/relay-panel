@@ -6,11 +6,21 @@
 // get double the budget, and the cap is on the RULE's aggregate traffic, not
 // per-connection.
 //
-// Implementation: a classic continuously-refilled token bucket per direction,
-// refilled lazily on each `acquire()` (elapsed time × rate). When the requested
-// amount exceeds the current balance, the caller sleeps for the deficit time
-// and then consumes. This keeps steady-state throughput at exactly the cap and
-// allows short bursts up to the bucket capacity (= 1 second of traffic).
+// Implementation: a continuously-refilled token bucket per direction. The
+// balance math is done in a SYNCHRONOUS `Bucket::charge()` that runs under the
+// bucket lock and returns how long the caller must sleep; the SLEEP then
+// happens AFTER the lock is released (RuleLimiter::charge). This is critical:
+// the bucket is shared across ALL of a rule's connections, so if a throttled
+// connection slept while holding the lock, every other connection of the rule
+// would be frozen behind it (head-of-line blocking → jitter + unfairness).
+//
+// The balance is allowed to go NEGATIVE ("debt"): a chunk LARGER than the burst
+// capacity is still admitted, it just incurs a proportionally longer wait to
+// repay the debt. (The earlier version capped the balance and looped forever
+// when `want > rate*burst`, hanging any connection whose read chunk exceeded
+// one second of the configured rate — e.g. a 64 KiB read on a sub-512 kbps
+// limit.) Steady-state throughput still equals the cap; short bursts up to one
+// second of traffic are allowed.
 //
 // A rate of 0 / None means unlimited: `acquire()` is a no-op, so unlimited
 // rules pay only a single branch per chunk.
@@ -27,8 +37,10 @@ const BURST_SECS: u64 = 1;
 struct Bucket {
     /// Refill rate in bytes/sec. 0 = this direction is unlimited.
     rate_bps: u64,
-    /// Current token balance (capped at rate_bps * BURST_SECS).
-    tokens: u64,
+    /// Current token balance in bytes. The POSITIVE side is capped at
+    /// rate_bps * BURST_SECS; the balance MAY go negative ("debt") so a chunk
+    /// bigger than the burst capacity is still admitted (with a longer wait).
+    tokens: f64,
     last_refill: Instant,
 }
 
@@ -37,38 +49,41 @@ impl Bucket {
         Self {
             rate_bps,
             // Start full so the first chunk isn't artificially delayed.
-            tokens: rate_bps.saturating_mul(BURST_SECS),
+            tokens: rate_bps.saturating_mul(BURST_SECS) as f64,
             last_refill: Instant::now(),
         }
     }
 
-    /// Refill based on elapsed wall time, then consume `want` bytes (sleeping
-    /// if the balance is too low). Returns the bytes actually reserved (always
-    /// == want once the await completes).
-    async fn acquire(&mut self, want: u64) {
+    /// SYNCHRONOUS: refill by elapsed wall time (positive side capped at the
+    /// burst ceiling), then charge `want` bytes — the balance is allowed to go
+    /// negative. Returns `Some(wait)` if the caller must sleep to repay the
+    /// resulting debt, or `None` if there was enough balance.
+    ///
+    /// This intentionally does NOT sleep: the caller (RuleLimiter::charge) holds
+    /// the bucket lock only for this call and releases it BEFORE sleeping, so a
+    /// throttled connection never blocks the other connections sharing the
+    /// bucket. Because `want` is charged unconditionally (into debt if needed),
+    /// there is no unbounded retry loop — a large chunk simply yields a larger
+    /// (but finite) `wait`.
+    fn charge(&mut self, want: u64) -> Option<Duration> {
         if self.rate_bps == 0 {
-            return;
+            return None;
         }
-        let cap = self.rate_bps.saturating_mul(BURST_SECS);
-        loop {
-            let now = Instant::now();
-            let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-            // Lazily refill, capped at the burst ceiling.
-            self.tokens = (self.tokens as f64 + elapsed * self.rate_bps as f64) as u64;
-            if self.tokens > cap {
-                self.tokens = cap;
-            }
-            self.last_refill = now;
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
 
-            if self.tokens >= want {
-                self.tokens -= want;
-                return;
-            }
-            // Not enough: sleep for the time needed to earn the remaining bytes,
-            // then loop to recompute (avoids underflow on u64).
-            let deficit = want - self.tokens;
-            let wait = Duration::from_secs_f64(deficit as f64 / self.rate_bps as f64);
-            tokio::time::sleep(wait).await;
+        let cap = self.rate_bps.saturating_mul(BURST_SECS) as f64;
+        self.tokens += elapsed * self.rate_bps as f64;
+        if self.tokens > cap {
+            // Only the positive (burst-credit) side is capped; debt is not.
+            self.tokens = cap;
+        }
+        self.tokens -= want as f64;
+        if self.tokens >= 0.0 {
+            None
+        } else {
+            Some(Duration::from_secs_f64(-self.tokens / self.rate_bps as f64))
         }
     }
 }
@@ -103,12 +118,23 @@ impl RuleLimiter {
         self.unlimited
     }
 
+    /// Charge `n` bytes against a bucket, then sleep for any resulting debt.
+    /// The lock is held ONLY for the synchronous `charge()` and is dropped
+    /// (end of the block) BEFORE the sleep — so a throttled connection never
+    /// holds the shared bucket lock while it waits.
+    async fn charge(bucket: &Mutex<Bucket>, n: u64) {
+        let wait = { bucket.lock().await.charge(n) };
+        if let Some(w) = wait {
+            tokio::time::sleep(w).await;
+        }
+    }
+
     /// Reserve `n` upload (client→target) bytes. No-op for unlimited limiters.
     pub async fn acquire_upload(&self, n: u64) {
         if self.unlimited {
             return;
         }
-        self.upload.lock().await.acquire(n).await;
+        Self::charge(&self.upload, n).await;
     }
 
     /// Reserve `n` download (target→client) bytes. No-op for unlimited limiters.
@@ -116,7 +142,7 @@ impl RuleLimiter {
         if self.unlimited {
             return;
         }
-        self.download.lock().await.acquire(n).await;
+        Self::charge(&self.download, n).await;
     }
 }
 
@@ -200,5 +226,53 @@ mod tests {
         // two halves may serialize on the bucket lock, but the refill time is
         // bounded by the aggregate amount).
         assert!(start.elapsed() >= Duration::from_millis(900));
+    }
+
+    /// Regression: a chunk LARGER than the burst capacity (rate * BURST_SECS)
+    /// must still complete, not loop forever. The old code capped the balance
+    /// below `want` and spun forever, hanging the connection. Rate is high so
+    /// the real wait is short (~0.5s).
+    #[tokio::test]
+    async fn large_chunk_over_burst_does_not_hang() {
+        // 100_000 B/s, burst cap = 100_000. Ask for 150_000 (1.5× the cap).
+        let r = RateLimit::new(Some(100_000), None);
+        let start = Instant::now();
+        r.acquire_upload(150_000).await;
+        let elapsed = start.elapsed();
+        // Starts with the full 100_000 burst → 50_000 debt at 100_000 B/s ≈ 0.5s.
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "must wait to repay the debt, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must not hang — the wait is finite, got {:?}",
+            elapsed
+        );
+    }
+
+    /// Two connections sharing a rate-limited bucket both complete and the
+    /// aggregate is paced to the cap (not doubled). The lock is provably NOT
+    /// held during the sleep because `Bucket::charge` is synchronous and its
+    /// guard is dropped before `RuleLimiter::charge` sleeps.
+    #[tokio::test]
+    async fn concurrent_charges_complete_and_pace_to_cap() {
+        let r = RateLimit::new(Some(100_000), None);
+        r.acquire_upload(100_000).await; // drain the burst
+        let r2 = r.clone();
+        let start = Instant::now();
+        let h1 = tokio::spawn(async move { r.acquire_upload(50_000).await });
+        let h2 = tokio::spawn(async move { r2.acquire_upload(50_000).await });
+        h1.await.unwrap();
+        h2.await.unwrap();
+        // 100_000 bytes of debt at 100_000 B/s → the later charger waits ~1s;
+        // both sleep concurrently, so total ≈ 1s (bounded, no deadlock).
+        let elapsed = start.elapsed();
+        assert!(
+            (Duration::from_millis(800)..Duration::from_secs(3)).contains(&elapsed),
+            "aggregate must pace to the cap, got {:?}",
+            elapsed
+        );
     }
 }
