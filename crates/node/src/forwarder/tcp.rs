@@ -183,14 +183,33 @@ async fn handle_tcp_connection(
 
     tracing::debug!("TCP: {} -> {}", client_addr, outbound.peer_addr()?);
 
-    // Bidirectional copy with traffic counting + per-rule rate limiting. We own
+    // v1.0.8: ZERO-COPY fast path. An UNLIMITED rule on Linux is forwarded with
+    // splice(2) — bytes move inside the kernel via a pipe and are never copied
+    // into userspace, which slashes CPU on high-throughput links. A rate-limited
+    // rule CANNOT use splice (the bytes must reach userspace to be throttled),
+    // but that's fine: a capped rule isn't running at max throughput, so the
+    // userspace copy's CPU cost is negligible. Byte counts still come back from
+    // the splice return values, so billing is unaffected. Non-Linux always uses
+    // the userspace copy below.
+    #[cfg(target_os = "linux")]
+    if matches!(rate_limit, RateLimit::Unlimited) {
+        match super::splice::zero_copy_bidirectional(inbound, outbound).await {
+            // (up = client→target, down = target→client) — same attribution as
+            // the userspace path's counter.add(rule_id, up, down).
+            Ok((up, down)) => counter.add(rule_id, up, down).await,
+            Err(e) => tracing::debug!("TCP splice forward (rule {}): {}", rule_id, e),
+        }
+        return Ok(());
+    }
+
+    // Userspace bidirectional copy with traffic counting + per-rule rate
+    // limiting (the rate-limited path, and the fallback on non-Linux). We own
     // both halves and pump both directions concurrently. When either side
     // returns (the remote closed the connection) we shut down the matching write
     // half so the other copy also sees EOF and returns.
     //
     // v0.4.6: each chunk is throttled through the shared RateLimit BEFORE being
-    // written, so the rule's aggregate cap holds across all connections. For
-    // unlimited rules the limiter is a no-op (one branch per chunk).
+    // written, so the rule's aggregate cap holds across all connections.
     let (mut ri, mut wi) = inbound.into_split();
     let (mut ro, mut wo) = outbound.into_split();
 
@@ -201,10 +220,11 @@ async fn handle_tcp_connection(
 
     let upload = Box::pin(async move {
         let mut total = 0u64;
-        // v1.0.8: 64 KiB copy buffer (was 16 KiB) — fewer syscalls / better
-        // throughput on high bandwidth-delay-product links. Heap-allocated as
-        // part of this Box::pin'd future, so it does not grow the task stack.
-        let mut buf = [0u8; 64 * 1024];
+        // v1.0.8: 32 KiB copy buffer (this userspace path is only used by
+        // rate-limited rules, which are capped anyway; the unlimited fast path
+        // uses splice above). Heap-allocated as part of this Box::pin'd future,
+        // so it does not grow the task stack.
+        let mut buf = [0u8; 32 * 1024];
         loop {
             let n = match ri.read(&mut buf).await {
                 Ok(0) => break,
@@ -222,8 +242,8 @@ async fn handle_tcp_connection(
     });
     let download = Box::pin(async move {
         let mut total = 0u64;
-        // v1.0.8: 64 KiB copy buffer (see the upload side above).
-        let mut buf = [0u8; 64 * 1024];
+        // v1.0.8: 32 KiB copy buffer (see the upload side above).
+        let mut buf = [0u8; 32 * 1024];
         loop {
             let n = match ro.read(&mut buf).await {
                 Ok(0) => break,
