@@ -47,9 +47,15 @@ pub async fn list_public_plans(
                     Vec::new()
                 })
         };
+        let device_group_names = state
+            .db
+            .list_group_names_by_ids(&device_group_ids)
+            .await
+            .unwrap_or_default();
         out.push(PlanWithGroups {
             plan,
             device_group_ids,
+            device_group_names,
         });
     }
     Json(ApiResponse::success(out))
