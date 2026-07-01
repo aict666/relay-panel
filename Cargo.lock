@@ -1591,6 +1591,7 @@ name = "relay-node"
 version = "1.0.7"
 dependencies = [
  "futures-util",
+ "libc",
  "rcgen",
  "relay-shared",
  "reqwest",
