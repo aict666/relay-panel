@@ -439,6 +439,11 @@ impl RuleRepository for SqliteRepository {
         }
         if paused.is_some() {
             sets.push("paused = ?");
+            // v1.0.8: an explicit paused write is always a human action (the
+            // on/off switch, batch pause/resume) — clear auto_paused so a later
+            // buy_plan re-authorization doesn't treat this rule as something IT
+            // needs to reconcile.
+            sets.push("auto_paused = 0");
         }
 
         if sets.is_empty() {
