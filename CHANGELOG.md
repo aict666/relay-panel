@@ -5,6 +5,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.0.8] - 2026-07-01
+
+A performance & correctness release for the node's TCP forwarding path
+(latency/jitter fixes plus zero-copy for unlimited rules), a switch to
+**replace-semantics** for plan-linked device-group authorization, and a small
+round of admin UI polish.
+
+### Added
+
+- **Zero-copy TCP forwarding (Linux).** Unlimited rules now forward with
+  `splice(2)` (kernel pipe, no userspace copy), cutting CPU and latency on long
+  forwarding chains. Rate-limited rules keep the userspace copy path so the
+  token bucket still applies; byte counters stay accurate on both paths.
+
+### Changed
+
+- **Plan authorization now replaces instead of only expanding.** Buying a plan
+  sets the user's device-group authorization to exactly what the plan grants
+  (a per-group plan resets `all_device_groups`; an all-groups plan clears any
+  stale per-group rows). This supersedes the v1.0.7 "append-only / only ever
+  expands" behavior, which could leave a downgraded user over-authorized.
+- **Auto-paused rules resume symmetrically.** A new `auto_paused` flag marks
+  rules the *system* paused (plan removal / expiry) versus ones a human paused;
+  only the former auto-resume when authorization is restored, so a manual pause
+  is never silently undone.
+- **Larger forwarding buffer, smarter pacing.** The userspace copy buffer moved
+  to 32 KiB and `TCP_NODELAY` is now set on every TCP socket (both accepted and
+  dialed) to remove Nagle/delayed-ACK stalls that compounded across hops.
+- **Admin UI.** The edit-user modal no longer exposes raw device-group toggles
+  (authorization is driven by the plan); the plan expiry is editable only for
+  time-based plans (grayed out for data plans); the delete-plan button is
+  enabled only when a plan is selected.
+
+### Fixed
+
+- **Rate limiter head-of-line blocking & stall.** The limiter no longer holds
+  its lock across the pacing sleep (one slow rule could stall others), and a
+  chunk larger than the burst capacity no longer loops forever (debt-based
+  tokens). This is the root cause of the reported forwarding jitter.
+
+### Disabled
+
+- **WS / TLS forwarding transports are no longer served.** The frontend already
+  hides them; the listener code is kept in-tree but skipped at runtime. TCP and
+  UDP are unaffected. (No config migration needed.)
+
+---
+
 ## [1.0.7] - 2026-06-30
 
 A feature release: a self-service **plan shop with billing**, a rewritten

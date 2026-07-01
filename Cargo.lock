@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "relay-node"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "futures-util",
  "libc",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "relay-panel"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "async-trait",
  "axum",
