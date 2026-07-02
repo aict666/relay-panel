@@ -42,6 +42,10 @@ libc = "0.2"
 dashmap = "6"
 # v1.0.10: verify the sha256 of a self-upgrade binary download before swapping.
 sha2 = "0.10"
+# v1.0.10: semver comparison to reject self-upgrade downgrades/reinstalls (a
+# compromised panel must not be able to roll a node back to an old, vulnerable
+# release).
+semver = "1"
 
 [dev-dependencies]
 # v0.4.16: test-only cert generator for the real WSS (wss://) regression test.

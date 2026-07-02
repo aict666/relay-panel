@@ -16,10 +16,11 @@
 //!   so concurrent/repeated commands can't race on the temp file / swap.
 //! - **Mandatory backup.** The current binary is copied to `.bak` BEFORE the
 //!   swap; if the backup fails the upgrade is aborted (nothing is replaced).
-//! - **Security.** The URL is hardcoded to the official GitHub release and the
-//!   version is validated as plain semver, so the panel can at most force an
-//!   upgrade to an official build — never run arbitrary code. A failed upgrade
-//!   (network / hash / io) leaves the current binary untouched.
+//! - **Security.** The URL is hardcoded to the official GitHub release, and the
+//!   target must be a valid semver STRICTLY NEWER than the running version — so
+//!   even a compromised panel can at most force an upgrade to a newer official
+//!   build (never arbitrary code, and never a downgrade to an old vulnerable
+//!   release). A failed upgrade (network / hash / io) leaves the binary intact.
 
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,30 +56,25 @@ fn asset_arch() -> Option<&'static str> {
     }
 }
 
-/// A plain semver: `x.y.z` with an optional `-suffix` of `[0-9A-Za-z.-]`. This
-/// gates the version before it goes into a URL path, so a panel value can never
-/// inject `/`, `..`, etc.
-fn is_plain_semver(v: &str) -> bool {
-    let (base, suffix) = match v.split_once('-') {
-        Some((b, s)) => (b, Some(s)),
-        None => (v, None),
-    };
-    let parts: Vec<&str> = base.split('.').collect();
-    if parts.len() != 3
-        || !parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return false;
+/// Validate a self-upgrade target against `current`. Returns Ok only when
+/// `target` parses as semver AND is STRICTLY greater than `current`. This does
+/// double duty:
+///   - Parsing as semver rejects anything that could escape the URL path
+///     (`/`, `..`, "latest", …) — a valid semver has none of those.
+///   - The strict `>` comparison blocks a downgrade or a same-version reinstall.
+///     Under the "panel is compromised" threat model, this stops an attacker
+///     from rolling a node back to an old, vulnerable official release.
+fn check_upgrade_target(target: &str, current: &str) -> Result<(), String> {
+    let t = semver::Version::parse(target)
+        .map_err(|_| format!("unparseable target version {target:?}"))?;
+    let c = semver::Version::parse(current)
+        .map_err(|_| format!("unparseable current version {current:?}"))?;
+    if t <= c {
+        return Err(format!(
+            "target v{t} is not newer than current v{c}; refusing downgrade/reinstall"
+        ));
     }
-    match suffix {
-        None => true,
-        Some(s) => {
-            !s.is_empty()
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-        }
-    }
+    Ok(())
 }
 
 /// Upgrade this node to `version` (a plain semver WITHOUT a leading "v"). On
@@ -93,11 +89,8 @@ pub async fn self_upgrade(version: &str) -> Result<(), String> {
              update the container image / re-run the install script instead"
         ));
     }
-    if !is_plain_semver(version) {
-        return Err(format!(
-            "refusing to upgrade to a non-semver version {version:?}"
-        ));
-    }
+    // Reject unparseable versions, downgrades, and same-version reinstalls.
+    check_upgrade_target(version, env!("CARGO_PKG_VERSION"))?;
     // Single-flight: reject a concurrent/repeat upgrade so two tasks can't race
     // on the temp file and swap, which could leave a truncated binary.
     if UPGRADING
@@ -238,16 +231,20 @@ mod tests {
     }
 
     #[test]
-    fn semver_validation() {
-        assert!(is_plain_semver("1.0.10"));
-        assert!(is_plain_semver("1.0.10-rc.1"));
-        assert!(is_plain_semver("12.34.56"));
-        // Rejects anything that could escape the URL path or isn't x.y.z.
-        assert!(!is_plain_semver("1.0"));
-        assert!(!is_plain_semver("1.0.10/../../etc"));
-        assert!(!is_plain_semver("latest"));
-        assert!(!is_plain_semver("1.0.x"));
-        assert!(!is_plain_semver(""));
-        assert!(!is_plain_semver("1.0.10-"));
+    fn upgrade_target_allows_only_strictly_newer() {
+        // Strictly newer → allowed.
+        assert!(check_upgrade_target("1.0.11", "1.0.10").is_ok());
+        assert!(check_upgrade_target("1.1.0", "1.0.10").is_ok());
+        assert!(check_upgrade_target("2.0.0", "1.9.9").is_ok());
+        // Same version → rejected (no reinstall).
+        assert!(check_upgrade_target("1.0.10", "1.0.10").is_err());
+        // Downgrade → rejected (blocks rolling back to an old vulnerable build).
+        assert!(check_upgrade_target("1.0.9", "1.0.10").is_err());
+        assert!(check_upgrade_target("0.4.20", "1.0.10").is_err());
+        // Unparseable / path-injection attempts → rejected.
+        assert!(check_upgrade_target("latest", "1.0.10").is_err());
+        assert!(check_upgrade_target("1.0.11/../../etc", "1.0.10").is_err());
+        assert!(check_upgrade_target("1.0", "1.0.10").is_err());
+        assert!(check_upgrade_target("", "1.0.10").is_err());
     }
 }

@@ -1618,6 +1618,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pemfile",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
