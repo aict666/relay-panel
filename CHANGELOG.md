@@ -5,6 +5,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.0.9] - 2026-07-02
+
+Finalizes the plan model to a **single current plan** (renew vs. switch), a
+substantial **UDP/TCP forwarding performance pass**, and a round of correctness
+fixes across billing, admin actions, and the rule editor.
+
+### Changed
+
+- **A user holds exactly one current plan.** Buying the **same** plan *renews*
+  it (traffic stacks; a time plan's expiry extends from its current end). Buying
+  a **different** plan *switches*: `traffic_limit` becomes the new plan's quota
+  (not stacked), `traffic_used` resets to 0, the expiry is recomputed from now,
+  and device-group authorization is fully replaced. The shop and the admin panel
+  both confirm before a switch. This replaces the short-lived additive model —
+  to give a user several lines, sell a bundled plan.
+- **Rate-limited rules pick up limit changes without a node restart.** A rule's
+  upload/download cap is part of the listener fingerprint now, so changing or
+  clearing a limit hot-reloads the listener instead of running the old cap until
+  the next restart.
+
+### Added
+
+- Shop plan cards resolve the **names** of the lines a plan grants server-side
+  (previously they could show a raw `#id` for lines the buyer wasn't yet
+  authorized for).
+- **DNS cache** for outbound TCP targets: domain targets no longer re-resolve on
+  every new connection, with a stale-entry fallback when the resolver blips.
+
+### Performance
+
+- **UDP forwarding.** Removed the per-packet full-table session scan; made the
+  traffic counter lock-free (atomic per rule); moved the outbound bind/connect
+  out of the session lock; sharded both the per-listener session map and the
+  connection tracker (concurrent maps); and enlarged UDP socket buffers. Large
+  reduction in per-packet lock contention on high-PPS links.
+
+### Fixed
+
+- **Traffic billing** is charged on upload **and** download (their sum × the
+  line's rate); this is now documented explicitly.
+- Plan **create** and admin **remove-plan** run as single transactions, so a
+  mid-operation DB error can't leave a plan with no lines or a half-revoked user.
+- **Batch rule delete** reports actual success/failure counts instead of always
+  claiming every selected rule was deleted.
+- List endpoints (plans / shop) return a real error on a DB failure instead of a
+  fake empty "success" list.
+- `update_plan` rejects setting `duration_days = 0` on a time plan.
+- Editing only a Basic-tab field of a rule (e.g. the listen port) no longer
+  wrongly demands "add a forward target".
+- `relay-node-install.sh` no longer fails with a `getcwd` error when run from a
+  directory that has since been deleted.
+- The device-group edit form no longer offers the unused **outbound/egress**
+  type; the inbound-group dropdown drops the redundant "(shared)" suffix; the
+  rule list shows all target IPs on hover.
+
+---
+
 ## [1.0.8] - 2026-07-01
 
 A performance & correctness release for the node's TCP forwarding path
