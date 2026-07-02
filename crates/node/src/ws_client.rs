@@ -310,9 +310,13 @@ async fn connect_and_run(
                                     node_id
                                 );
                             } else if um.msg_type == "upgrade_node" {
-                                tracing::warn!("websocket: self-upgrade requested; starting");
+                                let version = um.version.clone();
+                                tracing::warn!(
+                                    "websocket: self-upgrade to v{} requested; starting",
+                                    version
+                                );
                                 tokio::spawn(async move {
-                                    match crate::updater::self_upgrade().await {
+                                    match crate::updater::self_upgrade(&version).await {
                                         Ok(()) => {
                                             tracing::warn!(
                                                 "self-upgrade done; exiting to restart into new binary"

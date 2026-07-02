@@ -367,9 +367,12 @@ pub async fn upgrade_node(
             data: None,
         });
     }
+    // Pin the target to the PANEL's own version so a node never jumps ahead of
+    // the panel (e.g. to a newer GitHub release with an incompatible protocol).
     let msg = match serde_json::to_string(&relay_shared::protocol::UpgradeNodeMessage {
         msg_type: "upgrade_node".into(),
         node_id: node_id.clone(),
+        version: crate::config::app_version().to_string(),
     }) {
         Ok(s) => s,
         Err(e) => {

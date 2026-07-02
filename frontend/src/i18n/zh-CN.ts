@@ -328,6 +328,8 @@ export const zhCN = {
   nodeUpgrade: '节点更新',
   nodeUpgradeTip: '升级到 v{v}',
   nodeUpgradeLatest: '已是最新',
+  nodeUpgradeDocker: 'Docker 部署：请更新容器镜像（不支持二进制自替换）',
+  nodeUpgradeManual: '手动运行：不支持一键升级（退出后无人拉起）',
   nodeUpgradeConfirmTitle: '确认升级节点',
   nodeUpgradeConfirm: '将命令该节点从官方源下载并升级到 v{v}，升级期间该节点转发会短暂中断。是否继续？',
   nodeUpgradeOk: '升级',

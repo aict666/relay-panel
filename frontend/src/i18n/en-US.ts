@@ -329,6 +329,8 @@ export const enUS: Dict = {
   nodeUpgrade: 'Update',
   nodeUpgradeTip: 'Upgrade to v{v}',
   nodeUpgradeLatest: 'Up to date',
+  nodeUpgradeDocker: 'Docker deploy: update the container image (no binary self-replace)',
+  nodeUpgradeManual: 'Manual run: one-click upgrade unavailable (nothing would restart it)',
   nodeUpgradeConfirmTitle: 'Upgrade node',
   nodeUpgradeConfirm: 'This tells the node to download and upgrade to v{v} from the official source. The node briefly stops forwarding while it restarts. Continue?',
   nodeUpgradeOk: 'Upgrade',

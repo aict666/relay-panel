@@ -1,6 +1,6 @@
  
 import { Table, Tag, Typography, Button, Tooltip } from 'antd';
-import { CloudDownloadOutlined, CheckCircleOutlined } from '@ant-design/icons';
+import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined } from '@ant-design/icons';
 import type { Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { NodeResourceBar, NodeDiskBar } from './NodeResourceBar';
@@ -52,9 +52,22 @@ export function NodeDesktopTable({ rows, panelProtocol, currentVersion, t, openD
     ...(onUpgrade ? [{
       title: t('nodeUpgrade'), key: 'upgrade', width: 72,
       render: (_: unknown, r: NodeDisplayRow) => {
-        if (!r.node_id || !r.node_version) return <Typography.Text type="secondary">-</Typography.Text>;
-        if (versionRelation(r.node_version, currentVersion) !== 'behind') {
+        if (!r.node_id) return <Typography.Text type="secondary">-</Typography.Text>;
+        const rel = versionRelation(r.node_version, currentVersion);
+        // Version unknown/unparseable (incl. panel version fetch failed) → neutral
+        // placeholder, never a green "up to date" we can't actually vouch for.
+        if (rel === 'unknown') return <Typography.Text type="secondary">-</Typography.Text>;
+        // same / ahead → up to date.
+        if (rel !== 'behind') {
           return <Tooltip title={t('nodeUpgradeLatest')}><CheckCircleOutlined style={{ color: '#52c41a' }} /></Tooltip>;
+        }
+        // Behind → the offer depends on how the node is installed.
+        if (r.install_method === 'docker') {
+          return <Tooltip title={t('nodeUpgradeDocker')}><CloudServerOutlined style={{ color: '#faad14' }} /></Tooltip>;
+        }
+        if (r.install_method !== 'systemd') {
+          // manual run or unknown install method — no supervisor to restart it.
+          return <Tooltip title={t('nodeUpgradeManual')}><CloudDownloadOutlined style={{ color: '#bfbfbf' }} /></Tooltip>;
         }
         return (
           <Tooltip title={r.online ? t('nodeUpgradeTip').replace('{v}', currentVersion) : t('offline')}>
