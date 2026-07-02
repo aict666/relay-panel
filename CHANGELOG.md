@@ -5,6 +5,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.0] - 2026-07-02
+
+Minor release headlined by **one-click remote node upgrades** from the panel,
+capping off the plan-model / performance / correctness work of the 1.0.x line.
+
+### Added
+
+- **One-click node upgrade.** The Node Status page shows a per-node upgrade
+  action (active when a node is behind the panel version). Clicking it directs
+  that node to self-update: it downloads the panel's exact version from the
+  official GitHub release for its architecture, verifies the published sha256,
+  backs up its current binary, atomically swaps, and restarts (systemd). Safety:
+  - The command carries no URL/binary — the node only pulls the official release
+    and verifies the hash, so it can never be made to run arbitrary code.
+  - **Upgrade-only:** the target must be a valid semver strictly newer than the
+    running version, so a compromised panel can't force a downgrade to an old,
+    vulnerable build.
+  - **Install-aware:** only systemd nodes self-upgrade; docker nodes show
+    "update the image", and manual runs are disabled (nothing would restart
+    them). Nodes report their install method for this.
+  - Single-flight + mandatory backup, so repeated clicks can't corrupt the
+    binary and a failed backup aborts the swap.
+- Node binaries continue to ship for both **amd64 and arm64** (static musl).
+
+### Fixed
+
+- Shop plan cards no longer render ragged when a plan grants no lines — the
+  "granted lines" row now shows "无 / None" so all cards stay aligned.
+
+---
+
 ## [1.0.9] - 2026-07-02
 
 Finalizes the plan model to a **single current plan** (renew vs. switch), a
