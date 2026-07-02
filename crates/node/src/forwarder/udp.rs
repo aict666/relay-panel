@@ -33,18 +33,10 @@ const UDP_BUF_SIZE: usize = 65535;
 /// shared UDP_SESSION_TIMEOUT; this just controls how quickly an idle node
 // converges back to 0 in the absence of new datagrams.
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
-/// v1.0.9: how often (per session) we refresh the node-wide ConnectionTracker.
-/// `udp_touch` takes a process-wide lock, so touching it on EVERY datagram
-/// dominates cost at high PPS. We touch on session open and then at most once
-/// per this interval — kept well under UDP_SESSION_TIMEOUT (60s) so the tracker
-/// entry never expires between touches while the session is active.
-const TRACKER_TOUCH_INTERVAL: Duration = Duration::from_secs(15);
 
 struct UdpSession {
     outbound: Arc<UdpSocket>,
     last_active: tokio::time::Instant,
-    /// Last time we refreshed the node-wide tracker for this session (throttle).
-    last_touch: tokio::time::Instant,
 }
 
 /// v1.0.4: serve an ALREADY-BOUND UDP socket. Binding happens in the manager
@@ -125,7 +117,9 @@ pub async fn serve_udp_listener(
             // them; here we release the socket resources too.
             let before = sessions_clone.len();
             sessions_clone.retain(|_, s| s.last_active.elapsed() < UDP_SESSION_TIMEOUT);
-            let removed = before - sessions_clone.len();
+            // saturating: len() is read across shards without a global lock, so a
+            // concurrent insert between the two reads must not underflow usize.
+            let removed = before.saturating_sub(sessions_clone.len());
             if removed > 0 {
                 tracing::debug!(
                     "UDP port {}: cleaned up {} expired outbound sockets",
@@ -157,25 +151,21 @@ pub async fn serve_udp_listener(
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
         };
 
-        // Pick or refresh this client's session. v1.0.9: the session map is a
-        // sharded DashMap, so this per-packet lookup takes only a per-shard lock
-        // (sync — the guard is dropped before any .await). We ALSO throttle the
-        // node-wide ConnectionTracker refresh here (see TRACKER_TOUCH_INTERVAL)
-        // so it isn't hit on every datagram.
-        let hit = sessions.get_mut(&src).map(|mut s| {
-            let now = tokio::time::Instant::now();
-            s.last_active = now;
-            let touch = s.last_touch.elapsed() >= TRACKER_TOUCH_INTERVAL;
-            if touch {
-                s.last_touch = now;
-            }
-            (s.outbound.clone(), touch)
+        // Register/refresh this client with the tracker on EVERY datagram. The
+        // tracker is a sharded DashMap (keyed by client+rule), so this is a cheap
+        // per-shard op — not a process-wide lock — and keeps the panel's count
+        // accurate without any throttling.
+        connections.udp_touch(src, rule_id).await;
+
+        // Fast path: existing session. The session map is a sharded DashMap, so
+        // this per-packet lookup takes only a per-shard lock (sync guard, dropped
+        // before any .await).
+        let existing = sessions.get_mut(&src).map(|mut s| {
+            s.last_active = tokio::time::Instant::now();
+            s.outbound.clone()
         });
 
-        let outbound_sock = if let Some((sock, touch)) = hit {
-            if touch {
-                connections.udp_touch(src, rule_id).await;
-            }
+        let outbound_sock = if let Some(sock) = existing {
             sock
         } else {
             // New session: bind an ephemeral outbound socket + pick/connect the
@@ -227,15 +217,14 @@ pub async fn serve_udp_listener(
                     e.insert(UdpSession {
                         outbound: outbound.clone(),
                         last_active: now,
-                        last_touch: now,
                     });
                     (outbound.clone(), true)
                 }
             };
 
             if we_won {
-                // First datagram from this client → register it with the tracker.
-                connections.udp_touch(src, rule_id).await;
+                // The tracker was already refreshed at the top of the loop; just
+                // log the new session (the target is known only on this path).
                 tracing::debug!(
                     "UDP port {}: new session {} -> {} (rule {})",
                     port,
@@ -262,24 +251,15 @@ pub async fn serve_udp_listener(
                                 // forwarding back to the client.
                                 rl_c.acquire_download(m as u64).await;
                                 counter_c.add(rule_id, 0, m as u64).await;
-                                // Refresh activity + (throttled) tracker touch.
-                                // The DashMap guard is dropped before the awaits.
-                                let touch = if let Some(mut s) = sessions_c.get_mut(&src_c) {
-                                    let now = tokio::time::Instant::now();
-                                    s.last_active = now;
-                                    let t = s.last_touch.elapsed() >= TRACKER_TOUCH_INTERVAL;
-                                    if t {
-                                        s.last_touch = now;
-                                    }
-                                    t
-                                } else {
-                                    false
-                                };
-                                if touch {
-                                    connections_c.udp_touch(src_c, rule_id).await;
-                                }
+                                // A reply is activity too: refresh the tracker
+                                // (cheap, sharded) and the session's last_active
+                                // so a long request/response flow isn't expired.
+                                connections_c.udp_touch(src_c, rule_id).await;
                                 if inbound_c.send_to(&rbuf[..m], src_c).await.is_err() {
                                     break;
+                                }
+                                if let Some(mut s) = sessions_c.get_mut(&src_c) {
+                                    s.last_active = tokio::time::Instant::now();
                                 }
                             }
                             Err(e) => {
