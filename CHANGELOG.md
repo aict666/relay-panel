@@ -23,9 +23,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   half-rule) and the side-tables always land on the right row. Existing
   port-conflict, `max_rules` quota and ownership checks are unchanged.
   (`create_rule_full` on the Repository trait, used by `create_rule`.)
+- **Every password input now enforces the backend's 8–72 UTF-8-byte rule.**
+  Previously MainLayout / Account change-password and the admin create-user form
+  used an antd `min: 6` *character* rule (UTF-16 code units, no upper bound),
+  while Register / ForcePasswordChange / admin-reset used a copy-pasted
+  TextEncoder byte check — so a 6-char password could be set via change-password
+  but never re-set via self-service, and a >72-byte password passed the client
+  only to be rejected by bcrypt. All six inputs now share one
+  `validatePassword` util (`frontend/src/utils/password.ts`) that counts UTF-8
+  bytes via `TextEncoder` (exactly matching `password.len()` in Rust), and the
+  zh/en hint text is unified to "8–72 bytes (UTF-8)".
 
 ### Security
 
+- **Security response headers are now set on every panel response** (API + the
+  static SPA): `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: strict-origin-when-cross-origin`, `X-Frame-Options: DENY`,
+  a strict `Content-Security-Policy` (`default-src 'self'`, `script-src 'self'`,
+  `object-src 'none'`, `base-uri 'self'`, `frame-ancestors 'none'`,
+  `form-action 'self'`), and a conservative `Permissions-Policy` (camera,
+  microphone, geolocation, USB, etc. disabled). `style-src` is widened to
+  `'self' 'unsafe-inline'` because Ant Design v6 injects runtime CSS-in-JS;
+  `script-src` stays strict (Vite's production build has no inline scripts).
+  HSTS is intentionally NOT set by the panel — it belongs to the HTTPS / reverse
+  proxy layer (Caddy). Each header is `if_not_present`, so a stricter header set
+  by an edge proxy is preserved.
 - Pinned by regression test: a freshly-registered user has **no usable device
   groups** by design (`all_device_groups = false`, `user_device_groups` empty),
   so they cannot forward until a plan or admin grants authorization. Covered
