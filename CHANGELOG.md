@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The minimal share-export now has a regression test pinning its round-trip.**
+  The export format (`[{"dest":["host:port"],"listen_port":10000,"name":"…"}]`,
+  enabled targets only, IPv6 bracketed) and the import validation previously
+  lived as private functions inside `Rules.tsx`, so a future change could have
+  silently broken the "export pastes straight back into import" property. They
+  are extracted into a pure `frontend/src/utils/rulesIO.ts` module
+  (`buildExportJSON`, `validateImportEntry`, `parseDest`, `ruleTargets`) and
+  covered by `rulesIO.test.ts`, which asserts that a rule exported by
+  `buildExportJSON` always re-imports cleanly (every entry passes
+  `validateImportEntry`, and the parsed targets match the original enabled
+  targets) for single/multi target, IPv4/IPv6, disabled-target filtering, and
+  whitespace-trim cases. `Rules.tsx` now imports the shared helpers (removing
+  the duplicated dest regex).
+
 ### Fixed
 
 - **Creating a forward rule no longer cross-writes into a different rule when
@@ -33,6 +49,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `validatePassword` util (`frontend/src/utils/password.ts`) that counts UTF-8
   bytes via `TextEncoder` (exactly matching `password.len()` in Rust), and the
   zh/en hint text is unified to "8–72 bytes (UTF-8)".
+- **`validateImportEntry` now runtime-type-checks every field** of the pasted
+  JSON (it receives `unknown`, straight from `JSON.parse`). A malformed paste —
+  e.g. `{"name": 123, "listen_port": "80", "dest": "1.2.3.4:80"}`, a bare
+  primitive, `null`, or an array where an entry object was expected — now
+  produces a clean per-entry "❌" error in the import results instead of
+  throwing (`.trim is not a function`, etc.). `handleImport` likewise labels
+  non-object entries safely and only casts via the new `asValidatedEntry`
+  helper after validation. Covered by 9 new "anomalous input does not crash"
+  tests.
 
 ### Security
 
