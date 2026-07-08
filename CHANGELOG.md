@@ -192,7 +192,6 @@ independent `v*` / `node-v*` tracks since this release).
   so they cannot forward until a plan or admin grants authorization. Covered
   on both SQLite and PostgreSQL to guard against a future auto-grant-on-register
   change flipping this silently.
-
 ---
 
 ## [1.1.0] - 2026-07-02
