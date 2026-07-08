@@ -1,0 +1,324 @@
+name: Node Release
+
+# v1.2: panel and node release on INDEPENDENT tracks. This workflow is NODE-
+# ONLY and fires on `node-v*` tags. It builds the static (musl + rustls) node
+# binaries (amd64 + arm64), builds + pushes the node Docker image, creates the
+# node GitHub Release (body from CHANGELOG-NODE.md), and verifies the assets.
+# The panel image and panel Release are published by docker-release.yml on `v*`
+# tags. A node release never touches relay-panel-panel:* and a panel release
+# never touches relay-panel-node:*.
+
+on:
+  push:
+    tags:
+      - 'node-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Node version (e.g. 1.1.0), without node-v prefix'
+        required: true
+        default: '1.1.0'
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: x86_64-unknown-linux-musl
+            asset_name: relay-node-linux-amd64
+          - rust_target: aarch64-unknown-linux-musl
+            asset_name: relay-node-linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup target add ${{ matrix.rust_target }}
+
+      - name: Install musl tools (amd64)
+        if: matrix.rust_target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install aarch64 cross-compiler
+        if: matrix.rust_target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            musl-tools
+          # musl-tools provides musl-gcc for amd64; for arm64 we need the
+          # cross toolchain. Create a musl wrapper that uses the arm64 gcc.
+          sudo ln -sf /usr/bin/aarch64-linux-gnu-gcc /usr/bin/musl-gcc-aarch64 || true
+
+      - name: Build relay-node (static musl)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_musl: aarch64-linux-gnu-g++
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }} -p relay-node
+
+      - name: Rename binary
+        run: |
+          cp target/${{ matrix.rust_target }}/release/relay-node ${{ matrix.asset_name }}
+          chmod +x ${{ matrix.asset_name }}
+          file ${{ matrix.asset_name }}
+          ls -lh ${{ matrix.asset_name }}
+
+      - name: Generate SHA256 checksum
+        run: |
+          sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
+          echo "----- checksum -----"
+          cat ${{ matrix.asset_name }}.sha256
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            # Strip leading 'node-v' from tag name (node-v1.1.0 -> 1.1.0)
+            VERSION="${GITHUB_REF_NAME#node-v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=node-v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release body from CHANGELOG-NODE.md
+        id: body
+        run: |
+          # Extract ONLY this node version's section from the NODE changelog.
+          # The script exits non-zero if the section is missing or empty, which
+          # fails the job — we never publish a release with body=null.
+          if ! bash scripts/extract-changelog.sh "${{ steps.ver.outputs.version }}" CHANGELOG-NODE.md > RELEASE_BODY.md; then
+            echo "::error::No non-empty CHANGELOG-NODE.md section for ${{ steps.ver.outputs.version }} — refusing to publish an empty release body."
+            exit 1
+          fi
+          echo "----- release body preview -----"
+          cat RELEASE_BODY.md
+
+      # v1.2 (release gate): upload the binaries to the node-v* GitHub Release
+      # as a DRAFT. A draft is the only state that is truly INVISIBLE to
+      # unauthenticated callers: GitHub's public /releases list omits drafts, so
+      # a verification-failed draft node version can NEVER leak into the panel's
+      # latest_node_version (system.rs queries that same list) nor into the
+      # installer's resolve_node_version (relay-node-install.sh). A prerelease
+      # would NOT do that — the panel's ALLOW_PRERELEASE_UPDATES=true includes
+      # prereleases, and the installer doesn't filter them, so a failed prerelease
+      # would surface as an upgrade target / installable version before verify.
+      # The verify job (next) is authenticated (GH_TOKEN) so its gh release
+      # download CAN see the draft and pull the assets for sha256/version checks.
+      # Only after verify passes does publish-release publish it (draft:false,
+      # prerelease:false, make_latest:false).
+      - name: Upload to GitHub Release (DRAFT — hidden until verified)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.sha256
+          draft: true
+          name: ${{ steps.ver.outputs.tag }}
+          body_path: RELEASE_BODY.md
+
+  # Build + push the node Docker image, VERSION TAG ONLY (:X.Y.Z). The :latest
+  # tag is moved separately by `promote-latest` AFTER `verify` passes, so a
+  # release that fails verification never repoints :latest at a broken image.
+  # Separate job from build-and-upload so a binary-build failure doesn't block
+  # the image (and vice versa).
+  docker-node:
+    name: Build + push node image (:X.Y.Z)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#node-v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing NODE image version $VERSION (version tag only; :latest promoted after verify)"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # v1.2: NODE-ONLY. target: node selects the node stage of the Dockerfile
+      # (which now compiles only relay-node). The panel image is NOT built here.
+      # NOTE: only the explicit version tag is pushed here. :latest is moved by
+      # the `promote-latest` job after `verify` passes — a failed release must
+      # never repoint :latest at a broken image.
+      - name: Build and push node image (version tag only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: node
+          push: true
+          tags: ghcr.io/moeshinx/relay-panel-node:${{ steps.ver.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Post-release verification: download the amd64 asset, verify its checksum,
+  # confirm the binary reports the expected version, and confirm the pushed node
+  # image reports the expected version. Catches truncated uploads, wrong-arch
+  # binaries, and version/tag mismatches.
+  verify:
+    name: Verify release assets
+    needs: [build-and-upload, docker-node]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#node-v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=node-v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download + checksum-verify amd64 asset
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          gh release download "$TAG" --pattern "relay-node-linux-amd64*" --dir dl
+          cd dl
+          # Confirm the asset is intact (re-run the published sha256).
+          sha256sum -c relay-node-linux-amd64.sha256
+          # Confirm it's a valid ELF, not a truncated/HTML error page.
+          file relay-node-linux-amd64 | grep -q "ELF"
+          # Confirm the binary reports the expected node version.
+          chmod +x relay-node-linux-amd64
+          OUT=$(./relay-node-linux-amd64 --version 2>/dev/null || true)
+          echo "binary reports: $OUT"
+          echo "$OUT" | grep -q "${{ steps.ver.outputs.version }}" || { echo "::error::binary version does not match ${{ steps.ver.outputs.version }}"; exit 1; }
+
+      - name: Verify node Docker image version matches tag
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          # docker-node job finished before this one (needs:), but retry the
+          # pull a few times in case the registry is still propagating.
+          for i in 1 2 3 4 5; do
+            docker pull ghcr.io/moeshinx/relay-panel-node:"$VERSION" && break
+            echo "image not ready yet, retrying in 30s ($i/5)…"
+            sleep 30
+          done
+          OUT=$(docker run --rm ghcr.io/moeshinx/relay-panel-node:"$VERSION" --version)
+          echo "image reports: $OUT"
+          # The version constant is baked at compile time, so this catches a
+          # release built from a branch where Cargo.toml wasn't bumped.
+          echo "$OUT" | grep -q "$VERSION" || { echo "::error::image version does not match tag $VERSION"; exit 1; }
+
+  # v1.2 (release gate): promote :latest ONLY after verify passes. The previous
+  # shape pushed :X.Y.Z and :latest in one build-push step, so a release whose
+  # image reported the wrong version (or whose binary failed sha256) had ALREADY
+  # moved :latest at a broken image. Now :latest is re-tagged from the verified
+  # :X.Y.Z image, so a failed release can never repoint :latest.
+  promote-latest:
+    name: Promote :latest (after verify)
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#node-v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Re-tag the already-pushed, already-verified :X.Y.Z image as :latest via
+      # the registry API (CRAB /container/blobs — pull the manifest of :X.Y.Z
+      # and PUT it under :latest). Using `docker buildx imagetools` avoids a
+      # full re-pull/re-push and preserves the exact verified digest.
+      - name: Re-tag :X.Y.Z as :latest
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          IMAGE="ghcr.io/moeshinx/relay-panel-node"
+          echo "Promoting $IMAGE:$VERSION -> $IMAGE:latest (verified image)"
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
+          echo "::notice::Promoted $IMAGE:$VERSION to :latest after verify passed"
+
+  # v1.2 (release gate): publish the GitHub Release ONLY after verify +
+  # promote-latest pass. build-and-upload created it as a DRAFT (invisible to
+  # unauthenticated /releases callers, so it could never leak as an upgrade
+  # target or installer pick); this job flips it to a published stable release.
+  # make_latest is explicitly false: a node release must NOT take the repo's
+  # "Latest" pointer away from the panel (the README badge links there).
+  publish-release:
+    name: Publish GitHub Release (after verify)
+    needs: [verify, promote-latest]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#node-v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=node-v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # Publish the draft: draft:false + prerelease:false + make_latest:false.
+      # softprops/action-gh-release with the same tag_name edits the existing
+      # release in place (idempotent). Once published it becomes visible to the
+      # panel version check + the installer — but ONLY after verify passed.
+      - name: Publish node Release (draft:false, stable, not latest)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          draft: false
+          prerelease: false
+          make_latest: 'false'
+          # body_path is omitted here; build-and-upload already set the body
+          # from CHANGELOG-NODE.md when it created the prerelease.
+
