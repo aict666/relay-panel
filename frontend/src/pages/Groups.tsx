@@ -176,11 +176,10 @@ export default function Groups() {
     }
   };
 
-  // v1.0.4: create form only shows in/monitor (no out/egress).
-  // v1.0.9: the edit form uses the same set — outbound/egress groups are no
-  // longer offered anywhere in the UI.
+  // Chain intermediate/exit nodes use type `out` (egress/mid-hop).
   const groupTypeOptions = [
     { value: 'in', label: t('inboundListener') },
+    { value: 'out', label: t('outboundEgress') },
     { value: 'monitor', label: t('typeMonitor') },
   ];
 

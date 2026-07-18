@@ -196,6 +196,20 @@ CREATE TABLE IF NOT EXISTS forward_rule_targets (
 CREATE INDEX IF NOT EXISTS idx_forward_rule_targets_rule_position
     ON forward_rule_targets (rule_id, position);
 
+-- Multi-hop chain hops: position 0 = entry, last = exit.
+CREATE TABLE IF NOT EXISTS forward_rule_hops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    device_group_id INTEGER NOT NULL REFERENCES device_groups(id),
+    listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (rule_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_rule_id ON forward_rule_hops (rule_id);
+CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_group_port
+    ON forward_rule_hops (device_group_id, listen_port);
+
 CREATE TABLE IF NOT EXISTS statistics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     stat_type TEXT NOT NULL,
@@ -1403,6 +1417,33 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     )
     .await?;
     tracing::info!("Migration 38: forward_rules.max_connections + auto_restart_minutes present");
+
+    // ── Migration 39: multi-hop chain hops table ──
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS forward_rule_hops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL CHECK (position >= 0),
+            device_group_id INTEGER NOT NULL REFERENCES device_groups(id),
+            listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (rule_id, position)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_rule_id ON forward_rule_hops (rule_id)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_group_port \
+         ON forward_rule_hops (device_group_id, listen_port)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 39: forward_rule_hops table present");
 
     Ok(())
 }

@@ -428,7 +428,39 @@ pub trait RuleRepository: Send + Sync {
     async fn delete_rules_by_uid(&self, uid: i64) -> Result<u64, DbError>;
     /// List active rules for config build (the JOIN+filter query).
     /// This returns raw ForwardRule rows; config assembly is service-layer.
+    /// For multi-hop chain: returns rules whose **entry** is this group
+    /// (`device_group_in`), including chain entry hops. Intermediate/exit
+    /// placements are loaded via [`list_active_chain_hops_for_group`].
     async fn list_active_for_config(&self, group_id: i64) -> Result<Vec<ForwardRule>, DbError>;
+
+    /// Replace all hops for a chain rule (delete + insert in order).
+    /// `hops` is `(device_group_id, listen_port)` ordered by position 0..n-1.
+    async fn replace_rule_hops(
+        &self,
+        rule_id: i64,
+        hops: &[(i64, i32)],
+    ) -> Result<(), DbError>;
+
+    /// List hops for a rule ordered by position ascending.
+    async fn list_rule_hops(
+        &self,
+        rule_id: i64,
+    ) -> Result<Vec<relay_shared::models::ForwardRuleHop>, DbError>;
+
+    /// Active chain hop placements for this device group (any position).
+    /// Used when building node config so intermediate/exit groups receive
+    /// listeners. Includes the owning rule's user gating (banned/suspended/quota/expiry).
+    async fn list_active_chain_hops_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<relay_shared::models::ForwardRuleHop>, DbError>;
+
+    /// Look up a single hop's next sibling (position + 1) for a rule, if any.
+    async fn find_rule_hop_at(
+        &self,
+        rule_id: i64,
+        position: i32,
+    ) -> Result<Option<relay_shared::models::ForwardRuleHop>, DbError>;
 }
 
 // ── Group (device_groups) ──

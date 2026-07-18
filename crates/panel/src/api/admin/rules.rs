@@ -60,7 +60,13 @@ pub async fn create_rule(
                     return Json(err(500, "数据库错误"));
                 }
             };
-            if !allowed.contains(&req.device_group_in) {
+            // Chain: entry is hops[0] when provided; otherwise device_group_in.
+            let entry_gid = req
+                .hops
+                .as_ref()
+                .and_then(|h| h.first().copied())
+                .unwrap_or(req.device_group_in);
+            if !allowed.contains(&entry_gid) {
                 return Json(err(403, "device_group_in 不在您允许的分组列表中"));
             }
         }

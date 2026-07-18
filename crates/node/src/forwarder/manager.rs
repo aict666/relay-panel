@@ -501,6 +501,7 @@ impl ForwarderManager {
                     let cn = connections.clone();
                     let rid = rule_id;
                     let ipv4_src = src_ipv4;
+                    let count_traffic = listener.count_traffic;
                     // v1.2.0: both families get a gate cloned from the SAME
                     // RuleRuntime, so `max_connections` is a per-rule total
                     // rather than a per-family allowance.
@@ -522,7 +523,16 @@ impl ForwarderManager {
                         let v4_fut = async move {
                             if let Some(l) = v4_listener {
                                 tcp::serve_tcp_listener(
-                                    l, tgt4, sel4, rl4, ctr4, cn4, rid, ipv4_src, gate4,
+                                    l,
+                                    tgt4,
+                                    sel4,
+                                    rl4,
+                                    ctr4,
+                                    cn4,
+                                    rid,
+                                    ipv4_src,
+                                    gate4,
+                                    count_traffic,
                                 )
                                 .await
                             } else {
@@ -532,7 +542,16 @@ impl ForwarderManager {
                         let v6_fut = async move {
                             if let Some(l) = v6_listener {
                                 tcp::serve_tcp_listener(
-                                    l, tgt, sel, rl, ctr, cn, rid, ipv4_src, gate6,
+                                    l,
+                                    tgt,
+                                    sel,
+                                    rl,
+                                    ctr,
+                                    cn,
+                                    rid,
+                                    ipv4_src,
+                                    gate6,
+                                    count_traffic,
                                 )
                                 .await
                             } else {
@@ -611,6 +630,7 @@ impl ForwarderManager {
                     let cn = connections.clone();
                     let rid = rule_id;
                     let ipv4_src = src_ipv4;
+                    let count_traffic = listener.count_traffic;
                     tokio::spawn(async move {
                         type SrvResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
                         let (tgt4, sel4, rl4, ctr4, cn4) = (
@@ -623,7 +643,15 @@ impl ForwarderManager {
                         let v4_fut = async move {
                             if let Some(s) = v4_sock {
                                 udp::serve_udp_listener(
-                                    s, tgt4, sel4, rl4, ctr4, cn4, rid, ipv4_src,
+                                    s,
+                                    tgt4,
+                                    sel4,
+                                    rl4,
+                                    ctr4,
+                                    cn4,
+                                    rid,
+                                    ipv4_src,
+                                    count_traffic,
                                 )
                                 .await
                             } else {
@@ -632,8 +660,18 @@ impl ForwarderManager {
                         };
                         let v6_fut = async move {
                             if let Some(s) = v6_sock {
-                                udp::serve_udp_listener(s, tgt, sel, rl, ctr, cn, rid, ipv4_src)
-                                    .await
+                                udp::serve_udp_listener(
+                                    s,
+                                    tgt,
+                                    sel,
+                                    rl,
+                                    ctr,
+                                    cn,
+                                    rid,
+                                    ipv4_src,
+                                    count_traffic,
+                                )
+                                .await
                             } else {
                                 std::future::pending::<SrvResult>().await
                             }
@@ -872,6 +910,7 @@ mod tests {
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                count_traffic: true,
             }],
         }
     }
@@ -895,6 +934,7 @@ mod tests {
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                count_traffic: true,
             }],
         }
     }
@@ -1157,6 +1197,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 2,
@@ -1169,6 +1210,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
             ],
         };
@@ -1237,6 +1279,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 2,
@@ -1249,6 +1292,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
             ],
         };
@@ -1370,6 +1414,7 @@ mod tests {
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                count_traffic: true,
             }],
         };
         mgr.apply_config(&mk(LoadBalanceStrategy::First)).await;
@@ -1403,6 +1448,7 @@ mod tests {
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                count_traffic: true,
             }],
         };
         mgr.apply_config(&mk(NodeTransport::Raw)).await;
@@ -1466,6 +1512,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 2,
@@ -1478,6 +1525,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
             ],
         };
@@ -1499,6 +1547,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 2,
@@ -1511,6 +1560,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
             ],
         };
@@ -1777,6 +1827,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 1,
@@ -1789,6 +1840,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                count_traffic: true,
                 },
             ],
         };
@@ -1809,6 +1861,7 @@ mod tests {
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                count_traffic: true,
             }],
         };
         mgr.apply_config(&tcp_cfg).await;

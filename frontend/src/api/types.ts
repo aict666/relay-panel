@@ -46,6 +46,18 @@ export interface RuleTargetInput {
   enabled: boolean;
 }
 
+/** One hop in a multi-hop chain rule (position 0 = entry). */
+export interface ForwardRuleHop {
+  id: number;
+  rule_id: number;
+  position: number;
+  device_group_id: number;
+  listen_port: number;
+  created_at: string;
+  group_name?: string | null;
+  connect_host?: string | null;
+}
+
 export interface ForwardRule {
   id: number;
   name: string;
@@ -59,7 +71,7 @@ export interface ForwardRule {
   /** v0.4.0: the transport the node listens on (derived from public_transport).
    *  "raw" | "ws" | "tls_simple". The node never receives "wss". */
   node_transport?: string;
-  /** v0.4.0: forwarding topology. "direct" | "group". (v0.4.7: chain removed.) */
+  /** Forwarding topology. "direct" | "group" | "chain". */
   route_mode?: string;
   /** v0.4.0: WS path override for ws/wss rules. Null/undefined → the node uses
    *  its built-in default ("/relay"). Only meaningful for ws/wss. */
@@ -70,6 +82,8 @@ export interface ForwardRule {
   target_addr: string;
   target_port: number;
   targets?: ForwardRuleTarget[];
+  /** Multi-hop chain hops (ordered: entry first, exit last). Empty for direct. */
+  hops?: ForwardRuleHop[];
   /** v0.4.6: multi-target load-balancing strategy.
    *  "first" | "round_robin" | "failover". Defaults to "first". */
   load_balance_strategy?: string;

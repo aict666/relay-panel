@@ -245,8 +245,9 @@ def main():
         # 4b. WITH the header but wrong token → empty listeners (gate passes,
         #     token check returns empty). This confirms the gate is before the
         #     token check but both work.
+        # CONFIG_PROTOCOL_VERSION is 5 (multi-hop chain / count_traffic).
         with_auth = api("GET", "/node/config", token=in_g1_token,
-                        extra_headers={"X-Config-Protocol-Version": "4"})
+                        extra_headers={"X-Config-Protocol-Version": "5"})
         assert with_auth["listeners"] != [], \
             "config pull with valid header + token should return listeners"
         print("[ok] config pull with valid header + token returns listeners")

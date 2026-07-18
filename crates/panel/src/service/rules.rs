@@ -9,15 +9,13 @@
 use crate::db::error::DbError;
 use crate::db::repo::{GroupRepository, ProfileScope, Repository, ResourceScope};
 use relay_shared::protocol::{
-    CreateRuleRequest, GroupType, Protocol, PublicTransport, RuleTargetRequest, UpdateRuleRequest,
+    CreateRuleRequest, GroupType, Protocol, PublicTransport, RouteMode, RuleTargetRequest,
+    UpdateRuleRequest, CHAIN_HOPS_MAX, CHAIN_HOPS_MIN,
 };
 
-/// v0.4.20: forward_mode is locked to "direct" at the API boundary
-/// (create_rule / update_rule reject group/chain). This validator is retained
-/// for potential future re-enablement and for config-generation compatibility.
-#[allow(dead_code)]
+/// Accepted forward_mode values for create/update.
 pub fn validate_forward_mode(mode: &str) -> bool {
-    matches!(mode, "group" | "direct")
+    matches!(mode, "direct" | "chain")
 }
 
 /// Is `transport` accepted by the admin API in the current release?
@@ -304,6 +302,7 @@ async fn validate_admin_owned_inbound_group(
     }
 }
 
+#[allow(dead_code)] // retained for possible per-owner out-group checks later
 async fn validate_owner_outbound_group(
     db: &dyn Repository,
     gid_out: i64,
@@ -320,6 +319,97 @@ async fn validate_owner_outbound_group(
             Err(CreateRuleError::Database(e))
         }
     }
+}
+
+/// Validate chain hop group list. Returns normalized (entry, exit, hop ids).
+/// - length 2..=8, no duplicates
+/// - entry (first) must be admin-owned inbound
+/// - every hop after entry must exist, not monitor, non-empty connect_host
+async fn validate_chain_hops(
+    db: &dyn Repository,
+    hop_group_ids: &[i64],
+    context: &str,
+) -> Result<(), CreateRuleError> {
+    if hop_group_ids.len() < CHAIN_HOPS_MIN {
+        return Err(CreateRuleError::BadRequest(format!(
+            "hops: chain requires at least {} hops (entry + exit)",
+            CHAIN_HOPS_MIN
+        )));
+    }
+    if hop_group_ids.len() > CHAIN_HOPS_MAX {
+        return Err(CreateRuleError::BadRequest(format!(
+            "hops: at most {} hops allowed",
+            CHAIN_HOPS_MAX
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (i, &gid) in hop_group_ids.iter().enumerate() {
+        if !seen.insert(gid) {
+            return Err(CreateRuleError::BadRequest(format!(
+                "hops: duplicate device_group_id {} at position {}",
+                gid, i
+            )));
+        }
+        if i == 0 {
+            validate_admin_owned_inbound_group(db, gid, context).await?;
+            continue;
+        }
+        match GroupRepository::find_by_id(db, gid, &ResourceScope::All).await {
+            Ok(Some(g)) => {
+                if g.group_type == "monitor" {
+                    return Err(CreateRuleError::BadRequest(format!(
+                        "hops[{}]: monitor groups cannot be used as chain hops",
+                        i
+                    )));
+                }
+                if g.connect_host.trim().is_empty() {
+                    return Err(CreateRuleError::BadRequest(format!(
+                        "hops[{}]: group {} must have a non-empty connect_host (previous hop dials it)",
+                        i, gid
+                    )));
+                }
+            }
+            Ok(None) => {
+                return Err(CreateRuleError::BadRequest(format!(
+                    "hops[{}]: device group {} not found",
+                    i, gid
+                )));
+            }
+            Err(e) => {
+                tracing::error!("{}: hop find_by_id failed: {}", context, e);
+                return Err(CreateRuleError::Database(e));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Allocate listen ports for each hop. Entry uses `entry_listen_port`; later
+/// hops auto-assign from that group's free pool.
+async fn allocate_chain_hop_ports(
+    db: &dyn Repository,
+    hop_group_ids: &[i64],
+    entry_listen_port: u16,
+    protocol: &str,
+) -> Result<Vec<(i64, i32)>, CreateRuleError> {
+    let mut out = Vec::with_capacity(hop_group_ids.len());
+    for (i, &gid) in hop_group_ids.iter().enumerate() {
+        let port = if i == 0 {
+            entry_listen_port
+        } else {
+            match auto_assign_port(db, gid, protocol).await {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(CreateRuleError::BadRequest(format!(
+                        "hops[{}]: cannot allocate listen port on group {}: {}",
+                        i, gid, e
+                    )));
+                }
+            }
+        };
+        out.push((gid, port as i32));
+    }
+    Ok(out)
 }
 
 pub async fn create_rule(
@@ -352,33 +442,62 @@ pub async fn create_rule(
     }
 
     // The scope for validating referenced groups = the FINAL owner.
-    let owner_scope = ResourceScope::Owner(owner_uid);
+    let _owner_scope = ResourceScope::Owner(owner_uid);
 
-    // v0.4.20: only direct forward_mode is supported. Group/chain forwarding
-    // is no longer exposed in the UI and is rejected at the API boundary.
-    // Existing rules with group forwarding still generate valid config, but
-    // new rules must use direct.
-    if req.forward_mode != "direct" {
-        return Err(CreateRuleError::BadRequest(
-            "forward_mode: only 'direct' is supported; group/chain forwarding is no longer available"
-                .into(),
-        ));
-    }
-    if req.device_group_out.is_some() {
-        return Err(CreateRuleError::BadRequest(
-            "device_group_out: outbound-group forwarding is no longer supported; remove device_group_out"
-                .into(),
-        ));
-    }
+    // Resolve effective topology: chain via route_mode or forward_mode or hops.
+    let is_chain = matches!(req.route_mode, RouteMode::Chain)
+        || req.forward_mode == "chain"
+        || req.hops.as_ref().map(|h| !h.is_empty()).unwrap_or(false);
 
-    // v0.4.12 PR1: device_group_in MUST be an inbound group (`group_type='in'`)
-    // owned by an ADMIN.
-    validate_admin_owned_inbound_group(db, req.device_group_in, "create_rule").await?;
-
-    // Only validate device_group_out ownership (outbound is user-specific).
-    if let Some(gid_out) = req.device_group_out {
-        validate_owner_outbound_group(db, gid_out, &owner_scope, "create_rule").await?;
-    }
+    let (effective_device_group_in, effective_device_group_out, hop_group_ids, forward_mode, route_str) =
+        if is_chain {
+            let hops = req.hops.clone().unwrap_or_default();
+            if hops.is_empty() {
+                return Err(CreateRuleError::BadRequest(
+                    "hops: required for chain mode (ordered device_group ids, entry first)".into(),
+                ));
+            }
+            validate_chain_hops(db, &hops, "create_rule").await?;
+            // Allow device_group_in to be omitted/wrong if hops provided — hops[0] wins.
+            let entry = hops[0];
+            let exit = *hops.last().unwrap();
+            if req.device_group_in != 0 && req.device_group_in != entry {
+                // If client sent device_group_in, it must match hops[0].
+                return Err(CreateRuleError::BadRequest(
+                    "device_group_in must equal hops[0] (entry group) for chain rules".into(),
+                ));
+            }
+            (
+                entry,
+                Some(exit),
+                hops,
+                "chain".to_string(),
+                RouteMode::Chain.to_db_str(),
+            )
+        } else {
+            if !validate_forward_mode(&req.forward_mode) && req.forward_mode != "direct" {
+                // Accept default/group legacy by forcing direct.
+            }
+            if req.forward_mode == "group" {
+                return Err(CreateRuleError::BadRequest(
+                    "forward_mode 'group' is no longer supported; use 'direct' or 'chain'".into(),
+                ));
+            }
+            if req.device_group_out.is_some() {
+                return Err(CreateRuleError::BadRequest(
+                    "device_group_out: only used with chain mode (set via hops); omit for direct"
+                        .into(),
+                ));
+            }
+            validate_admin_owned_inbound_group(db, req.device_group_in, "create_rule").await?;
+            (
+                req.device_group_in,
+                None,
+                Vec::new(),
+                "direct".to_string(),
+                RouteMode::Direct.to_db_str(),
+            )
+        };
 
     if !is_public_transport_accepted(req.public_transport) {
         return Err(CreateRuleError::BadRequest(
@@ -461,7 +580,7 @@ pub async fn create_rule(
     let protocol_str = protocol_to_str(&req.protocol);
     let public_str = req.public_transport.to_db_str();
     let node_str = req.public_transport.derive_node_transport().to_db_str();
-    let route_str = req.route_mode.to_db_str();
+    // route_str / forward_mode already resolved above for chain vs direct.
     let ws_path: Option<String> = if req.public_transport == PublicTransport::Ws {
         req.ws_path
             .as_ref()
@@ -490,7 +609,7 @@ pub async fn create_rule(
     let result: Result<Option<i64>, DbError> = loop {
         let port = match last_port {
             Some(p) => p,
-            None => match auto_assign_port(db, req.device_group_in, protocol_str).await {
+            None => match auto_assign_port(db, effective_device_group_in, protocol_str).await {
                 Ok(p) => p,
                 // A full/unassignable range is a client-fixable condition, not a
                 // DB fault — surface the actionable message as a 400, not a
@@ -511,9 +630,9 @@ pub async fn create_rule(
                 route_str,
                 public_str,
                 ws_path.as_deref(),
-                req.device_group_in,
-                req.device_group_out,
-                &req.forward_mode,
+                effective_device_group_in,
+                effective_device_group_out,
+                &forward_mode,
                 &primary_target.host,
                 primary_target.port as i32,
                 &targets,
@@ -533,7 +652,7 @@ pub async fn create_rule(
                 tracing::debug!(
                     "create_rule: listen_port {} taken on group {}; retry {}",
                     port,
-                    req.device_group_in,
+                    effective_device_group_in,
                     attempt
                 );
                 continue;
@@ -552,7 +671,20 @@ pub async fn create_rule(
                 current_count, max_rules
             )))
         }
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(rule_id)) => {
+            if !hop_group_ids.is_empty() {
+                let entry_port = last_port.unwrap_or(0);
+                let hop_ports =
+                    allocate_chain_hop_ports(db, &hop_group_ids, entry_port, protocol_str).await?;
+                if let Err(e) = db.replace_rule_hops(rule_id, &hop_ports).await {
+                    // Best-effort cleanup so we don't leave a half-configured chain rule.
+                    let _ = db.delete_rule(rule_id, &ResourceScope::All).await;
+                    tracing::error!("create_rule: replace_rule_hops failed: {}", e);
+                    return Err(CreateRuleError::Database(e));
+                }
+            }
+            Ok(())
+        }
         Err(DbError::PortConflict | DbError::UniqueViolation) => {
             Err(CreateRuleError::PortConflict(last_port.unwrap_or(0)))
         }
@@ -577,20 +709,17 @@ pub async fn update_rule(
     scope: &ResourceScope,
     req: &UpdateRuleRequest,
 ) -> Result<(), UpdateRuleError> {
-    // v0.4.20: only direct forward_mode is supported.
     if let Some(ref mode) = req.forward_mode {
-        if mode != "direct" {
+        if mode == "group" {
             return Err(UpdateRuleError::BadRequest(
-                "forward_mode: only 'direct' is supported; group/chain forwarding is no longer available"
-                    .into(),
+                "forward_mode 'group' is no longer supported; use 'direct' or 'chain'".into(),
             ));
         }
-    }
-    if req.device_group_out.is_some() {
-        return Err(UpdateRuleError::BadRequest(
-            "device_group_out: outbound-group forwarding is no longer supported; remove device_group_out"
-                .into(),
-        ));
+        if !validate_forward_mode(mode) {
+            return Err(UpdateRuleError::BadRequest(
+                "forward_mode: only 'direct' or 'chain' is supported".into(),
+            ));
+        }
     }
 
     if let Some(ref transport) = req.public_transport {
@@ -610,15 +739,41 @@ pub async fn update_rule(
             return Err(UpdateRuleError::Database(e));
         }
     };
-    let owner_scope = ResourceScope::Owner(existing.uid);
+    let _owner_scope = ResourceScope::Owner(existing.uid);
+
+    // Effective topology after this update.
+    let becoming_chain = matches!(req.route_mode, Some(RouteMode::Chain))
+        || req.forward_mode.as_deref() == Some("chain")
+        || (req.hops.is_some() && existing.route_mode == "chain")
+        || (req.hops.is_some()
+            && req.route_mode.is_none()
+            && req.forward_mode.is_none()
+            && existing.route_mode == "chain");
+    let becoming_direct = matches!(req.route_mode, Some(RouteMode::Direct))
+        || req.forward_mode.as_deref() == Some("direct");
+
+    // device_group_out is derived from hops in chain mode — never set raw on
+    // direct rules (would hit FK or silently change topology).
+    if req.device_group_out.is_some() && req.hops.is_none() && !becoming_chain {
+        return Err(UpdateRuleError::BadRequest(
+            "device_group_out: only used with chain mode (set via hops); omit for direct".into(),
+        ));
+    }
+
+    if becoming_chain && !becoming_direct {
+        if let Some(ref hops) = req.hops {
+            validate_chain_hops(db, hops, "update_rule")
+                .await
+                .map_err(map_create_rule_validation_error)?;
+        } else if existing.route_mode != "chain" {
+            return Err(UpdateRuleError::BadRequest(
+                "hops: required when switching a rule to chain mode".into(),
+            ));
+        }
+    }
 
     if let Some(gid_in) = req.device_group_in {
         validate_admin_owned_inbound_group(db, gid_in, "update_rule")
-            .await
-            .map_err(map_create_rule_validation_error)?;
-    }
-    if let Some(gid_out) = req.device_group_out {
-        validate_owner_outbound_group(db, gid_out, &owner_scope, "update_rule")
             .await
             .map_err(map_create_rule_validation_error)?;
     }
@@ -647,12 +802,35 @@ pub async fn update_rule(
         }
     }
 
-    let switching_to_direct =
-        req.forward_mode.as_deref() == Some("direct") && req.device_group_out.is_none();
+    let switching_to_direct = becoming_direct && !becoming_chain;
     let device_group_out_arg: Option<Option<i64>> = if switching_to_direct {
         Some(None)
+    } else if let Some(ref hops) = req.hops {
+        hops.last().copied().map(Some)
     } else {
         req.device_group_out.map(Some)
+    };
+
+    // When hops are provided, entry group comes from hops[0].
+    let device_group_in_arg: Option<i64> = if let Some(ref hops) = req.hops {
+        hops.first().copied()
+    } else {
+        req.device_group_in
+    };
+
+    let route_mode_arg: Option<&str> = if becoming_chain && !switching_to_direct {
+        Some(RouteMode::Chain.to_db_str())
+    } else if switching_to_direct {
+        Some(RouteMode::Direct.to_db_str())
+    } else {
+        req.route_mode.as_ref().map(|r| r.to_db_str())
+    };
+    let forward_mode_arg: Option<&str> = if becoming_chain && !switching_to_direct {
+        Some("chain")
+    } else if switching_to_direct {
+        Some("direct")
+    } else {
+        req.forward_mode.as_deref()
     };
 
     let has_field = req.name.is_some()
@@ -664,6 +842,7 @@ pub async fn update_rule(
         || req.device_group_in.is_some()
         || req.device_group_out.is_some()
         || req.forward_mode.is_some()
+        || req.hops.is_some()
         || req.target_addr.is_some()
         || req.target_port.is_some()
         || req.targets.is_some()
@@ -686,6 +865,7 @@ pub async fn update_rule(
         || req.device_group_in.is_some()
         || req.device_group_out.is_some()
         || req.forward_mode.is_some()
+        || req.hops.is_some()
         || req.target_addr.is_some()
         || req.target_port.is_some()
         || req.paused.is_some();
@@ -841,11 +1021,11 @@ pub async fn update_rule(
             public,
             node,
             entry,
-            req.route_mode.as_ref().map(|r| r.to_db_str()),
+            route_mode_arg,
             ws_path,
-            req.device_group_in,
+            device_group_in_arg,
             device_group_out_arg,
-            req.forward_mode.as_deref(),
+            forward_mode_arg,
             req.target_addr.as_deref(),
             req.target_port.map(|p| p as i32),
             req.paused,
@@ -858,6 +1038,27 @@ pub async fn update_rule(
     match update_result {
         Ok(0) => Err(UpdateRuleError::NotFound),
         Ok(_) => {
+            if switching_to_direct {
+                // Clear hops when converting chain → direct.
+                if let Err(e) = db.replace_rule_hops(id, &[]).await {
+                    tracing::error!("update_rule {}: clear hops failed: {}", id, e);
+                    return Err(UpdateRuleError::Database(e));
+                }
+            } else if let Some(ref hop_gids) = req.hops {
+                let protocol_str = req
+                    .protocol
+                    .as_ref()
+                    .map(protocol_to_str)
+                    .unwrap_or(existing.protocol.as_str());
+                let entry_port = req.listen_port.unwrap_or(existing.listen_port as u16);
+                let hop_ports = allocate_chain_hop_ports(db, hop_gids, entry_port, protocol_str)
+                    .await
+                    .map_err(map_create_rule_validation_error)?;
+                if let Err(e) = db.replace_rule_hops(id, &hop_ports).await {
+                    tracing::error!("update_rule {}: replace_rule_hops failed: {}", id, e);
+                    return Err(UpdateRuleError::Database(e));
+                }
+            }
             if let Some(targets) = normalized_targets.as_ref() {
                 if let Err(e) = db.replace_rule_targets(id, scope, targets).await {
                     tracing::error!("update_rule {}: replace_rule_targets failed: {}", id, e);

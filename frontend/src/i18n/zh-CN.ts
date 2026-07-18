@@ -384,6 +384,14 @@ export const zhCN = {
   forwardMode: '转发方式',
   modeGroup: '出口分组转发',
   modeDirect: '入口直连目标',
+  modeChain: '转发链（多跳）',
+  chainHops: '转发链节点',
+  chainHopsHint: '按顺序选择：入口 → 中继… → 出口（至少 2 个分组）。中继/出口分组请使用类型「出口」，并填写 connect_host。',
+  addHop: '添加一跳',
+  hopEntry: '入口',
+  hopMid: '中继',
+  hopExit: '出口',
+  chainPath: '链路',
 
   // Protocol TCP+UDP
   tcpUdp: 'TCP + UDP',

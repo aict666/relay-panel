@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 /// wire fields from ListenerConfig. A v0.4.6 node still expects those fields,
 /// so deserialization would fail or misread — the gate forces a coordinated
 /// upgrade. Also adds node_transport to the listener fingerprint.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 4;
+/// v5 = multi-hop chain: `ListenerConfig.count_traffic` so intermediate/exit
+/// hops do not double-count billed bytes. Old nodes ignore the field and would
+/// over-count; the gate forces panel/node to upgrade together.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 5;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -186,11 +189,20 @@ pub struct ListenerConfig {
     /// `#[serde(default)]` so a v1.1.x node still deserializes a v1.2 config.
     #[serde(default)]
     pub max_connections: Option<u32>,
+    /// When false, the node still forwards but does NOT add bytes to the rule's
+    /// traffic counter. Used for multi-hop chain intermediate/exit hops so only
+    /// the entry hop bills once. Defaults to true (direct rules, entry hops).
+    #[serde(default = "default_true")]
+    pub count_traffic: bool,
     // v0.4.7: the placeholder `speed_limit` / `ip_limit` wire fields were
     // removed. They were always None and no node ever read them. The DB columns
     // on users/plans are kept (deprecated) to avoid a pointless migration, but
     // the ListenerConfig wire struct no longer carries them. CONFIG_PROTOCOL_VERSION
     // bumps 3→4 so a v0.4.6 node (which still expects these fields) is gated.
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// v0.4.6: convert a rule-level Mbps cap to bytes/sec for the node.
@@ -231,6 +243,19 @@ pub fn build_listeners_for_rule(
     rule: &crate::models::ForwardRule,
     targets: Vec<String>,
 ) -> Vec<ListenerConfig> {
+    build_listeners_for_rule_with(rule, targets, rule.listen_port as u16, true)
+}
+
+/// Like [`build_listeners_for_rule`], but allows overriding the listen port and
+/// whether this hop should bill traffic. Used by multi-hop chain config:
+/// intermediate/exit hops use their own `forward_rule_hops.listen_port` and
+/// `count_traffic=false` so only the entry hop is metered.
+pub fn build_listeners_for_rule_with(
+    rule: &crate::models::ForwardRule,
+    targets: Vec<String>,
+    listen_port: u16,
+    count_traffic: bool,
+) -> Vec<ListenerConfig> {
     // v0.4.0: the node transport is read DIRECTLY from the rule's stored
     // `node_transport` column. The panel derives this from `public_transport`
     // at rule create/update time (identity for raw/ws, tls_simple for tls_simple), so
@@ -242,7 +267,7 @@ pub fn build_listeners_for_rule(
         .into_iter()
         .map(|proto| ListenerConfig {
             rule_id: rule.id,
-            port: rule.listen_port as u16,
+            port: listen_port,
             protocol: proto,
             node_transport: transport,
             // Per-rule WS path override; None → node uses its built-in "/relay".
@@ -255,16 +280,28 @@ pub fn build_listeners_for_rule(
             // applied to BOTH expanded listeners of a tcp_udp rule, and the node
             // shares one token bucket per (rule_id, direction) so the budget is
             // NOT doubled.
-            upload_limit_bps: mbps_to_bps(rule.upload_limit_mbps),
-            download_limit_bps: mbps_to_bps(rule.download_limit_mbps),
+            // Intermediate/exit hops (count_traffic=false) skip billing AND
+            // rate-limit / connection-cap so they don't fight the entry hop's
+            // shared rule_id limiter or double-enforce user quotas mid-chain.
+            upload_limit_bps: if count_traffic {
+                mbps_to_bps(rule.upload_limit_mbps)
+            } else {
+                None
+            },
+            download_limit_bps: if count_traffic {
+                mbps_to_bps(rule.download_limit_mbps)
+            } else {
+                None
+            },
             // v1.2.0: 0 / negative → no cap (None). Both expanded listeners of
             // a tcp_udp rule carry the value, but only the Tcp one enforces it
             // (UDP has no accept() to reject at); see ListenerConfig.
-            max_connections: if rule.max_connections > 0 {
+            max_connections: if count_traffic && rule.max_connections > 0 {
                 Some(rule.max_connections as u32)
             } else {
                 None
             },
+            count_traffic,
         })
         .collect()
 }
@@ -281,30 +318,27 @@ pub enum Protocol {
     TcpUdp,
 }
 
-/// Forwarding topology (v0.4.0). Orthogonal to protocol and transport.
+/// Forwarding topology (v0.4.0+). Orthogonal to protocol and transport.
 /// - `Direct` = inbound listener connects to target_addr:target_port directly.
-/// - `Group` = forward via the outbound device group's connect_host.
-///
-/// v0.4.7: `Chain` was removed (it was reserved/never implemented; the API
-/// rejected it and the node never read the field). Historical DB rows with
-/// `route_mode='chain'` are paused by the v0.4.7 migration rather than
-/// silently reinterpreted.
+/// - `Group` = legacy outbound-group dial (kept for old rows; new creates use
+///   Direct or Chain).
+/// - `Chain` = multi-hop: entry → intermediate… → exit → final targets.
+///   Hop membership lives in `forward_rule_hops`.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteMode {
     #[default]
     Direct,
     Group,
+    Chain,
 }
 
 impl RouteMode {
     /// Parse the stored DB string. Unknown/empty → Direct (safe default).
-    /// Note: a stored `"chain"` value (left over from pre-v0.4.7) also maps to
-    /// Direct here — the migration pauses such rules, so this only matters for
-    /// rows the migration didn't touch.
     pub fn from_db_str(s: &str) -> Self {
         match s {
             "group" => RouteMode::Group,
+            "chain" => RouteMode::Chain,
             _ => RouteMode::Direct,
         }
     }
@@ -313,9 +347,14 @@ impl RouteMode {
         match self {
             RouteMode::Direct => "direct",
             RouteMode::Group => "group",
+            RouteMode::Chain => "chain",
         }
     }
 }
+
+/// Minimum / maximum hop count for a chain rule (entry + exit = 2).
+pub const CHAIN_HOPS_MIN: usize = 2;
+pub const CHAIN_HOPS_MAX: usize = 8;
 
 /// Multi-target load-balancing strategy (v0.4.6). Decides how the node picks
 /// among a rule's enabled targets for each new connection / UDP session.
@@ -840,10 +879,13 @@ pub struct CreateRuleRequest {
     /// connects to target_addr:target_port directly.
     #[serde(default = "default_forward_mode")]
     pub forward_mode: String,
-    /// v0.4.0: forwarding topology. Defaults to Direct. The panel accepts
-    /// direct/group; chain is rejected (node engine not implemented).
+    /// v0.4.0: forwarding topology. Defaults to Direct. Chain requires `hops`.
     #[serde(default)]
     pub route_mode: RouteMode,
+    /// Ordered device_group ids for chain mode: index 0 = entry, last = exit.
+    /// Required when `route_mode=chain` (length 2..=8). Ignored for direct.
+    #[serde(default)]
+    pub hops: Option<Vec<i64>>,
     /// v0.4.0: user-facing ingress transport. Defaults to Raw. The panel
     /// derives `node_transport` from this (identity for raw/ws) and
     /// stores both. Replaces the v0.3.x `entry_transport` field.
@@ -893,6 +935,10 @@ pub struct UpdateRuleRequest {
     /// v0.4.0: forwarding topology. Some(value) updates; omitted keeps current.
     #[serde(default)]
     pub route_mode: Option<RouteMode>,
+    /// Replace the chain hop list (ordered device_group ids). Only meaningful
+    /// when the effective route_mode is Chain. Omitted keeps current hops.
+    #[serde(default)]
+    pub hops: Option<Vec<i64>>,
     /// v0.4.0: user-facing ingress transport. Some(value) updates (and
     /// re-derives node_transport); omitted keeps current. Replaces the v0.3.x
     /// `entry_transport` field.
@@ -1209,11 +1255,10 @@ mod tests {
     fn route_mode_from_db_str_known_values() {
         assert_eq!(RouteMode::from_db_str("direct"), RouteMode::Direct);
         assert_eq!(RouteMode::from_db_str("group"), RouteMode::Group);
-        // v0.4.7: chain was removed; a stale "chain" row maps to Direct (the
-        // migration pauses such rules, so this only governs unmigrated rows).
-        assert_eq!(RouteMode::from_db_str("chain"), RouteMode::Direct);
+        assert_eq!(RouteMode::from_db_str("chain"), RouteMode::Chain);
         assert_eq!(RouteMode::from_db_str(""), RouteMode::Direct);
         assert_eq!(RouteMode::from_db_str("unknown"), RouteMode::Direct);
+        assert_eq!(RouteMode::Chain.to_db_str(), "chain");
     }
 
     // ── build_listeners_for_rule / expand_protocols ──
@@ -1247,6 +1292,7 @@ mod tests {
             target_addr: "127.0.0.1".into(),
             target_port: 53,
             targets: Vec::new(),
+            hops: Vec::new(),
             load_balance_strategy: "first".into(),
             upload_limit_mbps: 0,
             download_limit_mbps: 0,

@@ -30,28 +30,24 @@ use relay_shared::protocol::NodeConfigResponse;
 /// This is the ONE function both `get_config` (HTTP) and `build_config_snapshot`
 /// (WS) call. It performs, in order:
 ///
-/// 1. Group lookup + "only `in` groups receive listeners" gate.
-/// 2. Rule query with the unified filter:
-///    - `device_group_in` matches the group
-///    - `paused = 0`
-///    - owning user `banned = 0`
-///    - quota: `traffic_limit = 0` (unlimited) OR `traffic_used < traffic_limit`
-/// 3. Per-rule target resolution (direct addr vs outbound group connect_host).
-/// 4. [`relay_shared::protocol::build_listeners_for_rule`] for protocol
-///    expansion + transport derivation + ws_path passthrough.
+/// 1. Group lookup — `monitor` groups never forward; `in`/`out` (and other
+///    non-monitor) groups can receive listeners.
+/// 2. Direct rules + chain **entry** hops via `device_group_in` match.
+/// 3. Chain intermediate/exit hops via `forward_rule_hops` for this group.
+/// 4. Target resolution (final targets or next-hop connect_host:port).
+/// 5. [`relay_shared::protocol::build_listeners_for_rule_with`] for protocol
+///    expansion; intermediate hops set `count_traffic=false`.
 ///
-/// Returns `Ok(empty)` only for a legitimate empty state (non-`in` group, or an
-/// `in` group with no matching rules). A DB error is `Err`.
+/// Returns `Ok(empty)` only for a legitimate empty state. A DB error is `Err`.
 pub async fn build_node_config(
     db: &dyn Repository,
     group_id: i64,
 ) -> Result<NodeConfigResponse, DbError> {
-    // 1. Group + "in" gate. Non-`in` groups (out / monitor / chained_outbound)
-    //    never receive listeners — they are egress/observation only.
-    // find_by_id exists on both UserRepository and GroupRepository; we want the
-    // group one, so qualify the call.
+    // 1. Group gate. `monitor` groups never forward. `in` groups get direct +
+    //    chain-entry listeners; `out` (and any other non-monitor) groups get
+    //    chain intermediate/exit hop listeners when referenced by hops.
     let group = match GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await? {
-        Some(g) if g.group_type == "in" => g,
+        Some(g) if g.group_type != "monitor" => g,
         _ => return Ok(NodeConfigResponse { listeners: vec![] }),
     };
 
@@ -73,49 +69,40 @@ pub async fn build_node_config(
     //    drift between paths.
     let mut listeners = Vec::new();
     for rule in &rules {
-        // v0.4.7: if the rule is bound to a tunnel profile, the profile is the
-        // source of transport config (node_transport + ws_path). We resolve it
-        // here and override the rule's stored columns for this build only — the
-        // DB row is NOT rewritten. A NULL/missing profile falls back to the
-        // rule's own public_transport/ws_path (legacy behavior, zero break).
-        //
-        // If a bound profile no longer exists (deleted out from under the rule,
-        // or a stale FK), we skip the rule's listeners rather than emit a
-        // half-resolved config. The admin sees no listener for that rule.
-        let mut effective_rule = rule.clone();
-        if let Some(pid) = rule.tunnel_profile_id {
-            // v0.4.10: profile lookup here is a system-internal config build (no
-            // user context), so it uses ProfileScope::All to resolve the real
-            // binding. The dirty-data migration + list_active_for_config filter
-            // (this PR) ensure a regular user's rule can't reach this point bound
-            // to a non-builtin profile.
-            match TunnelProfileRepository::find_profile_by_id(db, pid, &ProfileScope::All).await? {
-                Some(profile) => {
-                    // Profile transport vocab: "direct" → node "raw"; "ws" → "ws";
-                    // "tls_simple" → "tls_simple".
-                    let node_transport = match profile.transport.as_str() {
-                        "direct" => "raw",
-                        "ws" => "ws",
-                        "tls_simple" => "tls_simple",
-                        other => other,
-                    };
-                    effective_rule.node_transport = node_transport.to_string();
-                    effective_rule.ws_path = if profile.transport == "ws" {
-                        Some(profile.ws_path.clone())
-                    } else {
-                        None
-                    };
-                }
-                None => {
-                    tracing::warn!(
-                        "rule {} bound to missing tunnel_profile_id {}; skipping (rebind or pause the rule)",
-                        rule.id,
-                        pid
-                    );
-                    continue;
-                }
+        let Some(effective_rule) = apply_tunnel_profile(db, rule).await? else {
+            continue;
+        };
+
+        if rule.route_mode == "chain" {
+            // Entry hop (position 0) for chain rules whose device_group_in is
+            // this group. Intermediate/exit hops are emitted below via
+            // list_active_chain_hops_for_group (position > 0 only here).
+            let hops = db.list_rule_hops(rule.id).await?;
+            if hops.is_empty() {
+                tracing::warn!(
+                    "chain rule {} has no hops; skipping listeners",
+                    rule.id
+                );
+                continue;
             }
+            let entry = &hops[0];
+            if entry.device_group_id != group.id {
+                // Stale device_group_in vs hops[0] — skip rather than misroute.
+                continue;
+            }
+            let targets = match chain_hop_targets(db, rule, &hops, 0).await? {
+                Some(t) => t,
+                None => continue,
+            };
+            listeners.extend(relay_shared::protocol::build_listeners_for_rule_with(
+                &effective_rule,
+                targets,
+                entry.listen_port as u16,
+                true, // entry bills traffic
+            ));
+            continue;
         }
+
         let targets = resolve_targets(db, rule).await?;
         listeners.extend(relay_shared::protocol::build_listeners_for_rule(
             &effective_rule,
@@ -123,7 +110,135 @@ pub async fn build_node_config(
         ));
     }
 
+    // 5. Chain intermediate / exit hops on this group (position > 0).
+    // Entry is already handled above via list_active_for_config.
+    let chain_hops = db.list_active_chain_hops_for_group(group.id).await?;
+    for hop in chain_hops {
+        if hop.position <= 0 {
+            continue; // entry emitted via device_group_in path
+        }
+        let Some(rule) = db
+            .find_rule_by_id(hop.rule_id, &ResourceScope::All)
+            .await?
+        else {
+            continue;
+        };
+        // find_rule_by_id does not re-check user gating; hop query already did.
+        if rule.paused || rule.route_mode != "chain" {
+            continue;
+        }
+        let Some(effective_rule) = apply_tunnel_profile(db, &rule).await? else {
+            continue;
+        };
+        let hops = db.list_rule_hops(rule.id).await?;
+        let targets = match chain_hop_targets(db, &rule, &hops, hop.position).await? {
+            Some(t) => t,
+            None => continue,
+        };
+        listeners.extend(relay_shared::protocol::build_listeners_for_rule_with(
+            &effective_rule,
+            targets,
+            hop.listen_port as u16,
+            false, // only entry bills
+        ));
+    }
+
     Ok(NodeConfigResponse { listeners })
+}
+
+/// Apply tunnel profile overrides onto a cloned rule, or None to skip the rule.
+async fn apply_tunnel_profile(
+    db: &dyn Repository,
+    rule: &ForwardRule,
+) -> Result<Option<ForwardRule>, DbError> {
+    let mut effective_rule = rule.clone();
+    if let Some(pid) = rule.tunnel_profile_id {
+        match TunnelProfileRepository::find_profile_by_id(db, pid, &ProfileScope::All).await? {
+            Some(profile) => {
+                let node_transport = match profile.transport.as_str() {
+                    "direct" => "raw",
+                    "ws" => "ws",
+                    "tls_simple" => "tls_simple",
+                    other => other,
+                };
+                effective_rule.node_transport = node_transport.to_string();
+                effective_rule.ws_path = if profile.transport == "ws" {
+                    Some(profile.ws_path.clone())
+                } else {
+                    None
+                };
+            }
+            None => {
+                tracing::warn!(
+                    "rule {} bound to missing tunnel_profile_id {}; skipping (rebind or pause the rule)",
+                    rule.id,
+                    pid
+                );
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(effective_rule))
+}
+
+/// Resolve dial targets for a chain hop at `position`.
+/// Non-last → next hop's connect_host:listen_port.
+/// Last → final rule targets.
+async fn chain_hop_targets(
+    db: &dyn Repository,
+    rule: &ForwardRule,
+    hops: &[relay_shared::models::ForwardRuleHop],
+    position: i32,
+) -> Result<Option<Vec<String>>, DbError> {
+    let pos = position as usize;
+    if pos >= hops.len() {
+        return Ok(None);
+    }
+    if pos + 1 < hops.len() {
+        let next = &hops[pos + 1];
+        let next_group =
+            GroupRepository::find_by_id(db, next.device_group_id, &ResourceScope::All).await?;
+        let host = match next_group {
+            Some(g) if !g.connect_host.is_empty() => g.connect_host,
+            _ => {
+                tracing::warn!(
+                    "chain rule {} hop {} next group {} missing connect_host; skipping",
+                    rule.id,
+                    position,
+                    next.device_group_id
+                );
+                return Ok(None);
+            }
+        };
+        Ok(Some(vec![format!("{}:{}", host, next.listen_port)]))
+    } else {
+        // Exit hop → final targets.
+        Ok(Some(resolve_final_targets(db, rule).await?))
+    }
+}
+
+async fn resolve_final_targets(
+    db: &dyn Repository,
+    rule: &ForwardRule,
+) -> Result<Vec<String>, DbError> {
+    let mut targets = db
+        .list_enabled_rule_targets(rule.id, &ResourceScope::All)
+        .await?;
+    if targets.is_empty() {
+        targets.push(relay_shared::models::ForwardRuleTarget {
+            id: 0,
+            rule_id: rule.id,
+            host: rule.target_addr.clone(),
+            port: rule.target_port,
+            position: 1,
+            enabled: true,
+            created_at: String::new(),
+        });
+    }
+    Ok(targets
+        .into_iter()
+        .map(|t| format!("{}:{}", t.host, t.port))
+        .collect())
 }
 
 /// Resolve a rule's target address list.
@@ -305,16 +420,67 @@ mod tests {
         assert!(cfg.listeners.is_empty(), "paused rule must be filtered");
     }
 
-    /// Non-`in` groups (out/monitor/chained_outbound) never receive listeners.
+    /// Monitor groups never receive listeners (observation only).
     #[tokio::test]
-    async fn non_in_group_yields_no_listeners() {
+    async fn monitor_group_yields_no_listeners() {
         let pool = pool().await;
         add_user(&pool, 2).await;
-        add_group(&pool, 10, "out", 2).await;
+        add_group(&pool, 10, "monitor", 2).await;
         add_rule(&pool, 100, 2, 10, 20000).await;
 
         let cfg = build_node_config(&repo(&pool), 10).await.unwrap();
         assert!(cfg.listeners.is_empty());
+    }
+
+    /// Multi-hop chain: entry emits next-hop target; exit emits final targets;
+    /// only entry has count_traffic=true.
+    #[tokio::test]
+    async fn chain_rule_entry_and_exit_listeners() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        // Entry + exit groups; exit needs connect_host for previous hop to dial.
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (10, 'entry', 'in', 'tok-10', 2, '1.1.1.1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (20, 'exit', 'out', 'tok-20', 2, '2.2.2.2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, device_group_in, device_group_out, forward_mode, \
+              route_mode, target_addr, target_port) \
+             VALUES (100, 'chain', 2, 20000, 10, 20, 'chain', 'chain', '9.9.9.9', 443)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops (rule_id, position, device_group_id, listen_port) \
+             VALUES (100, 0, 10, 20000), (100, 1, 20, 30000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let entry_cfg = build_node_config(&repo(&pool), 10).await.unwrap();
+        assert_eq!(entry_cfg.listeners.len(), 1);
+        assert_eq!(entry_cfg.listeners[0].port, 20000);
+        assert_eq!(entry_cfg.listeners[0].targets, vec!["2.2.2.2:30000".to_string()]);
+        assert!(entry_cfg.listeners[0].count_traffic);
+
+        let exit_cfg = build_node_config(&repo(&pool), 20).await.unwrap();
+        assert_eq!(exit_cfg.listeners.len(), 1);
+        assert_eq!(exit_cfg.listeners[0].port, 30000);
+        assert_eq!(exit_cfg.listeners[0].targets, vec!["9.9.9.9:443".to_string()]);
+        assert!(!exit_cfg.listeners[0].count_traffic);
     }
 
     /// traffic_limit = 0 means unlimited — never filtered by quota even if

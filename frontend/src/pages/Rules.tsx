@@ -201,6 +201,8 @@ export default function Rules() {
     ws_path?: string;
     device_group_in: number; device_group_out: number | null;
     forward_mode: string;
+    route_mode?: string;
+    hops?: number[];
     target_addr?: string; target_port?: number; targets?: RuleTargetInput[];
     load_balance_strategy?: string;
     upload_limit_mbps?: number;
@@ -209,12 +211,16 @@ export default function Rules() {
     owner_uid?: number | null;
   }) => {
     // v0.4.20: WS/TLS tunnel hidden — always raw, no profile.
-    // v0.4.20: forward_mode always direct, no outbound group.
-    // v0.4.20: owner determined by entry point (filterOwnerUid from URL).
+    // owner determined by entry point (filterOwnerUid from URL).
     const owner_uid = filterOwnerUid ?? undefined;
-    // v0.4.20: reject empty targets before payload generation.
     if (formTargets(values).length < 1) {
       message.error(t('targetRequired'));
+      return;
+    }
+    const isChain = values.route_mode === 'chain' || values.forward_mode === 'chain';
+    const hops = (values.hops ?? []).filter((id): id is number => typeof id === 'number' && id > 0);
+    if (isChain && hops.length < 2) {
+      message.error(t('chainHopsHint'));
       return;
     }
     const payload = payloadWithTargets({
@@ -222,9 +228,11 @@ export default function Rules() {
       listen_port: values.listen_port || null,
       public_transport: 'raw',
       tunnel_profile_id: null,
-      forward_mode: 'direct',
-      route_mode: 'direct',
-      device_group_out: null,
+      forward_mode: isChain ? 'chain' : 'direct',
+      route_mode: isChain ? 'chain' : 'direct',
+      device_group_in: isChain ? hops[0] : values.device_group_in,
+      device_group_out: isChain ? hops[hops.length - 1] : null,
+      hops: isChain ? hops : undefined,
       owner_uid,
     });
     try {
@@ -239,9 +247,15 @@ export default function Rules() {
 
   const handleEdit = (r: ForwardRule) => {
     setEditing(r);
+    const isChain = r.route_mode === 'chain' || r.forward_mode === 'chain';
     editForm.setFieldsValue({
       name: r.name, listen_port: r.listen_port, protocol: r.protocol,
       device_group_in: r.device_group_in,
+      route_mode: isChain ? 'chain' : 'direct',
+      forward_mode: isChain ? 'chain' : 'direct',
+      hops: isChain && r.hops?.length
+        ? r.hops.map(h => h.device_group_id)
+        : isChain ? [r.device_group_in, r.device_group_out].filter((x): x is number => !!x) : [],
       target_addr: r.target_addr, target_port: r.target_port,
       targets: ruleTargets(r),
       load_balance_strategy: r.load_balance_strategy ?? 'first',
@@ -349,6 +363,9 @@ const IMPORT_DEFAULTS = {
   const handleUpdate = async (values: {
     name?: string; listen_port?: number; protocol?: string;
     device_group_in?: number;
+    route_mode?: string;
+    forward_mode?: string;
+    hops?: number[];
     target_addr?: string; target_port?: number; targets?: RuleTargetInput[];
     load_balance_strategy?: string;
     upload_limit_mbps?: number;
@@ -362,6 +379,24 @@ const IMPORT_DEFAULTS = {
     if (values.listen_port !== undefined && values.listen_port !== editing.listen_port) payload.listen_port = values.listen_port;
     if (values.protocol !== undefined && values.protocol !== editing.protocol) payload.protocol = values.protocol;
     if (values.device_group_in !== undefined && values.device_group_in !== editing.device_group_in) payload.device_group_in = values.device_group_in;
+    const isChain = values.route_mode === 'chain' || values.forward_mode === 'chain';
+    const wasChain = editing.route_mode === 'chain' || editing.forward_mode === 'chain';
+    const hops = (values.hops ?? []).filter((id): id is number => typeof id === 'number' && id > 0);
+    if (isChain) {
+      if (hops.length < 2) {
+        message.error(t('chainHopsHint'));
+        return;
+      }
+      payload.route_mode = 'chain';
+      payload.forward_mode = 'chain';
+      payload.hops = hops;
+      payload.device_group_in = hops[0];
+      payload.device_group_out = hops[hops.length - 1];
+    } else if (wasChain) {
+      payload.route_mode = 'direct';
+      payload.forward_mode = 'direct';
+      payload.device_group_out = null;
+    }
     const newTargets = formTargets(values);
     const oldTargets = ruleTargets(editing);
     if (JSON.stringify(newTargets) !== JSON.stringify(oldTargets)) {
@@ -573,6 +608,21 @@ const IMPORT_DEFAULTS = {
           : <Text type="secondary">{t('unknownGroup')} (#{r.device_group_in})</Text>;
       },
     },
+    {
+      title: t('chainPath'), key: 'chain_path', width: 200, responsive: ['lg' as const],
+      render: (_: unknown, r: ForwardRule) => {
+        if (r.route_mode !== 'chain' && r.forward_mode !== 'chain') {
+          return <Text type="secondary">{t('modeDirect')}</Text>;
+        }
+        const labels = (r.hops ?? []).map(h =>
+          h.group_name || groupInfo.get(h.device_group_id)?.name || `#${h.device_group_id}`
+        );
+        if (labels.length === 0) {
+          return <Tag color="blue">{t('modeChain')}</Tag>;
+        }
+        return <Text style={{ fontSize: 12 }}>{labels.join(' → ')}</Text>;
+      },
+    },
     { title: t('name'), dataIndex: 'name', key: 'name' },
     {
       title: t('listenIp'), key: 'listen_ip', width: 160,
@@ -684,6 +734,14 @@ const IMPORT_DEFAULTS = {
   // also rejects. This keeps the UI and the API invariant in lock-step.
   const sharedInGroups = sharedGroups.filter(g => g.group_type === 'in');
   const allInGroups = isAdmin ? inGroups : sharedInGroups;
+  // Chain hops: entry must be `in`; mid/exit can be `in` or `out`.
+  const hopGroupOptions = (isAdmin
+    ? groups.filter(g => g.group_type === 'in' || g.group_type === 'out')
+    : sharedInGroups
+  ).map(g => ({
+    value: g.id,
+    label: `${g.name} (${g.group_type}${g.connect_host ? ` · ${g.connect_host}` : ''})`,
+  }));
   const protocolOptions = [
     { value: 'tcp_udp', label: t('tcpUdp') },
     { value: 'tcp', label: 'TCP' },
@@ -697,6 +755,8 @@ const IMPORT_DEFAULTS = {
   const isUdp = (p?: string) => p === 'udp' || p === 'tcp_udp';
 
   const createGroupId = Form.useWatch('device_group_in', createForm);
+  const createRouteMode = Form.useWatch('route_mode', createForm);
+  const editRouteMode = Form.useWatch('route_mode', editForm);
   const editGroupId = Form.useWatch('device_group_in', editForm);
   const createProto = Form.useWatch('protocol', createForm);
   const editProto = Form.useWatch('protocol', editForm);
@@ -915,7 +975,22 @@ const IMPORT_DEFAULTS = {
       />
 
       <Modal title={t('addRule')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={620}>
-        <Form form={createForm} onFinish={handleCreate} layout="vertical">
+        <Form
+          form={createForm}
+          onFinish={handleCreate}
+          layout="vertical"
+          onValuesChange={(changed) => {
+            if (changed.route_mode !== undefined) {
+              createForm.setFieldValue('forward_mode', changed.route_mode);
+              if (changed.route_mode === 'chain') {
+                const hops = createForm.getFieldValue('hops');
+                if (!hops || hops.length < 2) {
+                  createForm.setFieldValue('hops', [undefined, undefined]);
+                }
+              }
+            }
+          }}
+        >
           <Tabs items={[
             {
               key: 'basic',
@@ -940,11 +1015,42 @@ const IMPORT_DEFAULTS = {
                 </Form.Item>
                 {/* v0.4.20: WS/TLS tunnel hidden — public_transport always raw. */}
                 <Form.Item name="public_transport" hidden initialValue="raw"><Input /></Form.Item>
-                {/* v0.4.20: forward_mode always direct. */}
-                <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
-                <Form.Item name="device_group_in" label={t('inboundGroup')} rules={[{ required: true }]}>
-                  <Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} placeholder={allInGroups.length ? t('select') : t('createGroupFirst')} />
+                <Form.Item name="route_mode" label={t('forwardMode')} initialValue="direct" rules={[{ required: true }]}>
+                  <Select options={[
+                    { value: 'direct', label: t('modeDirect') },
+                    { value: 'chain', label: t('modeChain') },
+                  ]} />
                 </Form.Item>
+                <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
+                {createRouteMode !== 'chain' && (
+                  <Form.Item name="device_group_in" label={t('inboundGroup')} rules={[{ required: true }]}>
+                    <Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} placeholder={allInGroups.length ? t('select') : t('createGroupFirst')} />
+                  </Form.Item>
+                )}
+                {createRouteMode === 'chain' && (
+                  <Form.List name="hops" initialValue={[undefined, undefined]}>
+                    {(fields, { add, remove }) => (
+                      <Form.Item label={t('chainHops')} extra={t('chainHopsHint')} required>
+                        <Space orientation="vertical" style={{ width: '100%' }}>
+                          {fields.map((field, idx) => (
+                            <Space key={field.key} align="baseline" style={{ display: 'flex' }}>
+                              <Tag>{idx === 0 ? t('hopEntry') : idx === fields.length - 1 ? t('hopExit') : `${t('hopMid')} ${idx}`}</Tag>
+                              <Form.Item {...field} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1, minWidth: 280 }}>
+                                <Select options={hopGroupOptions} placeholder={t('select')} showSearch optionFilterProp="label" />
+                              </Form.Item>
+                              {fields.length > 2 && (
+                                <Button type="text" danger onClick={() => remove(field.name)} icon={<DeleteOutlined />} />
+                              )}
+                            </Space>
+                          ))}
+                          {fields.length < 8 && (
+                            <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>{t('addHop')}</Button>
+                          )}
+                        </Space>
+                      </Form.Item>
+                    )}
+                  </Form.List>
+                )}
               </>),
             },
             {
@@ -978,12 +1084,6 @@ const IMPORT_DEFAULTS = {
                     <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
                   </Space>
                 </Form.Item>
-                {/* v1.2.0: the connection cap / auto-restart controls are
-                    deliberately EDIT-ONLY. The atomic create transaction
-                    (create_rule_with_guard) doesn't carry them, so offering them
-                    here would silently discard whatever the user typed. They are
-                    also settings you tune after watching a rule misbehave, not
-                    ones you can guess up front. */}
               </>),
             },
           ]} />
@@ -991,7 +1091,22 @@ const IMPORT_DEFAULTS = {
       </Modal>
 
       <Modal title={t('editRule')} open={editOpen} onCancel={() => setEditOpen(false)} onOk={() => editForm.submit()} okText={t('save')} cancelText={t('cancel')} width={620}>
-        <Form form={editForm} onFinish={handleUpdate} layout="vertical">
+        <Form
+          form={editForm}
+          onFinish={handleUpdate}
+          layout="vertical"
+          onValuesChange={(changed) => {
+            if (changed.route_mode !== undefined) {
+              editForm.setFieldValue('forward_mode', changed.route_mode);
+              if (changed.route_mode === 'chain') {
+                const hops = editForm.getFieldValue('hops');
+                if (!hops || hops.length < 2) {
+                  editForm.setFieldValue('hops', [undefined, undefined]);
+                }
+              }
+            }
+          }}
+        >
           <Tabs items={[
             {
               key: 'basic',
@@ -1006,11 +1121,41 @@ const IMPORT_DEFAULTS = {
                     options={protocolOptions}
                   />
                 </Form.Item>
-                {/* v0.4.20: WS/TLS tunnel hidden — public_transport always raw. */}
                 <Form.Item name="public_transport" hidden initialValue="raw"><Input /></Form.Item>
-                {/* v0.4.20: forward_mode always direct. */}
-                <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
-                <Form.Item name="device_group_in" label={t('inboundGroup')}><Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} /></Form.Item>
+                <Form.Item name="route_mode" label={t('forwardMode')} rules={[{ required: true }]}>
+                  <Select options={[
+                    { value: 'direct', label: t('modeDirect') },
+                    { value: 'chain', label: t('modeChain') },
+                  ]} />
+                </Form.Item>
+                <Form.Item name="forward_mode" hidden><Input /></Form.Item>
+                {editRouteMode !== 'chain' && (
+                  <Form.Item name="device_group_in" label={t('inboundGroup')}><Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} /></Form.Item>
+                )}
+                {editRouteMode === 'chain' && (
+                  <Form.List name="hops">
+                    {(fields, { add, remove }) => (
+                      <Form.Item label={t('chainHops')} extra={t('chainHopsHint')} required>
+                        <Space orientation="vertical" style={{ width: '100%' }}>
+                          {fields.map((field, idx) => (
+                            <Space key={field.key} align="baseline" style={{ display: 'flex' }}>
+                              <Tag>{idx === 0 ? t('hopEntry') : idx === fields.length - 1 ? t('hopExit') : `${t('hopMid')} ${idx}`}</Tag>
+                              <Form.Item {...field} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1, minWidth: 280 }}>
+                                <Select options={hopGroupOptions} placeholder={t('select')} showSearch optionFilterProp="label" />
+                              </Form.Item>
+                              {fields.length > 2 && (
+                                <Button type="text" danger onClick={() => remove(field.name)} icon={<DeleteOutlined />} />
+                              )}
+                            </Space>
+                          ))}
+                          {fields.length < 8 && (
+                            <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>{t('addHop')}</Button>
+                          )}
+                        </Space>
+                      </Form.Item>
+                    )}
+                  </Form.List>
+                )}
               </>),
             },
             {
