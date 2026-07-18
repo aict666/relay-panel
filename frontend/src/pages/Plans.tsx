@@ -49,8 +49,9 @@ export default function Plans() {
         api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
       ]);
       setPlans(plansRes.data || []);
-      // Only inbound groups are meaningful as plan grants (rules bind inbound).
-      setGroups((groupsRes.data || []).filter((g) => g.group_type === 'in'));
+      // Only inbound-capable groups are meaningful as plan grants. A `both`
+      // group can be a rule entry and therefore belongs in this list too.
+      setGroups((groupsRes.data || []).filter((g) => g.group_type === 'in' || g.group_type === 'both'));
     } finally { setLoading(false); }
   }, []);
 

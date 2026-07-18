@@ -470,7 +470,8 @@ pub trait GroupRepository: Send + Sync {
     /// Returns all groups the caller has access to, scoped by ownership.
     /// Non-admins see only their own groups.
     async fn list_groups(&self, scope: &ResourceScope) -> Result<Vec<DeviceGroup>, DbError>;
-    /// v0.4.12 PR1: returns a summary of ADMIN-owned `group_type = 'in'` groups,
+    /// v0.4.12 PR1: returns a summary of ADMIN-owned inbound-capable (`in` or
+    /// `both`) groups,
     /// available for ANY regular user to attach rules to — independent of
     /// whether the user already has rules. Admins get an empty list (they manage
     /// groups directly, not via shared infrastructure). Never includes sensitive
@@ -534,7 +535,7 @@ pub trait GroupRepository: Send + Sync {
     async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError>;
     async fn delete_group(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
     async fn delete_groups_by_uid(&self, uid: i64) -> Result<u64, DbError>;
-    /// v1.0.8: list all inbound device groups (group_type = 'in'). Used by the
+    /// v1.0.8: list all inbound-capable device groups (`in` or `both`). Used by the
     /// purchase flow to compute the authorized set when grant_all_groups=true
     /// — in that mode the user gains access to every inbound group, so rules
     /// bound to inbound groups are NOT paused.
@@ -568,8 +569,8 @@ pub trait DeviceGroupAuthRepository: Send + Sync {
     /// Set the per-user `all_device_groups` flag. Returns rows affected
     /// (0 = user not found).
     async fn set_user_all_device_groups(&self, user_id: i64, all: bool) -> Result<u64, DbError>;
-    /// Effective set of inbound ('in') device-group IDs the user may use:
-    /// admins and `all_device_groups` users get ALL 'in' groups; everyone else
+    /// Effective set of inbound-capable (`in` or `both`) device-group IDs the user may use:
+    /// admins and `all_device_groups` users get ALL inbound-capable groups; everyone else
     /// gets only their explicit assignments. Empty = cannot forward.
     async fn authorized_device_group_ids(&self, user_id: i64) -> Result<Vec<i64>, DbError>;
     /// v1.0.4: pause all of `user_id`'s rules whose device_group_in is NOT in

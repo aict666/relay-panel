@@ -171,6 +171,7 @@ export default function Groups() {
     switch (gt) {
       case 'in': return 'green';
       case 'out': return 'cyan';
+      case 'both': return 'purple';
       case 'monitor': return 'default';
       default: return 'default';
     }
@@ -180,6 +181,7 @@ export default function Groups() {
   const groupTypeOptions = [
     { value: 'in', label: t('inboundListener') },
     { value: 'out', label: t('outboundEgress') },
+    { value: 'both', label: t('inboundOutbound') },
     { value: 'monitor', label: t('typeMonitor') },
   ];
 
@@ -306,7 +308,6 @@ export default function Groups() {
               <Select allowClear placeholder={t('ownerSelf')} options={users.map(u => ({ value: u.id, label: u.username }))} />
             </Form.Item>
           )}
-          {/* v1.0.4: new groups cannot be type 'out' (egress). */}
           <Form.Item name="group_type" label={t('type')} rules={[{ required: true }]} initialValue="in">
             <Select options={groupTypeOptions} />
           </Form.Item>

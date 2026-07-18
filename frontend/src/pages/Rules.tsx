@@ -727,16 +727,19 @@ const IMPORT_DEFAULTS = {
   // is empty and the column would show "-" everywhere).
   const columns = isAdmin ? allColumns : allColumns.filter(c => c.key !== 'owner');
 
-  const inGroups = groups.filter(g => g.group_type === 'in');
+  const isInboundGroup = (g: { group_type: string }) => g.group_type === 'in' || g.group_type === 'both';
+  const isForwardingGroup = (g: { group_type: string }) => g.group_type !== 'monitor';
+  const inGroups = groups.filter(isInboundGroup);
   // v0.4.12 PR1: inbound group selection. Admins pick from their OWN 'in'
   // groups. Regular users pick ONLY from admin-owned shared 'in' groups
   // (/groups/shared) — never their own historical groups, which the backend
   // also rejects. This keeps the UI and the API invariant in lock-step.
-  const sharedInGroups = sharedGroups.filter(g => g.group_type === 'in');
+  const sharedInGroups = sharedGroups.filter(isInboundGroup);
   const allInGroups = isAdmin ? inGroups : sharedInGroups;
-  // Chain hops: entry must be `in`; mid/exit can be `in` or `out`.
+  // Chain hops: entry must be inbound-capable; mid/exit can be any forwarding
+  // group. `both` is intentionally available in either position.
   const hopGroupOptions = (isAdmin
-    ? groups.filter(g => g.group_type === 'in' || g.group_type === 'out')
+    ? groups.filter(isForwardingGroup)
     : sharedInGroups
   ).map(g => ({
     value: g.id,
@@ -1212,7 +1215,7 @@ const IMPORT_DEFAULTS = {
           <>
             <Form.Item label={t('selectInboundGroup')}>
               <Select value={importGroupId} onChange={setImportGroupId}
-                options={(isAdmin ? groups.filter(g => g.group_type === 'in') : sharedGroups)
+                options={(isAdmin ? groups.filter(isInboundGroup) : sharedGroups.filter(isInboundGroup))
                   .map(g => ({ value: g.id, label: `${g.name} (#${g.id})` }))}
                 placeholder={t('selectDeviceGroups')} style={{ width: '100%' }} />
             </Form.Item>

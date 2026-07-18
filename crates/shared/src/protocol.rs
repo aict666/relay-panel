@@ -1146,6 +1146,7 @@ fn default_tls_mode() -> String {
 /// Device group types. Values map to stable machine strings in the DB:
 /// - In → "in" (listener node, receives forwarding rules)
 /// - Out → "out" (egress node, target for forwarding)
+/// - Both → "both" (one node can be selected as either entry or egress)
 /// - Monitor → "monitor" (observability only, no forwarding yet)
 ///
 /// v0.4.7: `ChainedOutbound` was removed (chain mode is gone). The migration
@@ -1158,6 +1159,8 @@ pub enum GroupType {
     In,
     #[serde(rename = "out")]
     Out,
+    #[serde(rename = "both")]
+    Both,
     #[serde(rename = "monitor")]
     Monitor,
 }
