@@ -10,6 +10,18 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-07-18
+
+### Fixed
+
+- **Restarting a SQLite-backed panel no longer pauses every current multi-hop
+  rule.** The historical v0.4.7 chain-removal migration runs idempotently on
+  each SQLite startup; after chain mode was reintroduced in v1.2, its old
+  `route_mode = 'chain'` update also matched the new format. It now pauses only
+  legacy chain rows without `forward_rule_hops`, while hop-backed v1.2 rules
+  remain active across panel restarts. A restart regression test pins this
+  behavior.
+
 ## [1.2.2] - 2026-07-18
 
 ### Added
