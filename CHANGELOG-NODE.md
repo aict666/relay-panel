@@ -13,6 +13,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-07-18
+
+### Fixed
+
+- **Linux zero-copy forwarding failures are no longer reported as successful
+  connections.** A failed `splice(2)` path is logged as a warning and returned
+  to the connection task, making forwarding faults visible instead of silently
+  completing the handler.
+- **Zero-copy pipe descriptors are now close-on-exec.** Relay pipes use
+  `O_CLOEXEC` in addition to non-blocking mode so descriptors cannot leak into
+  a future child process.
+
+### Tests
+
+- Added production-path, two-hop TCP and UDP regression coverage, including
+  fragmented full-duplex frames used by encrypted protocols, and an ignored
+  Linux loopback benchmark comparing `splice(2)` with userspace copying.
+
 ## [1.2.0] - 2026-07-18
 
 ### Changed

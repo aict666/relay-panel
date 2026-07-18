@@ -246,13 +246,12 @@ impl GroupRepository for SqliteRepository {
         }
         let row: (i64,) = q.fetch_one(&self.pool).await?;
         // Also count chain hop references (intermediate/exit groups).
-        let hop_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM forward_rule_hops WHERE device_group_id = ?",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or((0,));
+        let hop_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM forward_rule_hops WHERE device_group_id = ?")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or((0,));
         Ok(row.0 + hop_count.0)
     }
 

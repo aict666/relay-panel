@@ -435,11 +435,7 @@ pub trait RuleRepository: Send + Sync {
 
     /// Replace all hops for a chain rule (delete + insert in order).
     /// `hops` is `(device_group_id, listen_port)` ordered by position 0..n-1.
-    async fn replace_rule_hops(
-        &self,
-        rule_id: i64,
-        hops: &[(i64, i32)],
-    ) -> Result<(), DbError>;
+    async fn replace_rule_hops(&self, rule_id: i64, hops: &[(i64, i32)]) -> Result<(), DbError>;
 
     /// List hops for a rule ordered by position ascending.
     async fn list_rule_hops(

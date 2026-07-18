@@ -79,10 +79,7 @@ pub async fn build_node_config(
             // list_active_chain_hops_for_group (position > 0 only here).
             let hops = db.list_rule_hops(rule.id).await?;
             if hops.is_empty() {
-                tracing::warn!(
-                    "chain rule {} has no hops; skipping listeners",
-                    rule.id
-                );
+                tracing::warn!("chain rule {} has no hops; skipping listeners", rule.id);
                 continue;
             }
             let entry = &hops[0];
@@ -117,10 +114,7 @@ pub async fn build_node_config(
         if hop.position <= 0 {
             continue; // entry emitted via device_group_in path
         }
-        let Some(rule) = db
-            .find_rule_by_id(hop.rule_id, &ResourceScope::All)
-            .await?
-        else {
+        let Some(rule) = db.find_rule_by_id(hop.rule_id, &ResourceScope::All).await? else {
             continue;
         };
         // find_rule_by_id does not re-check user gating; hop query already did.
@@ -473,13 +467,19 @@ mod tests {
         let entry_cfg = build_node_config(&repo(&pool), 10).await.unwrap();
         assert_eq!(entry_cfg.listeners.len(), 1);
         assert_eq!(entry_cfg.listeners[0].port, 20000);
-        assert_eq!(entry_cfg.listeners[0].targets, vec!["2.2.2.2:30000".to_string()]);
+        assert_eq!(
+            entry_cfg.listeners[0].targets,
+            vec!["2.2.2.2:30000".to_string()]
+        );
         assert!(entry_cfg.listeners[0].count_traffic);
 
         let exit_cfg = build_node_config(&repo(&pool), 20).await.unwrap();
         assert_eq!(exit_cfg.listeners.len(), 1);
         assert_eq!(exit_cfg.listeners[0].port, 30000);
-        assert_eq!(exit_cfg.listeners[0].targets, vec!["9.9.9.9:443".to_string()]);
+        assert_eq!(
+            exit_cfg.listeners[0].targets,
+            vec!["9.9.9.9:443".to_string()]
+        );
         assert!(!exit_cfg.listeners[0].count_traffic);
     }
 

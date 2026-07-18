@@ -10,6 +10,24 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-18
+
+### Added
+
+- **A single device group can now act as both entry and egress.** The new
+  `both` group type is selectable anywhere an inbound or outbound group is
+  accepted, so one server needs only one node process even when rules enter
+  and leave through that same machine. Config generation deduplicates the
+  group while still installing every listener required by a multi-hop route.
+
+### Changed
+
+- **Responsive layouts now remain usable on narrow screens and compact
+  desktops.** Rule tables use stable minimum column widths and compact action
+  controls on desktop, switch to readable cards on mobile, and the shared
+  layout, forms, filters, dialogs, and pagination now avoid clipped content or
+  awkward single-character wrapping across the panel.
+
 ## [1.2.1] - 2026-07-18
 
 ### Fixed

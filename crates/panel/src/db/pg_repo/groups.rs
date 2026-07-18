@@ -250,13 +250,12 @@ impl GroupRepository for PgRepository {
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
-        let hop_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM forward_rule_hops WHERE device_group_id = $1",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or((0,));
+        let hop_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM forward_rule_hops WHERE device_group_id = $1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or((0,));
         Ok(row.0 + hop_count.0)
     }
 

@@ -1197,7 +1197,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 2,
@@ -1210,7 +1210,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
             ],
         };
@@ -1279,7 +1279,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 2,
@@ -1292,7 +1292,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
             ],
         };
@@ -1512,7 +1512,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 2,
@@ -1525,7 +1525,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
             ],
         };
@@ -1547,7 +1547,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 2,
@@ -1560,7 +1560,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
             ],
         };
@@ -1827,7 +1827,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
                 ListenerConfig {
                     rule_id: 1,
@@ -1840,7 +1840,7 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
-                count_traffic: true,
+                    count_traffic: true,
                 },
             ],
         };
