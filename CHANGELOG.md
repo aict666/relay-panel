@@ -10,6 +10,20 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-07-18
+
+### Fixed
+
+- **Chain rule diagnosis now covers every hop.** `POST /rules/{id}/diagnose`
+  dispatches to all hop groups (entry → mid → exit), not only
+  `device_group_in`. Intermediate/exit nodes may report results (group
+  membership check accepts any hop on the rule). The UI shows each hop's
+  listener and its next-hop / final-target TCP probe.
+- **Updating only `target_addr` / `target_port` no longer silently leaves
+  stale `forward_rule_targets` rows.** Node config prefers the targets table;
+  a scalar-only edit now rewrites that table so exit-hop forwarding follows the
+  new destination.
+
 ## [1.2.0] - 2026-07-18
 
 ### Changed

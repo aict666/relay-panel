@@ -873,11 +873,28 @@ pub async fn update_rule(
         return Err(UpdateRuleError::BadRequest("No fields to update".into()));
     }
 
+    // Prefer an explicit `targets` list. If the client only updates the legacy
+    // target_addr/target_port pair, ALSO rewrite the targets table — otherwise
+    // node_config's resolve_final_targets keeps serving the stale multi-target
+    // rows and the scalar columns change is a silent no-op for forwarding.
     let normalized_targets = if let Some(targets) = req.targets.clone() {
-        let legacy_host = req.target_addr.as_deref().unwrap_or("127.0.0.1");
-        let legacy_port = req.target_port.unwrap_or(1);
+        let legacy_host = req
+            .target_addr
+            .as_deref()
+            .unwrap_or(existing.target_addr.as_str());
+        let legacy_port = req.target_port.unwrap_or(existing.target_port as u16);
         Some(
             normalize_rule_targets(Some(targets), legacy_host, legacy_port)
+                .map_err(|msg| UpdateRuleError::BadRequest(msg.into()))?,
+        )
+    } else if req.target_addr.is_some() || req.target_port.is_some() {
+        let host = req
+            .target_addr
+            .as_deref()
+            .unwrap_or(existing.target_addr.as_str());
+        let port = req.target_port.unwrap_or(existing.target_port as u16);
+        Some(
+            normalize_rule_targets(None, host, port)
                 .map_err(|msg| UpdateRuleError::BadRequest(msg.into()))?,
         )
     } else {

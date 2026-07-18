@@ -246,18 +246,20 @@ pub(crate) struct NodeStatusRow {
 
 /// POST /api/v1/rules/{id}/diagnose — start a diagnosis run for a rule.
 ///
-/// Resolves the rule's inbound group, enumerates nodes that reported status in
-/// the last 120s, sends a DiagnoseRuleMessage to the group over WS, and waits
-/// up to DIAGNOSE_TIMEOUT for results (correlated by request_id). Nodes that
-/// are too old, offline, or silent are surfaced explicitly so the frontend
-/// doesn't confuse "no reply" with "network timeout".
+/// Resolves the groups that participate in the rule's path:
+///   - direct: the inbound group only
+///   - chain: every hop group (entry → intermediate → exit), so each hop
+///     probes its own next target (next hop, or final targets on the last hop)
+///
+/// Enumerates nodes that reported status, sends a directed DiagnoseRuleMessage
+/// over WS, and waits up to DIAGNOSE_TIMEOUT for results (correlated by
+/// request_id). Nodes that are too old, offline, or silent are surfaced
+/// explicitly so the frontend doesn't confuse "no reply" with "network timeout".
 ///
 /// v0.4.9: diagnosis is TCP-only. A pure-UDP rule is rejected (400) — UDP
-/// can't be probed cheaply. A tcp_udp rule probes its TCP listener. In
-/// parallel, the panel runs its OWN "panel → ingress listen" TCP probe
-/// (panel → group.connect_host:listen_port) so the total wait doesn't grow;
-/// that probe only confirms the ingress port is reachable from the PANEL's
-/// network, not that forwarding end-to-end works.
+/// can't be probed cheaply. A tcp_udp rule probes its TCP listener.
+/// v1.2.x: multi-hop chain diagnosis dispatches to every hop group, not only
+/// device_group_in — previously the UI only showed entry→next-hop reachability.
 pub async fn diagnose_rule(
     user: AuthUser,
     State(state): State<AppState>,
@@ -316,66 +318,103 @@ pub async fn diagnose_rule(
         });
     }
 
-    let group_id = rule.device_group_in;
+    // 2. Resolve which device groups participate in this rule's path.
+    //    - direct: only the inbound group (device_group_in)
+    //    - chain: every hop group in order (entry → mid → exit). Each hop node
+    //      probes ITS own next target (next hop connect_host:port, or the final
+    //      targets on the last hop), so the UI shows the full multi-hop path.
+    let hop_group_ids: Vec<i64> = if rule.route_mode == "chain" {
+        match state.db.list_rule_hops(rule_id).await {
+            Ok(hops) if !hops.is_empty() => hops.into_iter().map(|h| h.device_group_id).collect(),
+            Ok(_) => {
+                // Chain with no hop rows — fall back to inbound group so we
+                // still surface something useful rather than an empty diagnose.
+                tracing::warn!(
+                    "diagnose_rule {}: chain rule has no hops; falling back to device_group_in",
+                    rule_id
+                );
+                vec![rule.device_group_in]
+            }
+            Err(e) => {
+                tracing::error!("diagnose_rule {}: list_rule_hops failed: {}", rule_id, e);
+                return Json(ApiResponse {
+                    code: 500,
+                    message: "database error".into(),
+                    data: None,
+                });
+            }
+        }
+    } else {
+        vec![rule.device_group_in]
+    };
 
-    // v0.4.15: load the inbound group ONCE — its name is attached to every
-    // node row for display ("分组名 · 公网IP"), avoiding a per-node lookup. If
-    // the group is gone, fall back to the id string; the rule's FK still points
-    // at it but the row may have been pruned concurrently.
+    // 3. Enumerate nodes across all hop groups. Each row carries its group_id
+    //    so send_node can target the correct WS connection map.
     //
-    // Use ResourceScope::All (NOT the user's scope): a regular user diagnoses
-    // a rule bound to an ADMIN-owned shared group, which an owner scope lookup
-    // wouldn't find → the label would wrongly fall back to "#group_id". The
-    // rule's owner was already validated above; the group name is display-only.
-    let group_name = match crate::db::repo::GroupRepository::find_by_id(
-        state.db.as_ref(),
-        group_id,
-        &ResourceScope::All,
-    )
-    .await
-    {
-        Ok(Some(g)) => g.name,
-        Ok(None) => format!("#{group_id}"),
-        Err(e) => {
-            tracing::error!("diagnose_rule {}: group find_by_id failed: {}", rule_id, e);
-            return Json(ApiResponse {
-                code: 500,
-                message: "database error".into(),
-                data: None,
-            });
+    // Use ResourceScope::All for group name lookup: a regular user may diagnose
+    // a rule on an admin-owned shared group (name is display-only; the rule's
+    // owner was already validated above).
+    let mut nodes: Vec<NodeStatusRow> = Vec::new();
+    // node_id → group_id for dispatch (a node_id is unique per machine; if the
+    // same node ever appeared in two groups we'd keep the first).
+    let mut node_group: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for gid in &hop_group_ids {
+        let group_name = match crate::db::repo::GroupRepository::find_by_id(
+            state.db.as_ref(),
+            *gid,
+            &ResourceScope::All,
+        )
+        .await
+        {
+            Ok(Some(g)) => g.name,
+            Ok(None) => format!("#{gid}"),
+            Err(e) => {
+                tracing::error!("diagnose_rule {}: group find_by_id failed: {}", rule_id, e);
+                return Json(ApiResponse {
+                    code: 500,
+                    message: "database error".into(),
+                    data: None,
+                });
+            }
+        };
+        let group_nodes = match group_node_statuses(&state, *gid, group_name).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(
+                    "diagnose_rule {}: group_node_statuses({}) failed: {}",
+                    rule_id,
+                    gid,
+                    e
+                );
+                return Json(ApiResponse {
+                    code: 500,
+                    message: "database error".into(),
+                    data: None,
+                });
+            }
+        };
+        for n in group_nodes {
+            node_group.entry(n.node_id.clone()).or_insert(*gid);
+            nodes.push(n);
         }
-    };
+    }
 
-    // 2. Enumerate the group's nodes from kvs (for node_version + node_id +
-    //    public_ip; group_name is passed in for display).
-    let nodes = match group_node_statuses(&state, group_id, group_name.clone()).await {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::error!(
-                "diagnose_rule {}: group_node_statuses failed: {}",
-                rule_id,
-                e
-            );
-            return Json(ApiResponse {
-                code: 500,
-                message: "database error".into(),
-                data: None,
-            });
-        }
-    };
-
-    // 3. Classify each node. v0.4.14 ordering — VERSION first, THEN WS liveness:
+    // 4. Classify each node. v0.4.14 ordering — VERSION first, THEN WS liveness:
     //    - version < 0.4.14: the node has no X-Node-ID, so it can't be targeted
     //      by directed diagnosis even with a healthy socket → Unsupported
     //      ("please upgrade"), NOT a misleading "control channel offline".
     //    - recent enough but no live WS connection → ControlChannelOffline.
     //    - recent + online → a dispatch candidate.
-    let online = state.node_connections.online_node_ids(group_id).await;
+    //
+    // Online set is the UNION of every hop group's live WS connections.
+    let mut online: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for gid in &hop_group_ids {
+        online.extend(state.node_connections.online_node_ids(*gid).await);
+    }
     let mut candidates: Vec<String> = Vec::new();
     let mut unsupported: Vec<NodeDiagnoseStatus> = Vec::new();
     let mut offline: Vec<NodeDiagnoseStatus> = Vec::new();
     for n in &nodes {
-        // v0.4.15 取证 DEBUG + 纯函数分类（四场景可单测）。
         let directed_ok = node_supports_directed_diagnose(n.node_version.as_deref());
         let ws_online = online.contains(&n.node_id);
         tracing::debug!(
@@ -395,7 +434,7 @@ pub async fn diagnose_rule(
         }
     }
 
-    // 4. No dispatch candidate → return IMMEDIATELY (never wait the 8s deadline
+    // 5. No dispatch candidate → return IMMEDIATELY (never wait the 8s deadline
     //    when there's no node to hear from).
     if candidates.is_empty() {
         let mut statuses = unsupported;
@@ -413,7 +452,7 @@ pub async fn diagnose_rule(
         }));
     }
 
-    // 5. Register the run + dispatch a DIRECTED probe to each candidate
+    // 6. Register the run + dispatch a DIRECTED probe to each candidate
     //    (send_node, not send_group). Track which sends actually reached a live
     //    connection: the WS can drop between the online check above and
     //    send_node here (returns 0). Such a node is reclassified
@@ -435,7 +474,15 @@ pub async fn diagnose_rule(
         nodes.iter().map(|n| (n.node_id.as_str(), n)).collect();
     for nid in &candidates {
         let row = node_by_id.get(nid.as_str()).copied();
-        if state.node_connections.send_node(group_id, nid, &msg).await > 0 {
+        let Some(&gid) = node_group.get(nid) else {
+            offline.push(NodeDiagnoseStatus::ControlChannelOffline {
+                node_id: nid.clone(),
+                group_name: row.map(|r| r.group_name.clone()).unwrap_or_default(),
+                public_ip: row.and_then(|r| r.public_ip.clone()),
+            });
+            continue;
+        };
+        if state.node_connections.send_node(gid, nid, &msg).await > 0 {
             expected.push(nid.clone());
         } else {
             // Dropped between the online check and the send — treat as offline.
@@ -572,9 +619,10 @@ pub async fn receive_diagnose_result(
             });
         }
     };
-    // The rule must belong to THIS group's inbound set. This is the node-auth
+    // The rule must involve THIS group: either as the direct inbound group, or
+    // as any hop on a chain rule (entry / mid / exit). This is the node-auth
     // path (group token verified above), not a user request — use an unscoped
-    // lookup; the device_group_in check below is the real authorization.
+    // lookup; the group membership check below is the real authorization.
     let rule = match state
         .db
         .find_rule_by_id(req.rule_id, &ResourceScope::All)
@@ -597,7 +645,24 @@ pub async fn receive_diagnose_result(
             });
         }
     };
-    if rule.device_group_in != group.id {
+    let group_on_path = if rule.device_group_in == group.id {
+        true
+    } else if rule.route_mode == "chain" {
+        match state.db.list_rule_hops(req.rule_id).await {
+            Ok(hops) => hops.iter().any(|h| h.device_group_id == group.id),
+            Err(e) => {
+                tracing::error!("diagnose_result: list_rule_hops failed: {}", e);
+                return Json(ApiResponse {
+                    code: 500,
+                    message: "database error".into(),
+                    data: None,
+                });
+            }
+        }
+    } else {
+        false
+    };
+    if !group_on_path {
         return Json(ApiResponse {
             code: 403,
             message: "rule does not belong to this node's group".into(),
