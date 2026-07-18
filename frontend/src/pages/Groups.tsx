@@ -264,10 +264,12 @@ export default function Groups() {
           <Button size="small" icon={<ApiOutlined />} onClick={() => showInstallCommand(g)}>{t('addNode')}</Button>
         </div>
         <Table
+          className="rp-responsive-table"
           dataSource={groupNodes}
           rowKey={(n: NodeStatus) => n.node_id ?? `${n.public_ipv4 ?? n.public_ip}-${n.last_seen}`}
           pagination={false}
           size="small"
+          scroll={{ x: 'max-content' }}
           columns={[
             { title: 'ID', dataIndex: 'node_id', key: 'node_id', width: 120, render: (v: string | undefined) => v ? <Text code style={{ fontSize: 11 }}>{v.slice(0, 8)}...{v.slice(-4)}</Text> : '-' },
             { title: t('status'), dataIndex: 'online', key: 'online', width: 80, render: (v: boolean) => <Tag color={v ? 'green' : 'default'}>{v ? t('online') : t('offline')}</Tag> },
@@ -283,17 +285,19 @@ export default function Groups() {
     <>
       <div className="rp-page-header">
         <h2 className="rp-page-title"><CloudServerOutlined /> {t('deviceGroups')}</h2>
-        <Space>
+        <Space className="rp-page-actions" wrap>
           <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>{t('addGroup')}</Button>
         </Space>
       </div>
       <Table
+        className="rp-responsive-table"
         dataSource={groups}
         columns={columns}
         rowKey="id"
         loading={loading}
         pagination={{ pageSize: 20 }}
+        scroll={{ x: 'max-content' }}
         expandable={{
           expandedRowRender,
           rowExpandable: () => true,

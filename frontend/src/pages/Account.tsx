@@ -114,7 +114,7 @@ export default function Account() {
       <Card
         title={t('myAccount')}
         extra={
-          <Space>
+          <Space wrap className="rp-card-actions">
             <Button icon={<LockOutlined />} onClick={() => setChangePwOpen(true)}>{t('changePassword')}</Button>
             <Button danger icon={<LogoutOutlined />} onClick={logout}>{t('logout')}</Button>
           </Space>

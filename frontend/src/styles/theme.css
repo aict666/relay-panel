@@ -140,7 +140,193 @@ html, body, #root {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 16px;
   margin-bottom: 16px;
+}
+
+.rp-page-header .rp-page-title {
+  flex: 0 0 auto;
+  margin-bottom: 0;
+}
+
+.rp-page-actions {
+  justify-content: flex-end;
+}
+
+.rp-app-header {
+  height: var(--rp-header-height);
+  padding: 0 24px;
+  line-height: var(--rp-header-height);
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  background: #fff;
+  border-bottom: 1px solid var(--rp-border);
+}
+
+.rp-header-role {
+  font-size: 13px;
+}
+
+.rp-content {
+  min-width: 0;
+  margin: var(--rp-content-padding);
+  background: var(--rp-bg);
+}
+
+.rp-toolbar-filter {
+  min-width: 180px;
+}
+
+.rp-auth-page {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100dvh;
+  padding: 72px 20px 28px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  box-sizing: border-box;
+  background: var(--rp-bg);
+}
+
+.rp-auth-language {
+  position: absolute;
+  top: 20px;
+  right: 24px;
+}
+
+.rp-auth-card {
+  width: min(380px, 100%);
+  box-shadow: var(--rp-shadow);
+}
+
+.rp-auth-card-wide {
+  width: min(400px, 100%);
+}
+
+/* Keep admin tables readable. Horizontal scrolling is preferable to squeezing
+ * Chinese labels and values into one character per line. */
+.rp-responsive-table .ant-table-cell {
+  white-space: nowrap;
+}
+
+.rp-responsive-table .ant-table-container {
+  border-radius: var(--rp-radius);
+}
+
+.rp-rules-table .ant-table-cell-fix-right {
+  box-shadow: -8px 0 16px -16px rgba(24, 24, 27, 0.45);
+}
+
+.rp-rule-actions .ant-btn {
+  padding-inline: 7px;
+}
+
+.rp-target-row {
+  width: 100%;
+}
+
+.rp-target-host {
+  width: 180px;
+}
+
+.rp-target-port {
+  width: 110px;
+}
+
+.rp-chain-select {
+  min-width: 0;
+}
+
+/* Mobile rule cards replace the desktop's very wide operations table. */
+.rp-rule-mobile-list .ant-list-item {
+  padding: 0 0 10px;
+  border-block-end: 0;
+}
+
+.rp-rule-mobile-list .ant-list-pagination {
+  margin-block-start: 10px;
+  text-align: center;
+}
+
+.rp-rule-card {
+  width: 100%;
+}
+
+.rp-rule-card .ant-card-body {
+  padding: 14px;
+}
+
+.rp-rule-card-header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rp-border);
+}
+
+.rp-rule-card-title {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.rp-rule-card-title .ant-typography:first-child {
+  min-width: 0;
+}
+
+.rp-rule-card-id {
+  flex: 0 0 auto;
+  font-family: var(--rp-font-mono);
+  font-size: 11px;
+}
+
+.rp-rule-card-status {
+  justify-content: flex-end;
+}
+
+.rp-rule-card-status .ant-tag {
+  margin-inline-end: 0;
+}
+
+.rp-rule-card-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+  padding: 12px 0;
+}
+
+.rp-rule-card-field {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rp-rule-card-field-wide {
+  grid-column: 1 / -1;
+}
+
+.rp-rule-card-label {
+  color: var(--rp-text-tertiary);
+  font-size: 11px;
+}
+
+.rp-rule-card-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--rp-text);
+  font-size: 13px;
+}
+
+.rp-rule-card-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 8px;
+  border-top: 1px solid var(--rp-border);
 }
 
 .rp-stat-card {
@@ -184,4 +370,186 @@ html, body, #root {
   height: 14px;
   border-radius: 2px;
   background-size: cover;
+}
+
+@media (max-width: 991px) {
+  .rp-sidebar {
+    position: fixed !important;
+    inset-block: 0;
+    inset-inline-start: 0;
+    z-index: 1001;
+    height: 100dvh;
+  }
+
+  .rp-sidebar .ant-layout-sider-zero-width-trigger {
+    top: 12px;
+    inset-inline-end: -42px;
+    width: 36px;
+    height: 32px;
+    line-height: 32px;
+    border-radius: 0 var(--rp-radius-sm) var(--rp-radius-sm) 0;
+    background: var(--rp-sidebar-bg);
+    box-shadow: var(--rp-shadow);
+  }
+
+  .rp-app-header {
+    padding-inline: 16px;
+  }
+
+  .rp-content {
+    margin: 16px;
+  }
+}
+
+@media (max-width: 767px) {
+  :root {
+    --rp-content-padding: 12px;
+  }
+
+  .rp-app-header {
+    padding-inline: 12px;
+  }
+
+  .rp-header-actions {
+    gap: 6px !important;
+  }
+
+  .rp-header-role,
+  .rp-header-button-label {
+    display: none;
+  }
+
+  .rp-content {
+    margin: var(--rp-content-padding);
+  }
+
+  .rp-page-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .rp-page-title {
+    font-size: 17px;
+    flex-wrap: wrap;
+  }
+
+  .rp-page-title > .ant-space {
+    width: 100%;
+    margin-left: 0 !important;
+    flex-wrap: wrap;
+  }
+
+  .rp-page-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .rp-rules-toolbar .rp-toolbar-filter {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  .rp-rules-toolbar > .ant-space-item:first-child {
+    flex: 1 1 100%;
+  }
+
+  .rp-target-row,
+  .rp-chain-row {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  .rp-target-host {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  .rp-target-port {
+    flex: 1 1 140px;
+    width: auto;
+  }
+
+  .rp-chain-select {
+    flex: 1 1 220px !important;
+  }
+
+  .ant-modal {
+    top: 12px;
+    max-width: calc(100vw - 24px);
+    margin-inline: auto;
+    padding-bottom: 12px;
+  }
+
+  .ant-modal .ant-modal-content {
+    padding: 16px;
+  }
+
+  .ant-modal .ant-modal-body {
+    max-height: calc(100dvh - 160px);
+    overflow-y: auto;
+  }
+
+  .ant-card-head-wrapper {
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .ant-card-extra {
+    margin-inline-start: auto;
+  }
+
+  .rp-card-actions {
+    justify-content: flex-end;
+  }
+
+  .ant-table-wrapper .ant-table-thead > tr > th,
+  .ant-table-wrapper .ant-table-tbody > tr > td {
+    padding: 10px 12px;
+  }
+
+  .ant-pagination {
+    justify-content: center;
+  }
+
+  .rp-stat-card .ant-statistic-content {
+    font-size: 24px;
+  }
+}
+
+@media (max-width: 479px) {
+  .rp-auth-page {
+    padding-inline: 12px;
+  }
+
+  .rp-auth-language {
+    top: 14px;
+    right: 12px;
+  }
+
+  .rp-auth-card .ant-card-body {
+    padding: 20px;
+  }
+
+  .rp-mobile-hide {
+    display: none;
+  }
+
+  .rp-rule-card-header {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .rp-rule-card-status {
+    grid-column: 2;
+    justify-content: flex-start;
+  }
+
+  .rp-rule-card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .rp-rule-card-field,
+  .rp-rule-card-field-wide {
+    grid-column: 1;
+  }
 }

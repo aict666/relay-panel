@@ -93,7 +93,9 @@ describe('Dashboard group aggregation', () => {
     await flush();
 
     // the first table body row is clickable
-    const row = document.querySelector('.ant-table-tbody tr');
+    // A horizontally scrollable Ant table injects a hidden measurement row;
+    // target the real data row instead of clicking that layout-only element.
+    const row = document.querySelector('.ant-table-tbody tr:not(.ant-table-measure-row)');
     expect(row).not.toBeNull();
     await act(async () => {
       row!.dispatchEvent(new MouseEvent('click', { bubbles: true }));

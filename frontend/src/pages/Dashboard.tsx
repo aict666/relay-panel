@@ -257,14 +257,14 @@ export default function Dashboard() {
           </Button>
         </Tooltip>
       </div>
-      <Row gutter={16} style={{ marginBottom: 20 }}>
-        <Col span={8}>
+      <Row gutter={[16, 16]} style={{ marginBottom: 20 }}>
+        <Col xs={24} sm={8}>
           <Card className="rp-stat-card"><Statistic title={t('users')} value={stats.users} prefix={<UserOutlined style={{ color: 'var(--rp-primary)' }} />} /></Card>
         </Col>
-        <Col span={8}>
+        <Col xs={24} sm={8}>
           <Card className="rp-stat-card"><Statistic title={t('forwardRules')} value={stats.rules} prefix={<ApiOutlined style={{ color: 'var(--rp-primary)' }} />} /></Card>
         </Col>
-        <Col span={8}>
+        <Col xs={24} sm={8}>
           <Card className="rp-stat-card"><Statistic title={t('deviceGroups')} value={stats.groups} prefix={<CloudServerOutlined style={{ color: 'var(--rp-primary)' }} />} /></Card>
         </Col>
       </Row>
@@ -273,11 +273,13 @@ export default function Dashboard() {
         {groups.length === 0
           ? <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--rp-text-tertiary)', fontSize: 13 }}>{t('noNodesReporting')}</div>
           : <Table
+              className="rp-responsive-table"
               dataSource={groups}
               columns={groupColumns}
               rowKey="group_id"
               pagination={false}
               size="small"
+              scroll={{ x: 'max-content' }}
               onRow={() => ({ onClick: () => navigate('/nodes'), style: { cursor: 'pointer' } })}
             />
         }

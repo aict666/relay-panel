@@ -77,11 +77,8 @@ export default function Register() {
   const plans: Plan[] = status?.plans ?? [];
 
   return (
-    <div style={{
-      display: 'flex', justifyContent: 'center', alignItems: 'center',
-      minHeight: '100vh', background: 'var(--rp-bg)',
-    }}>
-      <div style={{ position: 'absolute', top: 20, right: 24 }}>
+    <div className="rp-auth-page">
+      <div className="rp-auth-language">
         <Segmented
           size="small"
           value={lang}
@@ -92,7 +89,7 @@ export default function Register() {
           ]}
         />
       </div>
-      <Card style={{ width: 380, boxShadow: 'var(--rp-shadow)' }}>
+      <Card className="rp-auth-card">
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
           <Title level={3} style={{ margin: 0, fontWeight: 600 }}>{t('registerTitle')}</Title>
           <Text type="secondary" style={{ fontSize: 13 }}>{t('subtitle')}</Text>

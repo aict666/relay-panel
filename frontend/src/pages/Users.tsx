@@ -374,14 +374,14 @@ export default function Users() {
     <>
       <div className="rp-page-header">
         <h2 className="rp-page-title"><UserOutlined /> {t('users')}</h2>
-        <Space>
+        <Space className="rp-page-actions" wrap>
           {isAdmin && (
             <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>{t('addUser')}</Button>
           )}
           <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
         </Space>
       </div>
-      <Table dataSource={users} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} />
+      <Table className="rp-responsive-table" dataSource={users} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} scroll={{ x: 'max-content' }} />
 
       <Modal
         title={editing ? `${t('editUser')}: ${editing.username}` : t('editUser')}

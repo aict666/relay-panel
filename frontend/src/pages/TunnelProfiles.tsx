@@ -139,12 +139,12 @@ export default function TunnelProfiles() {
     <>
       <div className="rp-page-header">
         <h2 className="rp-page-title"><ApartmentOutlined /> {t('tunnelProfiles')}</h2>
-        <Space>
+        <Space className="rp-page-actions" wrap>
           <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>{t('addTunnelProfile')}</Button>
         </Space>
       </div>
-      <Table dataSource={profiles} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} />
+      <Table className="rp-responsive-table" dataSource={profiles} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} scroll={{ x: 'max-content' }} />
 
       <Modal title={t('addTunnelProfile')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')}>
         <Form form={createForm} onFinish={handleCreate} layout="vertical">
