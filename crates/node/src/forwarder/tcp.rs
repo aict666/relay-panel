@@ -33,6 +33,7 @@ pub async fn serve_tcp_listener(
     rule_id: i64,
     source_ipv4: Option<Ipv4Addr>,
     gate: RuleGate,
+    count_traffic: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr = listener
         .local_addr()
@@ -130,6 +131,7 @@ pub async fn serve_tcp_listener(
                             counter,
                             rule_id,
                             source_ipv4,
+                            count_traffic,
                         ) => {
                             if let Err(e) = r {
                                 tracing::debug!("TCP connection error: {}", e);
@@ -188,6 +190,7 @@ async fn handle_tcp_connection(
     counter: Arc<TrafficCounter>,
     rule_id: i64,
     source_ipv4: Option<Ipv4Addr>,
+    count_traffic: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // v0.4.6: pick targets per the rule's load-balancing strategy. The selector
     // returns the ordered indices to attempt; we connect to the first reachable.
@@ -261,7 +264,11 @@ async fn handle_tcp_connection(
         match super::splice::zero_copy_bidirectional(inbound, outbound).await {
             // (up = client→target, down = target→client) — same attribution as
             // the userspace path's counter.add(rule_id, up, down).
-            Ok((up, down)) => counter.add(rule_id, up, down).await,
+            Ok((up, down)) => {
+                if count_traffic {
+                    counter.add(rule_id, up, down).await;
+                }
+            }
             Err(e) => tracing::debug!("TCP splice forward (rule {}): {}", rule_id, e),
         }
         return Ok(());
@@ -302,7 +309,9 @@ async fn handle_tcp_connection(
             }
             total += n as u64;
         }
-        counter_up.add(rule_id, total, 0).await;
+        if count_traffic {
+            counter_up.add(rule_id, total, 0).await;
+        }
         let _ = wo.shutdown().await;
     });
     let download = Box::pin(async move {
@@ -321,7 +330,9 @@ async fn handle_tcp_connection(
             }
             total += n as u64;
         }
-        counter_down.add(rule_id, 0, total).await;
+        if count_traffic {
+            counter_down.add(rule_id, 0, total).await;
+        }
         let _ = wi.shutdown().await;
     });
 
@@ -374,6 +385,7 @@ mod tests {
             1,
             None,
             runtime.gate(None),
+            true,
         ));
         // Keep the runtime alive for the duration of the test: dropping it would
         // cancel the connection we are about to make.
@@ -436,6 +448,7 @@ mod tests {
             1,
             None,
             runtime.gate(Some(2)),
+            true,
         ));
         let _runtime = runtime;
 

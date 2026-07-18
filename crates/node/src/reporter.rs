@@ -1240,6 +1240,7 @@ mod tests {
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                count_traffic: true,
             })
             .collect();
         let cfg = NodeConfigResponse { listeners };

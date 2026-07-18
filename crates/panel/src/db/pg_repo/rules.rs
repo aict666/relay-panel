@@ -19,6 +19,7 @@ impl RuleRepository for PgRepository {
         .await?;
         for rule in &mut rules {
             rule.targets = self.list_rule_targets(rule.id, scope).await?;
+            rule.hops = self.list_rule_hops_enriched(rule.id).await?;
         }
         Ok(rules)
     }
@@ -38,6 +39,7 @@ impl RuleRepository for PgRepository {
         .await?;
         if let Some(r) = &mut rule {
             r.targets = self.list_rule_targets(r.id, scope).await?;
+            r.hops = self.list_rule_hops_enriched(r.id).await?;
         }
         Ok(rule)
     }
@@ -245,12 +247,21 @@ impl RuleRepository for PgRepository {
         &self,
         device_group_in: i64,
     ) -> Result<Vec<(i32, String)>, DbError> {
-        let rows: Vec<(i32, String)> = sqlx::query_as(
+        let mut rows: Vec<(i32, String)> = sqlx::query_as(
             "SELECT listen_port, protocol FROM forward_rules WHERE device_group_in = $1",
         )
         .bind(device_group_in)
         .fetch_all(&self.pool)
         .await?;
+        let hop_rows: Vec<(i32, String)> = sqlx::query_as(
+            "SELECT h.listen_port, fr.protocol FROM forward_rule_hops h \
+             JOIN forward_rules fr ON fr.id = h.rule_id \
+             WHERE h.device_group_id = $1",
+        )
+        .bind(device_group_in)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.extend(hop_rows);
         Ok(rows)
     }
 
@@ -858,5 +869,102 @@ impl RuleRepository for PgRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rules)
+    }
+
+    async fn replace_rule_hops(
+        &self,
+        rule_id: i64,
+        hops: &[(i64, i32)],
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM forward_rule_hops WHERE rule_id = $1")
+            .bind(rule_id)
+            .execute(&mut *tx)
+            .await?;
+        for (pos, (gid, port)) in hops.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO forward_rule_hops (rule_id, position, device_group_id, listen_port) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(rule_id)
+            .bind(pos as i32)
+            .bind(gid)
+            .bind(port)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_rule_hops(
+        &self,
+        rule_id: i64,
+    ) -> Result<Vec<relay_shared::models::ForwardRuleHop>, DbError> {
+        let hops = sqlx::query_as(
+            "SELECT * FROM forward_rule_hops WHERE rule_id = $1 ORDER BY position, id",
+        )
+        .bind(rule_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(hops)
+    }
+
+    async fn list_active_chain_hops_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<relay_shared::models::ForwardRuleHop>, DbError> {
+        let hops = sqlx::query_as(
+            "SELECT h.* FROM forward_rule_hops h \
+             JOIN forward_rules fr ON fr.id = h.rule_id \
+             JOIN users u ON fr.uid = u.id \
+             WHERE h.device_group_id = $1 \
+             AND fr.route_mode = 'chain' AND fr.paused = FALSE \
+             AND u.banned = FALSE AND u.suspended = FALSE \
+             AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) \
+             AND (u.plan_expire_at IS NULL OR u.plan_expire_at > to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')) \
+             ORDER BY h.rule_id, h.position",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(hops)
+    }
+
+    async fn find_rule_hop_at(
+        &self,
+        rule_id: i64,
+        position: i32,
+    ) -> Result<Option<relay_shared::models::ForwardRuleHop>, DbError> {
+        let hop = sqlx::query_as(
+            "SELECT * FROM forward_rule_hops WHERE rule_id = $1 AND position = $2",
+        )
+        .bind(rule_id)
+        .bind(position)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(hop)
+    }
+}
+
+impl PgRepository {
+    async fn list_rule_hops_enriched(
+        &self,
+        rule_id: i64,
+    ) -> Result<Vec<relay_shared::models::ForwardRuleHop>, DbError> {
+        let mut hops = self.list_rule_hops(rule_id).await?;
+        for hop in &mut hops {
+            if let Ok(Some((name, host))) = sqlx::query_as::<_, (String, String)>(
+                "SELECT name, connect_host FROM device_groups WHERE id = $1",
+            )
+            .bind(hop.device_group_id)
+            .fetch_optional(&self.pool)
+            .await
+            {
+                hop.group_name = Some(name);
+                hop.connect_host = Some(host);
+            }
+        }
+        Ok(hops)
     }
 }

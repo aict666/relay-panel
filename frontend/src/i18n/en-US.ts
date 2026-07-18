@@ -383,6 +383,14 @@ export const enUS: Dict = {
 
   // Forward mode
   forwardMode: 'Forward Mode',
+  modeChain: 'Chain (multi-hop)',
+  chainHops: 'Chain hops',
+  chainHopsHint: 'Ordered groups: entry → mid… → exit (at least 2). Use type "out" for mid/exit and set connect_host.',
+  addHop: 'Add hop',
+  hopEntry: 'Entry',
+  hopMid: 'Mid',
+  hopExit: 'Exit',
+  chainPath: 'Path',
   modeGroup: 'Via outbound group',
   modeDirect: 'Direct to target',
 

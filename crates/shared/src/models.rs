@@ -53,6 +53,25 @@ pub struct ForwardRuleTarget {
     pub created_at: String,
 }
 
+/// One hop in a multi-hop chain rule (entry=position 0, exit=last).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ForwardRuleHop {
+    pub id: i64,
+    pub rule_id: i64,
+    pub position: i32,
+    pub device_group_id: i64,
+    pub listen_port: i32,
+    pub created_at: String,
+    /// Display-only: filled when listing rules, not stored on the hop row.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub group_name: Option<String>,
+    /// Display-only: next-hop dial address of this group.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub connect_host: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ForwardRule {
     pub id: i64,
@@ -88,6 +107,10 @@ pub struct ForwardRule {
     #[serde(default)]
     #[sqlx(skip)]
     pub targets: Vec<ForwardRuleTarget>,
+    /// Multi-hop chain membership (ordered by position). Empty for direct rules.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub hops: Vec<ForwardRuleHop>,
     /// v0.4.6: multi-target load-balancing strategy.
     /// "first" | "round_robin" | "failover". Defaults to "first".
     #[serde(default = "default_load_balance_strategy")]

@@ -160,6 +160,20 @@ CREATE TABLE IF NOT EXISTS forward_rule_targets (
 CREATE INDEX IF NOT EXISTS idx_forward_rule_targets_rule_position
     ON forward_rule_targets (rule_id, position);
 
+-- Multi-hop chain hops: position 0 = entry, last = exit.
+CREATE TABLE IF NOT EXISTS forward_rule_hops (
+    id BIGSERIAL PRIMARY KEY,
+    rule_id BIGINT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    device_group_id BIGINT NOT NULL REFERENCES device_groups(id),
+    listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    UNIQUE (rule_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_rule_id ON forward_rule_hops (rule_id);
+CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_group_port
+    ON forward_rule_hops (device_group_id, listen_port);
+
 CREATE TABLE IF NOT EXISTS statistics (
     id BIGSERIAL PRIMARY KEY,
     stat_type TEXT NOT NULL,
@@ -1113,6 +1127,40 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!(
             "PG migration 21: forward_rules.max_connections + auto_restart_minutes present"
         );
+    }
+
+    // ── Revision 22: multi-hop chain hops table ──
+    if current < 22 {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS forward_rule_hops (
+                id BIGSERIAL PRIMARY KEY,
+                rule_id BIGINT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL CHECK (position >= 0),
+                device_group_id BIGINT NOT NULL REFERENCES device_groups(id),
+                listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                UNIQUE (rule_id, position)
+            )"#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_rule_id ON forward_rule_hops (rule_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_group_port \
+             ON forward_rule_hops (device_group_id, listen_port)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (22) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+        tracing::info!("PG migration 22: forward_rule_hops table present");
     }
 
     Ok(())
