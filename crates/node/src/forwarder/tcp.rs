@@ -269,7 +269,10 @@ async fn handle_tcp_connection(
                     counter.add(rule_id, up, down).await;
                 }
             }
-            Err(e) => tracing::debug!("TCP splice forward (rule {}): {}", rule_id, e),
+            Err(e) => {
+                tracing::warn!("TCP splice forward failed (rule {}): {}", rule_id, e);
+                return Err(e.into());
+            }
         }
         return Ok(());
     }

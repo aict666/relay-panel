@@ -326,6 +326,68 @@ mod tests {
     use super::*;
     use relay_shared::protocol::LoadBalanceStrategy;
 
+    /// Real two-hop round-trip through the production UDP listener. This
+    /// covers the per-client socket mapping on both relays, including the
+    /// target→hop2→hop1→client return path used by SS/QUIC/DNS traffic.
+    #[tokio::test]
+    async fn two_hop_udp_roundtrip_preserves_datagrams() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; UDP_BUF_SIZE];
+            for _ in 0..3 {
+                let (n, peer) = echo.recv_from(&mut buf).await.unwrap();
+                echo.send_to(&buf[..n], peer).await.unwrap();
+            }
+        });
+
+        let hop2_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let hop2_addr = hop2_socket.local_addr().unwrap();
+        let hop2_task = tokio::spawn(serve_udp_listener(
+            hop2_socket,
+            vec![echo_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            RateLimit::Unlimited,
+            Arc::new(TrafficCounter::new()),
+            Arc::new(ConnectionTracker::new()),
+            2,
+            None,
+            false,
+        ));
+
+        let hop1_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let hop1_addr = hop1_socket.local_addr().unwrap();
+        let hop1_task = tokio::spawn(serve_udp_listener(
+            hop1_socket,
+            vec![hop2_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            RateLimit::Unlimited,
+            Arc::new(TrafficCounter::new()),
+            Arc::new(ConnectionTracker::new()),
+            1,
+            None,
+            true,
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut response = vec![0u8; UDP_BUF_SIZE];
+        for size in [1usize, 1200, 4096] {
+            let payload: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(31)).collect();
+            client.send_to(&payload, hop1_addr).await.unwrap();
+            let (n, peer) =
+                tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut response))
+                    .await
+                    .expect("two-hop UDP response timed out")
+                    .unwrap();
+            assert_eq!(peer, hop1_addr);
+            assert_eq!(&response[..n], payload);
+        }
+
+        echo_task.await.unwrap();
+        hop1_task.abort();
+        hop2_task.abort();
+    }
+
     // All targets below are IP literals ("ip:port"), which resolve LOCALLY via
     // lookup_host with no DNS query — keeping these tests hermetic (no network).
 

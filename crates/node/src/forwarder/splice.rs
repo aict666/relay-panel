@@ -43,8 +43,8 @@ struct Pipe {
 impl Pipe {
     fn new() -> io::Result<Pipe> {
         let mut fds = [0 as libc::c_int; 2];
-        // pipe2 with O_NONBLOCK so both ends never block a runtime worker.
-        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+        // O_CLOEXEC prevents relay pipes leaking into a future child process.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -168,8 +168,38 @@ pub async fn zero_copy_bidirectional(a: TcpStream, b: TcpStream) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    async fn spawn_fixed_relay(
+        target: std::net::SocketAddr,
+        connections: usize,
+        zero_copy: bool,
+    ) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut tasks = Vec::with_capacity(connections);
+            for _ in 0..connections {
+                let (mut inbound, _) = listener.accept().await.unwrap();
+                let mut outbound = TcpStream::connect(target).await.unwrap();
+                tasks.push(tokio::spawn(async move {
+                    if zero_copy {
+                        zero_copy_bidirectional(inbound, outbound).await.unwrap();
+                    } else {
+                        tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
+                            .await
+                            .unwrap();
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+        addr
+    }
 
     /// End-to-end: client → [splice relay] → echo target. The payload must
     /// round-trip and the returned byte counts must be exact.
@@ -252,5 +282,121 @@ mod tests {
             "target must receive all bytes"
         );
         assert_eq!(up, payload.len() as u64, "up count must equal payload size");
+    }
+
+    /// Regression for encrypted request/response protocols such as SS2022:
+    /// two splice relays in series must preserve many deliberately fragmented
+    /// frames while the connection remains open and traffic flows both ways.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_hop_splice_preserves_fragmented_full_duplex_frames() {
+        const CONNECTIONS: usize = 32;
+        const FRAMES: usize = 128;
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut tasks = Vec::with_capacity(CONNECTIONS);
+            for _ in 0..CONNECTIONS {
+                let (mut stream, _) = target.accept().await.unwrap();
+                tasks.push(tokio::spawn(async move {
+                    for _ in 0..FRAMES {
+                        let len = stream.read_u16().await.unwrap() as usize;
+                        let mut payload = vec![0u8; len];
+                        stream.read_exact(&mut payload).await.unwrap();
+                        for byte in &mut payload {
+                            *byte ^= 0xa5;
+                        }
+                        stream.write_u16(len as u16).await.unwrap();
+                        stream.write_all(&payload).await.unwrap();
+                        stream.flush().await.unwrap();
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+
+        let hop2 = spawn_fixed_relay(target_addr, CONNECTIONS, true).await;
+        let hop1 = spawn_fixed_relay(hop2, CONNECTIONS, true).await;
+
+        let mut clients = Vec::with_capacity(CONNECTIONS);
+        for client_id in 0..CONNECTIONS {
+            clients.push(tokio::spawn(async move {
+                let mut stream = TcpStream::connect(hop1).await.unwrap();
+                stream.set_nodelay(true).unwrap();
+                for frame_id in 0..FRAMES {
+                    let len = 1 + ((client_id * 131 + frame_id * 977) % 8191);
+                    let payload: Vec<u8> = (0..len)
+                        .map(|i| (client_id as u8).wrapping_mul(17) ^ (frame_id as u8) ^ i as u8)
+                        .collect();
+
+                    // Split the header and body into small writes to model a
+                    // cipher handshake arriving in arbitrary TCP segments.
+                    stream.write_all(&(len as u16).to_be_bytes()).await.unwrap();
+                    for chunk in payload.chunks(37) {
+                        stream.write_all(chunk).await.unwrap();
+                        tokio::task::yield_now().await;
+                    }
+
+                    let response_len = stream.read_u16().await.unwrap() as usize;
+                    assert_eq!(response_len, len);
+                    let mut response = vec![0u8; response_len];
+                    stream.read_exact(&mut response).await.unwrap();
+                    let expected: Vec<u8> = payload.into_iter().map(|byte| byte ^ 0xa5).collect();
+                    assert_eq!(response, expected);
+                }
+                stream.shutdown().await.unwrap();
+            }));
+        }
+        for client in clients {
+            tokio::time::timeout(std::time::Duration::from_secs(30), client)
+                .await
+                .expect("two-hop client timed out")
+                .unwrap();
+        }
+    }
+
+    async fn benchmark_upload(zero_copy: bool, payload_len: usize) -> f64 {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let sink = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut total = 0usize;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            total
+        });
+        let hop2 = spawn_fixed_relay(target_addr, 1, zero_copy).await;
+        let hop1 = spawn_fixed_relay(hop2, 1, zero_copy).await;
+        let mut client = TcpStream::connect(hop1).await.unwrap();
+        let payload = vec![0x5a; payload_len];
+        let started = Instant::now();
+        client.write_all(&payload).await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(sink.await.unwrap(), payload_len);
+        payload_len as f64 / started.elapsed().as_secs_f64()
+    }
+
+    /// Manual Linux loopback benchmark. It is ignored in normal CI because
+    /// throughput depends on the host; run with `--ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn benchmark_two_hop_splice_vs_userspace() {
+        const PAYLOAD_LEN: usize = 256 * 1024 * 1024;
+        let userspace = benchmark_upload(false, PAYLOAD_LEN).await;
+        let splice = benchmark_upload(true, PAYLOAD_LEN).await;
+        println!(
+            "two-hop upload: userspace={:.1} MiB/s splice={:.1} MiB/s ratio={:.2}x",
+            userspace / 1024.0 / 1024.0,
+            splice / 1024.0 / 1024.0,
+            splice / userspace
+        );
     }
 }
