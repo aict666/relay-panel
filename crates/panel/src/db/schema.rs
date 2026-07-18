@@ -813,6 +813,8 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     //
     // 1. Historical chain rules → paused (NOT rewritten to direct, to avoid
     //    silently changing the forwarding path). The admin must reconfigure.
+    //    v1.2 reintroduced chain mode with explicit forward_rule_hops rows;
+    //    those current-format rules must survive every migration re-run.
     // 2. chained_outbound groups → out (the only egress role now).
     // 3. Drop the dead builtin templates: chain, tls-passthrough, tls-terminate.
     // 4. Ensure a single canonical 'tls-simple' builtin exists (transport=
@@ -832,14 +834,33 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         )
         .fetch_one(&mut *tx)
         .await?;
+        let has_hops_table: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'forward_rule_hops'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         let paused = if has_columns.0 == 2 {
-            sqlx::query(
+            // SQLite migrations are intentionally idempotent and run on every
+            // boot. A v1.2 multi-hop chain is distinguished from the removed
+            // pre-v0.4.7 format by its explicit hop rows. Without this guard,
+            // every panel restart pauses every current chain rule.
+            let pause_sql = if has_hops_table.0 == 1 {
                 r#"UPDATE forward_rules SET paused = 1
-                   WHERE route_mode = 'chain' AND paused = 0"#,
-            )
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
+                   WHERE route_mode = 'chain' AND paused = 0
+                     AND NOT EXISTS (
+                         SELECT 1 FROM forward_rule_hops h
+                         WHERE h.rule_id = forward_rules.id
+                     )"#
+            } else {
+                // Minimal ancient schemas can predate forward_rule_hops.
+                r#"UPDATE forward_rules SET paused = 1
+                   WHERE route_mode = 'chain' AND paused = 0"#
+            };
+            sqlx::query(pause_sql)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
         } else {
             0
         };
@@ -2168,5 +2189,57 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(still_paused.0, 1);
+    }
+
+    /// v1.2 regression: SQLite migrations run on every boot, so the historical
+    /// Migration 22 chain-removal UPDATE must not pause a current-format chain
+    /// rule that is backed by explicit hop rows.
+    #[tokio::test]
+    async fn migration_22_keeps_hop_backed_chain_active_on_restart() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (101, 'entry', 'in', 'hop-entry', 1), \
+                    (102, 'exit', 'out', 'hop-exit', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rule_id = sqlx::query(
+            "INSERT INTO forward_rules (name, uid, listen_port, protocol, \
+             public_transport, node_transport, entry_transport, route_mode, \
+             forward_mode, target_addr, target_port, device_group_in, \
+             device_group_out, paused) \
+             VALUES ('current-chain', 1, 31001, 'tcp_udp', 'raw', 'raw', \
+                     'raw', 'chain', 'chain', '203.0.113.10', 443, 101, 102, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops \
+                 (rule_id, position, device_group_id, listen_port) \
+             VALUES (?, 0, 101, 31001), (?, 1, 102, 32001)",
+        )
+        .bind(rule_id)
+        .bind(rule_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool)
+            .await
+            .expect("panel restart migrations must succeed");
+
+        let paused: (i64,) = sqlx::query_as("SELECT paused FROM forward_rules WHERE id = ?")
+            .bind(rule_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            paused.0, 0,
+            "hop-backed v1.2 chain rule must remain active after restart"
+        );
     }
 }
