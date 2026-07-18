@@ -104,7 +104,7 @@ export default function Shop() {
       {/* Balance + the "流量叠加" note. */}
       {me && (
         <Card size="small" style={{ marginBottom: 16 }}>
-          <Space>
+          <Space wrap>
             <Text strong>{t('accountBalance')}:</Text>
             <span className="rp-mono">{me.balance}</span>
             <Text type="secondary" style={{ marginLeft: 16 }}>·</Text>
@@ -158,11 +158,13 @@ export default function Shop() {
       {/* Order history. */}
       <Card title={t('orderHistory')} style={{ marginTop: 24 }}>
         <Table
+          className="rp-responsive-table"
           dataSource={orders}
           columns={orderColumns}
           rowKey="id"
           pagination={{ pageSize: 10 }}
           size="small"
+          scroll={{ x: 'max-content' }}
           locale={{ emptyText: t('noOrders') }}
         />
       </Card>

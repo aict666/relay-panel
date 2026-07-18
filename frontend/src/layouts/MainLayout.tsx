@@ -79,7 +79,9 @@ export default function MainLayout() {
       <Sider
         collapsible
         breakpoint="lg"
+        collapsedWidth={0}
         width={220}
+        className="rp-sidebar"
         style={{ background: 'var(--rp-sidebar-bg)' }}
       >
         <div style={{
@@ -99,13 +101,8 @@ export default function MainLayout() {
         />
       </Sider>
       <Layout>
-        <Header style={{
-          background: '#fff', height: 'var(--rp-header-height)',
-          padding: '0 24px', lineHeight: 'var(--rp-header-height)',
-          display: 'flex', justifyContent: 'flex-end', alignItems: 'center',
-          borderBottom: '1px solid var(--rp-border)',
-        }}>
-          <Space size="middle">
+        <Header className="rp-app-header">
+          <Space size="middle" className="rp-header-actions">
             <Segmented
               size="small"
               value={lang}
@@ -115,18 +112,18 @@ export default function MainLayout() {
                 { value: 'en-US', label: t('langEnUS') },
               ]}
             />
-            <Text type="secondary" style={{ fontSize: 13 }}>
+            <Text type="secondary" className="rp-header-role">
               {isAdmin ? t('admin') : t('user')}
             </Text>
             <Button type="text" size="small" icon={<LockOutlined />} onClick={() => setChangePwOpen(true)}>
-              {t('changePassword')}
+              <span className="rp-header-button-label">{t('changePassword')}</span>
             </Button>
             <Button type="text" size="small" icon={<LogoutOutlined />} onClick={logout}>
-              {t('logout')}
+              <span className="rp-header-button-label">{t('logout')}</span>
             </Button>
           </Space>
         </Header>
-        <Content style={{ margin: 'var(--rp-content-padding)', background: 'var(--rp-bg)' }}>
+        <Content className="rp-content">
           {/* v1.2 (PR4): lazy-loaded pages (router.tsx) suspend here on first
               navigation to their chunk, showing a centered spinner instead of a
               blank pane. */}

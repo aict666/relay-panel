@@ -145,6 +145,7 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
 
   return (
     <Table
+      className="rp-responsive-table"
       dataSource={rows}
       columns={columns}
       rowKey={(r) => `${r.group_id}:${r.node_id || 'legacy'}`}

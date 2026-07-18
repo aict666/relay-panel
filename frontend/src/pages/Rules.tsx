@@ -1,6 +1,6 @@
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Tag, Alert, Typography, Dropdown, Switch, Tabs, Spin, Tooltip } from 'antd';
+import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Tag, Alert, Typography, Dropdown, Switch, Tabs, Spin, Tooltip, Card, Checkbox, Grid, List } from 'antd';
 import type { MenuProps } from 'antd';
-import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, MoreOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
@@ -55,6 +55,8 @@ function downloadText(filename: string, text: string) {
 export default function Rules() {
   const { t } = useI18n();
   const { isAdmin, user } = useAuth();
+  const screens = Grid.useBreakpoint();
+  const isMobile = !screens.md;
   const [searchParams] = useSearchParams();
   // v0.4.20: admin can manage another user's rules via /rules?owner_uid=X.
   const filterOwnerUid: number | null = isAdmin
@@ -595,12 +597,61 @@ const IMPORT_DEFAULTS = {
     return <Tag color="blue">TCP</Tag>;
   };
 
+  const confirmRestart = (r: ForwardRule) => {
+    Modal.confirm({
+      title: t('restartConfirmTitle'),
+      content: t('restartConfirmDesc'),
+      okButtonProps: { danger: true },
+      onOk: () => handleRestart(r),
+    });
+  };
+
+  const confirmDelete = (r: ForwardRule) => {
+    Modal.confirm({
+      title: t('deleteRuleConfirm'),
+      okButtonProps: { danger: true },
+      onOk: () => handleDelete(r.id),
+    });
+  };
+
+  const ruleMoreMenu = (r: ForwardRule): MenuProps => ({
+    items: [
+      { key: 'copy', label: t('copy'), icon: <CopyOutlined /> },
+      { key: 'diagnose', label: t('diagnose'), icon: <MedicineBoxOutlined />, disabled: r.protocol === 'udp' },
+      { key: 'restart', label: t('restart'), icon: <ThunderboltOutlined />, disabled: r.paused },
+      { type: 'divider' },
+      { key: 'delete', label: t('delete'), icon: <DeleteOutlined />, danger: true },
+    ],
+    onClick: ({ key }) => {
+      if (key === 'copy') handleCopy(r);
+      if (key === 'diagnose') handleDiagnose(r);
+      if (key === 'restart') confirmRestart(r);
+      if (key === 'delete') confirmDelete(r);
+    },
+  });
+
+  const renderRuleActions = (r: ForwardRule) => (
+    <Space size={2} className="rp-rule-actions">
+      <Button
+        size="small" type="text"
+        icon={r.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
+        onClick={() => handleTogglePause(r)}
+      >
+        {r.paused ? t('resume') : t('pause')}
+      </Button>
+      <Button size="small" type="text" icon={<EditOutlined />} onClick={() => handleEdit(r)}>{t('edit')}</Button>
+      <Dropdown menu={ruleMoreMenu(r)} trigger={['click']}>
+        <Button size="small" type="text" icon={<MoreOutlined />} aria-label={t('action')} />
+      </Dropdown>
+    </Space>
+  );
+
   const allColumns = [
     { title: t('id'), dataIndex: 'id', key: 'id', width: 60 },
     // v0.4.9: inbound group name. Hidden on small screens (responsive md+) so
     // the mobile view keeps the core columns. Lookup misses → "未知分组 (#ID)".
     {
-      title: t('groupName'), key: 'group_name', width: 140, responsive: ['md' as const],
+      title: t('groupName'), key: 'group_name', width: 140,
       render: (_: unknown, r: ForwardRule) => {
         const g = groupInfo.get(r.device_group_in);
         return g
@@ -609,7 +660,7 @@ const IMPORT_DEFAULTS = {
       },
     },
     {
-      title: t('chainPath'), key: 'chain_path', width: 200, responsive: ['lg' as const],
+      title: t('chainPath'), key: 'chain_path', width: 190,
       render: (_: unknown, r: ForwardRule) => {
         if (r.route_mode !== 'chain' && r.forward_mode !== 'chain') {
           return <Text type="secondary">{t('modeDirect')}</Text>;
@@ -620,10 +671,14 @@ const IMPORT_DEFAULTS = {
         if (labels.length === 0) {
           return <Tag color="blue">{t('modeChain')}</Tag>;
         }
-        return <Text style={{ fontSize: 12 }}>{labels.join(' → ')}</Text>;
+        const path = labels.join(' → ');
+        return <Text ellipsis={{ tooltip: path }} style={{ display: 'block', maxWidth: 170, fontSize: 12 }}>{path}</Text>;
       },
     },
-    { title: t('name'), dataIndex: 'name', key: 'name' },
+    {
+      title: t('name'), dataIndex: 'name', key: 'name', width: 140,
+      render: (v: string) => <Text ellipsis={{ tooltip: v }} style={{ display: 'block', maxWidth: 120 }}>{v}</Text>,
+    },
     {
       title: t('listenIp'), key: 'listen_ip', width: 160,
       render: (_: unknown, r: ForwardRule) => {
@@ -633,9 +688,9 @@ const IMPORT_DEFAULTS = {
           : <Text type="secondary">{t('notConfigured')}</Text>;
       },
     },
-    { title: t('listenPort'), dataIndex: 'listen_port', key: 'listen_port', render: (v: number) => <span className="rp-mono">{v}</span> },
+    { title: t('listenPort'), dataIndex: 'listen_port', key: 'listen_port', width: 90, render: (v: number) => <span className="rp-mono">{v}</span> },
     {
-      title: t('protocol'), dataIndex: 'protocol', key: 'protocol',
+      title: t('protocol'), dataIndex: 'protocol', key: 'protocol', width: 170,
       render: (p: string, r: ForwardRule) => (
         <Space size={4}>
           {protoTags(p)}
@@ -649,7 +704,7 @@ const IMPORT_DEFAULTS = {
       ),
     },
     {
-      title: t('target'), key: 'target',
+      title: t('target'), key: 'target', width: 190,
       render: (_: unknown, r: ForwardRule) => {
         // v1.0.9: a multi-target rule shows "first (+N)"; hovering lists every
         // enabled target IP so the admin can see the failover/round-robin pool.
@@ -675,51 +730,14 @@ const IMPORT_DEFAULTS = {
       // attach to an admin-owned shared group, so the rule owner and the group
       // owner often differ. Resolve the username from the rule's uid; fall back
       // to "#uid" when the user list isn't available.
-      title: t('owner'), key: 'owner', width: 100,
+      title: t('owner'), key: 'owner', width: 110,
       render: (_: unknown, r: ForwardRule) =>
         <Text>{userMap.get(r.uid) ?? `#${r.uid}`}</Text>,
     },
-    { title: t('traffic'), dataIndex: 'traffic_used', key: 'traffic_used', render: (v: number) => formatBytes(v) },
+    { title: t('traffic'), dataIndex: 'traffic_used', key: 'traffic_used', width: 100, render: (v: number) => formatBytes(v) },
     {
-      title: t('action'), key: 'action', width: 260,
-      render: (_: unknown, r: ForwardRule) => (
-        <Space>
-          <Button
-            size="small" type="text"
-            icon={r.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
-            onClick={() => handleTogglePause(r)}
-          >
-            {r.paused ? t('resume') : t('pause')}
-          </Button>
-          <Button size="small" type="text" icon={<EditOutlined />} onClick={() => handleEdit(r)}>{t('edit')}</Button>
-          <Button size="small" type="text" icon={<CopyOutlined />} onClick={() => handleCopy(r)}>{t('copy')}</Button>
-          {/* v0.4.9: diagnosis is TCP-only — disable for pure-UDP rules. */}
-          <Button size="small" type="text" icon={<MedicineBoxOutlined />} disabled={r.protocol === 'udp'} onClick={() => handleDiagnose(r)} title={r.protocol === 'udp' ? t('diagnoseUdpUnsupported') : t('diagnose')}>{t('diagnose')}</Button>
-          {/* v1.2.0: restart drops every live connection on this rule, so it is
-              behind a confirm (diagnose is read-only and isn't). Disabled while
-              paused — there are no listeners to restart. */}
-          <Popconfirm
-            title={t('restartConfirmTitle')}
-            description={t('restartConfirmDesc')}
-            onConfirm={() => handleRestart(r)}
-            okButtonProps={{ danger: true }}
-            disabled={r.paused}
-          >
-            <Button
-              size="small"
-              type="text"
-              icon={<ThunderboltOutlined />}
-              disabled={r.paused}
-              title={r.paused ? t('restartPausedHint') : t('restart')}
-            >
-              {t('restart')}
-            </Button>
-          </Popconfirm>
-          <Popconfirm title={t('deleteRuleConfirm')} onConfirm={() => handleDelete(r.id)}>
-            <Button danger size="small" type="text">{t('delete')}</Button>
-          </Popconfirm>
-        </Space>
-      ),
+      title: t('action'), key: 'action', width: 176, fixed: 'right' as const,
+      render: (_: unknown, r: ForwardRule) => renderRuleActions(r),
     },
   ];
   // v0.4.10: hide the owner column for regular users — they only ever own
@@ -832,18 +850,19 @@ const IMPORT_DEFAULTS = {
   const renderTargetsEditor = () => (
     <Form.List name="targets" initialValue={[{ host: '', port: undefined as unknown as number, enabled: true }]}>
       {(fields, { add, remove, move }) => (
-        <Space orientation="vertical" style={{ width: '100%' }}>
+        <Space orientation="vertical" style={{ width: '100%' }} className="rp-target-editor">
           <Text strong>{t('targets')}</Text>
           {fields.map((field, index) => (
-            <Space key={field.key} align="baseline" wrap>
+            <Space key={field.key} align="baseline" wrap className="rp-target-row">
               <Form.Item
                 {...field}
                 name={[field.name, 'host']}
                 label={t('address')}
                 rules={[{ required: true }]}
                 style={{ marginBottom: 8 }}
+                className="rp-target-host"
               >
-                <Input placeholder={t('targetAddress')} style={{ width: 180 }} />
+                <Input placeholder={t('targetAddress')} />
               </Form.Item>
               <Form.Item
                 {...field}
@@ -861,8 +880,9 @@ const IMPORT_DEFAULTS = {
                   },
                 ]}
                 style={{ marginBottom: 8 }}
+                className="rp-target-port"
               >
-                <InputNumber min={1} max={65535} placeholder={t('targetPort')} style={{ width: 110 }} />
+                <InputNumber min={1} max={65535} placeholder={t('targetPort')} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item
                 {...field}
@@ -889,15 +909,69 @@ const IMPORT_DEFAULTS = {
     { key: 'import', label: t('import'), icon: <UploadOutlined />, onClick: () => setImportOpen(true) },
   ];
 
+  const confirmBatchRestart = () => {
+    Modal.confirm({
+      title: t('batchRestartConfirm').replace('{count}', String(selectedRowKeys.length)),
+      content: t('restartConfirmDesc'),
+      okButtonProps: { danger: true },
+      onOk: handleBatchRestart,
+    });
+  };
+
+  const confirmBatchDelete = () => {
+    Modal.confirm({
+      title: t('batchDeleteConfirm').replace('{count}', String(selectedRowKeys.length)),
+      okButtonProps: { danger: true },
+      onOk: handleBatchDelete,
+    });
+  };
+
+  const batchMenu: MenuProps = {
+    items: [
+      { key: 'export', label: t('batchExport'), icon: <DownloadOutlined /> },
+      { key: 'resume', label: t('batchResume'), icon: <PlayCircleOutlined /> },
+      { key: 'pause', label: t('batchPause'), icon: <PauseCircleOutlined /> },
+      { key: 'restart', label: t('batchRestart'), icon: <ThunderboltOutlined /> },
+      { type: 'divider' },
+      { key: 'delete', label: t('batchDelete'), icon: <DeleteOutlined />, danger: true },
+    ],
+    onClick: ({ key }) => {
+      if (key === 'export') handleExportSelected();
+      if (key === 'resume') handleBatchSetPaused(false);
+      if (key === 'pause') handleBatchSetPaused(true);
+      if (key === 'restart') confirmBatchRestart();
+      if (key === 'delete') confirmBatchDelete();
+    },
+  };
+
+  const ruleGroupName = (r: ForwardRule) => {
+    const group = groupInfo.get(r.device_group_in);
+    return group?.name ?? `${t('unknownGroup')} (#${r.device_group_in})`;
+  };
+
+  const ruleChainPath = (r: ForwardRule) => {
+    if (r.route_mode !== 'chain' && r.forward_mode !== 'chain') return t('modeDirect');
+    const labels = (r.hops ?? []).map(h =>
+      h.group_name || groupInfo.get(h.device_group_id)?.name || `#${h.device_group_id}`
+    );
+    return labels.length > 0 ? labels.join(' → ') : t('modeChain');
+  };
+
+  const setRuleSelected = (id: number, checked: boolean) => {
+    setSelectedRowKeys(current => checked
+      ? Array.from(new Set([...current, id]))
+      : current.filter(key => key !== id));
+  };
+
   return (
     <>
       <div className="rp-page-header">
         <h2 className="rp-page-title"><ApiOutlined /> {t('forwardRules')}</h2>
-        <Space>
+        <Space className="rp-page-actions rp-rules-toolbar" wrap size={[8, 8]}>
           {/* v0.4.9: filter by inbound group. Only groups that actually have
               rules are offered, so the list stays short for large fleets. */}
           <Select
-            style={{ minWidth: 180 }}
+            className="rp-toolbar-filter"
             allowClear
             placeholder={t('filterByGroup')}
             value={selectedGroup ?? undefined}
@@ -908,22 +982,22 @@ const IMPORT_DEFAULTS = {
                 return { value: gid, label: g ? g.name : `${t('unknownGroup')} (#${gid})` };
               })}
           />
-          {selectedRowKeys.length > 0 && (
+          {!isMobile && selectedRowKeys.length > 0 && (
             <Button icon={<DownloadOutlined />} onClick={handleExportSelected}>
               {t('batchExport')} ({selectedRowKeys.length})
             </Button>
           )}
-          {selectedRowKeys.length > 0 && (
+          {!isMobile && selectedRowKeys.length > 0 && (
             <Button icon={<PlayCircleOutlined />} onClick={() => handleBatchSetPaused(false)}>
               {t('batchResume')} ({selectedRowKeys.length})
             </Button>
           )}
-          {selectedRowKeys.length > 0 && (
+          {!isMobile && selectedRowKeys.length > 0 && (
             <Button icon={<PauseCircleOutlined />} onClick={() => handleBatchSetPaused(true)}>
               {t('batchPause')} ({selectedRowKeys.length})
             </Button>
           )}
-          {selectedRowKeys.length > 0 && (
+          {!isMobile && selectedRowKeys.length > 0 && (
             <Popconfirm
               title={t('batchRestartConfirm').replace('{count}', String(selectedRowKeys.length))}
               description={t('restartConfirmDesc')}
@@ -935,7 +1009,7 @@ const IMPORT_DEFAULTS = {
               </Button>
             </Popconfirm>
           )}
-          {selectedRowKeys.length > 0 && (
+          {!isMobile && selectedRowKeys.length > 0 && (
             <Popconfirm
               title={t('batchDeleteConfirm').replace('{count}', String(selectedRowKeys.length))}
               onConfirm={handleBatchDelete}
@@ -946,9 +1020,16 @@ const IMPORT_DEFAULTS = {
               </Button>
             </Popconfirm>
           )}
-          <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
+          {isMobile && selectedRowKeys.length > 0 && (
+            <Dropdown menu={batchMenu} trigger={['click']}>
+              <Button icon={<MoreOutlined />}>
+                {t('selectedCount').replace('{count}', String(selectedRowKeys.length))}
+              </Button>
+            </Dropdown>
+          )}
+          <Button icon={<ReloadOutlined />} onClick={load}><span className="rp-mobile-hide">{t('refresh')}</span></Button>
           <Dropdown menu={{ items: exportMenuItems }}>
-            <Button icon={<DownloadOutlined />}>{t('exportImport')}</Button>
+            <Button icon={<DownloadOutlined />}><span className="rp-mobile-hide">{t('exportImport')}</span></Button>
           </Dropdown>
           <Button type="primary" icon={<PlusOutlined />} disabled={!isAdmin && sharedLoadFailed} onClick={() => { createForm.resetFields(); setCreateOpen(true); }}>{t('addRule')}</Button>
         </Space>
@@ -971,11 +1052,77 @@ const IMPORT_DEFAULTS = {
           description={t('loadFailedRetry')}
         />
       )}
-      <Table
-        rowSelection={{ selectedRowKeys, onChange: (keys) => setSelectedRowKeys(keys as number[]) }}
-        dataSource={visibleRules} columns={columns} rowKey="id" loading={loading}
-        pagination={{ pageSize: 20 }} scroll={{ x: 1200 }}
-      />
+      {isMobile ? (
+        <List
+          className="rp-rule-mobile-list"
+          loading={loading}
+          dataSource={visibleRules}
+          locale={{ emptyText: t('noRules') }}
+          pagination={{ pageSize: 10, size: 'small', hideOnSinglePage: true, showSizeChanger: false }}
+          renderItem={(r) => {
+            const listenHost = groupInfo.get(r.device_group_in)?.connect_host ?? t('notConfigured');
+            const overQuota = !r.paused && ruleOverQuota(r);
+            return (
+              <List.Item key={r.id}>
+                <Card size="small" className="rp-rule-card">
+                  <div className="rp-rule-card-header">
+                    <Checkbox
+                      checked={selectedRowKeys.includes(r.id)}
+                      onChange={event => setRuleSelected(r.id, event.target.checked)}
+                      aria-label={`${t('select')} #${r.id}`}
+                    />
+                    <div className="rp-rule-card-title">
+                      <Text strong ellipsis={{ tooltip: r.name }}>{r.name}</Text>
+                      <Text type="secondary" className="rp-rule-card-id">#{r.id}</Text>
+                    </div>
+                    <Space size={4} wrap className="rp-rule-card-status">
+                      {protoTags(r.protocol)}
+                      {r.paused && <Tag color="red">{t('paused')}</Tag>}
+                      {overQuota && <Tag color="orange">{t('quotaExhausted')}</Tag>}
+                    </Space>
+                  </div>
+                  <div className="rp-rule-card-grid">
+                    <div className="rp-rule-card-field rp-rule-card-field-wide">
+                      <span className="rp-rule-card-label">{t('chainPath')}</span>
+                      <span className="rp-rule-card-value">{ruleChainPath(r)}</span>
+                    </div>
+                    <div className="rp-rule-card-field">
+                      <span className="rp-rule-card-label">{t('groupName')}</span>
+                      <span className="rp-rule-card-value">{ruleGroupName(r)}</span>
+                    </div>
+                    <div className="rp-rule-card-field">
+                      <span className="rp-rule-card-label">{t('traffic')}</span>
+                      <span className="rp-rule-card-value">{formatBytes(r.traffic_used)}</span>
+                    </div>
+                    <div className="rp-rule-card-field rp-rule-card-field-wide">
+                      <span className="rp-rule-card-label">{t('listenIp')} / {t('listenPort')}</span>
+                      <span className="rp-rule-card-value rp-mono">{listenHost}:{r.listen_port}</span>
+                    </div>
+                    <div className="rp-rule-card-field rp-rule-card-field-wide">
+                      <span className="rp-rule-card-label">{t('target')}</span>
+                      <span className="rp-rule-card-value rp-mono">{targetSummary(r)}</span>
+                    </div>
+                    {isAdmin && (
+                      <div className="rp-rule-card-field rp-rule-card-field-wide">
+                        <span className="rp-rule-card-label">{t('owner')}</span>
+                        <span className="rp-rule-card-value">{userMap.get(r.uid) ?? `#${r.uid}`}</span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="rp-rule-card-footer">{renderRuleActions(r)}</div>
+                </Card>
+              </List.Item>
+            );
+          }}
+        />
+      ) : (
+        <Table
+          className="rp-responsive-table rp-rules-table"
+          rowSelection={{ selectedRowKeys, onChange: (keys) => setSelectedRowKeys(keys as number[]) }}
+          dataSource={visibleRules} columns={columns} rowKey="id" loading={loading}
+          pagination={{ pageSize: 20 }} scroll={{ x: 1480 }}
+        />
+      )}
 
       <Modal title={t('addRule')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={620}>
         <Form
@@ -1036,9 +1183,9 @@ const IMPORT_DEFAULTS = {
                       <Form.Item label={t('chainHops')} extra={t('chainHopsHint')} required>
                         <Space orientation="vertical" style={{ width: '100%' }}>
                           {fields.map((field, idx) => (
-                            <Space key={field.key} align="baseline" style={{ display: 'flex' }}>
+                            <Space key={field.key} align="baseline" style={{ display: 'flex' }} className="rp-chain-row">
                               <Tag>{idx === 0 ? t('hopEntry') : idx === fields.length - 1 ? t('hopExit') : `${t('hopMid')} ${idx}`}</Tag>
-                              <Form.Item {...field} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1, minWidth: 280 }}>
+                              <Form.Item {...field} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1 }} className="rp-chain-select">
                                 <Select options={hopGroupOptions} placeholder={t('select')} showSearch optionFilterProp="label" />
                               </Form.Item>
                               {fields.length > 2 && (
@@ -1141,9 +1288,9 @@ const IMPORT_DEFAULTS = {
                       <Form.Item label={t('chainHops')} extra={t('chainHopsHint')} required>
                         <Space orientation="vertical" style={{ width: '100%' }}>
                           {fields.map((field, idx) => (
-                            <Space key={field.key} align="baseline" style={{ display: 'flex' }}>
+                            <Space key={field.key} align="baseline" style={{ display: 'flex' }} className="rp-chain-row">
                               <Tag>{idx === 0 ? t('hopEntry') : idx === fields.length - 1 ? t('hopExit') : `${t('hopMid')} ${idx}`}</Tag>
-                              <Form.Item {...field} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1, minWidth: 280 }}>
+                              <Form.Item {...field} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1 }} className="rp-chain-select">
                                 <Select options={hopGroupOptions} placeholder={t('select')} showSearch optionFilterProp="label" />
                               </Form.Item>
                               {fields.length > 2 && (
@@ -1305,7 +1452,7 @@ function DiagnoseNodeRow({ node, t, isAdmin }: { node: NodeDiagnoseStatus; t: (k
         )}
       </Space>
       {node.status === 'result' && node.results.length > 0 && (
-        <Table<DiagnoseTargetResult> size="small" pagination={false} style={{ marginTop: 8 }}
+        <Table<DiagnoseTargetResult> className="rp-responsive-table" size="small" pagination={false} style={{ marginTop: 8 }} scroll={{ x: 'max-content' }}
           dataSource={node.results} rowKey="address"
           columns={[
             { title: t('diagnoseTarget'), dataIndex: 'address', key: 'address', render: (v: string) => <span className="rp-mono">{v}</span> },

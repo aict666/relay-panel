@@ -52,11 +52,8 @@ export default function ForcePasswordChange() {
   };
 
   return (
-    <div style={{
-      display: 'flex', justifyContent: 'center', alignItems: 'center',
-      minHeight: '100vh', background: 'var(--rp-bg)',
-    }}>
-      <Card style={{ width: 400, boxShadow: 'var(--rp-shadow)' }}>
+    <div className="rp-auth-page">
+      <Card className="rp-auth-card rp-auth-card-wide">
         <div style={{ textAlign: 'center', marginBottom: 20 }}>
           <Title level={4} style={{ margin: 0 }}>{t('forcePasswordChange')}</Title>
         </div>

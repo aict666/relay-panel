@@ -192,12 +192,12 @@ export default function Plans() {
     <>
       <div className="rp-page-header">
         <h2 className="rp-page-title"><ShoppingOutlined /> {t('planManagement')}</h2>
-        <Space>
+        <Space className="rp-page-actions" wrap>
           <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>{t('addPlan')}</Button>
         </Space>
       </div>
-      <Table dataSource={plans} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} />
+      <Table className="rp-responsive-table" dataSource={plans} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} scroll={{ x: 'max-content' }} />
 
       <Modal title={t('addPlan')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={520}>
         <Form form={createForm} onFinish={handleCreate} layout="vertical" initialValues={{ plan_type: 'data', duration_days: 0, hidden: false, reset_traffic: false, description: '', grant_all_groups: false, device_group_ids: [] }}>
