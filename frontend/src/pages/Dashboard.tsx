@@ -1,4 +1,4 @@
-import { Card, Col, Row, Statistic, Table, Tag, Typography, Alert, Modal, Button, Space, Tooltip } from 'antd';
+import { Card, Col, Row, Table, Tag, Typography, Alert, Modal, Button, Space, Tooltip } from 'antd';
 import {
   CloudServerOutlined, ApiOutlined, UserOutlined, DashboardOutlined, ReloadOutlined,
   ArrowUpOutlined, ArrowDownOutlined,
@@ -117,6 +117,14 @@ export default function Dashboard() {
   //  duplicating the node-status page on the dashboard).
   const groups = useMemo(() => aggregateNodesByGroup(nodes), [nodes]);
 
+  // KPI tiles. Each is a shortcut to the page that owns the number, so the
+  // dashboard doubles as navigation instead of being a read-only wall.
+  const kpis = [
+    { label: t('users'), value: stats.users, icon: <UserOutlined />, to: '/users', tone: '' },
+    { label: t('forwardRules'), value: stats.rules, icon: <ApiOutlined />, to: '/rules', tone: 'rp-stat-icon-cyan' },
+    { label: t('deviceGroups'), value: stats.groups, icon: <CloudServerOutlined />, to: '/groups', tone: 'rp-stat-icon-emerald' },
+  ];
+
   const statusColor = (s: string) =>
     s === 'online' ? 'green' : s === 'partial' ? 'orange' : 'red';
   const statusLabel = (s: string) =>
@@ -222,28 +230,25 @@ export default function Dashboard() {
           }
         />
       )}
-      {!versionInfo?.check_failed && !showUpdateBanner && versionInfo && (
-        <Alert
-          type="success"
-          showIcon
-          style={{ marginBottom: 16 }}
-          title={`${t('currentVersion')}: v${versionInfo.current_version} · ${t('upToDate')}`}
-        />
-      )}
-
+      {/* v1.2.4: the "you are up to date" state no longer gets a full-width
+          success banner — it's the normal case, so it reads as a quiet tag next
+          to the version in the page header. Only failures and available
+          updates still warrant a banner. */}
       <div className="rp-page-header">
         <h2 className="rp-page-title">
           <DashboardOutlined /> {t('dashboard')}
           {versionInfo && (
-            <Space size="middle" style={{ marginLeft: 16, fontSize: 13, fontWeight: 'normal' }}>
+            <Space size={8} style={{ marginLeft: 12, fontSize: 13, fontWeight: 'normal' }}>
               <Text type="secondary">
-                {t('currentVersion')}: <span className="rp-mono">v{versionInfo.current_version}</span>
+                <span className="rp-mono">v{versionInfo.current_version}</span>
               </Text>
-              {versionInfo.has_update && (
-                <Text type="warning">
-                  {t('latestVersion')}: <span className="rp-mono">{versionInfo.latest_version}</span>
-                </Text>
-              )}
+              {versionInfo.has_update ? (
+                <Tag color="gold">
+                  {t('latestVersion')}: {versionInfo.latest_version}
+                </Tag>
+              ) : !versionInfo.check_failed ? (
+                <Tag color="green">{t('upToDate')}</Tag>
+              ) : null}
             </Space>
           )}
         </h2>
@@ -258,15 +263,23 @@ export default function Dashboard() {
         </Tooltip>
       </div>
       <Row gutter={[16, 16]} style={{ marginBottom: 20 }}>
-        <Col xs={24} sm={8}>
-          <Card className="rp-stat-card"><Statistic title={t('users')} value={stats.users} prefix={<UserOutlined style={{ color: 'var(--rp-primary)' }} />} /></Card>
-        </Col>
-        <Col xs={24} sm={8}>
-          <Card className="rp-stat-card"><Statistic title={t('forwardRules')} value={stats.rules} prefix={<ApiOutlined style={{ color: 'var(--rp-primary)' }} />} /></Card>
-        </Col>
-        <Col xs={24} sm={8}>
-          <Card className="rp-stat-card"><Statistic title={t('deviceGroups')} value={stats.groups} prefix={<CloudServerOutlined style={{ color: 'var(--rp-primary)' }} />} /></Card>
-        </Col>
+        {kpis.map((k) => (
+          <Col xs={24} sm={12} lg={8} key={k.to}>
+            <Card
+              className="rp-stat-card rp-stat-card-link"
+              style={{ cursor: 'pointer' }}
+              onClick={() => navigate(k.to)}
+            >
+              <div className="rp-stat">
+                <div className="rp-stat-text">
+                  <span className="rp-stat-label">{k.label}</span>
+                  <span className="rp-stat-value">{k.value}</span>
+                </div>
+                <span className={`rp-stat-icon ${k.tone}`}>{k.icon}</span>
+              </div>
+            </Card>
+          </Col>
+        ))}
       </Row>
 
       <Card title={t('nodeStatus')} extra={<Text type="secondary" style={{ fontSize: 12 }}>{t('autoRefresh10s')}</Text>}>

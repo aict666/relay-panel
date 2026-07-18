@@ -120,7 +120,9 @@ export default function Account() {
           </Space>
         }
       >
-        <Descriptions column={1} bordered size="small">
+        {/* Two columns from md up — a single column left a very wide empty
+            value gutter on desktop. */}
+        <Descriptions column={{ xs: 1, sm: 1, md: 2 }} bordered size="small">
           <Descriptions.Item label={t('accountUsername')}>
             <Text strong>{me.username}</Text>
             {me.admin && <Text type="secondary"> ({t('admin')})</Text>}

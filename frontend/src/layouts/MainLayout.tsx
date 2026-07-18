@@ -1,4 +1,8 @@
-import { Layout, Menu, Button, Space, Typography, Segmented, Modal, Form, Input, message, Spin } from 'antd';
+import {
+  Layout, Menu, Button, Segmented, Modal, Form, Input, message, Spin,
+  Grid, Drawer, Dropdown, Avatar,
+} from 'antd';
+import type { MenuProps } from 'antd';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { useState, Suspense } from 'react';
 import {
@@ -10,6 +14,10 @@ import {
   LockOutlined,
   SettingOutlined,
   ShoppingOutlined,
+  MenuOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
+  ThunderboltFilled,
 } from '@ant-design/icons';
 import { useI18n } from '../i18n/context';
 import api from '../api/client';
@@ -18,16 +26,31 @@ import { useAuth } from '../auth/useAuth';
 import { makePasswordValidator } from '../utils/password';
 
 const { Sider, Content, Header } = Layout;
-const { Text } = Typography;
+
+/** Sidebar masthead. Shrinks to just the mark when the rail is collapsed. */
+function Brand({ collapsed = false }: { collapsed?: boolean }) {
+  return (
+    <div className="rp-brand">
+      <span className="rp-brand-mark"><ThunderboltFilled /></span>
+      {!collapsed && <span className="rp-brand-name">RelayPanel</span>}
+    </div>
+  );
+}
 
 export default function MainLayout() {
   const navigate = useNavigate();
   const location = useLocation();
   const { t, lang, setLang } = useI18n();
-  const { isAdmin, logout: authLogout } = useAuth();
+  const { isAdmin, user, logout: authLogout } = useAuth();
   const [changePwOpen, setChangePwOpen] = useState(false);
   const [pwForm] = Form.useForm();
   const [pwSubmitting, setPwSubmitting] = useState(false);
+  // Below lg the rail is replaced by a drawer; above it the rail collapses to
+  // an icon-only strip so wide tables get the horizontal room back.
+  const screens = Grid.useBreakpoint();
+  const isMobile = !screens.lg;
+  const [collapsed, setCollapsed] = useState(false);
+  const [navOpen, setNavOpen] = useState(false);
 
   // v0.4.11 PR2: role-based navigation.
   // Admin: Dashboard → 个人中心, 转发规则, 设备分组, 节点状态, 隧道配置, 用户管理, 系统设置
@@ -47,14 +70,63 @@ export default function MainLayout() {
     { key: '/users', icon: <UserOutlined />, label: t('users') },
     { key: '/settings', icon: <SettingOutlined />, label: t('systemSettings') },
   ];
-  const menuItems = isAdmin
-    ? [dashboardItem, ...sharedItems, ...adminOnlyItems]
-    : sharedItems;
+  // Admins get three sections so the 9-entry list scans; regular users have
+  // four entries, where a section header would be noise.
+  const sections = isAdmin
+    ? [
+        { label: t('navGroupOverview'), items: [dashboardItem] },
+        { label: t('navGroupWorkspace'), items: sharedItems },
+        { label: t('navGroupAdmin'), items: adminOnlyItems },
+      ]
+    : [{ label: '', items: sharedItems }];
+  const flatItems = sections.flatMap((s) => s.items);
+  // Group titles are dropped on the collapsed rail — antd renders them as
+  // clipped text next to icon-only entries.
+  const railCollapsed = collapsed && !isMobile;
+  const menuItems: MenuProps['items'] = isAdmin && !railCollapsed
+    ? sections.map((s) => ({ type: 'group' as const, label: s.label, children: s.items }))
+    : flatItems;
+
+  // The header shows a breadcrumb, not a repeat of the page's own <h1>.
+  const currentTitle = flatItems.find((i) => i.key === location.pathname)?.label;
+  const currentSection = sections.find((s) => s.items.some((i) => i.key === location.pathname));
 
   const logout = () => {
     authLogout();
     navigate('/login');
   };
+
+  const go = (key: string) => {
+    navigate(key);
+    setNavOpen(false);
+  };
+
+  const nav = (
+    <Menu
+      className="rp-nav"
+      mode="inline"
+      selectedKeys={[location.pathname]}
+      items={menuItems}
+      onClick={({ key }) => go(key)}
+    />
+  );
+
+  const userMenu: MenuProps['items'] = [
+    {
+      key: 'password',
+      icon: <LockOutlined />,
+      label: t('changePassword'),
+      onClick: () => setChangePwOpen(true),
+    },
+    { type: 'divider' },
+    {
+      key: 'logout',
+      icon: <LogoutOutlined />,
+      label: t('logout'),
+      danger: true,
+      onClick: logout,
+    },
+  ];
 
   const handleChangePassword = async (values: { current_password: string; new_password: string }) => {
     setPwSubmitting(true);
@@ -76,33 +148,54 @@ export default function MainLayout() {
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
-      <Sider
-        collapsible
-        breakpoint="lg"
-        collapsedWidth={0}
-        width={220}
-        className="rp-sidebar"
-        style={{ background: 'var(--rp-sidebar-bg)' }}
+      {!isMobile && (
+        <Sider
+          theme="light"
+          width={232}
+          collapsedWidth={72}
+          collapsed={collapsed}
+          trigger={null}
+          className={`rp-sidebar${collapsed ? ' rp-sidebar-collapsed' : ''}`}
+          style={{ position: 'sticky', top: 0, height: '100dvh', overflow: 'hidden' }}
+        >
+          <Brand collapsed={collapsed} />
+          {nav}
+        </Sider>
+      )}
+
+      <Drawer
+        placement="left"
+        open={navOpen}
+        onClose={() => setNavOpen(false)}
+        size={272}
+        closable={false}
+        styles={{ body: { padding: 0 }, header: { display: 'none' } }}
       >
-        <div style={{
-          height: 'var(--rp-header-height)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          color: '#fff', fontSize: 17, fontWeight: 600, letterSpacing: 0.5,
-        }}>
-          RelayPanel
-        </div>
-        <Menu
-          theme="dark"
-          mode="inline"
-          selectedKeys={[location.pathname]}
-          items={menuItems}
-          onClick={({ key }) => navigate(key)}
-          style={{ borderRight: 0 }}
-        />
-      </Sider>
-      <Layout>
+        <Brand />
+        {nav}
+      </Drawer>
+
+      <Layout style={{ minWidth: 0 }}>
         <Header className="rp-app-header">
-          <Space size="middle" className="rp-header-actions">
+          <div className="rp-header-left">
+            <Button
+              type="text"
+              className="rp-icon-button"
+              aria-label={t('toggleMenu')}
+              icon={isMobile ? <MenuOutlined /> : collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+              onClick={() => (isMobile ? setNavOpen(true) : setCollapsed((c) => !c))}
+            />
+            <span className="rp-header-crumb">
+              {currentSection?.label && (
+                <>
+                  <span className="rp-crumb-parent">{currentSection.label}</span>
+                  <span className="rp-crumb-sep">/</span>
+                </>
+              )}
+              <span className="rp-header-title">{currentTitle}</span>
+            </span>
+          </div>
+          <div className="rp-header-actions">
             <Segmented
               size="small"
               value={lang}
@@ -112,24 +205,37 @@ export default function MainLayout() {
                 { value: 'en-US', label: t('langEnUS') },
               ]}
             />
-            <Text type="secondary" className="rp-header-role">
-              {isAdmin ? t('admin') : t('user')}
-            </Text>
-            <Button type="text" size="small" icon={<LockOutlined />} onClick={() => setChangePwOpen(true)}>
-              <span className="rp-header-button-label">{t('changePassword')}</span>
-            </Button>
-            <Button type="text" size="small" icon={<LogoutOutlined />} onClick={logout}>
-              <span className="rp-header-button-label">{t('logout')}</span>
-            </Button>
-          </Space>
+            <span className="rp-header-divider" />
+            <Dropdown menu={{ items: userMenu }} trigger={['click']} placement="bottomRight">
+              <div className="rp-user-chip" role="button" tabIndex={0}>
+                <Avatar
+                  size={30}
+                  style={{
+                    background: 'var(--rp-primary-soft)',
+                    color: 'var(--rp-primary-strong)',
+                    fontSize: 13,
+                    fontWeight: 600,
+                  }}
+                >
+                  {(user?.username || 'U').slice(0, 1).toUpperCase()}
+                </Avatar>
+                <span className="rp-user-chip-meta">
+                  <span className="rp-user-chip-name">{user?.username || t('user')}</span>
+                  <span className="rp-user-chip-role">{isAdmin ? t('admin') : t('user')}</span>
+                </span>
+              </div>
+            </Dropdown>
+          </div>
         </Header>
         <Content className="rp-content">
-          {/* v1.2 (PR4): lazy-loaded pages (router.tsx) suspend here on first
-              navigation to their chunk, showing a centered spinner instead of a
-              blank pane. */}
-          <Suspense fallback={<div style={{ textAlign: 'center', padding: 48 }}><Spin /></div>}>
-            <Outlet />
-          </Suspense>
+          <div className="rp-content-inner">
+            {/* v1.2 (PR4): lazy-loaded pages (router.tsx) suspend here on first
+                navigation to their chunk, showing a centered spinner instead of a
+                blank pane. */}
+            <Suspense fallback={<div style={{ textAlign: 'center', padding: 48 }}><Spin /></div>}>
+              <Outlet />
+            </Suspense>
+          </div>
         </Content>
       </Layout>
 

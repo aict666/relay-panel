@@ -6,11 +6,12 @@ import type { Tfn } from './types';
 
 const { Text } = Typography;
 
-/** Threshold color for a usage percent: <70 green, 70-89 orange, >=90 red. */
+/** Threshold color for a usage percent: <70 healthy (theme teal), 70-89 amber,
+ *  >=90 red. Values track the palette in styles/theme.css. */
 export function usageColor(p: number): string {
-  if (p >= 90) return '#ff4d4f';
-  if (p >= 70) return '#faad14';
-  return '#52c41a';
+  if (p >= 90) return '#dc2626';
+  if (p >= 70) return '#d97706';
+  return '#0d9488';
 }
 
 /** A compact CPU/mem progress bar with a precise-value tooltip. Missing → "-"

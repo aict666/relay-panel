@@ -6,7 +6,7 @@ import type { ApiEnvelope, Plan, Order, UserSelf } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 
-const { Text, Title } = Typography;
+const { Text } = Typography;
 
 /**
  * v1.0.8: self-service shop. Lists purchasable (non-hidden) plans as cards,
@@ -125,10 +125,10 @@ export default function Shop() {
               title={<Space><Text strong>{p.name}</Text>{p.plan_type === 'time' && <Tag color="purple">{t('planTypeTime')}</Tag>}</Space>}
               extra={p.description ? <Text type="secondary" style={{ fontSize: 12 }}>{p.description}</Text> : null}
             >
-              <div style={{ marginBottom: 8 }}>
-                <Title level={3} style={{ margin: 0 }}><span className="rp-mono">{p.price}</span></Title>
-              </div>
-              <div style={{ color: 'var(--rp-text-secondary)', fontSize: 13, lineHeight: 1.8 }}>
+              {/* The price used to be a <Title> wrapping .rp-mono, whose 12px
+                  font-size won — it rendered smaller than the body text. */}
+              <div className="rp-plan-price">{p.price}</div>
+              <div className="rp-plan-features">
                 <div>{t('planTraffic')}: {p.traffic > 0 ? formatBytes(p.traffic) : t('unlimited')}</div>
                 <div>{t('planMaxRules')}: {p.max_rules}</div>
                 {p.duration_days > 0 && <div>{t('planDuration')}: {p.duration_days} {t('days')}</div>}
