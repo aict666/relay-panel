@@ -184,7 +184,7 @@ if [ "$TRACK" = "panel" ]; then
     # v1.2: the tag may be a literal (:1.1.0) OR an env-var override with a
     # default (${RELAYPANEL_PANEL_TAG:-1.1.0}); match the version anywhere on
     # the panel image line.
-    if grep -E "image:.*ghcr\.io/moeshinx/relay-panel-panel.*${VERSION}([^0-9.]|$)" docker-compose.release.yaml >/dev/null 2>&1; then
+    if grep -E "image:.*ghcr\.io/aict666/relay-panel-panel.*${VERSION}([^0-9.]|$)" docker-compose.release.yaml >/dev/null 2>&1; then
         ok "docker-compose.release.yaml panel image tag includes ${VERSION}"
     else
         fail "docker-compose.release.yaml: panel image tag ${VERSION} not found"
@@ -233,7 +233,7 @@ else
     # v1.2: the tag may be a literal (:1.1.0) OR an env-var override with a
     # default (${RELAYPANEL_NODE_TAG:-1.1.0}); match the version anywhere on
     # the node image line.
-    if grep -E "image:.*ghcr\.io/moeshinx/relay-panel-node.*${VERSION}([^0-9.]|$)" docker-compose.release.yaml >/dev/null 2>&1; then
+    if grep -E "image:.*ghcr\.io/aict666/relay-panel-node.*${VERSION}([^0-9.]|$)" docker-compose.release.yaml >/dev/null 2>&1; then
         ok "docker-compose.release.yaml node image tag includes ${VERSION}"
     else
         fail "docker-compose.release.yaml: node image tag ${VERSION} not found"

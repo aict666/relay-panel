@@ -45,7 +45,7 @@ This is the supported path. It detects the architecture, downloads the right
 binary from GitHub Releases, writes a systemd service, and starts it.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/scripts/relay-node-install.sh) \
   -t <NODE_TOKEN> \
   -u https://your-panel.example.com
 ```
@@ -79,7 +79,7 @@ server where you copy the binary over manually).
 ARCH=amd64   # or arm64
 VERSION=1.0.3
 curl -fL -o relay-node \
-  "https://github.com/MoeShinX/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
+  "https://github.com/aict666/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
 
 # 2. Make it executable and put it somewhere
 chmod +x relay-node
@@ -243,7 +243,7 @@ carries the correct `-t <NODE_TOKEN> -u <PANEL_URL>`, so you don't have to
 remember them:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/scripts/relay-node-install.sh) \
   -t <NODE_TOKEN> \
   -u https://your-panel.example.com
 ```
@@ -389,13 +389,13 @@ directly and install by hand (see [Manual install](#option-b-manual-install)):
 VERSION=1.0.3
 ARCH=amd64   # or arm64
 curl -fL -o relay-node \
-  "https://github.com/MoeShinX/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
+  "https://github.com/aict666/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
 ```
 
 Then follow the [Manual systemd setup](#manual-systemd-setup) to run it.
 
 All released versions and their assets are listed on the
-[Releases page](https://github.com/MoeShinX/relay-panel/releases).
+[Releases page](https://github.com/aict666/relay-panel/releases).
 
 ---
 

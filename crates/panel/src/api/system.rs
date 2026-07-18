@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-const REPO: &str = "MoeShinX/relay-panel";
+const REPO: &str = "aict666/relay-panel";
 const CACHE_TTL: Duration = Duration::from_secs(1800); // 30 minutes
 
 /// Cached GitHub Release info. Shared across all requests via AppState.
@@ -535,7 +535,7 @@ mod tests {
         // Real-world v0.2.0 shape: body is null
         let json = r#"{
             "tag_name": "v0.2.0",
-            "html_url": "https://github.com/MoeShinX/relay-panel/releases/tag/v0.2.0",
+            "html_url": "https://github.com/aict666/relay-panel/releases/tag/v0.2.0",
             "body": null,
             "published_at": "2026-05-01T00:00:00Z",
             "draft": false,

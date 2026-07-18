@@ -10,6 +10,23 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-18
+
+### Changed
+
+- **Brand / distribute under `aict666/relay-panel`.** Install scripts, docs,
+  update checks, node self-upgrade, and GHCR image names now point at
+  `github.com/aict666/relay-panel` and `ghcr.io/aict666/relay-panel-*`
+  instead of the upstream MoeShinX coordinates.
+
+### Added
+
+- **Multi-hop forwarding chain.** Rules can use `route_mode=chain` with an
+  ordered hop list (entry → mid… → exit → final targets). The panel allocates
+  per-hop listen ports, emits listeners on every hop group (including `out`),
+  and sets `count_traffic` so only the entry hop is billed. Protocol version
+  bumped to 5 (panel and node must upgrade together).
+
 ### Fixed
 
 - **The connection cap is no longer offered on UDP-only rules.** It is enforced

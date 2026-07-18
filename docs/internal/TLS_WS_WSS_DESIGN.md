@@ -1202,7 +1202,7 @@ exec /opt/relay-node/relay-node
 ```yaml
 services:
   panel:
-    image: ghcr.io/moeshinx/relay-panel-panel:0.3.0
+    image: ghcr.io/aict666/relay-panel-panel:0.3.0
     ports:
       - "18888:18888"
     environment:
@@ -1224,7 +1224,7 @@ services:
       - panel
 
   node:
-    image: ghcr.io/moeshinx/relay-panel-node:0.3.0
+    image: ghcr.io/aict666/relay-panel-node:0.3.0
     environment:
       - PANEL_URL=http://panel:18888
       - NODE_TOKEN=${NODE_TOKEN}
@@ -1241,8 +1241,8 @@ volumes:
 ```
 
 > **镜像命名约定**：GHCR 镜像统一以 `relay-panel-` 为前缀（仓库归属），后缀区分服务类型：
-> - `ghcr.io/moeshinx/relay-panel-panel:<version>` — 面板
-> - `ghcr.io/moeshinx/relay-panel-node:<version>` — 转发节点
+> - `ghcr.io/aict666/relay-panel-panel:<version>` — 面板
+> - `ghcr.io/aict666/relay-panel-node:<version>` — 转发节点
 >
 > 与 `docker-compose.release.yaml`、`.github/workflows/docker-release.yml`、`docs/VERSIONS.md` 保持一致。
 

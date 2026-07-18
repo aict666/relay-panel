@@ -13,7 +13,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-18
+
+### Changed
+
+- **Downloads and self-upgrade use `aict666/relay-panel` releases** (no longer
+  MoeShinX). GHCR image: `ghcr.io/aict666/relay-panel-node`.
+
 ### Added
+
+- **`ListenerConfig.count_traffic`.** Intermediate/exit hops of a multi-hop
+  chain forward without adding bytes to the rule traffic counter (entry hop
+  only). Config protocol version **5** — pair with panel ≥ 1.2.0.
+
+### Added (carry-over)
 
 - **`restart_rule` control message.** The panel can ask the node to drop one
   rule's connections and rebuild its listeners. The node re-creates listeners

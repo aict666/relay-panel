@@ -105,7 +105,7 @@ export default function Login() {
         )}
         <div style={{ marginTop: 16, textAlign: 'center' }}>
           <a
-            href="https://github.com/MoeShinX/relay-panel"
+            href="https://github.com/aict666/relay-panel"
             target="_blank"
             rel="noopener noreferrer"
             style={{ fontSize: 12, color: 'var(--rp-text-tertiary)' }}

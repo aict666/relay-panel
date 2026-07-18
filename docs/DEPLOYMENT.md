@@ -17,7 +17,7 @@ clones the repo into `/opt/relay-panel`, then runs `deploy.sh` (which installs
 Docker, generates secrets, builds, and verifies):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/install.sh | bash
 ```
 
 Run as root (default on most VPS / cloud servers). If logged in as a non-root
@@ -47,7 +47,7 @@ Two ways to run the stack:
 
 | Mode | What it does | When to use |
 |------|-------------|-------------|
-| **Pre-built (default)** | Pulls images from GHCR (`ghcr.io/moeshinx/relay-panel-*:x.y.z`). No compilation on the server. | **Recommended** for production. Fast (~30s). |
+| **Pre-built (default)** | Pulls images from GHCR (`ghcr.io/aict666/relay-panel-*:x.y.z`). No compilation on the server. | **Recommended** for production. Fast (~30s). |
 | **Source build** | Builds images locally from source (`docker-compose.yaml`). | Development, offline servers, or custom modifications. |
 
 `deploy.sh` picks the mode automatically:
@@ -68,7 +68,7 @@ Go to Device Groups → Add Group (type: inbound) → copy the **Install Command
 ### 2. Run on the node server
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/scripts/relay-node-install.sh) \
   -t <token> -u http://<panel-ip>:18888
 ```
 
@@ -99,7 +99,7 @@ rm -rf /opt/relay-node
 ### 1. Clone
 
 ```bash
-git clone https://github.com/MoeShinX/relay-panel.git
+git clone https://github.com/aict666/relay-panel.git
 cd relay-panel
 ```
 
