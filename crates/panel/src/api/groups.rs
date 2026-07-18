@@ -3,7 +3,7 @@
 //! Lets regular users discover and attach rules to inbound groups owned by an
 //! admin ("shared infrastructure"). The actual rule binding is done via the
 //! existing POST /rules endpoint; this module provides the discovery APIs:
-//!   - GET /groups/shared — admin-owned `group_type='in'` groups (selectable
+//!   - GET /groups/shared — admin-owned inbound-capable (`in` / `both`) groups (selectable
 //!     line list), independent of whether the user already has rules.
 //!   - GET /nodes/shared  — per-NODE availability + load metrics, built by
 //!     scanning the `node_status:*` kvs keys (there is NO node_status table).

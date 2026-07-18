@@ -29,11 +29,11 @@ impl GroupRepository for SqliteRepository {
         if is_admin {
             return Ok(vec![]);
         }
-        // v0.4.12 PR1: regular users see ALL ADMIN-owned inbound groups,
+        // v0.4.12 PR1: regular users see ALL ADMIN-owned inbound-capable groups,
         // independent of whether they already have rules. The JOIN to users
         // enforces admin ownership so a regular user's group is never exposed
-        // as "shared". group_type uses the stable machine value 'in' (the old
-        // LIKE 'inbound%' never matched — group_type is 'in' / 'out' / 'monitor').
+        // as "shared". `both` is inbound-capable and therefore follows the
+        // same sharing/authorization path as `in`.
         // v1.0.7: `g.hidden` is SELECTED (not filtered here) so the caller
         // decides. Only the node-status path (`list_shared_node_summary`) hides
         // it; the rule dropdown / shop still list hidden groups so existing and
@@ -42,7 +42,7 @@ impl GroupRepository for SqliteRepository {
             "SELECT g.id, g.name, g.group_type, g.connect_host, g.capabilities, g.region, g.line_type, g.hidden \
              FROM device_groups g \
              JOIN users u ON u.id = g.uid \
-             WHERE g.uid != ? AND u.admin = 1 AND g.group_type = 'in' \
+             WHERE g.uid != ? AND u.admin = 1 AND g.group_type IN ('in', 'both') \
              ORDER BY g.id",
         )
         .bind(uid)
@@ -277,10 +277,11 @@ impl GroupRepository for SqliteRepository {
     }
 
     async fn list_all_inbound_group_ids(&self) -> Result<Vec<i64>, DbError> {
-        let rows: Vec<(i64,)> =
-            sqlx::query_as("SELECT id FROM device_groups WHERE group_type = 'in' ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM device_groups WHERE group_type IN ('in', 'both') ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 

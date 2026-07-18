@@ -2008,7 +2008,8 @@ async fn pg_shared_groups_admin_inbound_only() {
         .execute(&db.pool)
         .await
         .unwrap();
-    // Admin-owned inbound (shared), admin-owned out/monitor (excluded), and
+    // Admin-owned inbound + dual-role (shared), admin-owned out/monitor
+    // (excluded), and
     // bob's inbound (excluded — not admin-owned).
     sqlx::query("INSERT INTO device_groups (id, name, group_type, token, connect_host, uid) VALUES (10, 'g10', 'in', 't10', '1.2.3.4', 1)")
         .execute(&db.pool).await.unwrap();
@@ -2016,13 +2017,19 @@ async fn pg_shared_groups_admin_inbound_only() {
         .execute(&db.pool).await.unwrap();
     sqlx::query("INSERT INTO device_groups (id, name, group_type, token, connect_host, uid) VALUES (12, 'g12', 'monitor', 't12', '1.2.3.4', 1)")
         .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, connect_host, uid) VALUES (13, 'g13', 'both', 't13', '1.2.3.4', 1)")
+        .execute(&db.pool).await.unwrap();
     sqlx::query("INSERT INTO device_groups (id, name, group_type, token, connect_host, uid) VALUES (20, 'g20', 'in', 't20', '1.2.3.4', 3)")
         .execute(&db.pool).await.unwrap();
 
-    // alice (regular, no rules) sees ONLY the admin inbound group 10.
+    // alice (regular, no rules) sees the admin inbound-capable groups 10 + 13.
     let shared = db.list_shared_groups(2, false).await.unwrap();
-    assert_eq!(shared.len(), 1, "only admin 'in' group is shared (PG)");
-    assert_eq!(shared[0].id, 10);
+    assert_eq!(
+        shared.iter().map(|g| g.id).collect::<Vec<_>>(),
+        vec![10, 13],
+        "admin 'in' and 'both' groups are shared (PG)"
+    );
+    assert_eq!(db.list_all_inbound_group_ids().await.unwrap(), vec![10, 13]);
 
     // admin caller gets an empty list.
     let admin_shared = db.list_shared_groups(1, true).await.unwrap();

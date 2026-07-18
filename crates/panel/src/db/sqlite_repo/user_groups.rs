@@ -51,7 +51,7 @@ impl DeviceGroupAuthRepository for SqliteRepository {
     }
 
     async fn authorized_device_group_ids(&self, user_id: i64) -> Result<Vec<i64>, DbError> {
-        // Admins and all_device_groups users get EVERY inbound group.
+        // Admins and all_device_groups users get EVERY inbound-capable group.
         let flags: Option<(bool, bool)> =
             sqlx::query_as("SELECT admin, all_device_groups FROM users WHERE id = ?")
                 .bind(user_id)
@@ -62,10 +62,11 @@ impl DeviceGroupAuthRepository for SqliteRepository {
             None => return Ok(Vec::new()),
         };
         if is_admin || all {
-            let all_in: Vec<(i64,)> =
-                sqlx::query_as("SELECT id FROM device_groups WHERE group_type = 'in' ORDER BY id")
-                    .fetch_all(&self.pool)
-                    .await?;
+            let all_in: Vec<(i64,)> = sqlx::query_as(
+                "SELECT id FROM device_groups WHERE group_type IN ('in', 'both') ORDER BY id",
+            )
+            .fetch_all(&self.pool)
+            .await?;
             return Ok(all_in.into_iter().map(|(id,)| id).collect());
         }
         // Otherwise only the user's explicit assignments (inbound groups only —
@@ -73,7 +74,7 @@ impl DeviceGroupAuthRepository for SqliteRepository {
         let rows: Vec<(i64,)> = sqlx::query_as(
             "SELECT dg.id FROM device_groups dg \
              JOIN user_device_groups udg ON udg.device_group_id = dg.id \
-             WHERE udg.user_id = ? AND dg.group_type = 'in' \
+             WHERE udg.user_id = ? AND dg.group_type IN ('in', 'both') \
              ORDER BY dg.id",
         )
         .bind(user_id)

@@ -126,8 +126,16 @@ pub fn group_type_to_str(gt: &GroupType) -> &'static str {
     match gt {
         GroupType::In => "in",
         GroupType::Out => "out",
+        GroupType::Both => "both",
         GroupType::Monitor => "monitor",
     }
+}
+
+/// Whether a device group can be used as the first hop of a rule.
+/// `both` deliberately shares all inbound behavior while remaining available
+/// as a later chain hop, so one relay-node registration can serve both roles.
+pub fn group_type_supports_inbound(group_type: &str) -> bool {
+    matches!(group_type, "in" | "both")
 }
 
 /// The default auto-assign pool used when a group's `port_range` is unset, is
@@ -285,7 +293,7 @@ async fn validate_admin_owned_inbound_group(
                     return Err(CreateRuleError::Database(e));
                 }
             };
-            if g.group_type != "in" || !owner_is_admin {
+            if !group_type_supports_inbound(&g.group_type) || !owner_is_admin {
                 return Err(CreateRuleError::BadRequest(
                     "device_group_in not found".into(),
                 ));
@@ -1176,6 +1184,15 @@ pub async fn update_rule(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_group_type_maps_and_supports_inbound() {
+        assert_eq!(group_type_to_str(&GroupType::Both), "both");
+        assert!(group_type_supports_inbound("both"));
+        assert!(group_type_supports_inbound("in"));
+        assert!(!group_type_supports_inbound("out"));
+        assert!(!group_type_supports_inbound("monitor"));
+    }
 
     /// The valid combinations must all pass (return None). These are the ones
     /// the UI and the node actually support in v0.3.0-alpha.

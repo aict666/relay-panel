@@ -30,8 +30,8 @@ use relay_shared::protocol::NodeConfigResponse;
 /// This is the ONE function both `get_config` (HTTP) and `build_config_snapshot`
 /// (WS) call. It performs, in order:
 ///
-/// 1. Group lookup — `monitor` groups never forward; `in`/`out` (and other
-///    non-monitor) groups can receive listeners.
+/// 1. Group lookup — `monitor` groups never forward; `in`/`out`/`both` groups
+///    can receive listeners.
 /// 2. Direct rules + chain **entry** hops via `device_group_in` match.
 /// 3. Chain intermediate/exit hops via `forward_rule_hops` for this group.
 /// 4. Target resolution (final targets or next-hop connect_host:port).
@@ -481,6 +481,64 @@ mod tests {
         assert_eq!(exit_cfg.listeners[0].port, 30000);
         assert_eq!(exit_cfg.listeners[0].targets, vec!["9.9.9.9:443".to_string()]);
         assert!(!exit_cfg.listeners[0].count_traffic);
+    }
+
+    /// One `both` group represents one relay-node registration that can serve
+    /// its own entry rules and another chain's exit hop at the same time. The
+    /// node must receive both listeners in one config snapshot; otherwise an
+    /// operator would still need two groups/processes on the same server.
+    #[tokio::test]
+    async fn dual_role_group_combines_entry_and_exit_listeners() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (10, 'entry', 'in', 'tok-10', 2, '1.1.1.1'), \
+                    (20, 'dual', 'both', 'tok-20', 2, '2.2.2.2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Rule 100 uses the dual-role node as its exit.
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, device_group_in, device_group_out, forward_mode, \
+              route_mode, target_addr, target_port) \
+             VALUES (100, 'chain-to-dual', 2, 20000, 10, 20, 'chain', 'chain', '9.9.9.9', 443)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops (rule_id, position, device_group_id, listen_port) \
+             VALUES (100, 0, 10, 20000), (100, 1, 20, 30000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Rule 200 uses that same node as a normal entry.
+        add_rule(&pool, 200, 2, 20, 40000).await;
+
+        let cfg = build_node_config(&repo(&pool), 20).await.unwrap();
+        assert_eq!(cfg.listeners.len(), 2);
+        let by_port: std::collections::HashMap<_, _> =
+            cfg.listeners.iter().map(|l| (l.port, l)).collect();
+
+        let exit = by_port.get(&30000).expect("chain exit listener");
+        assert_eq!(exit.targets, vec!["9.9.9.9:443".to_string()]);
+        assert!(
+            !exit.count_traffic,
+            "exit hop must not double-count traffic"
+        );
+
+        let entry = by_port.get(&40000).expect("direct entry listener");
+        assert_eq!(entry.targets, vec!["127.0.0.1:80".to_string()]);
+        assert!(
+            entry.count_traffic,
+            "entry listener owns traffic accounting"
+        );
     }
 
     /// traffic_limit = 0 means unlimited — never filtered by quota even if

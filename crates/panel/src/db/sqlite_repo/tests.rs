@@ -101,6 +101,44 @@ async fn shared_groups_lists_admin_inbound_for_user_without_rules() {
     // is sufficient here.
 }
 
+#[tokio::test]
+async fn both_groups_are_shared_and_authorized_as_inbound() {
+    let db = repo().await;
+    seed_user(&db, 2, false).await;
+    seed_group_typed(&db, 10, 1, "in").await;
+    seed_group_typed(&db, 11, 1, "both").await;
+    seed_group_typed(&db, 12, 1, "out").await;
+
+    let shared = db.list_shared_groups(2, false).await.unwrap();
+    assert_eq!(
+        shared.iter().map(|g| g.id).collect::<Vec<_>>(),
+        vec![10, 11],
+        "dual-role groups must be shared alongside inbound groups"
+    );
+    assert_eq!(
+        db.list_all_inbound_group_ids().await.unwrap(),
+        vec![10, 11],
+        "grant-all plans must include dual-role groups"
+    );
+
+    db.set_user_device_groups(2, &[11, 12]).await.unwrap();
+    assert_eq!(
+        db.authorized_device_group_ids(2).await.unwrap(),
+        vec![11],
+        "explicit authorization must keep dual-role entries and reject out-only groups"
+    );
+
+    sqlx::query("UPDATE users SET all_device_groups = 1 WHERE id = 2")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.authorized_device_group_ids(2).await.unwrap(),
+        vec![10, 11],
+        "all-device-groups users must be authorized for dual-role entries"
+    );
+}
+
 /// scenario 2: out / monitor groups never appear in the shared list.
 #[tokio::test]
 async fn shared_groups_excludes_non_inbound_types() {

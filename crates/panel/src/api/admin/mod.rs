@@ -1338,6 +1338,31 @@ mod tests {
         assert_eq!(resp.code, 0, "{}", resp.message);
     }
 
+    /// A `both` group is one physical relay-node registration with two roles:
+    /// it must pass the exact same entry validation as `in` while remaining
+    /// selectable as a later chain hop.
+    #[tokio::test]
+    async fn create_rule_allows_admin_both_group_as_inbound() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group_typed(&pool, 12, 1, "shared-dual-role", "both").await;
+
+        let Json(resp) = create_rule(
+            auth(2, false),
+            State(state.clone()),
+            Json(rule_req("r-both", 20012, 12, None)),
+        )
+        .await;
+        assert_eq!(resp.code, 0, "{}", resp.message);
+
+        let group_id: (i64,) =
+            sqlx::query_as("SELECT device_group_in FROM forward_rules WHERE name = 'r-both'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(group_id.0, 12);
+    }
+
     // ── v1.0.7 regression: per-user device-group authorization ──
 
     /// Restrict a user to an explicit device-group allowlist (all_device_groups
@@ -1546,7 +1571,7 @@ mod tests {
     }
 
     /// v0.4.12 PR1: an admin-owned OUT (or monitor) group is NOT a valid rule
-    /// entry — device_group_in must be `group_type='in'`.
+    /// entry — device_group_in must be inbound-capable (`in` or `both`).
     #[tokio::test]
     async fn create_rule_rejects_admin_out_group_as_inbound() {
         let (state, pool) = test_state().await;
