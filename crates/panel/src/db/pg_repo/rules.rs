@@ -871,11 +871,7 @@ impl RuleRepository for PgRepository {
         Ok(rules)
     }
 
-    async fn replace_rule_hops(
-        &self,
-        rule_id: i64,
-        hops: &[(i64, i32)],
-    ) -> Result<(), DbError> {
+    async fn replace_rule_hops(&self, rule_id: i64, hops: &[(i64, i32)]) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM forward_rule_hops WHERE rule_id = $1")
             .bind(rule_id)
@@ -936,13 +932,12 @@ impl RuleRepository for PgRepository {
         rule_id: i64,
         position: i32,
     ) -> Result<Option<relay_shared::models::ForwardRuleHop>, DbError> {
-        let hop = sqlx::query_as(
-            "SELECT * FROM forward_rule_hops WHERE rule_id = $1 AND position = $2",
-        )
-        .bind(rule_id)
-        .bind(position)
-        .fetch_optional(&self.pool)
-        .await?;
+        let hop =
+            sqlx::query_as("SELECT * FROM forward_rule_hops WHERE rule_id = $1 AND position = $2")
+                .bind(rule_id)
+                .bind(position)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(hop)
     }
 }

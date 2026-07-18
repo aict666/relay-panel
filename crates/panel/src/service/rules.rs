@@ -457,55 +457,60 @@ pub async fn create_rule(
         || req.forward_mode == "chain"
         || req.hops.as_ref().map(|h| !h.is_empty()).unwrap_or(false);
 
-    let (effective_device_group_in, effective_device_group_out, hop_group_ids, forward_mode, route_str) =
-        if is_chain {
-            let hops = req.hops.clone().unwrap_or_default();
-            if hops.is_empty() {
-                return Err(CreateRuleError::BadRequest(
-                    "hops: required for chain mode (ordered device_group ids, entry first)".into(),
-                ));
-            }
-            validate_chain_hops(db, &hops, "create_rule").await?;
-            // Allow device_group_in to be omitted/wrong if hops provided — hops[0] wins.
-            let entry = hops[0];
-            let exit = *hops.last().unwrap();
-            if req.device_group_in != 0 && req.device_group_in != entry {
-                // If client sent device_group_in, it must match hops[0].
-                return Err(CreateRuleError::BadRequest(
-                    "device_group_in must equal hops[0] (entry group) for chain rules".into(),
-                ));
-            }
-            (
-                entry,
-                Some(exit),
-                hops,
-                "chain".to_string(),
-                RouteMode::Chain.to_db_str(),
-            )
-        } else {
-            if !validate_forward_mode(&req.forward_mode) && req.forward_mode != "direct" {
-                // Accept default/group legacy by forcing direct.
-            }
-            if req.forward_mode == "group" {
-                return Err(CreateRuleError::BadRequest(
-                    "forward_mode 'group' is no longer supported; use 'direct' or 'chain'".into(),
-                ));
-            }
-            if req.device_group_out.is_some() {
-                return Err(CreateRuleError::BadRequest(
-                    "device_group_out: only used with chain mode (set via hops); omit for direct"
-                        .into(),
-                ));
-            }
-            validate_admin_owned_inbound_group(db, req.device_group_in, "create_rule").await?;
-            (
-                req.device_group_in,
-                None,
-                Vec::new(),
-                "direct".to_string(),
-                RouteMode::Direct.to_db_str(),
-            )
-        };
+    let (
+        effective_device_group_in,
+        effective_device_group_out,
+        hop_group_ids,
+        forward_mode,
+        route_str,
+    ) = if is_chain {
+        let hops = req.hops.clone().unwrap_or_default();
+        if hops.is_empty() {
+            return Err(CreateRuleError::BadRequest(
+                "hops: required for chain mode (ordered device_group ids, entry first)".into(),
+            ));
+        }
+        validate_chain_hops(db, &hops, "create_rule").await?;
+        // Allow device_group_in to be omitted/wrong if hops provided — hops[0] wins.
+        let entry = hops[0];
+        let exit = *hops.last().unwrap();
+        if req.device_group_in != 0 && req.device_group_in != entry {
+            // If client sent device_group_in, it must match hops[0].
+            return Err(CreateRuleError::BadRequest(
+                "device_group_in must equal hops[0] (entry group) for chain rules".into(),
+            ));
+        }
+        (
+            entry,
+            Some(exit),
+            hops,
+            "chain".to_string(),
+            RouteMode::Chain.to_db_str(),
+        )
+    } else {
+        if !validate_forward_mode(&req.forward_mode) && req.forward_mode != "direct" {
+            // Accept default/group legacy by forcing direct.
+        }
+        if req.forward_mode == "group" {
+            return Err(CreateRuleError::BadRequest(
+                "forward_mode 'group' is no longer supported; use 'direct' or 'chain'".into(),
+            ));
+        }
+        if req.device_group_out.is_some() {
+            return Err(CreateRuleError::BadRequest(
+                "device_group_out: only used with chain mode (set via hops); omit for direct"
+                    .into(),
+            ));
+        }
+        validate_admin_owned_inbound_group(db, req.device_group_in, "create_rule").await?;
+        (
+            req.device_group_in,
+            None,
+            Vec::new(),
+            "direct".to_string(),
+            RouteMode::Direct.to_db_str(),
+        )
+    };
 
     if !is_public_transport_accepted(req.public_transport) {
         return Err(CreateRuleError::BadRequest(

@@ -7,15 +7,14 @@ const INSECURE_JWT_SECRET: &str = "change-me-jwt-secret";
 /// The compiled-in app version. Bumped per release.
 ///
 /// **Single source of truth for the panel version.** This MUST stay in sync
-/// with the entries listed in `docs/VERSIONS.md` (the version-sync checklist):
-/// `crates/node/Cargo.toml`, `scripts/relay-node-install.sh` (SCRIPT_VERSION),
-/// `docker-compose.release.yaml` (GHCR image tags), the README version badges,
-/// and this constant.
+/// with the panel entries listed in `docs/VERSIONS.md`: `crates/panel/Cargo.toml`,
+/// `docker-compose.release.yaml`, `CHANGELOG.md`, `Cargo.lock`, and this
+/// constant. The node follows an independent `node-v*` release track.
 ///
 /// Overridable at runtime via the `APP_VERSION` env var — used by CI to inject
 /// the version into the Docker image without rebuilding. If the env var is
 /// unset, the compiled-in default below is used.
-const COMPILED_APP_VERSION: &str = "1.2.1";
+const COMPILED_APP_VERSION: &str = "1.2.2";
 
 /// Resolve the effective app version: the `APP_VERSION` env var if set,
 /// otherwise the compiled-in default. Cached for the process lifetime.
