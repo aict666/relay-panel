@@ -9,7 +9,7 @@ import { useAuth } from '../auth/useAuth';
 
 const { Text } = Typography;
 
-const INSTALL_SCRIPT_URL = 'https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh';
+const INSTALL_SCRIPT_URL = 'https://raw.githubusercontent.com/aict666/relay-panel/main/scripts/relay-node-install.sh';
 
 function buildInstallCommand(token: string, panelUrl: string): string {
   return `bash <(curl -fsSL ${INSTALL_SCRIPT_URL}) -t ${token} -u ${panelUrl}`;

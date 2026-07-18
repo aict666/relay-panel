@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Official release source. Never taken from the panel.
-const REPO: &str = "MoeShinX/relay-panel";
+const REPO: &str = "aict666/relay-panel";
 
 /// Single-flight guard: true while an upgrade is downloading/swapping.
 static UPGRADING: AtomicBool = AtomicBool::new(false);
@@ -291,7 +291,7 @@ mod tests {
         let (bin, sha) = build_download_urls("1.1.1", "amd64").unwrap();
         assert_eq!(
             bin,
-            "https://github.com/MoeShinX/relay-panel/releases/download/node-v1.1.1/relay-node-linux-amd64"
+            "https://github.com/aict666/relay-panel/releases/download/node-v1.1.1/relay-node-linux-amd64"
         );
         // sha256 URL always tracks the binary URL + ".sha256".
         assert_eq!(sha, format!("{bin}.sha256"));
@@ -300,7 +300,7 @@ mod tests {
         let (bin2, sha2) = build_download_urls("2.0.0", "arm64").unwrap();
         assert_eq!(
             bin2,
-            "https://github.com/MoeShinX/relay-panel/releases/download/node-v2.0.0/relay-node-linux-arm64"
+            "https://github.com/aict666/relay-panel/releases/download/node-v2.0.0/relay-node-linux-arm64"
         );
         assert_eq!(sha2, format!("{bin2}.sha256"));
     }
@@ -311,7 +311,7 @@ mod tests {
         let (bin, sha) = build_download_urls("1.1.0", "amd64").unwrap();
         assert_eq!(
             bin,
-            "https://github.com/MoeShinX/relay-panel/releases/download/v1.1.0/relay-node-linux-amd64"
+            "https://github.com/aict666/relay-panel/releases/download/v1.1.0/relay-node-linux-amd64"
         );
         assert_eq!(sha, format!("{bin}.sha256"));
 

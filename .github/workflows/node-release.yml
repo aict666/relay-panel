@@ -181,7 +181,7 @@ jobs:
           context: .
           target: node
           push: true
-          tags: ghcr.io/moeshinx/relay-panel-node:${{ steps.ver.outputs.version }}
+          tags: ghcr.io/aict666/relay-panel-node:${{ steps.ver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -230,11 +230,11 @@ jobs:
           # docker-node job finished before this one (needs:), but retry the
           # pull a few times in case the registry is still propagating.
           for i in 1 2 3 4 5; do
-            docker pull ghcr.io/moeshinx/relay-panel-node:"$VERSION" && break
+            docker pull ghcr.io/aict666/relay-panel-node:"$VERSION" && break
             echo "image not ready yet, retrying in 30s ($i/5)…"
             sleep 30
           done
-          OUT=$(docker run --rm ghcr.io/moeshinx/relay-panel-node:"$VERSION" --version)
+          OUT=$(docker run --rm ghcr.io/aict666/relay-panel-node:"$VERSION" --version)
           echo "image reports: $OUT"
           # The version constant is baked at compile time, so this catches a
           # release built from a branch where Cargo.toml wasn't bumped.
@@ -276,7 +276,7 @@ jobs:
       - name: Re-tag :X.Y.Z as :latest
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
-          IMAGE="ghcr.io/moeshinx/relay-panel-node"
+          IMAGE="ghcr.io/aict666/relay-panel-node"
           echo "Promoting $IMAGE:$VERSION -> $IMAGE:latest (verified image)"
           docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
           echo "::notice::Promoted $IMAGE:$VERSION to :latest after verify passed"

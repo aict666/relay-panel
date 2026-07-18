@@ -3,7 +3,7 @@
 # RelayPanel node installer - downloads and runs relay-node as a systemd service.
 #
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh) \
+#   bash <(curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/scripts/relay-node-install.sh) \
 #     -t <NODE_TOKEN> -u <PANEL_URL>
 #
 # Options:
@@ -34,8 +34,8 @@ cd / 2>/dev/null || true
 
 # Bump this when releasing a new version. The binary is downloaded from
 # GitHub Releases assets.
-SCRIPT_VERSION="1.1.2"
-REPO="MoeShinX/relay-panel"
+SCRIPT_VERSION="1.2.0"
+REPO="aict666/relay-panel"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'

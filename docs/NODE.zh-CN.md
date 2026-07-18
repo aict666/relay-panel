@@ -43,7 +43,7 @@ uname -m
 写好 systemd 服务并启动：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/scripts/relay-node-install.sh) \
   -t <NODE_TOKEN> \
   -u https://your-panel.example.com
 ```
@@ -76,7 +76,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/sc
 ARCH=amd64   # 或 arm64
 VERSION=1.0.3
 curl -fL -o relay-node \
-  "https://github.com/MoeShinX/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
+  "https://github.com/aict666/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
 
 # 2. 加可执行权限，放到固定位置
 chmod +x relay-node
@@ -199,7 +199,7 @@ journalctl -u relay-node -f
 不用自己记：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/scripts/relay-node-install.sh) \
   -t <NODE_TOKEN> \
   -u https://your-panel.example.com
 ```
@@ -331,12 +331,12 @@ GitHub Releases 在国内访问可能很慢。可以：
 VERSION=1.0.3
 ARCH=amd64   # 或 arm64
 curl -fL -o relay-node \
-  "https://github.com/MoeShinX/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
+  "https://github.com/aict666/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
 ```
 
 然后按[手动 systemd 配置](#手动-systemd-配置)运行。
 
-所有已发布版本和资产见 [Releases 页面](https://github.com/MoeShinX/relay-panel/releases)。
+所有已发布版本和资产见 [Releases 页面](https://github.com/aict666/relay-panel/releases)。
 
 ---
 

@@ -22,7 +22,7 @@ pre-flight check.
 |---|------|----------------|
 | 1 | `crates/panel/Cargo.toml` | `version = "x.y.z"` |
 | 2 | `crates/panel/src/config.rs` | `COMPILED_APP_VERSION` (the panel's own version, shown in the update-check UI). Overridable at runtime via the `APP_VERSION` env var. |
-| 3 | `docker-compose.release.yaml` | the panel image tag — `RELAYPANEL_PANEL_TAG` default (`ghcr.io/moeshinx/relay-panel-panel:x.y.z`) |
+| 3 | `docker-compose.release.yaml` | the panel image tag — `RELAYPANEL_PANEL_TAG` default (`ghcr.io/aict666/relay-panel-panel:x.y.z`) |
 | 4 | `README.md` / `README.en.md` | dynamic `github/v/release` badge (auto-reflects the latest panel release; no static string to bump, just confirm the badge exists) |
 
 Also bump, but not part of the "must match" set:
@@ -38,7 +38,7 @@ Also bump, but not part of the "must match" set:
 |---|------|----------------|
 | 1 | `crates/node/Cargo.toml` | `version = "x.y.z"` (read by `relay-node --version` via `env!("CARGO_PKG_VERSION")`) |
 | 2 | `scripts/relay-node-install.sh` | `SCRIPT_VERSION="x.y.z"` (the default version the install script pulls) |
-| 3 | `docker-compose.release.yaml` | the node image tag — `RELAYPANEL_NODE_TAG` default (`ghcr.io/moeshinx/relay-panel-node:x.y.z`) |
+| 3 | `docker-compose.release.yaml` | the node image tag — `RELAYPANEL_NODE_TAG` default (`ghcr.io/aict666/relay-panel-node:x.y.z`) |
 | 4 | `CHANGELOG-NODE.md` | a `## [x.y.z] - YYYY-MM-DD` section (the node release body source) |
 
 Also bump:
@@ -82,7 +82,7 @@ tagging.
 4. Commit ("release: vX.Y.Z") and push to `main`. Wait for main CI green.
 5. Tag on the current `main` HEAD: `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
 6. The `v*` tag triggers **docker-release.yml** (PANEL-ONLY): it builds + pushes
-   `ghcr.io/moeshinx/relay-panel-panel:X.Y.Z` + `:latest` (multi-arch manifest
+   `ghcr.io/aict666/relay-panel-panel:X.Y.Z` + `:latest` (multi-arch manifest
    with `linux/amd64` and `linux/arm64` legs), and creates the panel GitHub
    Release (body from CHANGELOG.md). **No node artifact is built or pushed.**
    `relay-panel-node:latest` is untouched.
@@ -101,7 +101,7 @@ tagging.
 5. Tag: `git tag -a node-vX.Y.Z -m "..." && git push origin node-vX.Y.Z`.
 6. The `node-v*` tag triggers **node-release.yml** (NODE-ONLY): it builds the
    static musl amd64 + arm64 binaries (with sha256 sidecars), builds + pushes
-   `ghcr.io/moeshinx/relay-panel-node:X.Y.Z` + `:latest`, creates the node
+   `ghcr.io/aict666/relay-panel-node:X.Y.Z` + `:latest`, creates the node
    GitHub Release (body from CHANGELOG-NODE.md), and verifies the assets +
    image version. **No panel artifact is built or pushed.**
 

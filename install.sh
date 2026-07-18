@@ -3,7 +3,7 @@
 # RelayPanel one-line installer for Linux (Debian / Ubuntu).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/install.sh | bash
 #
 
 # Touch: trigger script-check CI on version-only PRs (paths filter otherwise skips it).
@@ -22,7 +22,7 @@
 set -euo pipefail
 
 INSTALL_DIR="/opt/relay-panel"
-REPO_URL="https://github.com/MoeShinX/relay-panel.git"
+REPO_URL="https://github.com/aict666/relay-panel.git"
 
 # DEBUG=1 shows full git output during clone/pull (default: quiet, clean status
 # lines only). Most users want a clean install log without a wall of git diff
