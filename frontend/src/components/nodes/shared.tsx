@@ -16,7 +16,9 @@ export function NetworkCell({ row }: { row: NodeDisplayRow; t: Tfn }) {
   const line = (ip: string, code: string | null | undefined) => (
     <div key={ip} style={{ fontSize: 12, lineHeight: '18px', display: 'flex', alignItems: 'center', gap: 6 }}>
       <CountryFlag code={code} />
-      <span className="rp-mono" style={{ whiteSpace: 'nowrap' }}>{ip}</span>
+      {/* nowrap on desktop (table cell), wrapping on phones — a full IPv6
+          address is wider than a 375px card. See styles/theme.css. */}
+      <span className="rp-mono rp-net-ip">{ip}</span>
     </div>
   );
   return (

@@ -112,7 +112,9 @@ export default function SystemSettings() {
       title={t('systemSettings')}
       extra={<Button type="primary" loading={saving} onClick={onSave}>{t('save')}</Button>}
     >
-      <Form form={form} layout="vertical">
+      {/* Capped width: full-bleed inputs across a 1500px card are unreadable
+          and make the page look empty. */}
+      <Form form={form} layout="vertical" style={{ maxWidth: 620 }}>
         <Form.Item
           name="registration_enabled"
           label={t('registrationEnabled')}

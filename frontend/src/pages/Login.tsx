@@ -1,5 +1,5 @@
 import { Form, Input, Button, Card, message, Typography, Segmented, Alert } from 'antd';
-import { UserOutlined, LockOutlined, InfoCircleOutlined } from '@ant-design/icons';
+import { UserOutlined, LockOutlined, InfoCircleOutlined, ThunderboltFilled } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import api from '../api/client';
@@ -64,9 +64,12 @@ export default function Login() {
         />
       </div>
       <Card className="rp-auth-card">
-        <div style={{ textAlign: 'center', marginBottom: 28 }}>
-          <Title level={3} style={{ margin: 0, fontWeight: 600 }}>{t('brand')}</Title>
-          <Text type="secondary" style={{ fontSize: 13 }}>{t('subtitle')}</Text>
+        <div className="rp-auth-brand">
+          <span className="rp-brand-mark"><ThunderboltFilled /></span>
+          <div>
+            <Title level={3} style={{ margin: 0, fontWeight: 600 }}>{t('brand')}</Title>
+            <Text type="secondary" style={{ fontSize: 13 }}>{t('subtitle')}</Text>
+          </div>
         </div>
 
         {/* v0.3.6 / v0.4.22: first-login security reminder. Only shown when

@@ -16,3 +16,6 @@ config-cache.json
 # Windows reserved device name accidentally materialised as a file by
 # `> nul` redirects under git-bash. Never a real source file.
 nul
+
+.claude
+frontend/vite.config.online.ts

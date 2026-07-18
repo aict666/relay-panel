@@ -20,6 +20,10 @@ export const enUS: Dict = {
   sourceCode: 'Source Code / AGPL-3.0',
 
   // Nav
+  navGroupOverview: 'Overview',
+  navGroupWorkspace: 'Workspace',
+  navGroupAdmin: 'Administration',
+  toggleMenu: 'Menu',
   dashboard: 'Dashboard',
   forwardRules: 'Forward Rules',
   deviceGroups: 'Device Groups',

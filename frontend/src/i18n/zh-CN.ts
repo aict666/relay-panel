@@ -19,6 +19,10 @@ export const zhCN = {
   sourceCode: 'Source Code / AGPL-3.0',
 
   // Nav
+  navGroupOverview: '概览',
+  navGroupWorkspace: '工作台',
+  navGroupAdmin: '管理',
+  toggleMenu: '菜单',
   dashboard: '仪表盘',
   forwardRules: '转发规则',
   deviceGroups: '设备分组',

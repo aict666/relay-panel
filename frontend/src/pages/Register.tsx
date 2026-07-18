@@ -1,5 +1,5 @@
 import { Form, Input, Button, Card, message, Typography, Segmented, Result, Spin, Select } from 'antd';
-import { UserOutlined, LockOutlined } from '@ant-design/icons';
+import { UserOutlined, LockOutlined, ThunderboltFilled } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import api from '../api/client';
@@ -90,9 +90,12 @@ export default function Register() {
         />
       </div>
       <Card className="rp-auth-card">
-        <div style={{ textAlign: 'center', marginBottom: 28 }}>
-          <Title level={3} style={{ margin: 0, fontWeight: 600 }}>{t('registerTitle')}</Title>
-          <Text type="secondary" style={{ fontSize: 13 }}>{t('subtitle')}</Text>
+        <div className="rp-auth-brand">
+          <span className="rp-brand-mark"><ThunderboltFilled /></span>
+          <div>
+            <Title level={3} style={{ margin: 0, fontWeight: 600 }}>{t('registerTitle')}</Title>
+            <Text type="secondary" style={{ fontSize: 13 }}>{t('subtitle')}</Text>
+          </div>
         </div>
 
         {loadFailed ? (

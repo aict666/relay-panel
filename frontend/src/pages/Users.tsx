@@ -317,18 +317,21 @@ export default function Users() {
               `${t('remaining')}: ${remaining !== null ? formatBytes(remaining) : t('unlimited')}`
             }
           >
-            <div>
+            {/* Fixed width + block children: antd's Progress is inline-block,
+                so inside a nowrap table cell the usage text used to run onto
+                the same line and overlap the next column. */}
+            <div style={{ width: 176 }}>
               <Progress
                 percent={pct}
                 size="small"
                 status={overQuota ? 'exception' : 'normal'}
               />
-              <span style={{ fontSize: 11 }}>
+              <div style={{ fontSize: 11, color: 'var(--rp-text-secondary)' }}>
                 {formatBytes(used)}
                 {' / '}
                 {unlimited ? t('unlimited') : formatBytes(limit)}
                 {overQuota && <Tag color="red" style={{ marginLeft: 4 }}>{t('overQuota')}</Tag>}
-              </span>
+              </div>
             </div>
           </Tooltip>
         );

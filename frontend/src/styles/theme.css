@@ -1,47 +1,61 @@
-/* RelayPanel global theme — "石墨靛蓝 / Graphite + Indigo".
-   Near-black graphite sidebar, indigo accent, larger radii, hairline
-   borders. Premium admin look (Linear / Vercel direction), no template feel.
-   Component colors are driven by styles/antdTheme.ts; this file owns the
-   layout chrome + custom (non-antd) elements. */
+/* RelayPanel global theme — "薄雾青绿 / Mist + Teal".
+   All-light chrome: white sidebar + header separated by hairlines, near-white
+   canvas, one restrained teal accent. Component colors come from
+   styles/antdTheme.ts; this file owns the layout chrome, the tag system and
+   every custom (non-antd) element. Palette anchors are mirrored below as CSS
+   variables — keep them in sync with antdTheme.ts. */
 
 :root {
   /* Layout */
-  --rp-sidebar-bg: #18181b;
-  --rp-sidebar-width: 220px;
-  --rp-header-height: 56px;
+  --rp-sidebar-bg: #ffffff;
+  --rp-sidebar-width: 232px;
+  --rp-sidebar-collapsed-width: 72px;
+  --rp-header-height: 60px;
   --rp-content-padding: 24px;
+  --rp-content-max: 1520px;
 
-  /* Colors — muted, not garish */
-  --rp-bg: #fafafa;
+  /* Surfaces */
+  --rp-bg: #f6f7f9;
   --rp-card-bg: #ffffff;
-  --rp-border: #ececef;
-  --rp-text: #18181b;
-  --rp-text-secondary: #646a73;
-  --rp-text-tertiary: #8f959e;
+  --rp-subtle-bg: #fafbfc;
+  --rp-hover: #f2f4f6;
 
-  /* Accents — indigo */
-  --rp-primary: #6366f1;
-  --rp-primary-bg: #eef2ff;
-  --rp-success: #059669;
+  /* Lines — hairline for internal splits, border for real edges */
+  --rp-hairline: #ecedf1;
+  --rp-border: #dfe3e8;
+
+  /* Text */
+  --rp-text: #101828;
+  --rp-text-secondary: #5a6472;
+  --rp-text-tertiary: #98a2b3;
+
+  /* Accent — teal */
+  --rp-primary: #0d9488;
+  --rp-primary-strong: #0f766e;
+  --rp-primary-deep: #115e59;
+  --rp-primary-soft: #f0fdfa;
+  --rp-primary-line: #99f6e4;
+
+  /* Status */
+  --rp-success: #16a34a;
   --rp-warning: #d97706;
-  --rp-danger: #ef4444;
+  --rp-danger: #dc2626;
+  --rp-info: #0891b2;
 
-  /* Tags — desaturated for admin comfort */
-  --rp-tag-tcp: #6366f1;
-  --rp-tag-udp: #7c3aed;
-  --rp-tag-in: #059669;
-  --rp-tag-out: #0d9488;
-  --rp-tag-admin: #d97706;
-
-  /* Radii & shadows — subtle */
+  /* Radii */
+  --rp-radius-lg: 14px;
   --rp-radius: 10px;
   --rp-radius-sm: 8px;
-  --rp-shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
-  --rp-shadow: 0 2px 8px rgba(0,0,0,0.06);
+
+  /* Shadows — flat and wide; the light chrome separates with lines, not depth */
+  --rp-shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --rp-shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05), 0 1px 3px rgba(16, 24, 40, 0.04);
+  --rp-shadow: 0 4px 12px rgba(16, 24, 40, 0.07);
+  --rp-shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.10);
 
   /* Table */
-  --rp-table-header-bg: #fafafa;
-  --rp-table-row-hover: #f5f5ff;
+  --rp-table-header-bg: #fafbfc;
+  --rp-table-row-hover: #f5faf9;
 
   /* Font */
   --rp-font: "Noto Sans SC", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -63,55 +77,505 @@ html, body, #root {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Thin, unobtrusive scrollbars — the chrome is quiet, the scrollbars follow. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #d4d9e0 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #d4d9e0;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #bfc6cf;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---- Sidebar ---- */
+.rp-sidebar {
+  border-inline-end: 1px solid var(--rp-hairline);
+}
+
+.rp-brand {
+  height: var(--rp-header-height);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-inline: 18px;
+  border-bottom: 1px solid var(--rp-hairline);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.rp-brand-mark {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-size: 16px;
+  background: linear-gradient(135deg, #2dd4bf 0%, #0d9488 55%, #0f766e 100%);
+  box-shadow: 0 2px 6px rgba(13, 148, 136, 0.28);
+}
+
+.rp-brand-name {
+  min-width: 0;
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--rp-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rp-sidebar-collapsed .rp-brand {
+  padding-inline: 0;
+  justify-content: center;
+}
+
+.rp-nav {
+  padding-block: 12px 20px;
+  overflow-y: auto;
+  height: calc(100% - var(--rp-header-height));
+}
+
+.rp-nav.ant-menu-inline,
+.rp-nav.ant-menu-vertical {
+  border-inline-end: 0;
+}
+
+.rp-nav .ant-menu-item {
+  font-size: 14px;
+}
+
+.rp-nav .ant-menu-item-selected {
+  font-weight: 500;
+}
+
+.rp-nav .ant-menu-item-selected .anticon {
+  color: var(--rp-primary);
+}
+
+.rp-nav .ant-menu-item-group-title {
+  padding: 16px 22px 6px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.rp-nav.ant-menu-inline-collapsed .ant-menu-item-group-title {
+  padding-inline: 0;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: clip;
+}
+
+/* ---- Header ---- */
+.rp-app-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  height: var(--rp-header-height);
+  line-height: normal;
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: rgba(255, 255, 255, 0.88);
+  backdrop-filter: saturate(180%) blur(8px);
+  border-bottom: 1px solid var(--rp-hairline);
+}
+
+.rp-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* Breadcrumb — section / page. Deliberately not a repeat of the page <h1>:
+ * it gives the sticky bar context once the page scrolls. */
+.rp-header-crumb {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.rp-crumb-parent {
+  color: var(--rp-text-tertiary);
+  white-space: nowrap;
+}
+
+.rp-crumb-sep {
+  color: #d5dae1;
+}
+
+.rp-header-title {
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--rp-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.rp-header-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--rp-hairline);
+}
+
+.rp-header-role {
+  font-size: 13px;
+}
+
+/* User chip: avatar + name, opens the account menu. */
+.rp-user-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px 0 4px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.rp-user-chip:hover {
+  background: var(--rp-hover);
+}
+
+.rp-user-chip-name {
+  max-width: 140px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--rp-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-user-chip-role {
+  font-size: 11px;
+  color: var(--rp-text-tertiary);
+  line-height: 1.2;
+}
+
+.rp-user-chip-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.rp-icon-button {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--rp-radius-sm);
+  color: var(--rp-text-secondary);
+}
+
+/* ---- Content shell ---- */
+.rp-content {
+  min-width: 0;
+  padding: var(--rp-content-padding);
+  background: var(--rp-bg);
+}
+
+.rp-content-inner {
+  width: 100%;
+  max-width: var(--rp-content-max);
+  margin-inline: auto;
+}
+
 /* ---- antd overrides ---- */
 
-/* Table: comfortable rows, subtle header */
+/* Table: comfortable rows, quiet header, rounded shell */
 .ant-table {
   font-size: 13px;
 }
 .ant-table-thead > tr > th {
   background: var(--rp-table-header-bg) !important;
   font-weight: 500;
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
   color: var(--rp-text-secondary);
-  border-bottom: 1px solid var(--rp-border) !important;
+  border-bottom: 1px solid var(--rp-hairline) !important;
 }
 .ant-table-tbody > tr > td {
-  border-bottom: 1px solid var(--rp-border) !important;
+  border-bottom: 1px solid var(--rp-hairline) !important;
+}
+.ant-table-tbody > tr:last-child > td {
+  border-bottom: 0 !important;
 }
 .ant-table-tbody > tr:hover > td {
   background: var(--rp-table-row-hover) !important;
 }
+.ant-table-placeholder:hover > td {
+  background: transparent !important;
+}
+.ant-pagination {
+  margin-block: 16px 4px !important;
+}
 
-/* Cards: clean, minimal shadow */
+/* Cards: hairline edge, one soft shadow */
 .ant-card {
   border-radius: var(--rp-radius);
-  border: 1px solid var(--rp-border);
-  box-shadow: var(--rp-shadow-sm);
+  border: 1px solid var(--rp-hairline);
+  box-shadow: var(--rp-shadow-xs);
 }
 .ant-card-head {
-  min-height: 44px;
-  border-bottom: 1px solid var(--rp-border);
+  border-bottom: 1px solid var(--rp-hairline);
+  font-weight: 600;
+}
+.ant-card-head-title {
+  font-size: 15px;
 }
 
-/* Buttons: uniform sizing, no wrapping */
+/* Collapse: the node-status page groups nodes in collapsible panels — give
+ * them the same panel surface as cards instead of antd's grey shell. */
+.ant-collapse {
+  background: var(--rp-card-bg);
+  border: 1px solid var(--rp-hairline);
+  border-radius: var(--rp-radius);
+  box-shadow: var(--rp-shadow-xs);
+  overflow: hidden;
+}
+.ant-collapse > .ant-collapse-item {
+  border-bottom: 1px solid var(--rp-hairline);
+}
+.ant-collapse > .ant-collapse-item:last-child {
+  border-bottom: 0;
+}
+.ant-collapse > .ant-collapse-item > .ant-collapse-header {
+  align-items: center;
+  padding: 13px 16px;
+}
+.ant-collapse-content {
+  border-top: 1px solid var(--rp-hairline) !important;
+  background: transparent;
+}
+
+/* Buttons */
 .ant-btn {
   border-radius: var(--rp-radius-sm);
-  font-size: 13px;
+}
+.ant-btn-primary {
+  box-shadow: 0 1px 2px rgba(13, 148, 136, 0.24);
+}
+.ant-btn-sm {
+  border-radius: 7px;
+}
+
+/* Inputs */
+.ant-input,
+.ant-input-affix-wrapper,
+.ant-input-number,
+.ant-select .ant-select-selector,
+.ant-picker {
+  border-radius: var(--rp-radius-sm);
 }
 
 /* Modal */
 .ant-modal-content {
-  border-radius: var(--rp-radius);
+  border-radius: var(--rp-radius-lg);
+  box-shadow: var(--rp-shadow-lg);
+}
+.ant-modal-header {
+  margin-bottom: 18px !important;
+}
+.ant-modal-title {
+  font-weight: 600;
+}
+.ant-modal-footer {
+  margin-top: 22px !important;
+}
+/* Long forms (new plan / new rule) used to push the whole page into a scroll
+ * with the modal's own OK button somewhere below the fold. Scroll the body and
+ * keep title + footer pinned. */
+.ant-modal .ant-modal-body {
+  max-height: calc(100dvh - 220px);
+  overflow-y: auto;
 }
 
 /* Form labels */
 .ant-form-item-label > label {
   font-size: 13px;
+  font-weight: 500;
   color: var(--rp-text-secondary);
+}
+.ant-form-vertical .ant-form-item-label {
+  padding-bottom: 4px !important;
+}
+.ant-form-item-extra {
+  font-size: 12px;
+  color: var(--rp-text-tertiary);
+}
+
+/* Side-by-side form rows are built with <Space>, whose item wrappers don't
+ * inherit the Form.Item's flex:1 — on narrow viewports the second field used
+ * to overflow the modal. Make any Space that hosts form items share the row
+ * evenly and allow its children to shrink. */
+.ant-form .ant-space-horizontal:not(.rp-target-row):has(> .ant-space-item > .ant-form-item) {
+  width: 100%;
+}
+.ant-form .ant-space-horizontal:not(.rp-target-row):has(> .ant-space-item > .ant-form-item)
+  > .ant-space-item {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* Target rows mix fields with icon buttons, so an even split is wrong: the
+ * address takes the slack, port and the move/delete buttons keep their size. */
+.rp-target-row {
+  width: 100%;
+}
+.rp-target-row > .ant-space-item:first-child {
+  flex: 1 1 200px;
+  min-width: 0;
 }
 
 /* Segmented (language switch) */
 .ant-segmented {
+  border-radius: var(--rp-radius-sm);
+  padding: 2px;
+}
+
+/* Dropdown / Select popups */
+.ant-dropdown-menu,
+.ant-select-dropdown {
+  border-radius: var(--rp-radius);
+  box-shadow: var(--rp-shadow-lg) !important;
+  border: 1px solid var(--rp-hairline);
+}
+.ant-dropdown-menu-item {
+  border-radius: 6px;
+}
+
+/* Alert: quieter banners, tinted rather than saturated */
+.ant-alert {
+  border-radius: var(--rp-radius);
+}
+.ant-alert-success {
+  background: #ecfdf3;
+  border-color: #d1fadf;
+}
+.ant-alert-info {
+  background: #ecfeff;
+  border-color: #cff9fe;
+}
+.ant-alert-warning {
+  background: #fffaeb;
+  border-color: #fef0c7;
+}
+.ant-alert-error {
+  background: #fef3f2;
+  border-color: #fee4e2;
+}
+
+/* ---- Tag system ----
+ * Pages use antd's preset colors (green/red/blue/orange/gold/purple/cyan).
+ * Restyle the presets once, here, into one soft pastel family so every status,
+ * protocol and role tag across the app reads as a single system. */
+.ant-tag {
+  height: 22px;
+  padding-inline: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 20px;
+}
+.ant-tag-green, .ant-tag-success {
+  color: #027a48;
+  background: #ecfdf3;
+  border-color: #d1fadf;
+}
+.ant-tag-red, .ant-tag-error {
+  color: #b42318;
+  background: #fef3f2;
+  border-color: #fee4e2;
+}
+.ant-tag-blue, .ant-tag-processing {
+  color: #175cd3;
+  background: #eff8ff;
+  border-color: #d1e9ff;
+}
+.ant-tag-cyan {
+  color: #0e7090;
+  background: #ecfeff;
+  border-color: #cff9fe;
+}
+.ant-tag-orange, .ant-tag-warning {
+  color: #c4320a;
+  background: #fff6ed;
+  border-color: #fdead7;
+}
+.ant-tag-gold {
+  color: #b54708;
+  background: #fffaeb;
+  border-color: #fef0c7;
+}
+.ant-tag-purple {
+  color: #5925dc;
+  background: #f4f3ff;
+  border-color: #ebe9fe;
+}
+.ant-tag-geekblue {
+  color: #3538cd;
+  background: #eef4ff;
+  border-color: #e0eaff;
+}
+.ant-tag-magenta, .ant-tag-pink {
+  color: #c11574;
+  background: #fdf2fa;
+  border-color: #fce7f6;
+}
+.ant-tag-volcano {
+  color: #b42318;
+  background: #fff6ed;
+  border-color: #fdead7;
+}
+.ant-tag-lime {
+  color: #3f6212;
+  background: #f7fee7;
+  border-color: #ecfccb;
+}
+.ant-tag-default {
+  color: var(--rp-text-secondary);
+  background: var(--rp-hover);
+  border-color: var(--rp-hairline);
+}
+
+/* Descriptions: fixed, quiet label gutter so key/value pairs line up. */
+.ant-descriptions-bordered .ant-descriptions-item-label {
+  width: 160px;
+  font-weight: 500;
+  color: var(--rp-text-secondary);
+}
+.ant-descriptions-bordered .ant-descriptions-view {
   border-radius: var(--rp-radius-sm);
 }
 
@@ -119,21 +583,27 @@ html, body, #root {
 .ant-typography code {
   font-family: var(--rp-font-mono);
   font-size: 12px;
-  background: var(--rp-table-header-bg);
-  border: 1px solid var(--rp-border);
-  border-radius: var(--rp-radius-sm);
+  background: var(--rp-subtle-bg);
+  border: 1px solid var(--rp-hairline);
+  border-radius: 6px;
   padding: 1px 6px;
 }
 
-/* ---- Layout helpers ---- */
+/* ---- Page helpers ---- */
 .rp-page-title {
-  font-size: 18px;
-  font-weight: 500;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   color: var(--rp-text);
-  margin: 0 0 16px 0;
+  margin: 0 0 18px 0;
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.rp-page-title > .anticon {
+  color: var(--rp-primary);
+  font-size: 18px;
 }
 
 .rp-page-header {
@@ -141,7 +611,7 @@ html, body, #root {
   justify-content: space-between;
   align-items: center;
   gap: 16px;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 
 .rp-page-header .rp-page-title {
@@ -153,31 +623,11 @@ html, body, #root {
   justify-content: flex-end;
 }
 
-.rp-app-header {
-  height: var(--rp-header-height);
-  padding: 0 24px;
-  line-height: var(--rp-header-height);
-  display: flex;
-  justify-content: flex-end;
-  align-items: center;
-  background: #fff;
-  border-bottom: 1px solid var(--rp-border);
-}
-
-.rp-header-role {
-  font-size: 13px;
-}
-
-.rp-content {
-  min-width: 0;
-  margin: var(--rp-content-padding);
-  background: var(--rp-bg);
-}
-
 .rp-toolbar-filter {
   min-width: 180px;
 }
 
+/* ---- Auth pages ---- */
 .rp-auth-page {
   position: relative;
   min-height: 100vh;
@@ -187,7 +637,9 @@ html, body, #root {
   justify-content: center;
   align-items: center;
   box-sizing: border-box;
-  background: var(--rp-bg);
+  background:
+    radial-gradient(1100px 520px at 50% -12%, #e6fbf7 0%, rgba(230, 251, 247, 0) 62%),
+    var(--rp-bg);
 }
 
 .rp-auth-language {
@@ -197,26 +649,62 @@ html, body, #root {
 }
 
 .rp-auth-card {
-  width: min(380px, 100%);
-  box-shadow: var(--rp-shadow);
+  width: min(400px, 100%);
+  border-radius: var(--rp-radius-lg);
+  box-shadow: var(--rp-shadow-lg);
+}
+
+.rp-auth-card .ant-card-body {
+  padding: 32px 28px;
 }
 
 .rp-auth-card-wide {
-  width: min(400px, 100%);
+  width: min(430px, 100%);
 }
 
+.rp-auth-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 26px;
+  text-align: center;
+}
+
+.rp-auth-brand .rp-brand-mark {
+  width: 44px;
+  height: 44px;
+  border-radius: 13px;
+  font-size: 21px;
+}
+
+/* ---- Tables (admin, wide) ---- */
 /* Keep admin tables readable. Horizontal scrolling is preferable to squeezing
  * Chinese labels and values into one character per line. */
 .rp-responsive-table .ant-table-cell {
   white-space: nowrap;
 }
 
-.rp-responsive-table .ant-table-container {
+/* Most pages drop a bare <Table> straight onto the canvas. Give those their
+ * own panel surface so they don't float; tables hosted by a Card or Modal
+ * inherit that surface instead and stay flat. */
+.rp-responsive-table .ant-table {
+  background: var(--rp-card-bg);
+  border: 1px solid var(--rp-hairline);
   border-radius: var(--rp-radius);
+  box-shadow: var(--rp-shadow-xs);
+  overflow: hidden;
+}
+
+.ant-card .rp-responsive-table .ant-table,
+.ant-modal .rp-responsive-table .ant-table {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .rp-rules-table .ant-table-cell-fix-right {
-  box-shadow: -8px 0 16px -16px rgba(24, 24, 27, 0.45);
+  box-shadow: -8px 0 16px -16px rgba(16, 24, 40, 0.45);
 }
 
 .rp-rule-actions .ant-btn {
@@ -228,7 +716,8 @@ html, body, #root {
 }
 
 .rp-target-host {
-  width: 180px;
+  width: 100%;
+  min-width: 180px;
 }
 
 .rp-target-port {
@@ -264,7 +753,7 @@ html, body, #root {
   align-items: start;
   gap: 10px;
   padding-bottom: 12px;
-  border-bottom: 1px solid var(--rp-border);
+  border-bottom: 1px solid var(--rp-hairline);
 }
 
 .rp-rule-card-title {
@@ -326,27 +815,109 @@ html, body, #root {
   display: flex;
   justify-content: flex-end;
   padding-top: 8px;
-  border-top: 1px solid var(--rp-border);
+  border-top: 1px solid var(--rp-hairline);
 }
 
+/* ---- Stat cards (dashboard KPIs) ---- */
 .rp-stat-card {
   border-radius: var(--rp-radius);
-  border: 1px solid var(--rp-border);
-  box-shadow: var(--rp-shadow-sm);
+  border: 1px solid var(--rp-hairline);
+  box-shadow: var(--rp-shadow-xs);
+  transition: box-shadow 0.18s ease, transform 0.18s ease;
 }
-.rp-stat-card .ant-statistic-title {
+
+.rp-stat-card .ant-card-body {
+  padding: 18px 20px;
+}
+
+.rp-stat-card-link:hover {
+  box-shadow: var(--rp-shadow);
+  transform: translateY(-1px);
+}
+
+.rp-stat {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.rp-stat-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rp-stat-label {
   font-size: 13px;
   color: var(--rp-text-secondary);
 }
-.rp-stat-card .ant-statistic-content {
-  font-size: 28px;
-  font-weight: 500;
+
+.rp-stat-value {
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  color: var(--rp-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-stat-icon {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  font-size: 20px;
+  background: var(--rp-primary-soft);
+  color: var(--rp-primary-strong);
+}
+
+.rp-stat-icon-cyan {
+  background: #ecfeff;
+  color: #0e7090;
+}
+
+.rp-stat-icon-emerald {
+  background: #ecfdf3;
+  color: #047857;
+}
+
+/* ---- Plan cards (shop) ---- */
+.rp-plan-price {
+  margin-bottom: 12px;
+  font-family: var(--rp-font-mono);
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  color: var(--rp-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-plan-features {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--rp-text-secondary);
+}
+
+.rp-plan-features .ant-tag {
+  margin-inline-end: 0;
+}
+
+.rp-net-ip {
+  white-space: nowrap;
 }
 
 /* Mono fields in tables */
 .rp-mono {
   font-family: var(--rp-font-mono);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* v0.4.17: country-flag pill wrapper. Outer layer sizes & rounds the slot;
@@ -357,10 +928,10 @@ html, body, #root {
   align-items: center;
   justify-content: center;
   min-width: 40px;
-  height: 28px;
+  height: 26px;
   padding: 0 6px;
   border-radius: 8px;
-  background: #eee7ff;
+  background: var(--rp-hover);
   font-size: 12px;
   color: var(--rp-text-secondary);
   vertical-align: middle;
@@ -372,38 +943,21 @@ html, body, #root {
   background-size: cover;
 }
 
+/* ---- Responsive ---- */
 @media (max-width: 991px) {
-  .rp-sidebar {
-    position: fixed !important;
-    inset-block: 0;
-    inset-inline-start: 0;
-    z-index: 1001;
-    height: 100dvh;
-  }
-
-  .rp-sidebar .ant-layout-sider-zero-width-trigger {
-    top: 12px;
-    inset-inline-end: -42px;
-    width: 36px;
-    height: 32px;
-    line-height: 32px;
-    border-radius: 0 var(--rp-radius-sm) var(--rp-radius-sm) 0;
-    background: var(--rp-sidebar-bg);
-    box-shadow: var(--rp-shadow);
+  :root {
+    --rp-content-padding: 16px;
   }
 
   .rp-app-header {
     padding-inline: 16px;
-  }
-
-  .rp-content {
-    margin: 16px;
   }
 }
 
 @media (max-width: 767px) {
   :root {
     --rp-content-padding: 12px;
+    --rp-header-height: 56px;
   }
 
   .rp-app-header {
@@ -411,16 +965,18 @@ html, body, #root {
   }
 
   .rp-header-actions {
-    gap: 6px !important;
+    gap: 6px;
   }
 
   .rp-header-role,
+  .rp-header-divider,
+  .rp-user-chip-meta,
   .rp-header-button-label {
     display: none;
   }
 
-  .rp-content {
-    margin: var(--rp-content-padding);
+  .rp-user-chip {
+    padding: 0 4px;
   }
 
   .rp-page-header {
@@ -430,7 +986,7 @@ html, body, #root {
   }
 
   .rp-page-title {
-    font-size: 17px;
+    font-size: 18px;
     flex-wrap: wrap;
   }
 
@@ -460,14 +1016,31 @@ html, body, #root {
     flex-wrap: wrap;
   }
 
-  .rp-target-host {
+  /* Address gets its own line; port shares the second line with the enable
+     switch and the move/delete buttons. Sizing has to happen on the Space's
+     item wrappers — the Form.Item inside them is not the flex child. */
+  .rp-target-row > .ant-space-item:first-child {
     flex: 1 1 100%;
-    width: 100%;
   }
 
+  .rp-target-row > .ant-space-item:nth-child(2) {
+    flex: 1 1 80px;
+    min-width: 0;
+  }
+
+  .rp-target-host,
   .rp-target-port {
-    flex: 1 1 140px;
-    width: auto;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .rp-target-row .ant-btn {
+    padding-inline: 8px;
+  }
+
+  .rp-net-ip {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .rp-chain-select {
@@ -503,6 +1076,10 @@ html, body, #root {
     justify-content: flex-end;
   }
 
+  .ant-card .ant-card-body {
+    padding: 16px;
+  }
+
   .ant-table-wrapper .ant-table-thead > tr > th,
   .ant-table-wrapper .ant-table-tbody > tr > td {
     padding: 10px 12px;
@@ -512,8 +1089,19 @@ html, body, #root {
     justify-content: center;
   }
 
-  .rp-stat-card .ant-statistic-content {
+  .rp-stat-card .ant-card-body {
+    padding: 14px 16px;
+  }
+
+  .rp-stat-value {
     font-size: 24px;
+  }
+
+  .rp-stat-icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    font-size: 17px;
   }
 }
 
@@ -528,7 +1116,7 @@ html, body, #root {
   }
 
   .rp-auth-card .ant-card-body {
-    padding: 20px;
+    padding: 24px 20px;
   }
 
   .rp-mobile-hide {
