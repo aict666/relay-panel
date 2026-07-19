@@ -183,6 +183,10 @@ pub fn routes() -> Router<AppState> {
         )
         // Stats & monitoring
         .route("/stats", axum::routing::get(stats::get_stats))
+        .route(
+            "/dashboard/history",
+            axum::routing::get(stats::get_dashboard_history),
+        )
         // v0.4.10: node status is owner-scoped (a user sees only nodes for
         // groups they own). Renamed /node_status → /nodes.
         .route("/nodes", axum::routing::get(stats::get_node_status))

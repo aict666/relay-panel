@@ -22,6 +22,10 @@ export default defineConfig({
           icons: ['@ant-design/icons'],
           // semver is used by the node-version compare util.
           semver: ['semver'],
+          // Dashboard charts are admin-only and large; keep them outside the
+          // RoleHome/Dashboard page chunks so regular users never fetch them
+          // and returning admins can reuse the browser-cached chart runtime.
+          charts: ['@ant-design/charts'],
         },
       },
     },
@@ -37,4 +41,3 @@ export default defineConfig({
     },
   },
 });
-

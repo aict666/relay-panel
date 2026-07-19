@@ -1,4 +1,5 @@
 pub mod auto_restart;
+pub mod dashboard_metrics;
 pub mod groups;
 pub mod node_config;
 pub mod password;

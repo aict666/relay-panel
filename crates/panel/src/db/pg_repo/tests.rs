@@ -4761,3 +4761,54 @@ async fn pg_rule_list_auto_restart_rules_excludes_off_and_paused() {
     assert_eq!(got[0].2, 10, "the interval is carried");
     cleanup(&db).await;
 }
+
+#[tokio::test]
+async fn pg_statistics_upsert_is_idempotent_and_cleanup_is_scoped() {
+    let Some(db) = repo("dashboard_stats").await else {
+        return;
+    };
+    db.upsert_stats(
+        "dashboard_global",
+        "2026-07-19T12:00:00Z",
+        &[("upload_bps", 10), ("connections", 2)],
+    )
+    .await
+    .unwrap();
+    db.upsert_stats(
+        "dashboard_global",
+        "2026-07-19T12:00:00Z",
+        &[("upload_bps", 99), ("connections", 3)],
+    )
+    .await
+    .unwrap();
+    db.upsert_stats("other", "2026-01-01T00:00:00Z", &[("x", 1)])
+        .await
+        .unwrap();
+
+    let rows = db
+        .query_stats(Some("dashboard_global"), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.stat_key == "upload_bps")
+            .unwrap()
+            .number,
+        99
+    );
+    assert_eq!(
+        db.delete_stats_before("dashboard_global", "2026-07-20T00:00:00Z")
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query_stats(Some("other"), None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    cleanup(&db).await;
+}

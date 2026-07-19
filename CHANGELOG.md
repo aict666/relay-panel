@@ -10,6 +10,34 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-07-19
+
+### Added
+
+- **The administrator dashboard now retains and visualizes operational history.**
+  A minute sampler persists UTC upload/download rates, connection peaks, and
+  online/recent node counts for 30 days. The new admin-only history API serves
+  1-hour, 24-hour, 7-day, and 30-day ranges with range-appropriate aggregation.
+- **Dashboard health and ranking charts make the current fleet easier to scan.**
+  Group health distinguishes fully online, partially online, offline, and
+  never-reported groups; live group bandwidth and cumulative forwarded rule
+  traffic are ranked separately so machine-NIC and RelayPanel byte counters are
+  never presented as the same metric.
+
+### Changed
+
+- **Dashboard charts are responsive and administrator-only on the client too.**
+  The mobile layout is single-column, history gaps remain visible, loading,
+  empty, and failure states are independent, and the chart runtime is loaded
+  only after an administrator enters the dashboard.
+
+### Fixed
+
+- **Historical statistics survive restarts and concurrent minute samples.**
+  SQLite and PostgreSQL now safely deduplicate old placeholder rows before
+  adding the natural series/time unique key, atomically upsert minute samples,
+  and clean only expired dashboard rows.
+
 ## [1.3.1] - 2026-07-19
 
 ### Fixed

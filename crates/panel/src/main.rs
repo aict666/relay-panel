@@ -101,7 +101,7 @@ async fn main() {
     // api::security_headers for the exact policy.
     let app = api::security_headers::apply_security_headers(app);
     let state = api::AppState {
-        db,
+        db: db.clone(),
         config: config.clone(),
         release_cache: api::system::ReleaseCache::new(),
         node_connections: api::ws::NodeConnections::new(),
@@ -115,6 +115,7 @@ async fn main() {
     // same node WS registry) with the HTTP handlers, so a scheduled restart goes
     // out over exactly the same control channel as a manual one.
     service::auto_restart::spawn(state.clone());
+    service::dashboard_metrics::spawn(db);
 
     let app = app.with_state(state);
 

@@ -772,6 +772,20 @@ pub trait KvsRepository: Send + Sync {
 
 #[async_trait]
 pub trait StatisticsRepository: Send + Sync {
+    /// Atomically upsert one minute bucket for a statistics series group.
+    /// `values` maps stat_key -> number; every entry shares stat_type + time.
+    /// The `(stat_type, stat_key, time)` unique index makes repeated sampler
+    /// ticks and multiple panel instances idempotent.
+    async fn upsert_stats(
+        &self,
+        stat_type: &str,
+        time: &str,
+        values: &[(&str, i64)],
+    ) -> Result<(), DbError>;
+
+    /// Delete samples for one statistics group older than the UTC cutoff.
+    async fn delete_stats_before(&self, stat_type: &str, before: &str) -> Result<u64, DbError>;
+
     async fn query_stats(
         &self,
         stat_type: Option<&str>,

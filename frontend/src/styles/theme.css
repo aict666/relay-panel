@@ -885,6 +885,97 @@ html, body, #root {
   color: #047857;
 }
 
+/* ---- Dashboard charts ---- */
+.rp-dashboard-charts {
+  margin-bottom: 20px;
+}
+
+.rp-dashboard-charts > .ant-row + .ant-row {
+  margin-top: 16px;
+}
+
+.rp-dashboard-live-error {
+  margin-bottom: 16px;
+}
+
+.rp-dashboard-chart-col {
+  display: flex;
+}
+
+.rp-dashboard-chart-card {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.rp-dashboard-chart-card > .ant-card-body {
+  min-width: 0;
+}
+
+.rp-dashboard-chart-help {
+  color: var(--rp-text-tertiary);
+  font-size: 13px;
+}
+
+.rp-dashboard-chart-empty {
+  min-height: 350px;
+  display: grid;
+  place-items: center;
+}
+
+.rp-dashboard-chart-empty-short {
+  min-height: 250px;
+}
+
+.rp-dashboard-history-chart {
+  min-width: 0;
+}
+
+.rp-dashboard-connection-label {
+  margin: 4px 0 0 42px;
+  color: var(--rp-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.rp-dashboard-refresh-note {
+  display: block;
+  margin-top: 4px;
+  text-align: right;
+  font-size: 11px;
+}
+
+.rp-dashboard-chart-subtitle {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.rp-dashboard-health-chart {
+  position: relative;
+  min-height: 350px;
+}
+
+.rp-dashboard-health-total {
+  position: absolute;
+  top: 134px;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+  color: var(--rp-text-secondary);
+  font-size: 12px;
+}
+
+.rp-dashboard-health-total strong {
+  color: var(--rp-text);
+  font-family: var(--rp-font-mono);
+  font-size: 28px;
+  line-height: 1.1;
+}
+
 /* ---- Plan cards (shop) ---- */
 .rp-plan-price {
   margin-bottom: 12px;
@@ -1102,6 +1193,23 @@ html, body, #root {
     height: 38px;
     border-radius: 10px;
     font-size: 17px;
+  }
+
+  .rp-dashboard-chart-card .ant-card-head-wrapper {
+    flex-wrap: wrap;
+  }
+
+  .rp-dashboard-chart-card .ant-card-extra {
+    width: 100%;
+    margin-inline-start: 0;
+  }
+
+  .rp-dashboard-chart-card .ant-segmented {
+    max-width: 100%;
+  }
+
+  .rp-dashboard-connection-label {
+    margin-left: 28px;
   }
 }
 

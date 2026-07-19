@@ -1502,6 +1502,41 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 41: forward_rule_hops.tunnel_port present");
 
+    // ── Migration 42: dashboard statistics minute buckets ──
+    // The statistics table existed as a read-only placeholder. Before making
+    // its natural series key unique, collapse any manually-created duplicate
+    // rows deterministically (keep the oldest id). Very old/minimal databases
+    // may predate the placeholder table entirely, so create it here as well as
+    // in the fresh-install baseline before touching its rows or indexes.
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS statistics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stat_type TEXT NOT NULL,
+            stat_key TEXT NOT NULL,
+            time TEXT NOT NULL,
+            number INTEGER NOT NULL DEFAULT 0
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM statistics WHERE id NOT IN (\
+            SELECT MIN(id) FROM statistics GROUP BY stat_type, stat_key, time\
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_statistics_series_time \
+         ON statistics (stat_type, stat_key, time)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_statistics_time ON statistics (time)")
+        .execute(pool)
+        .await?;
+    tracing::info!("Migration 42: statistics series/time indexes present");
+
     Ok(())
 }
 
@@ -1592,6 +1627,49 @@ mod tests {
             n, 1,
             "expected column {}.{} to exist after migration",
             table, column
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_42_deduplicates_statistics_before_adding_unique_index() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect memory db");
+        sqlx::query(SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .expect("schema");
+        for number in [10_i64, 20] {
+            sqlx::query(
+                "INSERT INTO statistics (stat_type, stat_key, time, number) \
+                 VALUES ('dashboard_global', 'upload_bps', '2026-07-19T12:00:00Z', ?)",
+            )
+            .bind(number)
+            .execute(&pool)
+            .await
+            .expect("insert duplicate legacy statistic");
+        }
+
+        run_migrations(&pool).await.expect("migration 42");
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT number FROM statistics WHERE stat_type='dashboard_global' \
+             AND stat_key='upload_bps' AND time='2026-07-19T12:00:00Z'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![(10,)], "the oldest duplicate is retained");
+        let duplicate = sqlx::query(
+            "INSERT INTO statistics (stat_type, stat_key, time, number) \
+             VALUES ('dashboard_global', 'upload_bps', '2026-07-19T12:00:00Z', 30)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "the new unique index must reject duplicates"
         );
     }
 
