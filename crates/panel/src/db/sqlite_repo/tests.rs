@@ -3029,6 +3029,11 @@ async fn shared_groups_admin_inbound_only() {
     let shared = db.list_shared_groups(2, false).await.unwrap();
     assert_eq!(shared.len(), 1, "only admin 'in' group is shared");
     assert_eq!(shared[0].id, 10);
+    assert_eq!(
+        db.list_all_inbound_group_ids().await.unwrap(),
+        vec![10, 20],
+        "grant-all includes every inbound-capable group, regardless of owner"
+    );
 
     // admin caller gets empty list.
     let admin_shared = db.list_shared_groups(1, true).await.unwrap();
