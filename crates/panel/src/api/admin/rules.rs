@@ -100,10 +100,25 @@ pub async fn update_rule(
     Json(req): Json<UpdateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
     let scope = user.resource_scope();
+    // Resolve the actual entry group exactly as the service layer does.  A
+    // chain update derives its entry from hops[0], so authorizing only the
+    // optional device_group_in field would let a restricted user smuggle an
+    // unauthorized group through `hops`.
+    let hops_entry = req.hops.as_ref().and_then(|hops| hops.first().copied());
+    if let (Some(device_group_in), Some(hops_entry)) = (req.device_group_in, hops_entry) {
+        if device_group_in != hops_entry {
+            return Json(err(
+                400,
+                "device_group_in must equal hops[0] (entry group) for chain rules",
+            ));
+        }
+    }
+    let requested_entry_group = hops_entry.or(req.device_group_in);
+
     // v1.0.4: restricted non-admin users can only switch to authorized device
     // groups. Legacy/allow-all users skip this. DB error → 500.
     if !user.admin {
-        if let Some(dgi) = req.device_group_in {
+        if let Some(dgi) = requested_entry_group {
             let restricted = match state.db.is_user_restricted(user.user_id).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -134,7 +149,7 @@ pub async fn update_rule(
     // by sending only {paused:false} — the device_group_in check above is
     // skipped when that field is absent. Only needed when not switching groups
     // in the same request (that path is already covered above).
-    if !user.admin && req.paused == Some(false) && req.device_group_in.is_none() {
+    if !user.admin && req.paused == Some(false) && requested_entry_group.is_none() {
         let restricted = match state.db.is_user_restricted(user.user_id).await {
             Ok(r) => r,
             Err(e) => {

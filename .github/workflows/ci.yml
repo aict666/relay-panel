@@ -124,3 +124,11 @@ jobs:
         run: python3 tests/e2e_test.py
         env:
           RELAY_E2E_PROFILE: release
+
+      - name: multi-hop TCP + UOT e2e (2 hops)
+        run: python3 tests/e2e_chain_test.py
+
+      - name: multi-hop TCP + UOT e2e (3 hops)
+        run: python3 tests/e2e_chain_test.py
+        env:
+          CHAIN_MID: "1"

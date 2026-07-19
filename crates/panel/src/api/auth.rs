@@ -1,6 +1,7 @@
 use crate::api::AppState;
 use crate::service::password::{
-    hash_password, validate_password, verify_password, PasswordValidationError,
+    hash_password_async, validate_password, verify_password_async, PasswordValidationError,
+    PasswordWorkError,
 };
 use crate::service::users::validate_username;
 use axum::{extract::State, Json};
@@ -10,9 +11,8 @@ use relay_shared::models::User;
 use relay_shared::protocol::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 
 /// In-memory login rate-limit state. Per-username counters protect accounts;
 /// the separate global counter bounds work from fabricated usernames. State
@@ -33,12 +33,9 @@ static GLOBAL_LOGIN_LIMITER: Lazy<Mutex<LoginAttempt>> = Lazy::new(|| {
     })
 });
 
-/// Keep expensive bcrypt work out of Tokio's async worker threads and bound
-/// the number of blocking jobs that can be queued by the public auth routes.
-static BCRYPT_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
-
 const MAX_LOGIN_ATTEMPTS: u32 = 5;
 const MAX_GLOBAL_LOGIN_ATTEMPTS: u32 = 120;
+const MAX_GLOBAL_REGISTRATION_ATTEMPTS: u32 = 120;
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const LOGIN_LIMITER_CAP: usize = 10_000;
 
@@ -112,6 +109,25 @@ struct Claims {
 /// early return).
 static DUMMY_HASH: &str = "$2b$12$AAAAAAAAAAAAAAAAAAAAAOYEUtP4bEYKnMmFJEPW9HTZLX9R5gO4iSq";
 
+static GLOBAL_REGISTRATION_LIMITER: Lazy<Mutex<LoginAttempt>> = Lazy::new(|| {
+    Mutex::new(LoginAttempt {
+        count: 0,
+        window_start: Instant::now(),
+    })
+});
+
+fn check_registration_rate_limit() -> bool {
+    let now = Instant::now();
+    let mut entry = GLOBAL_REGISTRATION_LIMITER.lock().unwrap();
+    if now.duration_since(entry.window_start) >= LOGIN_WINDOW {
+        entry.count = 1;
+        entry.window_start = now;
+        return false;
+    }
+    entry.count += 1;
+    entry.count > MAX_GLOBAL_REGISTRATION_ATTEMPTS
+}
+
 pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
@@ -149,28 +165,22 @@ pub async fn login(
     // reveal whether a username exists. Run it on the blocking pool and cap
     // concurrency so public requests cannot occupy every async runtime worker
     // or enqueue an unbounded number of expensive jobs.
-    let permit = match BCRYPT_SLOTS.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
+    let verified = match verify_password_async(
+        &req.password,
+        user.as_ref()
+            .map(|u| u.password.as_str())
+            .unwrap_or(DUMMY_HASH),
+    )
+    .await
+    {
+        Ok(value) => value && user.is_some(),
+        Err(PasswordWorkError::Busy) => {
             return Json(ApiResponse {
                 code: 429,
                 message: "Too many login attempts. Please try again shortly.".into(),
                 data: None,
             });
         }
-    };
-    let password = req.password.clone();
-    let hash = user
-        .as_ref()
-        .map(|u| u.password.clone())
-        .unwrap_or_else(|| DUMMY_HASH.to_string());
-    let verified = match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        verify_password(&password, &hash)
-    })
-    .await
-    {
-        Ok(value) => value && user.is_some(),
         Err(e) => {
             tracing::error!("login: bcrypt worker failed: {}", e);
             false
@@ -274,8 +284,26 @@ pub async fn register(
         });
     }
 
-    let hashed = match hash_password(&req.password) {
+    // Count only requests that passed all cheap validation.  Invalid input must
+    // not be able to consume the legitimate registration budget, while every
+    // request that is about to schedule bcrypt is globally bounded.
+    if check_registration_rate_limit() {
+        return Json(ApiResponse {
+            code: 429,
+            message: "Too many registration attempts. Please wait a minute and try again.".into(),
+            data: None,
+        });
+    }
+
+    let hashed = match hash_password_async(&req.password).await {
         Ok(h) => h,
+        Err(PasswordWorkError::Busy) => {
+            return Json(ApiResponse {
+                code: 429,
+                message: "Password service is busy. Please try again shortly.".into(),
+                data: None,
+            });
+        }
         Err(e) => {
             return Json(ApiResponse {
                 code: 500,

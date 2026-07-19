@@ -10,6 +10,28 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-19
+
+### Fixed
+
+- **Rule updates are authorized and committed as one operation.** The effective
+  chain entry is always derived from and checked against `hops[0]`, conflicting
+  topology fields are rejected, and scalar fields, hops, targets, limits, and
+  tunnel profiles now update in one SQLite/PostgreSQL transaction with rollback
+  coverage.
+- **Password work no longer blocks Tokio workers.** Login, registration,
+  password changes, resets, and admin-created users share a bounded blocking
+  bcrypt pool, with public registration and password-change rate limits.
+- **Partial listener recovery preserves the rule's aggregate rate limit.** A
+  recovered TCP or UDP half of a `tcp_udp` rule rejoins the existing shared
+  bucket instead of receiving an independent fresh allowance.
+
+### Tests
+
+- CI now requires real two-hop and three-hop TCP, UDP-over-UOT, and mixed
+  `tcp_udp` forwarding, including TCP Fast Open configuration and single-count
+  traffic accounting.
+
 ## [1.3.0] - 2026-07-19
 
 ### Added

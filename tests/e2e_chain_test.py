@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import socketserver
@@ -36,16 +37,38 @@ except (AttributeError, ValueError):
     pass
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PANEL_BIN = os.path.join(PROJECT_ROOT, "target", "debug", "relay-panel")
-NODE_BIN = os.path.join(PROJECT_ROOT, "target", "debug", "relay-node")
+E2E_PROFILE = os.environ.get("RELAY_E2E_PROFILE", "debug")
+if E2E_PROFILE not in ("debug", "release"):
+    raise ValueError("RELAY_E2E_PROFILE must be 'debug' or 'release'")
+PANEL_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-panel")
+NODE_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-node")
 if sys.platform == "win32":
     PANEL_BIN += ".exe"
     NODE_BIN += ".exe"
 
 BASE_URL = "http://127.0.0.1:18889/api/v1"
-CONFIG_PROTOCOL_VERSION = "5"
+
+
+def config_protocol_version():
+    """Read the shared wire version so the E2E gate cannot drift."""
+    source_path = os.path.join(
+        PROJECT_ROOT, "crates", "shared", "src", "protocol.rs"
+    )
+    with open(source_path, encoding="utf-8") as source:
+        match = re.search(
+            r"pub const CONFIG_PROTOCOL_VERSION:\s*u32\s*=\s*(\d+)\s*;",
+            source.read(),
+        )
+    if match is None:
+        raise AssertionError("CONFIG_PROTOCOL_VERSION constant not found")
+    return match.group(1)
+
+
+CONFIG_PROTOCOL_VERSION = config_protocol_version()
 ECHO_PORT = 18881
 CHAIN_ENTRY_PORT = 19001
+UDP_CHAIN_ENTRY_PORT = 19002
+TCPUDP_CHAIN_ENTRY_PORT = 19003
 ADMIN_PW = "admin-chain-e2e-pass-1"
 
 
@@ -83,12 +106,21 @@ class TCPHandler(socketserver.BaseRequestHandler):
             self.request.sendall(data)
 
 
+class UDPHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        data, sock = self.request
+        sock.sendto(data, self.client_address)
+
+
 def start_echo():
-    srv = socketserver.ThreadingTCPServer(("127.0.0.1", ECHO_PORT), TCPHandler)
-    srv.allow_reuse_address = True
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"[echo] TCP :{ECHO_PORT}")
-    return srv
+    tcp = socketserver.ThreadingTCPServer(("127.0.0.1", ECHO_PORT), TCPHandler)
+    udp = socketserver.ThreadingUDPServer(("127.0.0.1", ECHO_PORT), UDPHandler)
+    tcp.allow_reuse_address = True
+    udp.allow_reuse_address = True
+    threading.Thread(target=tcp.serve_forever, daemon=True).start()
+    threading.Thread(target=udp.serve_forever, daemon=True).start()
+    print(f"[echo] TCP+UDP :{ECHO_PORT}")
+    return [tcp, udp]
 
 
 def tcp_roundtrip(port, payload, timeout=5):
@@ -107,6 +139,34 @@ def tcp_roundtrip(port, payload, timeout=5):
             if sum(len(c) for c in chunks) >= len(payload):
                 break
         return b"".join(chunks)
+
+
+def udp_roundtrip(port, payload, timeout=8):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        sock.sendto(payload, ("127.0.0.1", port))
+        data, peer = sock.recvfrom(65535)
+        assert peer[1] == port, peer
+        return data
+
+
+def wait_for_node_config(node_token, predicate, timeout=45):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            last = api(
+                "GET",
+                "/node/config",
+                token=node_token,
+                extra_headers={"X-Config-Protocol-Version": CONFIG_PROTOCOL_VERSION},
+            )
+            if predicate(last):
+                return last
+        except Exception:
+            pass
+        time.sleep(1)
+    raise AssertionError(f"node config did not reach expected state: {last}")
 
 
 def main():
@@ -224,6 +284,45 @@ def main():
             },
         )
         assert rule["code"] == 0, rule
+
+        udp_rule = api(
+            "POST",
+            "/rules",
+            token,
+            {
+                "name": "udp-chain-rule",
+                "listen_port": UDP_CHAIN_ENTRY_PORT,
+                "protocol": "udp",
+                "device_group_in": entry_id,
+                "forward_mode": "chain",
+                "route_mode": "chain",
+                "hops": hop_ids,
+                "target_addr": "127.0.0.1",
+                "target_port": ECHO_PORT,
+                "public_transport": "raw",
+            },
+        )
+        assert udp_rule["code"] == 0, udp_rule
+
+        tcpudp_rule = api(
+            "POST",
+            "/rules",
+            token,
+            {
+                "name": "tcpudp-chain-rule",
+                "listen_port": TCPUDP_CHAIN_ENTRY_PORT,
+                "protocol": "tcp_udp",
+                "device_group_in": entry_id,
+                "forward_mode": "chain",
+                "route_mode": "chain",
+                "hops": hop_ids,
+                "target_addr": "127.0.0.1",
+                "target_port": ECHO_PORT,
+                "public_transport": "raw",
+            },
+        )
+        assert tcpudp_rule["code"] == 0, tcpudp_rule
+
         rules = {r["name"]: r for r in api("GET", "/rules", token)["data"]}
         chain = rules["chain-rule"]
         assert chain["route_mode"] == "chain", chain
@@ -256,17 +355,31 @@ def main():
         start_node("exit", exit_token)
 
         assert wait_for_port("127.0.0.1", CHAIN_ENTRY_PORT, 45), "entry listener not up"
+        assert wait_for_port("127.0.0.1", TCPUDP_CHAIN_ENTRY_PORT, 45), "tcp_udp TCP entry not up"
         # Exit hop auto port should also be listening.
         exit_port = hop_ports[len(hop_ids) - 1]
         assert wait_for_port("127.0.0.1", exit_port, 20), f"exit hop :{exit_port} not up"
         print(f"[ok] listeners up entry=:{CHAIN_ENTRY_PORT} exit=:{exit_port}")
 
         # Verify config for entry/exit via node API gate.
-        cfg_entry = api(
-            "GET",
-            "/node/config",
-            token=entry_token,
-            extra_headers={"X-Config-Protocol-Version": CONFIG_PROTOCOL_VERSION},
+        tcp_rule_id = chain["id"]
+        udp_rule_id = rules["udp-chain-rule"]["id"]
+        tcpudp_rule_id = rules["tcpudp-chain-rule"]["id"]
+        cfg_entry = wait_for_node_config(
+            entry_token,
+            lambda cfg: any(
+                listener["rule_id"] == udp_rule_id
+                and listener["protocol"] == "udp"
+                and listener.get("uot_role") == "ingress"
+                and listener.get("zero_rtt") is True
+                for listener in cfg["listeners"]
+            )
+            and any(
+                listener["rule_id"] == tcpudp_rule_id
+                and listener["protocol"] == "tcp"
+                and listener.get("tcp_fast_open") is True
+                for listener in cfg["listeners"]
+            ),
         )
         assert any(l["port"] == CHAIN_ENTRY_PORT for l in cfg_entry["listeners"]), cfg_entry
         entry_l = next(l for l in cfg_entry["listeners"] if l["port"] == CHAIN_ENTRY_PORT)
@@ -275,13 +388,26 @@ def main():
         assert entry_l["targets"], entry_l
         print(f"[ok] entry config targets={entry_l['targets']} count_traffic=true")
 
-        cfg_exit = api(
-            "GET",
-            "/node/config",
-            token=exit_token,
-            extra_headers={"X-Config-Protocol-Version": CONFIG_PROTOCOL_VERSION},
+        cfg_exit = wait_for_node_config(
+            exit_token,
+            lambda cfg: any(
+                listener["rule_id"] == udp_rule_id
+                and listener["protocol"] == "uot"
+                and listener.get("uot_role") == "egress"
+                for listener in cfg["listeners"]
+            )
+            and any(
+                listener["rule_id"] == tcpudp_rule_id
+                and listener["protocol"] == "uot"
+                and listener.get("uot_role") == "egress"
+                for listener in cfg["listeners"]
+            ),
         )
-        exit_l = next(l for l in cfg_exit["listeners"] if l["port"] == exit_port)
+        exit_l = next(
+            l
+            for l in cfg_exit["listeners"]
+            if l["rule_id"] == tcp_rule_id and l["port"] == exit_port
+        )
         assert exit_l["targets"] == [f"127.0.0.1:{ECHO_PORT}"], exit_l
         assert exit_l.get("count_traffic", True) is False
         print("[ok] exit config targets final echo, count_traffic=false")
@@ -291,11 +417,24 @@ def main():
         assert resp == payload, f"TCP chain mismatch got={resp[:40]!r} len={len(resp)}"
         print(f"[ok] TCP chain forwarded {len(payload)} bytes entry→…→exit→echo")
 
+        udp_payload = b"uot-chain-e2e-" + bytes(range(256)) * 4
+        udp_resp = udp_roundtrip(UDP_CHAIN_ENTRY_PORT, udp_payload)
+        assert udp_resp == udp_payload, f"UOT UDP mismatch len={len(udp_resp)}"
+        print(f"[ok] UDP chain forwarded {len(udp_payload)} bytes through authenticated warm UOT")
+
+        mixed_tcp = b"tcpudp-tcp-" + b"T" * 1024
+        assert tcp_roundtrip(TCPUDP_CHAIN_ENTRY_PORT, mixed_tcp) == mixed_tcp
+        mixed_udp = b"tcpudp-uot-" + b"U" * 1024
+        assert udp_roundtrip(TCPUDP_CHAIN_ENTRY_PORT, mixed_udp) == mixed_udp
+        print("[ok] tcp_udp chain forwarded raw TCP (TFO-enabled) and UDP-over-UOT")
+
         # Traffic should accrue on the rule (entry hop only).
         time.sleep(6)
         rules = {r["name"]: r for r in api("GET", "/rules", token)["data"]}
         used = rules["chain-rule"]["traffic_used"]
         assert used > 0, f"expected traffic_used > 0, got {used}"
+        assert rules["udp-chain-rule"]["traffic_used"] > 0
+        assert rules["tcpudp-chain-rule"]["traffic_used"] > 0
         # Rough upper bound: not multiplied by hop count (upload+download ~ 2x payload)
         # Allow generous slack for protocol overhead / multiple reports.
         assert used < len(payload) * 10, f"traffic suspiciously high (multi-count?): {used}"
@@ -329,10 +468,12 @@ def main():
                 except Exception:
                     pass
         if echo is not None:
-            try:
-                echo.shutdown()
-            except Exception:
-                pass
+            for server in echo:
+                try:
+                    server.shutdown()
+                    server.server_close()
+                except Exception:
+                    pass
         shutil.rmtree(work, ignore_errors=True)
 
 

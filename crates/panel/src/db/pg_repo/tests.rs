@@ -3165,6 +3165,65 @@ async fn pg_rule_update_rule_fields_partial_update() {
     cleanup(&db).await;
 }
 
+#[tokio::test]
+async fn pg_rule_update_full_rolls_back_scalar_when_hop_insert_fails() {
+    let Some(db) = repo("upd_rule_full_rollback").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (1, 'gin', 'in', 'tok1', 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.insert_quota_guarded(
+        "before",
+        1,
+        20000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        1,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    let rule_id = db.list_rules(&ResourceScope::All).await.unwrap()[0].id;
+
+    let result = db
+        .update_rule_full(&RuleUpdateData {
+            id: rule_id,
+            effective_device_group_in: 1,
+            name: Some("must-roll-back".into()),
+            hops: Some(vec![(999, 21000)]),
+            ..Default::default()
+        })
+        .await;
+    assert!(result.is_err(), "invalid PG hop must fail the full update");
+
+    let name: String = sqlx::query_scalar("SELECT name FROM forward_rules WHERE id = $1")
+        .bind(rule_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let hop_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id = $1")
+            .bind(rule_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(name, "before");
+    assert_eq!(hop_count, 0);
+    cleanup(&db).await;
+}
+
 /// overflow entry rejects and rolls back (no data written).
 #[tokio::test]
 async fn pg_traffic_batch_single_entry_overflow_rejects_and_rolls_back() {

@@ -17,6 +17,8 @@
 #   RELAY_PROXY           Same as -p (e.g. socks5://127.0.0.1:10808)
 #   RELAY_NODE_BASE_URL   Custom download mirror base, e.g. https://download.example.com/relay-panel
 #                         The script will fetch {BASE_URL}/relay-node-linux-{arch}
+#   RELAY_NODE_CHECKSUM_URL  Optional trusted checksum URL when using a mirror;
+#                         defaults to the official GitHub Release .sha256
 #
 # Idempotent re-runs: downloading to a temp file and swapping atomically means
 # this script can be re-run to upgrade an already-running node. The running
@@ -34,7 +36,7 @@ cd / 2>/dev/null || true
 
 # Bump this when releasing a new version. The binary is downloaded from
 # GitHub Releases assets.
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 REPO="aict666/relay-panel"
 
 GREEN='\033[0;32m'
@@ -77,6 +79,7 @@ while [[ $# -gt 0 ]]; do
             echo "Environment:"
             echo "  RELAY_PROXY           Same as -p"
             echo "  RELAY_NODE_BASE_URL   Custom mirror for binary downloads"
+            echo "  RELAY_NODE_CHECKSUM_URL Trusted checksum URL override for mirrors"
             exit 0
             ;;
         *)
@@ -91,6 +94,9 @@ if [ -z "$NODE_TOKEN" ]; then
 fi
 if [ -z "$PANEL_URL" ]; then
     fail "Missing required option: -u/--url. Example: http://45.149.92.10:18888"
+fi
+if [[ ! "$SERVICE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*$ ]]; then
+    fail "Invalid service name: ${SERVICE_NAME}. It must start with a letter or digit and contain only letters, digits, dot, underscore, @ and hyphen."
 fi
 
 # ---------- Platform check ----------
@@ -113,13 +119,119 @@ esac
 info "Detected architecture: $ARCH ($ARCH_RAW)"
 
 # ---------- Install dirs ----------
-INSTALL_DIR="/opt/${SERVICE_NAME}"
+# The override roots are used by the hermetic installer regression test; normal
+# installations keep the documented /opt and /etc/systemd/system locations.
+INSTALL_ROOT="${RELAY_NODE_INSTALL_ROOT:-/opt}"
+SYSTEMD_DIR="${RELAY_NODE_SYSTEMD_DIR:-/etc/systemd/system}"
+INSTALL_DIR="${INSTALL_ROOT%/}/${SERVICE_NAME}"
 BINARY="${INSTALL_DIR}/relay-node"
+START_SH="${INSTALL_DIR}/start.sh"
+ENV_FILE="${INSTALL_DIR}/relay-node.env"
+CERTS_DIR="${INSTALL_DIR}/certs"
+SERVICE_FILE="${SYSTEMD_DIR%/}/${SERVICE_NAME}.service"
 # Temp download target. We never curl directly onto $BINARY because if the
 # service is running, the kernel refuses writes to the executing file with
 # ETXTBSY ("Text file busy"). Downloading to .tmp sidesteps that entirely;
 # the atomic mv happens only after the service is stopped.
 TMP_BINARY="${BINARY}.tmp"
+HAD_INSTALL_DIR=0
+HAD_ENV_FILE=0
+HAD_CERTS_DIR=0
+[ ! -d "$INSTALL_DIR" ] || HAD_INSTALL_DIR=1
+[ ! -e "$ENV_FILE" ] || HAD_ENV_FILE=1
+[ ! -d "$CERTS_DIR" ] || HAD_CERTS_DIR=1
+mkdir -p "$INSTALL_DIR"
+mkdir -p "$SYSTEMD_DIR"
+chmod 700 "$INSTALL_DIR"
+
+# Rollback snapshots. They live beside their targets so restoring the binary is
+# an atomic same-filesystem rename. Flags distinguish an upgrade from a fresh
+# install, where rollback must remove newly-created files instead.
+BINARY_BACKUP="${BINARY}.rollback"
+START_SH_BACKUP="${START_SH}.rollback"
+SERVICE_FILE_BACKUP="${SERVICE_FILE}.rollback"
+HAD_BINARY=0
+HAD_START_SH=0
+HAD_SERVICE_FILE=0
+BINARY_REPLACED=0
+SERVICE_EXISTED=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
+ROLLBACK_ARMED=0
+if systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    SERVICE_EXISTED=1
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        SERVICE_WAS_ACTIVE=1
+    fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME" >/dev/null 2>&1; then
+        SERVICE_WAS_ENABLED=1
+    fi
+fi
+
+rollback_install() {
+    local reason="$1"
+    set +e
+    ROLLBACK_ARMED=0
+    trap - ERR
+    warn "Upgrade health check failed: ${reason}. Rolling back ..."
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+
+    if [ "$HAD_SERVICE_FILE" = "1" ] && [ -e "$SERVICE_FILE_BACKUP" ]; then
+        mv -f "$SERVICE_FILE_BACKUP" "$SERVICE_FILE"
+    else
+        rm -f "$SERVICE_FILE"
+    fi
+    if [ "$HAD_START_SH" = "1" ] && [ -e "$START_SH_BACKUP" ]; then
+        mv -f "$START_SH_BACKUP" "$START_SH"
+    else
+        rm -f "$START_SH"
+    fi
+    if [ "$BINARY_REPLACED" = "1" ]; then
+        if [ "$HAD_BINARY" = "1" ] && [ -e "$BINARY_BACKUP" ]; then
+            mv -f "$BINARY_BACKUP" "$BINARY"
+        else
+            rm -f "$BINARY"
+        fi
+    fi
+    if [ "$HAD_ENV_FILE" = "0" ]; then
+        rm -f "$ENV_FILE"
+    fi
+    if [ "$HAD_CERTS_DIR" = "0" ]; then
+        rmdir "$CERTS_DIR" >/dev/null 2>&1
+    fi
+    if [ "$HAD_INSTALL_DIR" = "0" ]; then
+        # These files can be created by a short-lived first boot before the
+        # stability check detects failure. They belong to this fresh install.
+        rm -f "$INSTALL_DIR/config-cache.json" "$INSTALL_DIR/node-id" "$TMP_BINARY"
+        rmdir "$INSTALL_DIR" >/dev/null 2>&1
+    fi
+
+    systemctl daemon-reload >/dev/null 2>&1
+    if [ "$SERVICE_WAS_ENABLED" = "1" ]; then
+        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+    else
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
+    fi
+    if [ "$SERVICE_WAS_ACTIVE" = "1" ]; then
+        if systemctl restart "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
+            warn "Previous relay-node version/config restored and running."
+        else
+            warn "Rollback files were restored, but the previous service did not recover."
+        fi
+    fi
+
+    rm -f "$BINARY_BACKUP" "$START_SH_BACKUP" "$SERVICE_FILE_BACKUP"
+    journalctl -u "$SERVICE_NAME" --no-pager -n 50 2>/dev/null || true
+    fail "relay-node installation failed and was rolled back: ${reason}"
+}
+
+rollback_on_error() {
+    local status=$?
+    if [ "$ROLLBACK_ARMED" = "1" ]; then
+        rollback_install "installer command failed with exit ${status}"
+    fi
+    exit "$status"
+}
 
 # ---------- Resolve the install version ----------
 # v1.2: nodes release on their own node-v* track. By default install the LATEST
@@ -159,6 +271,9 @@ if [ -z "$TARGET_VERSION" ]; then
     fi
 else
     info "Installing node version: $TARGET_VERSION (pinned via --version)"
+fi
+if [[ ! "$TARGET_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    fail "Invalid node version '${TARGET_VERSION}'. Expected MAJOR.MINOR.PATCH (for example 1.3.0)."
 fi
 
 # ---------- Already-latest check ----------
@@ -205,12 +320,13 @@ url_tag_prefix() {
         echo "node-v"
     fi
 }
+TAG_PREFIX=$(url_tag_prefix "$TARGET_VERSION")
+OFFICIAL_DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG_PREFIX}${TARGET_VERSION}/${ASSET_NAME}"
 if [ -n "${RELAY_NODE_BASE_URL:-}" ]; then
     DOWNLOAD_URL="${RELAY_NODE_BASE_URL}/${ASSET_NAME}"
     info "Using custom mirror: ${RELAY_NODE_BASE_URL}"
 else
-    TAG_PREFIX=$(url_tag_prefix "$TARGET_VERSION")
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG_PREFIX}${TARGET_VERSION}/${ASSET_NAME}"
+    DOWNLOAD_URL="$OFFICIAL_DOWNLOAD_URL"
     info "Download URL: $DOWNLOAD_URL"
 fi
 
@@ -260,11 +376,19 @@ fi
 #   - GitHub Releases (default): checksum is REQUIRED. Missing file or mismatch
 #     is a hard FAIL — the release is expected to ship one (binary-release.yml
 #     generates it). Set SKIP_CHECKSUM=1 only if you accept the risk.
-#   - Custom mirror (RELAY_NODE_BASE_URL): we try the checksum but, if the
-#     mirror doesn't serve a .sha256, we WARN and continue (a mirror operator
-#     may legitimately not mirror it). A mismatch is still a hard FAIL.
+#   - Custom mirror (RELAY_NODE_BASE_URL): checksum is equally REQUIRED. A
+#     mirror is not a weaker trust boundary; explicit SKIP_CHECKSUM=1 is the
+#     only opt-out.
 if [ "${SKIP_CHECKSUM:-0}" != "1" ]; then
-    CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+    # With a custom binary mirror, fetch the expected digest from the official
+    # release by default so compromise of one mirror cannot replace both the
+    # binary and its checksum. Networks that must proxy the digest too can set
+    # RELAY_NODE_CHECKSUM_URL explicitly.
+    if [ -n "${RELAY_NODE_BASE_URL:-}" ]; then
+        CHECKSUM_URL="${RELAY_NODE_CHECKSUM_URL:-${OFFICIAL_DOWNLOAD_URL}.sha256}"
+    else
+        CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+    fi
     TMP_CHECKSUM="${TMP_BINARY}.sha256"
     # v0.3.11: MUST use -L (follow redirects). GitHub Releases download URLs
     # 302-redirect to objects.githubusercontent.com; without -L, curl returns
@@ -318,15 +442,14 @@ truncated, corrupted, or tampered download. The existing binary was NOT touched.
 To bypass (NOT recommended), re-run with SKIP_CHECKSUM=1."
         fi
         rm -f "$TMP_CHECKSUM"
-    elif [ -z "${RELAY_NODE_BASE_URL:-}" ]; then
-        # GitHub Releases is REQUIRED to ship a checksum. Missing = hard fail.
+    else
+        # Every source, including a ghfast/custom mirror, must serve the signed
+        # release's checksum. Never silently turn a root installer into an
+        # arbitrary-ELF launcher just because the primary CDN is unavailable.
         rm -f "$TMP_BINARY" "$TMP_CHECKSUM"
         fail "Checksum file not found at ${CHECKSUM_URL}.
 Release v${TARGET_VERSION} is expected to publish a .sha256. The download was
 discarded. To bypass (NOT recommended): SKIP_CHECKSUM=1"
-    else
-        warn "No checksum available at mirror (${CHECKSUM_URL}); skipping verification.
-Prefer a mirror that also serves .sha256, or set SKIP_CHECKSUM=1 to silence this."
     fi
 fi
 
@@ -365,8 +488,19 @@ fi
 # ("Text file busy"). The download went to .tmp so we avoided that during
 # curl, but we still stop before the swap so the old binary releases cleanly
 # and the new one starts from a known state.
-if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}\.service"; then
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
+if [ -e "$START_SH" ]; then
+    cp -p "$START_SH" "$START_SH_BACKUP"
+    HAD_START_SH=1
+fi
+if [ -e "$SERVICE_FILE" ]; then
+    cp -p "$SERVICE_FILE" "$SERVICE_FILE_BACKUP"
+    HAD_SERVICE_FILE=1
+fi
+ROLLBACK_ARMED=1
+trap rollback_on_error ERR
+
+if [ "$SERVICE_EXISTED" = "1" ]; then
+    if [ "$SERVICE_WAS_ACTIVE" = "1" ]; then
         info "Stopping existing ${SERVICE_NAME} service for binary swap ..."
         systemctl stop "$SERVICE_NAME" || warn "systemctl stop returned non-zero (continuing)"
     else
@@ -379,60 +513,61 @@ fi
 # mv -f on the same filesystem is a single rename(2) syscall: atomic and
 # never partial. The old running binary (if any) keeps its inode alive for
 # the already-open file descriptors, so this cannot corrupt anything.
+if [ -e "$BINARY" ]; then
+    cp -p "$BINARY" "$BINARY_BACKUP"
+    HAD_BINARY=1
+fi
 mv -f "$TMP_BINARY" "$BINARY"
+BINARY_REPLACED=1
 chmod +x "$BINARY"
 info "Binary installed: ${BINARY} ($(( FILE_SIZE / 1024 / 1024 )) MB, ELF ${ARCH})"
 
 fi  # end ALREADY_AT_VERSION skip (binary download/swap)
 
+# The already-current path skips the binary swap block above, but still rewrites
+# start.sh/systemd configuration. Arm the same rollback protection before those
+# mutations so a bad token/path refresh cannot destroy a working service.
+if [ "$ROLLBACK_ARMED" != "1" ]; then
+    if [ -e "$START_SH" ]; then
+        cp -p "$START_SH" "$START_SH_BACKUP"
+        HAD_START_SH=1
+    fi
+    if [ -e "$SERVICE_FILE" ]; then
+        cp -p "$SERVICE_FILE" "$SERVICE_FILE_BACKUP"
+        HAD_SERVICE_FILE=1
+    fi
+    ROLLBACK_ARMED=1
+    trap rollback_on_error ERR
+fi
+
 # ---------- Write start.sh ----------
-# IMPORTANT: the here-doc uses quoted 'EOF' delimiter so NOTHING is expanded
-# at install time - all values are written literally. This prevents bugs like
-# $0 being /dev/fd/63 when the installer runs via bash <(curl ...).
-START_SH="${INSTALL_DIR}/start.sh"
 info "Writing start script: $START_SH"
-cat > "$START_SH" <<'STARTEOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd "/opt/relay-node"
-export PANEL_URL="__PANEL_URL__"
-export NODE_TOKEN="__NODE_TOKEN__"
-export POLL_INTERVAL="${POLL_INTERVAL:-10}"
-export RUST_LOG="${RUST_LOG:-info}"
-# Optional config sourced from relay-node.env if present (written by the
-# installer with commented examples; edit it to set LISTEN_IPV4/LISTEN_IPV6,
-# OUTBOUND_INTERFACE/OUTBOUND_BIND_IPV4, or TLS_CERT_PATH/TLS_KEY_PATH). If the
-# file doesn't exist, all of these stay unset and the node uses its defaults
-# (dual-stack listen, system-routed egress, no TLS).
-# NOTE: path is hardcoded (/opt/relay-node) because this script runs with set -u
-# and INSTALL_DIR is not defined in the generated start.sh context.
-if [ -f "/opt/relay-node/relay-node.env" ]; then
-    set -a
-    . "/opt/relay-node/relay-node.env"
-    set +a
-fi
-exec ./relay-node
-STARTEOF
-
-# Replace the placeholders with actual values (safe - no shell expansion).
-sed -i "s|__PANEL_URL__|${PANEL_URL}|" "$START_SH"
-sed -i "s|__NODE_TOKEN__|${NODE_TOKEN}|" "$START_SH"
+# printf %q produces a Bash-safe representation even if the URL or token has
+# characters meaningful to sed or the shell. Fixed lines use %s so runtime
+# parameter expansion remains literal in the generated script.
+{
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+    printf 'cd %q\n' "$INSTALL_DIR"
+    printf 'export RELAY_NODE_DATA_DIR=%q\n' "$INSTALL_DIR"
+    printf 'export PANEL_URL=%q\n' "$PANEL_URL"
+    printf 'export NODE_TOKEN=%q\n' "$NODE_TOKEN"
+    printf '%s\n' 'export POLL_INTERVAL="${POLL_INTERVAL:-10}"'
+    printf '%s\n' 'export RUST_LOG="${RUST_LOG:-info}"'
+    printf '%s\n' '# Optional per-node environment:'
+    printf 'if [ -f %q ]; then\n' "$ENV_FILE"
+    printf '%s\n' '    set -a'
+    printf '    . %q\n' "$ENV_FILE"
+    printf '%s\n' '    set +a' 'fi' 'exec ./relay-node'
+} > "$START_SH"
 chmod 700 "$START_SH"
-
-# Safety check: make sure /dev/fd did not leak into the file.
-if grep -q '/dev/fd' "$START_SH" 2>/dev/null; then
-    fail "start.sh generated incorrectly (contains /dev/fd). Aborting."
-fi
 
 # v0.4.1: create the certs directory + example env file for TLS Simple.
 # The operator places their cert+key here (or points the env file elsewhere).
-CERTS_DIR="${INSTALL_DIR}/certs"
 mkdir -p "$CERTS_DIR"
 chmod 700 "$CERTS_DIR"
 
 # Write an example env file if one doesn't exist (don't overwrite an existing
 # one — the operator may have configured it).
-ENV_FILE="${INSTALL_DIR}/relay-node.env"
 if [ ! -f "$ENV_FILE" ]; then
     info "Writing example env file: $ENV_FILE (edit to tune listen / egress / TLS)"
     cat > "$ENV_FILE" <<'ENVEOF'
@@ -458,14 +593,14 @@ if [ ! -f "$ENV_FILE" ]; then
 # Uncomment and set these to enable TLS Simple ingress on this node.
 # The cert must be PEM format (fullchain recommended); the key must be PEM
 # (PKCS#8, PKCS#1 RSA, or SEC1 EC). The key file MUST be chmod 600.
-#   TLS_CERT_PATH=/opt/relay-node/certs/fullchain.pem
-#   TLS_KEY_PATH=/opt/relay-node/certs/privkey.pem
+#   TLS_CERT_PATH=__INSTALL_DIR__/certs/fullchain.pem
+#   TLS_KEY_PATH=__INSTALL_DIR__/certs/privkey.pem
 ENVEOF
+    sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
 fi
 
 # ---------- Write systemd service ----------
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 info "Writing systemd service: $SERVICE_FILE"
 cat > "$SERVICE_FILE" <<SVCEOF
 [Unit]
@@ -487,21 +622,46 @@ SVCEOF
 
 # ---------- Enable and start ----------
 info "Enabling and starting ${SERVICE_NAME} ..."
-systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
+if ! systemctl daemon-reload; then
+    rollback_install "systemd daemon-reload failed"
+fi
+if ! systemctl enable "$SERVICE_NAME"; then
+    rollback_install "systemd enable failed"
+fi
 # restart handles both fresh start and post-upgrade start.
-systemctl restart "$SERVICE_NAME"
+if ! systemctl restart "$SERVICE_NAME"; then
+    rollback_install "systemd restart returned non-zero"
+fi
 
 # ---------- Verify ----------
-sleep 2
-if systemctl is-active --quiet "$SERVICE_NAME"; then
-    info "Service ${SERVICE_NAME} is running."
-else
-    warn "Service ${SERVICE_NAME} failed to start. Recent logs:"
-    echo "---"
-    journalctl -u "$SERVICE_NAME" --no-pager -n 50 2>/dev/null || echo "(journalctl not available)"
-    echo "---"
+INSTALLED_VERSION="$($BINARY --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+if [ "$INSTALLED_VERSION" != "$TARGET_VERSION" ]; then
+    rollback_install "installed binary reports '${INSTALLED_VERSION:-unknown}', expected '${TARGET_VERSION}'"
 fi
+
+# A successful systemctl restart only proves the process was launched. Require
+# it to remain active across multiple RestartSec cycles so an immediate crash
+# loop cannot be reported as a successful upgrade.
+START_MAIN_PID=$(systemctl show "$SERVICE_NAME" --property MainPID --value 2>/dev/null || true)
+if [ -z "$START_MAIN_PID" ] || [ "$START_MAIN_PID" = "0" ]; then
+    rollback_install "service has no live MainPID after restart"
+fi
+for _attempt in 1 2 3 4 5 6; do
+    sleep 1
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+        rollback_install "service did not remain active during the stability window"
+    fi
+    CURRENT_MAIN_PID=$(systemctl show "$SERVICE_NAME" --property MainPID --value 2>/dev/null || true)
+    if [ "$CURRENT_MAIN_PID" != "$START_MAIN_PID" ]; then
+        rollback_install "service restarted during the stability window (crash loop)"
+    fi
+done
+info "Service ${SERVICE_NAME} is running and stable."
+
+# The new version is healthy; rollback snapshots are no longer needed.
+ROLLBACK_ARMED=0
+trap - ERR
+rm -f "$BINARY_BACKUP" "$START_SH_BACKUP" "$SERVICE_FILE_BACKUP"
 
 # ---------- Done ----------
 echo ""

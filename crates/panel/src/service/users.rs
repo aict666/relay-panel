@@ -1,6 +1,8 @@
 use crate::db::error::DbError;
 use crate::db::repo::Repository;
-use crate::service::password::{hash_password, validate_password, PasswordValidationError};
+use crate::service::password::{
+    hash_password_async, validate_password, PasswordValidationError, PasswordWorkError,
+};
 
 pub const DEFAULT_ADMIN_CREATED_USER_PLAN_ID: i64 = 1;
 
@@ -53,7 +55,10 @@ pub async fn create_user(
     }
     validate_password(password).map_err(CreateUserError::Password)?;
 
-    let hashed = hash_password(password).map_err(|e| CreateUserError::Hash(e.to_string()))?;
+    let hashed = hash_password_async(password).await.map_err(|e| match e {
+        PasswordWorkError::Busy => CreateUserError::Hash("password service is busy".into()),
+        error => CreateUserError::Hash(error.to_string()),
+    })?;
 
     match db
         .insert_user_from_plan(username, &hashed, DEFAULT_ADMIN_CREATED_USER_PLAN_ID)

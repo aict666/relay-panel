@@ -1,5 +1,6 @@
 use crate::config::NodeConfig;
 use relay_shared::protocol::{NodeConfigResponse, CONFIG_PROTOCOL_VERSION};
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Path for the config cache file. Used when the panel is unreachable.
@@ -85,6 +86,11 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
 /// Returns None if file doesn't exist or is corrupt.
 pub fn load_cache() -> Option<NodeConfigResponse> {
     let path = cache_path();
+    #[cfg(unix)]
+    if path.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     let data = std::fs::read_to_string(&path).ok()?;
     let resp: NodeConfigResponse = serde_json::from_str(&data).ok()?;
     tracing::info!(
@@ -100,7 +106,7 @@ fn save_cache(config: &NodeConfigResponse) {
     let path = cache_path();
     match serde_json::to_string_pretty(config) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = write_private_atomic(&path, json.as_bytes()) {
                 tracing::warn!("Failed to write config cache to {}: {}", path.display(), e);
             }
         }
@@ -110,23 +116,63 @@ fn save_cache(config: &NodeConfigResponse) {
     }
 }
 
-fn cache_path() -> PathBuf {
-    // Try /opt/relay-node first (production path), then current dir (dev)
-    let prod = PathBuf::from("/opt/relay-node").join(CACHE_FILE);
-    if prod.parent().map(|p| p.exists()).unwrap_or(false) {
-        return prod;
+fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(CACHE_FILE);
+    let temporary = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-    PathBuf::from(CACHE_FILE)
+    result
+}
+
+fn data_dir() -> PathBuf {
+    std::env::var_os("RELAY_NODE_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn cache_path() -> PathBuf {
+    data_dir().join(CACHE_FILE)
 }
 
 /// Resolve where the node-id file lives — same directory logic as cache_path
 /// so the two files sit together (production: /opt/relay-node/, dev: cwd).
 fn node_id_path() -> PathBuf {
-    let prod = PathBuf::from("/opt/relay-node").join(NODE_ID_FILE);
-    if prod.parent().map(|p| p.exists()).unwrap_or(false) {
-        return prod;
-    }
-    PathBuf::from(NODE_ID_FILE)
+    data_dir().join(NODE_ID_FILE)
 }
 
 /// Get this node's stable identity, generating + persisting it on first call.
@@ -200,6 +246,36 @@ fn fallback_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_write_is_atomic_and_private() {
+        let path = std::env::temp_dir().join(format!(
+            "relaypanel-test-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_private_atomic(&path, br#"{"listeners":[]}"#).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"listeners":[]}"#);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let prefix = format!(".{}.tmp-", path.file_name().unwrap().to_string_lossy());
+        let leftovers = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .count();
+        assert_eq!(leftovers, 0, "atomic cache write left temporary files");
+        let _ = std::fs::remove_file(path);
+    }
 
     /// A node_id generated once must be reused verbatim on every subsequent
     /// call — this stability is the contract the panel's status dedup depends

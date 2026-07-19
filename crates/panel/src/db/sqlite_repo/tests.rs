@@ -1443,6 +1443,60 @@ async fn rule_update_rule_fields_partial_update() {
 }
 
 #[tokio::test]
+async fn rule_update_full_rolls_back_scalar_when_hop_insert_fails() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    db.insert_quota_guarded(
+        "before",
+        1,
+        20000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        1,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    let rule_id = db.list_rules(&ResourceScope::All).await.unwrap()[0].id;
+
+    let result = db
+        .update_rule_full(&RuleUpdateData {
+            id: rule_id,
+            effective_device_group_in: 1,
+            name: Some("must-roll-back".into()),
+            // Missing group 999 violates the hop FK after the scalar UPDATE.
+            hops: Some(vec![(999, 21000)]),
+            ..Default::default()
+        })
+        .await;
+    assert!(result.is_err(), "invalid hop must fail the full update");
+
+    let name: String = sqlx::query_scalar("SELECT name FROM forward_rules WHERE id = ?")
+        .bind(rule_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let hop_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id = ?")
+            .bind(rule_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        name, "before",
+        "scalar field escaped the rolled-back transaction"
+    );
+    assert_eq!(hop_count, 0);
+}
+
+#[tokio::test]
 async fn rule_list_active_for_config_filters_banned_paused_overquota() {
     let db = repo().await;
     // Seed a second user (non-admin) with a group + rule.
