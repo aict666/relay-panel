@@ -63,8 +63,11 @@ pub async fn create_user(
         }
         Err(CreateUserError::Hash(e)) => Json(err(500, format!("Failed to hash password: {}", e))),
         Err(CreateUserError::DuplicateUsername) => Json(err(409, "用户名已存在")),
-        Err(CreateUserError::DefaultPlanMissing) => {
-            tracing::error!("create_user: default plan 1 is missing; no user created");
+        Err(CreateUserError::DefaultPlanMissing(plan_id)) => {
+            tracing::error!(
+                "create_user: configured default plan {} is missing; no user created",
+                plan_id
+            );
             Json(err(
                 500,
                 "Default plan is missing; contact an administrator",

@@ -333,6 +333,32 @@ pub async fn delete_plan(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
+    // Resolve the target before checking settings so a missing plan still gets
+    // the expected 404 instead of being mistaken for the fallback default.
+    match state.db.find_plan_name_by_id(id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Json(err(404, "套餐不存在")),
+        Err(e) => {
+            tracing::error!("delete_plan {}: existence check failed: {}", id, e);
+            return Json(err(500, "数据库错误"));
+        }
+    }
+
+    let settings =
+        match crate::service::settings::get_registration_settings(state.db.as_ref()).await {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::error!("delete_plan {}: settings lookup failed: {}", id, e);
+                return Json(err(500, "数据库错误"));
+            }
+        };
+    if settings.default_registration_plan_id == id {
+        return Json(err(
+            409,
+            "该套餐是当前默认套餐，请先在系统设置中更换默认套餐。",
+        ));
+    }
+
     // Pre-delete safety check: refuse if any user's plan_id references this
     // plan. Deleting would orphan the FK and leave users on a ghost plan.
     let in_use = match state.db.count_users_on_plan(id).await {

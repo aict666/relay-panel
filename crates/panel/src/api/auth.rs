@@ -411,6 +411,7 @@ pub async fn registration_status(
         enabled: settings.registration_enabled,
         default_plan_id: settings.default_registration_plan_id,
         plans,
+        site_name: settings.site_name,
         default_password_change_required: default_password_change_required(state.db.as_ref()).await,
     }))
 }

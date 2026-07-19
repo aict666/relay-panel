@@ -1,8 +1,9 @@
-import { Card, Form, Switch, Select, Button, message, Spin, Result, Typography } from 'antd';
+import { Card, Form, Switch, Select, Button, Input, message, Spin, Result, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, Plan, RegistrationSettings } from '../api/types';
 import { useI18n } from '../i18n/context';
+import { useSiteConfig } from '../site/useSiteConfig';
 
 const { Text } = Typography;
 
@@ -11,6 +12,7 @@ const { Text } = Typography;
  *  and the default selected plan. */
 export default function SystemSettings() {
   const { t } = useI18n();
+  const { setSiteName } = useSiteConfig();
   const [form] = Form.useForm();
   const [plans, setPlans] = useState<Plan[]>([]);
   const [loading, setLoading] = useState(true);
@@ -27,6 +29,7 @@ export default function SystemSettings() {
       ]);
       if (settingsRes.data) {
         form.setFieldsValue({
+          site_name: settingsRes.data.site_name,
           registration_enabled: settingsRes.data.registration_enabled,
           default_registration_plan_id: settingsRes.data.default_registration_plan_id,
           allowed_plan_ids: settingsRes.data.allowed_plan_ids,
@@ -47,6 +50,7 @@ export default function SystemSettings() {
 
   const onSave = async () => {
     const values = await form.validateFields();
+    const siteName = String(values.site_name).trim();
 
     // Client-side guard: allowed_plan_ids must not be empty.
     const allowed = (values.allowed_plan_ids as number[]) || [];
@@ -70,11 +74,15 @@ export default function SystemSettings() {
           enabled: values.registration_enabled,
           default_plan_id: defaultId,
           allowed_plan_ids: allowed,
+          site_name: siteName,
         }
       );
       if (res.code !== 0) {
         message.error(res.message);
         return;
+      }
+      if (res.data?.site_name) {
+        setSiteName(res.data.site_name);
       }
       message.success(t('settingsSaved'));
     } catch {
@@ -115,6 +123,18 @@ export default function SystemSettings() {
       {/* Capped width: full-bleed inputs across a 1500px card are unreadable
           and make the page look empty. */}
       <Form form={form} layout="vertical" style={{ maxWidth: 620 }}>
+        <Form.Item
+          name="site_name"
+          label={t('siteName')}
+          extra={t('siteNameHint')}
+          rules={[
+            { required: true, whitespace: true, message: t('siteNameRequired') },
+            { max: 64, message: t('siteNameTooLong') },
+          ]}
+        >
+          <Input maxLength={64} showCount placeholder="RelayPanel" />
+        </Form.Item>
+
         <Form.Item
           name="registration_enabled"
           label={t('registrationEnabled')}

@@ -35,6 +35,7 @@ pub async fn update_registration_settings(
         req.enabled,
         req.default_plan_id,
         &req.allowed_plan_ids,
+        req.site_name.as_deref(),
     )
     .await
     {
@@ -55,6 +56,10 @@ pub async fn update_registration_settings(
                     );
                     (400, format!("套餐 {} 不存在", id))
                 }
+                RegistrationSettingsError::InvalidSiteName => (
+                    400,
+                    "站点名称不能为空、不能包含控制字符，且最多 64 个字符".into(),
+                ),
                 RegistrationSettingsError::Database(e) => {
                     tracing::error!("update_registration_settings: db error: {}", e);
                     (500, "数据库错误".into())

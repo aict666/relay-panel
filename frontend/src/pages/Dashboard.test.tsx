@@ -6,6 +6,7 @@ import { MemoryRouter } from 'react-router-dom';
 // /rules, /groups, /nodes, and /system/version.
 const { mockGet } = vi.hoisted(() => ({ mockGet: vi.fn() }));
 const { mockNavigate } = vi.hoisted(() => ({ mockNavigate: vi.fn() }));
+const { mockArea, mockLine } = vi.hoisted(() => ({ mockArea: vi.fn(), mockLine: vi.fn() }));
 
 vi.mock('../api/client', () => ({
   default: { get: mockGet },
@@ -14,8 +15,8 @@ vi.mock('../api/client', () => ({
 // tests verify data flow/layout around charts; pure chart-data transforms have
 // their own tests, so lightweight stand-ins keep this suite deterministic.
 vi.mock('@ant-design/charts', () => ({
-  Area: () => <div data-testid="area-chart" />,
-  Line: () => <div data-testid="line-chart" />,
+  Area: (props: unknown) => { mockArea(props); return <div data-testid="area-chart" />; },
+  Line: (props: unknown) => { mockLine(props); return <div data-testid="line-chart" />; },
   Pie: () => <div data-testid="pie-chart" />,
   Bar: () => <div data-testid="bar-chart" />,
 }));
@@ -25,7 +26,7 @@ vi.mock('react-router-dom', async () => {
 });
 
 import Dashboard from './Dashboard';
-import type { NodeStatus } from '../api/types';
+import type { DashboardHistoryPoint, NodeStatus } from '../api/types';
 
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 
@@ -39,6 +40,8 @@ function ns(group_id: number, over: Partial<NodeStatus>): NodeStatus {
 beforeEach(() => {
   mockGet.mockReset();
   mockNavigate.mockReset();
+  mockArea.mockReset();
+  mockLine.mockReset();
   vi.useFakeTimers();
 });
 afterEach(() => {
@@ -48,14 +51,14 @@ afterEach(() => {
 
 /** Resolve every Dashboard API call. Unspecified endpoints 404-reject so a
  *  missed mock is loud rather than silently swallowed. */
-function mockAll(nodes: NodeStatus[]) {
+function mockAll(nodes: NodeStatus[], historyPoints: DashboardHistoryPoint[] = []) {
   mockGet.mockImplementation((url: string) => {
     if (url === '/admin/users') return Promise.resolve(ok([{}]));
     if (url === '/rules') return Promise.resolve(ok([{}]));
     if (url === '/groups') return Promise.resolve(ok([{}]));
     if (url === '/nodes') return Promise.resolve(ok(nodes));
     if (url.startsWith('/dashboard/history?range=')) {
-      return Promise.resolve(ok({ range: url.split('=').pop(), bucket_seconds: 300, points: [] }));
+      return Promise.resolve(ok({ range: url.split('=').pop(), bucket_seconds: 300, points: historyPoints }));
     }
     if (url === '/system/version') {
       return Promise.resolve({ current_version: '0.4.17', latest_version: '', has_update: false, is_outdated: false, release_url: '', release_notes: '', published_at: '', check_failed: false, error_message: '' });
@@ -134,6 +137,27 @@ describe('Dashboard group aggregation', () => {
       await vi.advanceTimersByTimeAsync(0);
     });
     expect(mockGet).toHaveBeenCalledWith('/dashboard/history?range=7d');
+  });
+
+  it('keeps both history chart x-axis labels horizontal', async () => {
+    mockAll([], [{
+      timestamp: '2026-07-19T09:00:00Z',
+      upload_bps_avg: 100,
+      download_bps_avg: 200,
+      connections_max: 3,
+      online_nodes_min: 2,
+      recent_nodes_max: 2,
+      sample_count: 1,
+    }]);
+    renderDashboard();
+    await flush();
+
+    const areaProps = mockArea.mock.calls.at(-1)?.[0] as { axis?: { x?: Record<string, unknown> } };
+    const lineProps = mockLine.mock.calls.at(-1)?.[0] as { axis?: { x?: Record<string, unknown> } };
+    expect(areaProps.axis?.x?.labelAutoRotate).toBe(false);
+    expect(areaProps.axis?.x?.labelAutoHide).toBe(true);
+    expect(lineProps.axis?.x?.labelAutoRotate).toBe(false);
+    expect(lineProps.axis?.x?.labelAutoHide).toBe(true);
   });
 
   it('stops the history refresh timer after unmount', async () => {

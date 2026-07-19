@@ -111,10 +111,10 @@ fn err<T: Serialize, S: Into<String>>(code: i32, msg: S) -> ApiResponse<T> {
 mod tests {
     use super::{change_password, reset_user_password, ResetPasswordRequest};
     use super::{
-        create_group, create_rule, create_user, delete_group, delete_rule, delete_user, err,
-        get_me, get_registration_settings, list_groups, list_rules, reset_user_traffic,
-        update_group, update_registration_settings, update_rule, update_user, ApiResponse,
-        ChangePasswordRequest, CreateUserRequest, ListRulesQuery,
+        create_group, create_rule, create_user, delete_group, delete_plan, delete_rule,
+        delete_user, err, get_me, get_registration_settings, list_groups, list_rules,
+        reset_user_traffic, update_group, update_registration_settings, update_rule, update_user,
+        ApiResponse, ChangePasswordRequest, CreateUserRequest, ListRulesQuery,
     };
     use crate::api::auth::{register, registration_status};
     use crate::api::middleware::{AdminOnly, AuthUser};
@@ -421,6 +421,29 @@ mod tests {
     async fn create_user_makes_non_admin_and_rejects_duplicates_and_bad_input() {
         let (state, pool) = test_state().await;
 
+        // Production installations may delete the original plan id=1 and use
+        // another plan as the registration default. Admin provisioning must
+        // read that persisted setting instead of assuming plan 1 forever.
+        sqlx::query(
+            "INSERT INTO plans (id, name, max_rules, traffic) \
+             VALUES (2, 'configured-default', 10, 268435456000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_settings \
+             (id, registration_enabled, default_registration_plan_id, registration_allowed_plan_ids) \
+             VALUES (1, 0, 2, '[2]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM plans WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
         // Happy path: creates a regular (non-admin) user.
         let Json(ok) = create_user(
             AdminOnly { user_id: 1 },
@@ -433,9 +456,9 @@ mod tests {
         .await;
         assert_eq!(ok.code, 0, "create should succeed: {}", ok.message);
 
-        // v0.4.10: an admin-created user must inherit the default plan's quota
-        // (plan 1 = 'free': max_rules=5, traffic=107374182400) atomically, the
-        // same as self-registration — NOT a bare insert with schema defaults.
+        // An admin-created user inherits the configured default plan's quota
+        // atomically, the same as self-registration — NOT a bare insert with
+        // schema defaults and NOT the historical hard-coded plan id=1.
         let row: (i64, bool, Option<i64>, i64, i64) = sqlx::query_as(
             "SELECT id, admin, plan_id, max_rules, traffic_limit FROM users WHERE username = 'bob'",
         )
@@ -443,11 +466,11 @@ mod tests {
         .await
         .unwrap();
         assert!(!row.1, "created user must be NON-admin");
-        assert_eq!(row.2, Some(1), "created user must be attached to plan 1");
-        assert_eq!(row.3, 5, "max_rules must be inherited from plan 1");
+        assert_eq!(row.2, Some(2), "user must use the configured default plan");
+        assert_eq!(row.3, 10, "max_rules must be inherited from plan 2");
         assert_eq!(
-            row.4, 107374182400,
-            "traffic_limit must be inherited from plan 1"
+            row.4, 268435456000,
+            "traffic_limit must be inherited from plan 2"
         );
 
         // Duplicate username → 409.
@@ -515,6 +538,81 @@ mod tests {
         )
         .await;
         assert_eq!(bad.code, 400);
+    }
+
+    #[tokio::test]
+    async fn delete_plan_requires_changing_configured_default_first() {
+        let (state, pool) = test_state().await;
+        sqlx::query(
+            "INSERT INTO plans (id, name, max_rules, traffic) \
+             VALUES (2, 'configured-default', 10, 268435456000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        state
+            .db
+            .set_registration_settings(false, 2, &[2])
+            .await
+            .unwrap();
+
+        let Json(default_resp) =
+            delete_plan(AdminOnly { user_id: 1 }, State(state.clone()), Path(2)).await;
+        assert_eq!(default_resp.code, 409);
+        assert_eq!(
+            default_resp.message,
+            "该套餐是当前默认套餐，请先在系统设置中更换默认套餐。"
+        );
+        let default_exists: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM plans WHERE id = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(default_exists.0, 1, "the configured default must remain");
+
+        // Once the default has moved away from the original free plan, that
+        // otherwise-unused plan can be deleted normally.
+        let Json(old_default_resp) =
+            delete_plan(AdminOnly { user_id: 1 }, State(state.clone()), Path(1)).await;
+        assert_eq!(old_default_resp.code, 0);
+        let old_default_exists: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM plans WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(old_default_exists.0, 0);
+
+        let Json(missing_resp) =
+            delete_plan(AdminOnly { user_id: 1 }, State(state), Path(999)).await;
+        assert_eq!(missing_resp.code, 404);
+        assert_eq!(missing_resp.message, "套餐不存在");
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_a_missing_configured_default_without_inserting() {
+        let (state, pool) = test_state().await;
+        // With no persisted settings row the safe fallback is plan id=1. Once
+        // that plan is absent, account creation must fail atomically.
+        sqlx::query("DELETE FROM plans WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let Json(resp) = create_user(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Json(CreateUserRequest {
+                username: "missing_plan_user".into(),
+                password: "secret123".into(),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.code, 500);
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users WHERE username = 'missing_plan_user'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 0, "failed provisioning must not leave a user row");
     }
 
     #[tokio::test]
@@ -2493,6 +2591,7 @@ mod tests {
                 enabled: true,
                 default_plan_id: 999, // does not exist
                 allowed_plan_ids: vec![999],
+                site_name: None,
             }),
         )
         .await;
@@ -2511,6 +2610,7 @@ mod tests {
                 enabled: true,
                 default_plan_id: 1,
                 allowed_plan_ids: vec![1],
+                site_name: Some("星海中转".into()),
             }),
         )
         .await;
@@ -2518,10 +2618,46 @@ mod tests {
         let data = resp.data.unwrap();
         assert!(data.registration_enabled);
         assert_eq!(data.default_registration_plan_id, 1);
+        assert_eq!(data.site_name, "星海中转");
 
         // registration_status now reports enabled=true.
         let Json(status) = registration_status(State(state.clone())).await;
-        assert!(status.data.unwrap().enabled);
+        let status = status.data.unwrap();
+        assert!(status.enabled);
+        assert_eq!(status.site_name, "星海中转");
+
+        // An older frontend omitting site_name must preserve the configured
+        // brand while changing registration settings.
+        let Json(legacy) = update_registration_settings(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Json(RegistrationSettingsRequest {
+                enabled: false,
+                default_plan_id: 1,
+                allowed_plan_ids: vec![1],
+                site_name: None,
+            }),
+        )
+        .await;
+        assert_eq!(legacy.code, 0);
+        assert_eq!(legacy.data.unwrap().site_name, "星海中转");
+    }
+
+    #[tokio::test]
+    async fn admin_update_settings_rejects_an_invalid_site_name() {
+        let (state, _pool) = test_state().await;
+        let Json(resp) = update_registration_settings(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Json(RegistrationSettingsRequest {
+                enabled: false,
+                default_plan_id: 1,
+                allowed_plan_ids: vec![1],
+                site_name: Some("   ".into()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 400);
     }
 
     /// admin get_registration_settings returns safe defaults on an unseeded DB.
@@ -2535,6 +2671,7 @@ mod tests {
         assert!(!data.registration_enabled);
         assert_eq!(data.default_registration_plan_id, 1);
         assert_eq!(data.allowed_plan_ids, vec![1]);
+        assert_eq!(data.site_name, crate::service::settings::DEFAULT_SITE_NAME);
     }
 
     // ── v0.4.21 PR2: registration multi-plan settings ──
@@ -2551,6 +2688,7 @@ mod tests {
                 enabled: true,
                 default_plan_id: 1,
                 allowed_plan_ids: vec![1],
+                site_name: None,
             }),
         )
         .await;
@@ -2584,6 +2722,7 @@ mod tests {
                 enabled: true,
                 default_plan_id: 1,
                 allowed_plan_ids: vec![1],
+                site_name: None,
             }),
         )
         .await;
@@ -2659,6 +2798,7 @@ mod tests {
                 enabled: true,
                 default_plan_id: 1,
                 allowed_plan_ids: vec![],
+                site_name: None,
             }),
         )
         .await;
@@ -2677,6 +2817,7 @@ mod tests {
                 enabled: true,
                 default_plan_id: 999,
                 allowed_plan_ids: vec![1],
+                site_name: None,
             }),
         )
         .await;
@@ -2694,6 +2835,7 @@ mod tests {
                 enabled: true,
                 default_plan_id: 1,
                 allowed_plan_ids: vec![1, 999],
+                site_name: None,
             }),
         )
         .await;

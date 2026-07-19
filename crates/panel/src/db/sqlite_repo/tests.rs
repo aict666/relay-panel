@@ -2412,6 +2412,7 @@ async fn settings_insert_if_absent_is_idempotent() {
     let s = db.get_registration_settings().await.unwrap().unwrap();
     assert!(s.registration_enabled);
     assert_eq!(s.default_registration_plan_id, 1);
+    assert_eq!(s.site_name, "RelayPanel");
 
     // Simulate a restart with env still =1. The row already exists, so the
     // insert_if_absent must NOT run — even though we pass true again. To
@@ -2454,7 +2455,7 @@ async fn settings_allowed_plan_ids_round_trip() {
     .unwrap();
 
     // Multi-plan settings round-trip.
-    db.set_registration_settings(true, 1, &[1, 2])
+    db.set_system_settings(true, 1, &[1, 2], "My Relay")
         .await
         .unwrap();
     let s = db.get_registration_settings().await.unwrap().unwrap();
@@ -2465,6 +2466,7 @@ async fn settings_allowed_plan_ids_round_trip() {
         vec![1, 2],
         "SQLite multi-plan round-trip"
     );
+    assert_eq!(s.site_name, "My Relay", "SQLite site-name round-trip");
 
     // Unseeded row insert must also carry allowed_plan_ids.
     sqlx::query("DELETE FROM app_settings WHERE id = 1")
@@ -2481,6 +2483,10 @@ async fn settings_allowed_plan_ids_round_trip() {
         s2.allowed_plan_ids,
         vec![2, 1],
         "SQLite unseeded round-trip (order preserved)"
+    );
+    assert_eq!(
+        s2.site_name, "RelayPanel",
+        "unseeded row uses brand default"
     );
 }
 

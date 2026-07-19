@@ -28,7 +28,13 @@ export default function Register() {
       const res = await api.get<unknown, ApiEnvelope<RegistrationStatus>>(
         '/auth/registration-status'
       );
-      const data = res.data ?? { enabled: false, default_plan_id: 1, plans: [], default_password_change_required: false };
+      const data = res.data ?? {
+        enabled: false,
+        default_plan_id: 1,
+        plans: [],
+        site_name: 'RelayPanel',
+        default_password_change_required: false,
+      };
       setStatus(data);
       // Pre-select the default plan.
       setSelectedPlanId(data.default_plan_id);

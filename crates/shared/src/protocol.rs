@@ -74,6 +74,7 @@ pub struct RegistrationStatus {
     pub enabled: bool,
     pub default_plan_id: i64,
     pub plans: Vec<Plan>,
+    pub site_name: String,
     /// v0.4.22: whether the default admin account still has must_change_password
     /// set. The login page uses this to decide whether to show the security
     /// reminder banner. Only meaningful when the DB has been seeded.
@@ -87,6 +88,10 @@ pub struct RegistrationSettingsRequest {
     pub enabled: bool,
     pub default_plan_id: i64,
     pub allowed_plan_ids: Vec<i64>,
+    /// Optional for backward compatibility with older frontends during a
+    /// rolling panel upgrade. Omission preserves the current site name.
+    #[serde(default)]
+    pub site_name: Option<String>,
 }
 
 // === Admin API — Users ===

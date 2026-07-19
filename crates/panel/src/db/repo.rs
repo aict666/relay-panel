@@ -944,6 +944,7 @@ pub struct RegistrationSettings {
     pub registration_enabled: bool,
     pub default_registration_plan_id: i64,
     pub allowed_plan_ids: Vec<i64>,
+    pub site_name: String,
 }
 
 /// v0.4.10 PR3: registration settings stored in the `app_settings` single-row
@@ -974,6 +975,14 @@ pub trait SettingsRepository: Send + Sync {
         enabled: bool,
         default_plan_id: i64,
         allowed_plan_ids: &[i64],
+    ) -> Result<(), DbError>;
+    /// Atomic upsert for the complete administrator-owned system settings row.
+    async fn set_system_settings(
+        &self,
+        enabled: bool,
+        default_plan_id: i64,
+        allowed_plan_ids: &[i64],
+        site_name: &str,
     ) -> Result<(), DbError>;
 }
 
