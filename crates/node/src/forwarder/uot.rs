@@ -7,7 +7,7 @@
 //! session id to a native UDP socket. This gives the entry a zero additional
 //! application round trip for a new session once the tunnel is warm.
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::limiter::RateLimit;
 use super::selector::{TargetLease, TargetSelector};
@@ -29,6 +29,10 @@ const AUTH_TAG_LEN: usize = 32;
 const FRAME_HEADER_LEN: usize = 10;
 const CHANNEL_DEPTH: usize = 2048;
 const MAX_UOT_TUNNELS_PER_LISTENER: usize = 256;
+/// Both sides allocate per-client/session state. Bound it independently of the
+/// tunnel count so one authenticated peer or spoofed UDP source flood cannot
+/// grow the maps and exit-side sockets without limit.
+const MAX_UOT_SESSIONS_PER_LISTENER: usize = 4096;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug)]
@@ -45,6 +49,7 @@ struct EntrySession {
 struct ExitSession {
     socket: Arc<UdpSocket>,
     last_ms: Arc<AtomicU64>,
+    _session_slot: OwnedSemaphorePermit,
     _target_lease: Option<TargetLease>,
 }
 
@@ -80,14 +85,18 @@ impl ShutdownState {
             notified.await;
         }
     }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
 }
 
 struct ShutdownGuard(Arc<ShutdownState>);
 
 impl Drop for ShutdownGuard {
     fn drop(&mut self) {
-        self.0.cancelled.store(true, Ordering::Release);
-        self.0.notify.notify_waiters();
+        self.0.cancel();
     }
 }
 
@@ -148,6 +157,18 @@ pub async fn serve_ingress(
             reply_limit
                 .acquire_download(frame.payload.len() as u64)
                 .await;
+            // Rate limiting may have waited long enough for this session id to
+            // expire and the same client address to be assigned a replacement.
+            // Never deliver the old session's delayed datagram into the new one.
+            let still_current = reply_sessions
+                .get(&client)
+                .is_some_and(|session| session.id == frame.session_id)
+                && reply_reverse
+                    .get(&frame.session_id)
+                    .is_some_and(|mapped| *mapped == client);
+            if !still_current {
+                continue;
+            }
             let Some(reply_socket) = reply_socket.upgrade() else {
                 break;
             };
@@ -191,9 +212,27 @@ pub async fn serve_ingress(
                 .map(|s| (*s.key(), s.id))
                 .collect();
             for (client, id) in expired {
-                cleanup_sessions.remove(&client);
-                cleanup_reverse.remove(&id);
-                cleanup_connections.udp_close(client, rule_id).await;
+                let removed_current = if let Entry::Occupied(entry) = cleanup_sessions.entry(client)
+                {
+                    if entry.get().id == id && entry.get().last_ms.load(Ordering::Relaxed) < cutoff
+                    {
+                        entry.remove();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if removed_current {
+                    if cleanup_reverse
+                        .get(&id)
+                        .is_some_and(|mapped| *mapped == client)
+                    {
+                        cleanup_reverse.remove(&id);
+                    }
+                    cleanup_connections.udp_close(client, rule_id).await;
+                }
             }
         }
     });
@@ -201,11 +240,21 @@ pub async fn serve_ingress(
     let mut buf = vec![0u8; u16::MAX as usize];
     loop {
         let (n, client) = inbound.recv_from(&mut buf).await?;
-        connections.udp_touch(client, rule_id).await;
         let session_id = if let Some(s) = sessions.get(&client) {
             s.last_ms.store(now_millis(), Ordering::Relaxed);
             s.id
         } else {
+            if sessions.len() >= MAX_UOT_SESSIONS_PER_LISTENER {
+                tracing::debug!(
+                    "UOT ingress session cap {} reached; dropping new client {}",
+                    MAX_UOT_SESSIONS_PER_LISTENER,
+                    client
+                );
+                // Clear a possible stale tracker entry from an expired session;
+                // this source was not admitted into the current map.
+                connections.udp_close(client, rule_id).await;
+                continue;
+            }
             let id = next_session.fetch_add(1, Ordering::Relaxed).max(1);
             let last_ms = Arc::new(AtomicU64::new(now_millis()));
             sessions.insert(
@@ -218,6 +267,7 @@ pub async fn serve_ingress(
             reverse.insert(id, client);
             id
         };
+        connections.udp_touch(client, rule_id).await;
         rate_limit.acquire_upload(n as u64).await;
         if out_tx
             .send(Frame {
@@ -245,10 +295,18 @@ pub async fn serve_listener(
     relay: bool,
     source_ipv4: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The manager owns only this outer serve future.  Every accepted tunnel is
+    // detached, so tie them all to a listener-level shutdown state whose guard
+    // fires when the manager aborts this future for delete/restart/token change.
+    let shutdown = ShutdownState::new();
+    let _shutdown_guard = ShutdownGuard(shutdown.clone());
     // Bound both authenticated tunnels and unauthenticated sockets waiting on
     // the five-second challenge timeout. A public tunnel port must not be able
     // to consume every process fd through a slow-auth connection flood.
     let tunnel_slots = Arc::new(Semaphore::new(MAX_UOT_TUNNELS_PER_LISTENER));
+    // Exit-side UDP sockets are bounded across ALL authenticated tunnels on
+    // this listener, not per tunnel (256 × 4096 would defeat the admission cap).
+    let session_slots = Arc::new(Semaphore::new(MAX_UOT_SESSIONS_PER_LISTENER));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(value) => value,
@@ -272,23 +330,42 @@ pub async fn serve_listener(
         let selector = selector.clone();
         let inbound_token = inbound_token.clone();
         let downstream_token = downstream_token.clone();
+        let connection_shutdown = shutdown.clone();
+        let connection_session_slots = session_slots.clone();
         tokio::spawn(async move {
             let _tunnel_slot = tunnel_slot;
-            let result = if relay {
-                handle_relay(
-                    stream,
-                    &inbound_token,
-                    &targets,
-                    selector,
-                    downstream_token.as_deref().unwrap_or_default(),
-                    source_ipv4,
-                )
-                .await
-            } else {
-                handle_egress(stream, &inbound_token, &targets, selector, source_ipv4).await
+            let work = async move {
+                if relay {
+                    handle_relay(
+                        stream,
+                        &inbound_token,
+                        &targets,
+                        selector,
+                        downstream_token.as_deref().unwrap_or_default(),
+                        source_ipv4,
+                    )
+                    .await
+                } else {
+                    handle_egress(
+                        stream,
+                        &inbound_token,
+                        &targets,
+                        selector,
+                        source_ipv4,
+                        connection_session_slots,
+                    )
+                    .await
+                }
             };
-            if let Err(error) = result {
-                tracing::debug!("UOT connection from {} ended: {}", peer, error);
+            tokio::select! {
+                _ = connection_shutdown.cancelled() => {
+                    tracing::debug!("UOT connection from {} cancelled with listener", peer);
+                }
+                result = work => {
+                    if let Err(error) = result {
+                        tracing::debug!("UOT connection from {} ended: {}", peer, error);
+                    }
+                }
             }
         });
     }
@@ -328,6 +405,7 @@ async fn handle_egress(
     targets: &[String],
     selector: Arc<TargetSelector>,
     source_ipv4: Option<Ipv4Addr>,
+    session_slots: Arc<Semaphore>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     authenticate(&mut stream, inbound_token).await?;
     let session_shutdown = ShutdownState::new();
@@ -347,6 +425,14 @@ async fn handle_egress(
             s.last_ms.store(now_millis(), Ordering::Relaxed);
             s.socket.clone()
         } else {
+            let Ok(session_slot) = session_slots.clone().try_acquire_owned() else {
+                tracing::debug!(
+                    "UOT exit session cap {} reached; dropping session {}",
+                    MAX_UOT_SESSIONS_PER_LISTENER,
+                    frame.session_id
+                );
+                continue;
+            };
             let (idx, target) = resolve_udp_target(targets, &selector).await?;
             let socket = Arc::new(super::outbound::udp_outbound_socket(source_ipv4).await?);
             socket.connect(target).await?;
@@ -356,6 +442,7 @@ async fn handle_egress(
                 ExitSession {
                     socket: socket.clone(),
                     last_ms: last_ms.clone(),
+                    _session_slot: session_slot,
                     _target_lease: selector.acquire(idx),
                 },
             );
@@ -723,6 +810,36 @@ mod tests {
         let tag = auth_tag(&"a".repeat(TOKEN_LEN), b"client", &nonce).unwrap();
         assert_eq!(tag.len(), AUTH_TAG_LEN);
         assert_ne!(tag.as_slice(), "a".repeat(TOKEN_LEN).as_bytes());
+    }
+
+    #[tokio::test]
+    async fn aborting_listener_closes_authenticated_child_tunnels() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "c".repeat(TOKEN_LEN);
+        let server = tokio::spawn(serve_listener(
+            listener,
+            vec!["127.0.0.1:9".into()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            token.clone(),
+            None,
+            false,
+            None,
+        ));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        send_handshake(&mut client, &token).await.unwrap();
+        server.abort();
+        let _ = server.await;
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .expect("authenticated child tunnel survived listener abort");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "listener abort must close the old authenticated tunnel"
+        );
     }
 
     #[test]

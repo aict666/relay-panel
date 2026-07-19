@@ -2,13 +2,68 @@ use super::{err, UserSelf};
 use crate::api::middleware::{AdminOnly, AuthUser};
 use crate::api::AppState;
 use crate::service::password::{
-    hash_password, validate_password, verify_password, PasswordValidationError,
+    hash_password_async, validate_password, verify_password_async, PasswordValidationError,
+    PasswordWorkError,
 };
 use axum::{
     extract::{Path, State},
     Json,
 };
+use once_cell::sync::Lazy;
 use relay_shared::protocol::ApiResponse;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+struct PasswordAttempt {
+    count: u32,
+    window_start: Instant,
+}
+
+static PASSWORD_CHANGE_LIMITER: Lazy<Mutex<HashMap<i64, PasswordAttempt>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static GLOBAL_PASSWORD_CHANGE_LIMITER: Lazy<Mutex<PasswordAttempt>> = Lazy::new(|| {
+    Mutex::new(PasswordAttempt {
+        count: 0,
+        window_start: Instant::now(),
+    })
+});
+const PASSWORD_CHANGE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_PASSWORD_CHANGE_ATTEMPTS: u32 = 10;
+const MAX_GLOBAL_PASSWORD_CHANGE_ATTEMPTS: u32 = 120;
+
+fn check_password_change_rate_limit(user_id: i64) -> bool {
+    let now = Instant::now();
+    let mut attempts = PASSWORD_CHANGE_LIMITER.lock().unwrap();
+    match attempts.get_mut(&user_id) {
+        Some(entry) if now.duration_since(entry.window_start) < PASSWORD_CHANGE_WINDOW => {
+            entry.count += 1;
+            entry.count > MAX_PASSWORD_CHANGE_ATTEMPTS
+        }
+        _ => {
+            attempts.insert(
+                user_id,
+                PasswordAttempt {
+                    count: 1,
+                    window_start: now,
+                },
+            );
+            false
+        }
+    }
+}
+
+fn check_global_password_change_rate_limit() -> bool {
+    let now = Instant::now();
+    let mut entry = GLOBAL_PASSWORD_CHANGE_LIMITER.lock().unwrap();
+    if now.duration_since(entry.window_start) >= PASSWORD_CHANGE_WINDOW {
+        entry.count = 1;
+        entry.window_start = now;
+        return false;
+    }
+    entry.count += 1;
+    entry.count > MAX_GLOBAL_PASSWORD_CHANGE_ATTEMPTS
+}
 // === v0.4.10 PR4: admin password reset ===
 /// PUT /admin/users/{id}/password — an admin sets a (temporary) password for
 /// another user. Atomically bumps the target's token_version (revoking ALL
@@ -56,8 +111,9 @@ pub async fn reset_user_password(
         return Json(err(403, "无法重置其他管理员的密码"));
     }
 
-    let new_hash = match hash_password(&req.new_password) {
+    let new_hash = match hash_password_async(&req.new_password).await {
         Ok(h) => h,
+        Err(PasswordWorkError::Busy) => return Json(err(429, "密码服务繁忙，请稍后重试")),
         Err(e) => return Json(err(500, format!("Failed to hash password: {}", e))),
     };
 
@@ -294,6 +350,10 @@ pub async fn change_password(
         ));
     }
 
+    if check_password_change_rate_limit(user.user_id) || check_global_password_change_rate_limit() {
+        return Json(err(429, "密码修改尝试过多，请一分钟后再试"));
+    }
+
     // Fetch the user's current password hash
     let current_hash = match state.db.find_password_by_id(user.user_id).await {
         Ok(Some(h)) => h,
@@ -309,13 +369,24 @@ pub async fn change_password(
     };
 
     // Verify current password
-    if !verify_password(&req.current_password, &current_hash) {
-        return Json(err(401, "Current password is incorrect"));
+    match verify_password_async(&req.current_password, &current_hash).await {
+        Ok(true) => {}
+        Ok(false) => return Json(err(401, "Current password is incorrect")),
+        Err(PasswordWorkError::Busy) => return Json(err(429, "密码服务繁忙，请稍后重试")),
+        Err(e) => {
+            tracing::error!(
+                "change_password {}: bcrypt verify failed: {}",
+                user.user_id,
+                e
+            );
+            return Json(err(500, "密码校验失败"));
+        }
     }
 
     // Hash and update
-    let new_hash = match hash_password(&req.new_password) {
+    let new_hash = match hash_password_async(&req.new_password).await {
         Ok(h) => h,
+        Err(PasswordWorkError::Busy) => return Json(err(429, "密码服务繁忙，请稍后重试")),
         Err(e) => return Json(err(500, format!("Failed to hash password: {}", e))),
     };
 

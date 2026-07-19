@@ -31,6 +31,10 @@ use super::selector::{TargetLease, TargetSelector};
 use crate::reporter::{ConnectionTracker, TrafficCounter, UDP_SESSION_TIMEOUT};
 
 const UDP_BUF_SIZE: usize = 65535;
+/// A public UDP port must have an admission bound independent of the process
+/// file-descriptor limit.  Every native session owns one outbound socket and a
+/// reply task, so source-port churn must not be able to consume the whole node.
+const MAX_UDP_SESSIONS_PER_LISTENER: usize = 4096;
 /// How often the periodic sweeper runs. Sessions themselves expire on the
 /// shared UDP_SESSION_TIMEOUT; this just controls how quickly an idle node
 // converges back to 0 in the absence of new datagrams.
@@ -39,7 +43,34 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 struct UdpSession {
     outbound: Arc<UdpSocket>,
     last_active: tokio::time::Instant,
+    shutdown: Arc<ShutdownState>,
     _target_lease: Option<TargetLease>,
+}
+
+fn prune_expired_sessions(sessions: &DashMap<SocketAddr, UdpSession>, timeout: Duration) -> usize {
+    let before = sessions.len();
+    sessions.retain(|_, session| {
+        let keep = session.last_active.elapsed() < timeout;
+        if !keep {
+            session.shutdown.cancel();
+        }
+        keep
+    });
+    before.saturating_sub(sessions.len())
+}
+
+fn remove_session_if_current(
+    sessions: &DashMap<SocketAddr, UdpSession>,
+    client: SocketAddr,
+    outbound: &Arc<UdpSocket>,
+) -> bool {
+    if let Entry::Occupied(entry) = sessions.entry(client) {
+        if Arc::ptr_eq(&entry.get().outbound, outbound) {
+            entry.remove();
+            return true;
+        }
+    }
+    false
 }
 
 struct ShutdownState {
@@ -67,14 +98,18 @@ impl ShutdownState {
             notified.await;
         }
     }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
 }
 
 struct ShutdownGuard(Arc<ShutdownState>);
 
 impl Drop for ShutdownGuard {
     fn drop(&mut self) {
-        self.0.cancelled.store(true, Ordering::Release);
-        self.0.notify.notify_waiters();
+        self.0.cancel();
     }
 }
 
@@ -140,11 +175,10 @@ pub async fn serve_udp_listener(
             // Drop our local outbound sockets for clients whose local entry is
             // older than the timeout. The tracker already stopped counting
             // them; here we release the socket resources too.
-            let before = sessions_clone.len();
-            sessions_clone.retain(|_, s| s.last_active.elapsed() < UDP_SESSION_TIMEOUT);
-            // saturating: len() is read across shards without a global lock, so a
-            // concurrent insert between the two reads must not underflow usize.
-            let removed = before.saturating_sub(sessions_clone.len());
+            // Removing the map entry alone is insufficient: the detached reply
+            // task owns another Arc<UdpSocket>. prune_expired_sessions wakes it
+            // so the fd is released with the logical session.
+            let removed = prune_expired_sessions(&sessions_clone, UDP_SESSION_TIMEOUT);
             if removed > 0 {
                 tracing::debug!(
                     "UDP port {}: cleaned up {} expired outbound sockets",
@@ -164,7 +198,7 @@ pub async fn serve_udp_listener(
         let (n, src) = match inbound.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) if is_transient_recv_error(&e) => {
-                tracing::warn!(
+                tracing::debug!(
                     "UDP listener on {} (rule {}): transient recv_from error: {}; retrying in 100ms",
                     listen_addr,
                     rule_id,
@@ -175,12 +209,6 @@ pub async fn serve_udp_listener(
             }
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
         };
-
-        // Register/refresh this client with the tracker on EVERY datagram. The
-        // tracker is a sharded DashMap (keyed by client+rule), so this is a cheap
-        // per-shard op — not a process-wide lock — and keeps the panel's count
-        // accurate without any throttling.
-        connections.udp_touch(src, rule_id).await;
 
         // Fast path: existing session. The session map is a sharded DashMap, so
         // this per-packet lookup takes only a per-shard lock (sync guard, dropped
@@ -193,6 +221,19 @@ pub async fn serve_udp_listener(
         let outbound_sock = if let Some(sock) = existing {
             sock
         } else {
+            if sessions.len() >= MAX_UDP_SESSIONS_PER_LISTENER {
+                // This branch is attacker-triggerable from the public UDP
+                // socket. Keep it at debug level so source-address churn at
+                // the admission cap cannot turn into an unbounded disk-log DoS.
+                tracing::debug!(
+                    "UDP port {}: session cap {} reached; dropping new client {}",
+                    port,
+                    MAX_UDP_SESSIONS_PER_LISTENER,
+                    src
+                );
+                connections.udp_close(src, rule_id).await;
+                continue;
+            }
             // New session: bind an ephemeral outbound socket + pick/connect the
             // target, all WITHOUT holding any map guard.
             let outbound = match super::outbound::udp_outbound_socket(source_ipv4).await {
@@ -224,6 +265,7 @@ pub async fn serve_udp_listener(
                 continue;
             }
             let outbound = Arc::new(outbound);
+            let session_shutdown = ShutdownState::new();
 
             // Publish via the entry API (per-shard lock, sync — no .await while
             // the guard is held). Double-check for a concurrent datagram from the
@@ -239,6 +281,7 @@ pub async fn serve_udp_listener(
                     e.insert(UdpSession {
                         outbound: outbound.clone(),
                         last_active: now,
+                        shutdown: session_shutdown.clone(),
                         _target_lease: selector.acquire(target_idx),
                     });
                     (outbound.clone(), true)
@@ -266,6 +309,7 @@ pub async fn serve_udp_listener(
                 let rl_c = rate_limit.clone();
                 let src_c = src;
                 let outbound_c = outbound.clone();
+                let session_shutdown_c = session_shutdown.clone();
                 let port_c = port;
                 let reply_shutdown = shutdown.clone();
                 tokio::spawn(async move {
@@ -273,10 +317,21 @@ pub async fn serve_udp_listener(
                     loop {
                         let received = tokio::select! {
                             _ = reply_shutdown.cancelled() => break,
+                            _ = session_shutdown_c.cancelled() => break,
                             result = outbound_c.recv(&mut rbuf) => result,
                         };
                         match received {
                             Ok(m) => {
+                                // The idle sweeper may have expired this socket
+                                // and a new session for the same client may now
+                                // exist.  Never deliver a late reply from the old
+                                // target into that replacement session.
+                                let still_current = sessions_c
+                                    .get(&src_c)
+                                    .is_some_and(|s| Arc::ptr_eq(&s.outbound, &outbound_c));
+                                if !still_current {
+                                    break;
+                                }
                                 // v0.4.6: throttle target→client (download) bytes
                                 // through the shared per-rule limiter BEFORE
                                 // forwarding back to the client.
@@ -295,7 +350,9 @@ pub async fn serve_udp_listener(
                                     break;
                                 }
                                 if let Some(mut s) = sessions_c.get_mut(&src_c) {
-                                    s.last_active = tokio::time::Instant::now();
+                                    if Arc::ptr_eq(&s.outbound, &outbound_c) {
+                                        s.last_active = tokio::time::Instant::now();
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -306,12 +363,24 @@ pub async fn serve_udp_listener(
                     }
                     // Outbound side ended (target closed / error): release this
                     // client's session immediately rather than waiting for timeout.
-                    sessions_c.remove(&src_c);
-                    connections_c.udp_close(src_c, rule_id).await;
+                    // Do not let an old task remove a newer replacement session
+                    // that happens to use the same client address.
+                    // Only the task that actually removed the CURRENT mapping
+                    // owns the corresponding tracker entry. An expired old
+                    // task must not close a replacement session's statistics.
+                    if remove_session_if_current(&sessions_c, src_c, &outbound_c) {
+                        connections_c.udp_close(src_c, rule_id).await;
+                    }
                 });
             }
             chosen
         };
+
+        // Count only sessions that reached a connected outbound socket. Doing
+        // this before target resolution let spoofed source addresses grow the
+        // tracker while the target was unavailable, even though no forwarding
+        // session had actually been admitted.
+        connections.udp_touch(src, rule_id).await;
 
         // Forward client datagram to target via the connected outbound socket.
         // v0.4.6: throttle client→target (upload) bytes through the shared
@@ -387,6 +456,61 @@ fn is_transient_recv_error(e: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use relay_shared::protocol::LoadBalanceStrategy;
+
+    #[tokio::test]
+    async fn expired_session_cancels_detached_socket_owner() {
+        let sessions = DashMap::new();
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let weak = Arc::downgrade(&socket);
+        let shutdown = ShutdownState::new();
+        let task_socket = socket.clone();
+        let task_shutdown = shutdown.clone();
+        let detached = tokio::spawn(async move {
+            task_shutdown.cancelled().await;
+            drop(task_socket);
+        });
+        sessions.insert(
+            addr,
+            UdpSession {
+                outbound: socket,
+                last_active: tokio::time::Instant::now() - Duration::from_secs(2),
+                shutdown,
+                _target_lease: None,
+            },
+        );
+
+        assert_eq!(prune_expired_sessions(&sessions, Duration::from_secs(1)), 1);
+        tokio::time::timeout(Duration::from_secs(1), detached)
+            .await
+            .expect("detached owner did not observe cancellation")
+            .unwrap();
+        assert!(weak.upgrade().is_none(), "outbound socket must be released");
+    }
+
+    #[tokio::test]
+    async fn old_reader_cannot_remove_replacement_session() {
+        let sessions = DashMap::new();
+        let addr: SocketAddr = "127.0.0.1:12346".parse().unwrap();
+        let old = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let replacement = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        sessions.insert(
+            addr,
+            UdpSession {
+                outbound: replacement.clone(),
+                last_active: tokio::time::Instant::now(),
+                shutdown: ShutdownState::new(),
+                _target_lease: None,
+            },
+        );
+
+        assert!(!remove_session_if_current(&sessions, addr, &old));
+        assert!(sessions
+            .get(&addr)
+            .is_some_and(|session| Arc::ptr_eq(&session.outbound, &replacement)));
+        assert!(remove_session_if_current(&sessions, addr, &replacement));
+        assert!(sessions.is_empty());
+    }
 
     /// Real two-hop round-trip through the production UDP listener. This
     /// covers the per-client socket mapping on both relays, including the

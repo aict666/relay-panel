@@ -13,6 +13,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-19
+
+### Fixed
+
+- **UDP and UOT sessions are bounded and fully cancellable.** Native UDP and
+  authenticated UOT enforce per-listener admission caps, release detached
+  sockets/tasks on expiry or listener replacement, and prevent stale readers
+  from deleting or delivering into replacement sessions.
+- **UOT tunnels close on rule, token, or listener replacement.** Authenticated
+  child connections now share the listener lifecycle, so an old tunnel cannot
+  survive a hot configuration update with stale routing or credentials.
+- **Cached node configuration is private and crash-safe.** Cache writes use a
+  same-directory atomic rename with `0600` permissions and follow the actual
+  custom service installation directory.
+- **Node upgrades fail closed and roll back.** The installer requires a trusted
+  checksum for mirrored binaries, safely handles custom service names/paths,
+  verifies the installed version and stable MainPID, and restores the previous
+  binary, scripts, unit file, active state, and enabled state after failure.
+
+### Tests
+
+- Added Linux installer rollback checks plus real two-hop and three-hop TCP,
+  UDP-over-UOT, and mixed `tcp_udp` data-plane coverage.
+
 ## [1.3.0] - 2026-07-19
 
 ### Added

@@ -830,6 +830,224 @@ impl RuleRepository for PgRepository {
         Ok(result.rows_affected())
     }
 
+    async fn update_rule_full(&self, update: &RuleUpdateData) -> Result<u64, DbError> {
+        let mut tx = self.pool.begin().await?;
+        macro_rules! try_ {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
+        }
+
+        // Match create_rule_full's lock order so an update that moves a port or
+        // protocol cannot race a concurrent create on the effective group.
+        try_!(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(update.effective_device_group_in)
+                .execute(&mut *tx)
+                .await
+        );
+
+        let has_scalar = update.name.is_some()
+            || update.listen_port.is_some()
+            || update.protocol.is_some()
+            || update.public_transport.is_some()
+            || update.route_mode.is_some()
+            || update.ws_path.is_some()
+            || update.device_group_in.is_some()
+            || update.device_group_out.is_some()
+            || update.forward_mode.is_some()
+            || update.target_addr.is_some()
+            || update.target_port.is_some()
+            || update.paused.is_some();
+
+        let rows = if has_scalar {
+            let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE forward_rules SET ");
+            {
+                let mut set = query.separated(", ");
+                if let Some(value) = update.name.as_deref() {
+                    set.push("name = ").push_bind(value);
+                }
+                if let Some(value) = update.listen_port {
+                    set.push("listen_port = ").push_bind(value);
+                }
+                if let Some(value) = update.protocol.as_deref() {
+                    set.push("protocol = ").push_bind(value);
+                }
+                if let Some(value) = update.public_transport.as_deref() {
+                    set.push("public_transport = ").push_bind(value);
+                    set.push("node_transport = ")
+                        .push_bind(update.node_transport.as_deref().unwrap_or(value));
+                    set.push("entry_transport = ")
+                        .push_bind(update.entry_transport.as_deref().unwrap_or(value));
+                }
+                if let Some(value) = update.route_mode.as_deref() {
+                    set.push("route_mode = ").push_bind(value);
+                }
+                if let Some(value) = &update.ws_path {
+                    set.push("ws_path = ").push_bind(value.as_deref());
+                }
+                if let Some(value) = update.device_group_in {
+                    set.push("device_group_in = ").push_bind(value);
+                }
+                if let Some(value) = update.device_group_out {
+                    set.push("device_group_out = ").push_bind(value);
+                }
+                if let Some(value) = update.forward_mode.as_deref() {
+                    set.push("forward_mode = ").push_bind(value);
+                }
+                if let Some(value) = update.target_addr.as_deref() {
+                    set.push("target_addr = ").push_bind(value);
+                }
+                if let Some(value) = update.target_port {
+                    set.push("target_port = ").push_bind(value);
+                }
+                if let Some(value) = update.paused {
+                    set.push("paused = ").push_bind(value);
+                    set.push("auto_paused = ").push_bind(false);
+                }
+            }
+            query.push(" WHERE id = ").push_bind(update.id);
+            if let Some(uid) = update.owner_uid {
+                query.push(" AND uid = ").push_bind(uid);
+            }
+            try_!(query.build().execute(&mut *tx).await).rows_affected()
+        } else {
+            let found: Option<i64> = if let Some(uid) = update.owner_uid {
+                try_!(
+                    sqlx::query_scalar(
+                        "SELECT id FROM forward_rules WHERE id = $1 AND uid = $2 FOR UPDATE",
+                    )
+                    .bind(update.id)
+                    .bind(uid)
+                    .fetch_optional(&mut *tx)
+                    .await
+                )
+            } else {
+                try_!(
+                    sqlx::query_scalar("SELECT id FROM forward_rules WHERE id = $1 FOR UPDATE",)
+                        .bind(update.id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                )
+            };
+            u64::from(found.is_some())
+        };
+
+        if rows == 0 {
+            let _ = tx.rollback().await;
+            return Ok(0);
+        }
+
+        if let Some(hops) = &update.hops {
+            let old_tunnel_ports: std::collections::HashMap<i64, Option<i32>> = try_!(
+                sqlx::query_as::<_, (i64, Option<i32>)>(
+                    "SELECT device_group_id, tunnel_port FROM forward_rule_hops WHERE rule_id = $1",
+                )
+                .bind(update.id)
+                .fetch_all(&mut *tx)
+                .await
+            )
+            .into_iter()
+            .collect();
+            try_!(
+                sqlx::query("DELETE FROM forward_rule_hops WHERE rule_id = $1")
+                    .bind(update.id)
+                    .execute(&mut *tx)
+                    .await
+            );
+            for (position, (group_id, listen_port)) in hops.iter().enumerate() {
+                try_!(
+                    sqlx::query(
+                        "INSERT INTO forward_rule_hops \
+                     (rule_id, position, device_group_id, listen_port, tunnel_port) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                    )
+                    .bind(update.id)
+                    .bind(position as i32)
+                    .bind(group_id)
+                    .bind(listen_port)
+                    .bind(old_tunnel_ports.get(group_id).copied().flatten())
+                    .execute(&mut *tx)
+                    .await
+                );
+            }
+        }
+
+        if let Some(targets) = &update.targets {
+            try_!(
+                sqlx::query("DELETE FROM forward_rule_targets WHERE rule_id = $1")
+                    .bind(update.id)
+                    .execute(&mut *tx)
+                    .await
+            );
+            for (position, target) in targets.iter().enumerate() {
+                try_!(
+                    sqlx::query(
+                        "INSERT INTO forward_rule_targets \
+                     (rule_id, host, port, position, enabled, weight) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    )
+                    .bind(update.id)
+                    .bind(target.host.trim())
+                    .bind(target.port as i32)
+                    .bind(position as i32 + 1)
+                    .bind(target.enabled)
+                    .bind(target.weight.clamp(1, 100) as i32)
+                    .execute(&mut *tx)
+                    .await
+                );
+            }
+        }
+
+        if let Some(strategy) = update.load_balance_strategy.as_deref() {
+            try_!(
+                sqlx::query("UPDATE forward_rules SET load_balance_strategy = $1 WHERE id = $2",)
+                    .bind(strategy)
+                    .bind(update.id)
+                    .execute(&mut *tx)
+                    .await
+            );
+        }
+        if let Some((upload, download)) = update.rate_limits {
+            try_!(sqlx::query(
+                "UPDATE forward_rules SET upload_limit_mbps = $1, download_limit_mbps = $2 WHERE id = $3",
+            )
+            .bind(upload)
+            .bind(download)
+            .bind(update.id)
+            .execute(&mut *tx)
+            .await);
+        }
+        if let Some((max_connections, auto_restart_minutes)) = update.connection_controls {
+            try_!(sqlx::query(
+                "UPDATE forward_rules SET max_connections = $1, auto_restart_minutes = $2 WHERE id = $3",
+            )
+            .bind(max_connections)
+            .bind(auto_restart_minutes)
+            .bind(update.id)
+            .execute(&mut *tx)
+            .await);
+        }
+        if let Some(profile_id) = update.tunnel_profile_id {
+            try_!(
+                sqlx::query("UPDATE forward_rules SET tunnel_profile_id = $1 WHERE id = $2",)
+                    .bind(profile_id)
+                    .bind(update.id)
+                    .execute(&mut *tx)
+                    .await
+            );
+        }
+
+        tx.commit().await?;
+        Ok(rows)
+    }
+
     async fn increment_rule_traffic(
         &self,
         id: i64,

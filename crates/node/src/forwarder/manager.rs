@@ -130,8 +130,29 @@ pub struct ListenerInfo {
     pub running: bool,
 }
 
+struct ManagedRateLimit {
+    upload_bps: Option<u64>,
+    download_bps: Option<u64>,
+    limiter: RateLimit,
+}
+
+impl ManagedRateLimit {
+    fn new(upload_bps: Option<u64>, download_bps: Option<u64>) -> Self {
+        Self {
+            upload_bps,
+            download_bps,
+            limiter: RateLimit::new(upload_bps, download_bps),
+        }
+    }
+}
+
 pub struct ForwarderManager {
     listeners: HashMap<ListenerKey, ManagedListener>,
+    /// Persistent per-rule traffic buckets. Keeping these outside a single
+    /// apply_config call ensures a recovered TCP or UDP half of a tcp_udp rule
+    /// rejoins the sibling's existing aggregate budget instead of receiving a
+    /// fresh independent bucket.
+    rule_limiters: HashMap<i64, ManagedRateLimit>,
     /// v1.2.0: per-rule runtime state (live-connection counter + restart
     /// cancellation), keyed by rule_id. Lives HERE rather than in the listener
     /// because a rule's IPv4 and IPv6 listeners must share one connection
@@ -166,6 +187,7 @@ impl ForwarderManager {
     pub fn new(counter: Arc<TrafficCounter>, connections: Arc<ConnectionTracker>) -> Self {
         Self {
             listeners: HashMap::new(),
+            rule_limiters: HashMap::new(),
             rule_runtime: HashMap::new(),
             last_config: None,
             counter,
@@ -362,11 +384,10 @@ impl ForwarderManager {
         }
 
         // ── Step 4: start new / changed listeners ──
-        // v0.4.6: per-rule rate limiters are shared across ALL listeners of the same
-        // rule (so a tcp_udp rule's TCP + UDP listeners draw from one bucket, not
-        // two). We index them by rule_id within this apply; identical caps on the
-        // two expanded listeners of one rule produce one Arc<RuleLimiter>.
-        let mut rule_limiters: HashMap<i64, RateLimit> = HashMap::new();
+        // Per-rule rate limiters are shared across ALL listeners of the same
+        // rule and persist across apply calls. A tcp_udp rule's TCP + UDP halves
+        // therefore keep drawing from one bucket even if only one dead listener
+        // is recovered during this pass.
         for listener in &config.listeners {
             let key = (listener.port, listener.protocol, listener.node_transport);
             // Skip if already running with the SAME fingerprint (no change).
@@ -391,11 +412,23 @@ impl ForwarderManager {
             ));
             // v0.4.6: shared per-rule limiter. Both expanded listeners of a
             // tcp_udp rule reuse the same Arc so the budget isn't doubled.
-            let rate_limit = rule_limiters
+            let rate_limit = self
+                .rule_limiters
                 .entry(listener.rule_id)
-                .or_insert_with(|| {
-                    RateLimit::new(listener.upload_limit_bps, listener.download_limit_bps)
+                .and_modify(|managed| {
+                    if managed.upload_bps != listener.upload_limit_bps
+                        || managed.download_bps != listener.download_limit_bps
+                    {
+                        *managed = ManagedRateLimit::new(
+                            listener.upload_limit_bps,
+                            listener.download_limit_bps,
+                        );
+                    }
                 })
+                .or_insert_with(|| {
+                    ManagedRateLimit::new(listener.upload_limit_bps, listener.download_limit_bps)
+                })
+                .limiter
                 .clone();
             let counter = self.counter.clone();
             let connections = self.connections.clone();
@@ -966,6 +999,8 @@ impl ForwarderManager {
         // connections outlive it would forward bytes nobody accounts for.
         self.rule_runtime
             .retain(|rule_id, _| desired_rule_ids.contains(rule_id));
+        self.rule_limiters
+            .retain(|rule_id, _| desired_rule_ids.contains(rule_id));
 
         // v1.2.0: remember the applied config so restart_rule can rebuild a
         // rule's listeners from it without a round-trip to the panel.
@@ -1426,6 +1461,41 @@ mod tests {
         assert!(
             !mgr.rule_runtime.contains_key(&1),
             "a removed rule must not leak its runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_listener_reuses_persistent_rule_limiter() {
+        let mut mgr = fresh_mgr();
+        mgr.listen_ipv6 = String::new();
+        let mut config = one_rule(40563, Protocol::Udp, NodeTransport::Raw);
+        config.listeners[0].upload_limit_bps = Some(1024);
+        config.listeners[0].download_limit_bps = Some(2048);
+        mgr.apply_config(&config).await;
+
+        let first = match &mgr.rule_limiters.get(&1).unwrap().limiter {
+            RateLimit::Limited(limiter) => limiter.clone(),
+            RateLimit::Unlimited => panic!("test config must create a real limiter"),
+        };
+        let key = (40563, Protocol::Udp, NodeTransport::Raw);
+        mgr.listeners.get(&key).unwrap().handle.abort();
+        tokio::task::yield_now().await;
+        mgr.apply_config(&config).await;
+
+        let recovered = match &mgr.rule_limiters.get(&1).unwrap().limiter {
+            RateLimit::Limited(limiter) => limiter.clone(),
+            RateLimit::Unlimited => panic!("recovered listener lost its limiter"),
+        };
+        assert!(
+            Arc::ptr_eq(&first, &recovered),
+            "partial listener recovery must rejoin the existing aggregate bucket"
+        );
+
+        mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
+            .await;
+        assert!(
+            mgr.rule_limiters.is_empty(),
+            "deleted rule leaked its limiter"
         );
     }
 

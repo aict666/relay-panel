@@ -7,7 +7,7 @@
 //! trait and is unit-testable without the HTTP layer.
 
 use crate::db::error::DbError;
-use crate::db::repo::{GroupRepository, ProfileScope, Repository, ResourceScope};
+use crate::db::repo::{GroupRepository, ProfileScope, Repository, ResourceScope, RuleUpdateData};
 use relay_shared::protocol::{
     CreateRuleRequest, GroupType, Protocol, PublicTransport, RouteMode, RuleTargetRequest,
     UpdateRuleRequest, CHAIN_HOPS_MAX, CHAIN_HOPS_MIN,
@@ -772,6 +772,34 @@ pub async fn update_rule(
     };
     let _owner_scope = ResourceScope::Owner(existing.uid);
 
+    // `route_mode` and the legacy `forward_mode` describe the same topology.
+    // Reject contradictions rather than silently giving one field precedence.
+    let route_requests_chain = matches!(req.route_mode, Some(RouteMode::Chain));
+    let route_requests_direct = matches!(req.route_mode, Some(RouteMode::Direct));
+    let forward_requests_chain = req.forward_mode.as_deref() == Some("chain");
+    let forward_requests_direct = req.forward_mode.as_deref() == Some("direct");
+    if (route_requests_chain && forward_requests_direct)
+        || (route_requests_direct && forward_requests_chain)
+    {
+        return Err(UpdateRuleError::BadRequest(
+            "route_mode and forward_mode describe conflicting topologies".into(),
+        ));
+    }
+
+    // A hop list is meaningful only for an effective chain rule. Without this
+    // guard a direct rule could accumulate hidden hop rows and even have its
+    // entry group changed through hops[0], only for those rows to become live
+    // after a later unrelated mode change.
+    let explicitly_chain = route_requests_chain || forward_requests_chain;
+    let explicitly_direct = route_requests_direct || forward_requests_direct;
+    if req.hops.is_some()
+        && (explicitly_direct || (!explicitly_chain && existing.route_mode != "chain"))
+    {
+        return Err(UpdateRuleError::BadRequest(
+            "hops are only valid for chain mode".into(),
+        ));
+    }
+
     // Effective topology after this update.
     let becoming_chain = matches!(req.route_mode, Some(RouteMode::Chain))
         || req.forward_mode.as_deref() == Some("chain")
@@ -886,19 +914,6 @@ pub async fn update_rule(
         || req.max_connections.is_some()
         || req.auto_restart_minutes.is_some()
         || req.tunnel_profile_id.is_some()
-        || req.paused.is_some();
-    let has_scalar_field = req.name.is_some()
-        || req.listen_port.is_some()
-        || req.protocol.is_some()
-        || req.public_transport.is_some()
-        || req.route_mode.is_some()
-        || req.ws_path.is_some()
-        || req.device_group_in.is_some()
-        || req.device_group_out.is_some()
-        || req.forward_mode.is_some()
-        || req.hops.is_some()
-        || req.target_addr.is_some()
-        || req.target_port.is_some()
         || req.paused.is_some();
     if !has_field {
         return Err(UpdateRuleError::BadRequest("No fields to update".into()));
@@ -1122,134 +1137,80 @@ pub async fn update_rule(
         None
     };
 
-    let update_result = if has_scalar_field {
-        db.update_rule_fields(
-            id,
-            scope,
-            req.name.as_deref(),
-            req.listen_port.map(|p| p as i32),
-            req.protocol.as_ref().map(protocol_to_str),
-            public,
-            node,
-            entry,
-            route_mode_arg,
-            ws_path,
-            device_group_in_arg,
-            device_group_out_arg,
-            forward_mode_arg,
-            req.target_addr.as_deref(),
-            req.target_port.map(|p| p as i32),
-            req.paused,
-        )
-        .await
+    let rate_limits = if req.upload_limit_mbps.is_some() || req.download_limit_mbps.is_some() {
+        Some((
+            req.upload_limit_mbps
+                .unwrap_or(existing.upload_limit_mbps)
+                .max(0),
+            req.download_limit_mbps
+                .unwrap_or(existing.download_limit_mbps)
+                .max(0),
+        ))
     } else {
-        Ok(1)
+        None
     };
 
-    match update_result {
-        Ok(0) => Err(UpdateRuleError::NotFound),
-        Ok(_) => {
-            if let Some(ref hop_ports) = planned_hop_ports {
-                if let Err(e) = db.replace_rule_hops(id, hop_ports).await {
-                    tracing::error!("update_rule {}: replace_rule_hops failed: {}", id, e);
-                    return Err(UpdateRuleError::Database(e));
-                }
-            }
-            if let Some(targets) = normalized_targets.as_ref() {
-                if let Err(e) = db.replace_rule_targets(id, scope, targets).await {
-                    tracing::error!("update_rule {}: replace_rule_targets failed: {}", id, e);
-                    return Err(UpdateRuleError::Database(e));
-                }
-            }
-            if let Some(strategy) = req.load_balance_strategy {
-                if let Err(e) = db
-                    .set_rule_load_balance_strategy(id, scope, strategy.to_db_str())
-                    .await
-                {
-                    tracing::error!(
-                        "update_rule {}: set_rule_load_balance_strategy failed: {}",
-                        id,
-                        e
-                    );
-                    return Err(UpdateRuleError::Database(e));
-                }
-            }
-            if req.upload_limit_mbps.is_some() || req.download_limit_mbps.is_some() {
-                let up_mbps = req
-                    .upload_limit_mbps
-                    .unwrap_or(existing.upload_limit_mbps)
-                    .max(0);
-                let down_mbps = req
-                    .download_limit_mbps
-                    .unwrap_or(existing.download_limit_mbps)
-                    .max(0);
-                if let Err(e) = db.set_rule_rate_limits(id, scope, up_mbps, down_mbps).await {
-                    tracing::error!("update_rule {}: set_rule_rate_limits failed: {}", id, e);
-                    return Err(UpdateRuleError::Database(e));
-                }
-            }
-            // v1.2.0: connection cap + scheduled restart.
-            //
-            // Unlike the rate-limit branch above, an omitted field here falls
-            // back to the rule's CURRENT value rather than to 0. These two live
-            // in one form and are normally sent together, but defaulting to 0
-            // would mean an API client that sets only `max_connections` silently
-            // switches off that rule's scheduled restart — a destructive
-            // side-effect of an unrelated edit.
-            if req.max_connections.is_some() || req.auto_restart_minutes.is_some() {
-                let current = match db.find_rule_by_id(id, scope).await {
-                    Ok(Some(r)) => r,
-                    Ok(None) => return Err(UpdateRuleError::NotFound),
-                    Err(e) => {
-                        tracing::error!(
-                            "update_rule {}: reload for conn controls failed: {}",
-                            id,
-                            e
-                        );
-                        return Err(UpdateRuleError::Database(e));
-                    }
-                };
-                let max_connections = req
-                    .max_connections
-                    .unwrap_or(current.max_connections)
-                    .max(0);
-                let auto_restart_minutes = req
-                    .auto_restart_minutes
-                    .unwrap_or(current.auto_restart_minutes)
-                    .max(0);
-
-                // 0 = off. Any other value must clear the floor: a 1-minute
-                // restart loop would drop connections faster than clients
-                // reconnect, turning the safety valve into the outage.
-                if auto_restart_minutes != 0
-                    && auto_restart_minutes < relay_shared::models::MIN_AUTO_RESTART_MINUTES
-                {
-                    return Err(UpdateRuleError::BadRequest(format!(
-                        "自动重启间隔最小 {} 分钟（0 = 关闭）",
-                        relay_shared::models::MIN_AUTO_RESTART_MINUTES
-                    )));
-                }
-
-                if let Err(e) = db
-                    .set_rule_connection_controls(id, scope, max_connections, auto_restart_minutes)
-                    .await
-                {
-                    tracing::error!(
-                        "update_rule {}: set_rule_connection_controls failed: {}",
-                        id,
-                        e
-                    );
-                    return Err(UpdateRuleError::Database(e));
-                }
-            }
-            if let Some(pid_opt) = req.tunnel_profile_id {
-                if let Err(e) = db.set_rule_tunnel_profile(id, scope, pid_opt).await {
-                    tracing::error!("update_rule {}: set_rule_tunnel_profile failed: {}", id, e);
-                    return Err(UpdateRuleError::Database(e));
-                }
-            }
-            Ok(())
+    // Resolve and validate connection controls before opening the repository
+    // transaction.  Falling back to the already-loaded row preserves omitted
+    // counterparts without a second post-update read.
+    let connection_controls = if req.max_connections.is_some() || req.auto_restart_minutes.is_some()
+    {
+        let max_connections = req
+            .max_connections
+            .unwrap_or(existing.max_connections)
+            .max(0);
+        let auto_restart_minutes = req
+            .auto_restart_minutes
+            .unwrap_or(existing.auto_restart_minutes)
+            .max(0);
+        if auto_restart_minutes != 0
+            && auto_restart_minutes < relay_shared::models::MIN_AUTO_RESTART_MINUTES
+        {
+            return Err(UpdateRuleError::BadRequest(format!(
+                "自动重启间隔最小 {} 分钟（0 = 关闭）",
+                relay_shared::models::MIN_AUTO_RESTART_MINUTES
+            )));
         }
+        Some((max_connections, auto_restart_minutes))
+    } else {
+        None
+    };
+
+    let update = RuleUpdateData {
+        id,
+        owner_uid: scope.owner_id(),
+        effective_device_group_in: device_group_in_arg.unwrap_or(existing.device_group_in),
+        name: req.name.clone(),
+        listen_port: req.listen_port.map(|port| port as i32),
+        protocol: req
+            .protocol
+            .as_ref()
+            .map(protocol_to_str)
+            .map(str::to_owned),
+        public_transport: public.map(str::to_owned),
+        node_transport: node.map(str::to_owned),
+        entry_transport: entry.map(str::to_owned),
+        route_mode: route_mode_arg.map(str::to_owned),
+        ws_path: ws_path.map(|value| value.map(str::to_owned)),
+        device_group_in: device_group_in_arg,
+        device_group_out: device_group_out_arg,
+        forward_mode: forward_mode_arg.map(str::to_owned),
+        target_addr: req.target_addr.clone(),
+        target_port: req.target_port.map(|port| port as i32),
+        paused: req.paused,
+        targets: normalized_targets,
+        hops: planned_hop_ports,
+        load_balance_strategy: req
+            .load_balance_strategy
+            .map(|strategy| strategy.to_db_str().to_owned()),
+        rate_limits,
+        connection_controls,
+        tunnel_profile_id: req.tunnel_profile_id,
+    };
+
+    match db.update_rule_full(&update).await {
+        Ok(0) => Err(UpdateRuleError::NotFound),
+        Ok(_) => Ok(()),
         Err(DbError::UniqueViolation | DbError::PortConflict) => Err(UpdateRuleError::PortConflict),
         Err(e) => {
             tracing::error!("update_rule {}: update_rule_fields failed: {}", id, e);

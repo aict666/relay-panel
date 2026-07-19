@@ -1569,6 +1569,109 @@ mod tests {
         assert_eq!(deny.code, 403, "empty authorization must deny, not allow");
     }
 
+    /// A chain update takes its effective entry group from hops[0].  The API
+    /// must authorize that value even when device_group_in is omitted; checking
+    /// only the legacy field lets restricted users move their rules to shared
+    /// infrastructure they cannot otherwise use.
+    #[tokio::test]
+    async fn update_rule_rejects_unauthorized_entry_from_hops() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "allowed-entry").await;
+        add_group(&pool, 2, 1, "forbidden-entry").await;
+        add_group_typed(&pool, 3, 1, "exit", "out").await;
+        add_rule(&pool, 200, 2, 1, 20001, 0).await;
+        assign_user_groups(&pool, 2, &[1]).await;
+
+        let Json(deny) = update_rule(
+            auth(2, false),
+            State(state.clone()),
+            Path(200),
+            Json(UpdateRuleRequest {
+                hops: Some(vec![2, 3]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(deny.code, 403, "hops[0] must be authorization checked");
+
+        let stored_group: (i64,) =
+            sqlx::query_as("SELECT device_group_in FROM forward_rules WHERE id = 200")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_group.0, 1, "denied update must not mutate the rule");
+    }
+
+    #[tokio::test]
+    async fn update_rule_rejects_conflicting_entry_fields() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "allowed-entry").await;
+        add_group(&pool, 2, 1, "other-entry").await;
+        add_group_typed(&pool, 3, 1, "exit", "out").await;
+        add_rule(&pool, 200, 2, 1, 20001, 0).await;
+
+        let Json(deny) = update_rule(
+            auth(2, false),
+            State(state),
+            Path(200),
+            Json(UpdateRuleRequest {
+                device_group_in: Some(1),
+                hops: Some(vec![2, 3]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(deny.code, 400, "conflicting entry sources must be rejected");
+    }
+
+    #[tokio::test]
+    async fn update_rule_rejects_hops_on_direct_rule() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 1, 1, "entry").await;
+        add_group_typed(&pool, 2, 1, "exit", "out").await;
+        add_rule(&pool, 200, 1, 1, 20001, 0).await;
+
+        let Json(deny) = update_rule(
+            auth(1, true),
+            State(state),
+            Path(200),
+            Json(UpdateRuleRequest {
+                hops: Some(vec![1, 2]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(deny.code, 400, "direct rules must not accept hidden hops");
+        let hop_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id = 200")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hop_count.0, 0);
+    }
+
+    #[tokio::test]
+    async fn update_rule_rejects_conflicting_topology_fields() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 1, 1, "entry").await;
+        add_rule(&pool, 200, 1, 1, 20001, 0).await;
+
+        let Json(deny) = update_rule(
+            auth(1, true),
+            State(state),
+            Path(200),
+            Json(UpdateRuleRequest {
+                route_mode: Some(relay_shared::protocol::RouteMode::Chain),
+                forward_mode: Some("direct".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(deny.code, 400);
+    }
+
     /// REGRESSION: removing a device group from a user's authorization pauses
     /// the user's existing rules on that group (kept, not deleted).
     #[tokio::test]

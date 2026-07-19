@@ -52,6 +52,36 @@ pub enum ResourceScope {
     Owner(i64),
 }
 
+/// Complete, already-validated rule update passed from the service layer to a
+/// repository.  Repositories apply every populated scalar/child-table field in
+/// one transaction so callers never observe a half-updated forwarding graph.
+#[derive(Debug, Default)]
+pub struct RuleUpdateData {
+    pub id: i64,
+    pub owner_uid: Option<i64>,
+    pub effective_device_group_in: i64,
+    pub name: Option<String>,
+    pub listen_port: Option<i32>,
+    pub protocol: Option<String>,
+    pub public_transport: Option<String>,
+    pub node_transport: Option<String>,
+    pub entry_transport: Option<String>,
+    pub route_mode: Option<String>,
+    pub ws_path: Option<Option<String>>,
+    pub device_group_in: Option<i64>,
+    pub device_group_out: Option<Option<i64>>,
+    pub forward_mode: Option<String>,
+    pub target_addr: Option<String>,
+    pub target_port: Option<i32>,
+    pub paused: Option<bool>,
+    pub targets: Option<Vec<RuleTargetRequest>>,
+    pub hops: Option<Vec<(i64, i32)>>,
+    pub load_balance_strategy: Option<String>,
+    pub rate_limits: Option<(i32, i32)>,
+    pub connection_controls: Option<(i32, i32)>,
+    pub tunnel_profile_id: Option<Option<i64>>,
+}
+
 impl ResourceScope {
     /// `Some(uid)` when scoped to one owner, `None` when unscoped (admin).
     /// Repository impls use this to pick the scoped vs unscoped SQL branch.
@@ -412,6 +442,9 @@ pub trait RuleRepository: Send + Sync {
         target_port: Option<i32>,
         paused: Option<bool>,
     ) -> Result<u64, DbError>;
+    /// Apply a complete rule patch atomically, including targets, hops and all
+    /// auxiliary control columns. Returns the number of matching rule rows.
+    async fn update_rule_full(&self, update: &RuleUpdateData) -> Result<u64, DbError>;
     /// Increment rule traffic (upload, download).
     async fn increment_rule_traffic(
         &self,

@@ -429,7 +429,11 @@ check_in_file "scripts/deploy-web-mode-check.sh" "REVERSE_PROXY_EXTERNAL" "deplo
 check_in_file "scripts/deploy-web-mode-check.sh" "RELAYPANEL_WEB_MODE=caddy" "deploy web-mode harness covers Caddy mode"
 
 check_in_file "scripts/relay-node-install.sh" "SCRIPT_VERSION" "install script has SCRIPT_VERSION"
-check_in_file "scripts/relay-node-install.sh" "/opt/relay-node" "install script mentions /opt/relay-node"
+# The installer supports custom service names and install roots, so it must not
+# hard-code /opt/relay-node. Verify that the documented default is composed from
+# /opt + relay-node instead.
+check_in_file "scripts/relay-node-install.sh" 'SERVICE_NAME="relay-node"' "install script defaults service name to relay-node"
+check_in_file "scripts/relay-node-install.sh" 'RELAY_NODE_INSTALL_ROOT:-/opt' "install script defaults install root to /opt"
 check_in_file "scripts/relay-node-install.sh" "systemctl" "install script mentions systemctl"
 check_in_file "scripts/relay-node-install.sh" 'relay-node-linux-${ARCH}' "install script uses relay-node-linux-\${ARCH} asset"
 check_in_file "scripts/relay-node-install.sh" "NODE_TOKEN" "install script mentions NODE_TOKEN"
