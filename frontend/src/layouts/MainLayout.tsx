@@ -24,15 +24,17 @@ import api from '../api/client';
 import type { ApiEnvelope } from '../api/types';
 import { useAuth } from '../auth/useAuth';
 import { makePasswordValidator } from '../utils/password';
+import { useSiteConfig } from '../site/useSiteConfig';
 
 const { Sider, Content, Header } = Layout;
 
 /** Sidebar masthead. Shrinks to just the mark when the rail is collapsed. */
 function Brand({ collapsed = false }: { collapsed?: boolean }) {
+  const { siteName } = useSiteConfig();
   return (
     <div className="rp-brand">
       <span className="rp-brand-mark"><ThunderboltFilled /></span>
-      {!collapsed && <span className="rp-brand-name">RelayPanel</span>}
+      {!collapsed && <span className="rp-brand-name" title={siteName}>{siteName}</span>}
     </div>
   );
 }

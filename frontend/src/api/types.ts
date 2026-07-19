@@ -351,6 +351,7 @@ export interface RegistrationStatus {
   enabled: boolean;
   default_plan_id: number;
   plans: Plan[];
+  site_name: string;
   default_password_change_required: boolean;
 }
 
@@ -359,6 +360,7 @@ export interface RegistrationSettings {
   registration_enabled: boolean;
   default_registration_plan_id: number;
   allowed_plan_ids: number[];
+  site_name: string;
 }
 
 // === v0.4.8: rule diagnosis ===  === v0.4.9: TCP-only + panel→ingress probe ===

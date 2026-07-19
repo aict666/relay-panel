@@ -143,7 +143,12 @@ export default function DashboardCharts({
             color: { domain: [uploadLabel, downloadLabel], range: ['#159f91', '#2f7edb'] },
           }}
           axis={{
-            x: { labelFormatter: formatTime, title: false },
+            x: {
+              labelAutoRotate: false,
+              labelAutoHide: true,
+              labelFormatter: formatTime,
+              title: false,
+            },
             y: { labelFormatter: (value: unknown) => formatBps(Number(value)), title: false },
           }}
           legend={{ color: { position: 'top' } }}
@@ -158,7 +163,12 @@ export default function DashboardCharts({
           height={110}
           scale={{ x: { type: 'time' } }}
           axis={{
-            x: { labelFormatter: formatTime, title: false },
+            x: {
+              labelAutoRotate: false,
+              labelAutoHide: true,
+              labelFormatter: formatTime,
+              title: false,
+            },
             y: { labelFormatter: (value: unknown) => String(Math.round(Number(value))), title: false },
           }}
           tooltip={{ items: [{ channel: 'y', valueFormatter: (value: unknown) => String(Math.round(Number(value))) }] }}

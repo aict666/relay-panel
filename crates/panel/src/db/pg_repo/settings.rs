@@ -555,18 +555,19 @@ fn serialize_allowed_plan_ids(ids: &[i64]) -> String {
 #[async_trait]
 impl SettingsRepository for PgRepository {
     async fn get_registration_settings(&self) -> Result<Option<RegistrationSettings>, DbError> {
-        let row: Option<(bool, i64, String)> = sqlx::query_as(
+        let row: Option<(bool, i64, String, String)> = sqlx::query_as(
             "SELECT registration_enabled, default_registration_plan_id, \
-             registration_allowed_plan_ids FROM app_settings WHERE id = 1",
+             registration_allowed_plan_ids, site_name FROM app_settings WHERE id = 1",
         )
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(enabled, plan_id, raw_allowed)| {
+        Ok(row.map(|(enabled, plan_id, raw_allowed, site_name)| {
             let allowed = parse_allowed_plan_ids(&raw_allowed, plan_id);
             RegistrationSettings {
                 registration_enabled: enabled,
                 default_registration_plan_id: plan_id,
                 allowed_plan_ids: allowed,
+                site_name,
             }
         }))
     }
@@ -611,6 +612,33 @@ impl SettingsRepository for PgRepository {
         .bind(enabled)
         .bind(default_plan_id)
         .bind(&allowed_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn set_system_settings(
+        &self,
+        enabled: bool,
+        default_plan_id: i64,
+        allowed_plan_ids: &[i64],
+        site_name: &str,
+    ) -> Result<(), DbError> {
+        let allowed_json = serialize_allowed_plan_ids(allowed_plan_ids);
+        sqlx::query(
+            "INSERT INTO app_settings (id, registration_enabled, \
+             default_registration_plan_id, registration_allowed_plan_ids, site_name) \
+             VALUES (1, $1, $2, $3, $4) \
+             ON CONFLICT (id) DO UPDATE SET \
+                 registration_enabled = EXCLUDED.registration_enabled, \
+                 default_registration_plan_id = EXCLUDED.default_registration_plan_id, \
+                 registration_allowed_plan_ids = EXCLUDED.registration_allowed_plan_ids, \
+                 site_name = EXCLUDED.site_name",
+        )
+        .bind(enabled)
+        .bind(default_plan_id)
+        .bind(&allowed_json)
+        .bind(site_name)
         .execute(&self.pool)
         .await?;
         Ok(())

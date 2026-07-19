@@ -2,6 +2,8 @@ use crate::db::error::DbError;
 use crate::db::repo::{RegistrationSettings, Repository};
 
 pub const DEFAULT_REGISTRATION_PLAN_ID: i64 = 1;
+pub const DEFAULT_SITE_NAME: &str = "RelayPanel";
+pub const MAX_SITE_NAME_CHARS: usize = 64;
 
 #[derive(Debug)]
 pub enum RegistrationSettingsError {
@@ -9,6 +11,7 @@ pub enum RegistrationSettingsError {
     AllowedPlansEmpty,
     DefaultPlanNotInAllowed,
     AllowedPlanNotFound(i64),
+    InvalidSiteName,
     Database(DbError),
 }
 
@@ -17,6 +20,7 @@ pub fn default_registration_settings() -> RegistrationSettings {
         registration_enabled: false,
         default_registration_plan_id: DEFAULT_REGISTRATION_PLAN_ID,
         allowed_plan_ids: vec![DEFAULT_REGISTRATION_PLAN_ID],
+        site_name: DEFAULT_SITE_NAME.to_string(),
     }
 }
 
@@ -42,7 +46,20 @@ pub async fn update_registration_settings(
     enabled: bool,
     default_plan_id: i64,
     raw_allowed_plan_ids: &[i64],
+    raw_site_name: Option<&str>,
 ) -> Result<RegistrationSettings, RegistrationSettingsError> {
+    let site_name = match raw_site_name {
+        Some(value) => {
+            normalize_site_name(value).ok_or(RegistrationSettingsError::InvalidSiteName)?
+        }
+        None => {
+            get_registration_settings(db)
+                .await
+                .map_err(RegistrationSettingsError::Database)?
+                .site_name
+        }
+    };
+
     // Deduplicate.
     let mut allowed: Vec<i64> = raw_allowed_plan_ids.to_vec();
     allowed.sort_unstable();
@@ -74,7 +91,7 @@ pub async fn update_registration_settings(
         }
     }
 
-    db.set_registration_settings(enabled, default_plan_id, &allowed)
+    db.set_system_settings(enabled, default_plan_id, &allowed, &site_name)
         .await
         .map_err(RegistrationSettingsError::Database)?;
 
@@ -82,7 +99,19 @@ pub async fn update_registration_settings(
         registration_enabled: enabled,
         default_registration_plan_id: default_plan_id,
         allowed_plan_ids: allowed,
+        site_name,
     })
+}
+
+pub fn normalize_site_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() > MAX_SITE_NAME_CHARS
+        || trimmed.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -95,5 +124,18 @@ mod tests {
         assert!(!settings.registration_enabled);
         assert_eq!(settings.default_registration_plan_id, 1);
         assert_eq!(settings.allowed_plan_ids, vec![1]);
+        assert_eq!(settings.site_name, DEFAULT_SITE_NAME);
+    }
+
+    #[test]
+    fn site_name_validation_trims_and_rejects_invalid_values() {
+        assert_eq!(normalize_site_name("  My Relay  "), Some("My Relay".into()));
+        assert_eq!(normalize_site_name("中转站"), Some("中转站".into()));
+        assert_eq!(normalize_site_name("   "), None);
+        assert_eq!(normalize_site_name("bad\nname"), None);
+        assert_eq!(
+            normalize_site_name(&"x".repeat(MAX_SITE_NAME_CHARS + 1)),
+            None
+        );
     }
 }

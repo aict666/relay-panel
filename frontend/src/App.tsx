@@ -7,6 +7,7 @@ import { rpTheme } from './styles/antdTheme';
 import { LanguageProvider } from './i18n';
 import { useI18n } from './i18n/context';
 import { AuthProvider } from './auth/AuthContext';
+import { SiteConfigProvider } from './site/SiteConfigProvider';
 
 function AppInner() {
   const { lang } = useI18n();
@@ -24,7 +25,9 @@ function AppInner() {
 function App() {
   return (
     <LanguageProvider>
-      <AppInner />
+      <SiteConfigProvider>
+        <AppInner />
+      </SiteConfigProvider>
     </LanguageProvider>
   );
 }

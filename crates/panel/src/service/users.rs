@@ -3,8 +3,7 @@ use crate::db::repo::Repository;
 use crate::service::password::{
     hash_password_async, validate_password, PasswordValidationError, PasswordWorkError,
 };
-
-pub const DEFAULT_ADMIN_CREATED_USER_PLAN_ID: i64 = 1;
+use crate::service::settings::get_registration_settings;
 
 #[derive(Debug)]
 pub enum CreateUserError {
@@ -12,7 +11,7 @@ pub enum CreateUserError {
     Password(PasswordValidationError),
     Hash(String),
     DuplicateUsername,
-    DefaultPlanMissing,
+    DefaultPlanMissing(i64),
     Database(DbError),
 }
 
@@ -30,7 +29,7 @@ impl PartialEq for CreateUserError {
                     Self::Password(PasswordValidationError::TooLong)
                 )
                 | (Self::DuplicateUsername, Self::DuplicateUsername)
-                | (Self::DefaultPlanMissing, Self::DefaultPlanMissing)
+                | (Self::DefaultPlanMissing(_), Self::DefaultPlanMissing(_))
         )
     }
 }
@@ -55,17 +54,22 @@ pub async fn create_user(
     }
     validate_password(password).map_err(CreateUserError::Password)?;
 
+    // Admin-created users inherit the configured registration default plan.
+    // The registration-enabled switch only controls the public signup route;
+    // it must not prevent an administrator from provisioning an account.
+    let plan_id = get_registration_settings(db)
+        .await
+        .map_err(CreateUserError::Database)?
+        .default_registration_plan_id;
+
     let hashed = hash_password_async(password).await.map_err(|e| match e {
         PasswordWorkError::Busy => CreateUserError::Hash("password service is busy".into()),
         error => CreateUserError::Hash(error.to_string()),
     })?;
 
-    match db
-        .insert_user_from_plan(username, &hashed, DEFAULT_ADMIN_CREATED_USER_PLAN_ID)
-        .await
-    {
+    match db.insert_user_from_plan(username, &hashed, plan_id).await {
         Ok(1) => Ok(()),
-        Ok(_) => Err(CreateUserError::DefaultPlanMissing),
+        Ok(_) => Err(CreateUserError::DefaultPlanMissing(plan_id)),
         Err(DbError::UniqueViolation) => Err(CreateUserError::DuplicateUsername),
         Err(e) => Err(CreateUserError::Database(e)),
     }

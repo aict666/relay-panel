@@ -292,7 +292,8 @@ CREATE TABLE IF NOT EXISTS app_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     registration_enabled INTEGER NOT NULL DEFAULT 0,
     default_registration_plan_id INTEGER NOT NULL DEFAULT 1 REFERENCES plans(id),
-    registration_allowed_plan_ids TEXT NOT NULL DEFAULT '[1]'
+    registration_allowed_plan_ids TEXT NOT NULL DEFAULT '[1]',
+    site_name TEXT NOT NULL DEFAULT 'RelayPanel'
 );
 
 -- v1.0.7: per-user device-group authorization. Replaces the user_groups /
@@ -1537,6 +1538,16 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         .await?;
     tracing::info!("Migration 42: statistics series/time indexes present");
 
+    // ── Migration 43: configurable site branding ──
+    add_column_if_missing(
+        pool,
+        "app_settings",
+        "site_name",
+        "TEXT NOT NULL DEFAULT 'RelayPanel'",
+    )
+    .await?;
+    tracing::info!("Migration 43: app_settings.site_name present");
+
     Ok(())
 }
 
@@ -1671,6 +1682,53 @@ mod tests {
             duplicate.is_err(),
             "the new unique index must reject duplicates"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_43_adds_site_name_with_a_safe_default() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect memory db");
+        sqlx::query(SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .expect("schema");
+
+        // Replace the fresh app_settings table with its pre-migration shape.
+        sqlx::query("DROP TABLE app_settings")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE app_settings (\
+                id INTEGER PRIMARY KEY CHECK (id = 1), \
+                registration_enabled INTEGER NOT NULL DEFAULT 0, \
+                default_registration_plan_id INTEGER NOT NULL DEFAULT 1 REFERENCES plans(id), \
+                registration_allowed_plan_ids TEXT NOT NULL DEFAULT '[1]'\
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_settings \
+             (id, registration_enabled, default_registration_plan_id, registration_allowed_plan_ids) \
+             VALUES (1, 0, 1, '[1]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.expect("migration 43");
+        assert_column(&pool, "app_settings", "site_name").await;
+        let site_name: String =
+            sqlx::query_scalar("SELECT site_name FROM app_settings WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(site_name, "RelayPanel");
     }
 
     /// Migration 38 must reach BOTH a fresh database (via SCHEMA_SQL) and an

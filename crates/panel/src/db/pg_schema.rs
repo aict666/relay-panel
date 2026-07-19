@@ -287,7 +287,8 @@ CREATE TABLE IF NOT EXISTS app_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     registration_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     default_registration_plan_id BIGINT NOT NULL DEFAULT 1 REFERENCES plans(id),
-    registration_allowed_plan_ids TEXT NOT NULL DEFAULT '[1]'
+    registration_allowed_plan_ids TEXT NOT NULL DEFAULT '[1]',
+    site_name TEXT NOT NULL DEFAULT 'RelayPanel'
 );
 
 -- v1.0.7: per-user device-group authorization (replaces the user_groups layer).
@@ -305,7 +306,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 25;
+pub const PG_SCHEMA_VERSION: i32 = 26;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1236,6 +1237,24 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .await?;
         tx.commit().await?;
         tracing::info!("PG migration 25: statistics series/time indexes present");
+    }
+
+    // ── Revision 26: configurable site branding ──
+    if current < 26 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS \
+             site_name TEXT NOT NULL DEFAULT 'RelayPanel'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (26) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 26: app_settings.site_name present");
     }
 
     Ok(())

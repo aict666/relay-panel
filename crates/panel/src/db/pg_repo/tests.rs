@@ -2398,6 +2398,7 @@ async fn pg_settings_set_upserts_when_no_row() {
     db.set_registration_settings(true, 1, &[1]).await.unwrap();
     let s = db.get_registration_settings().await.unwrap().unwrap();
     assert!(s.registration_enabled, "upsert must create the row (PG)");
+    assert_eq!(s.site_name, "RelayPanel");
     cleanup(&db).await;
 }
 
@@ -2419,13 +2420,14 @@ async fn pg_settings_allowed_plan_ids_round_trip() {
     .unwrap();
 
     // Multi-plan settings.
-    db.set_registration_settings(true, 1, &[1, 2])
+    db.set_system_settings(true, 1, &[1, 2], "My Relay")
         .await
         .unwrap();
     let s = db.get_registration_settings().await.unwrap().unwrap();
     assert!(s.registration_enabled);
     assert_eq!(s.default_registration_plan_id, 1);
     assert_eq!(s.allowed_plan_ids, vec![1, 2], "PG multi-plan round-trip");
+    assert_eq!(s.site_name, "My Relay", "PG site-name round-trip");
 
     // Unseeded row insert must also carry allowed_plan_ids.
     sqlx::query("DELETE FROM app_settings WHERE id = 1")
@@ -2442,6 +2444,10 @@ async fn pg_settings_allowed_plan_ids_round_trip() {
         s2.allowed_plan_ids,
         vec![2, 1],
         "PG unseeded round-trip (order preserved)"
+    );
+    assert_eq!(
+        s2.site_name, "RelayPanel",
+        "PG unseeded row uses brand default"
     );
 
     cleanup(&db).await;
