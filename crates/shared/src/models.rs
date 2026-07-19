@@ -50,7 +50,13 @@ pub struct ForwardRuleTarget {
     pub port: i32,
     pub position: i32,
     pub enabled: bool,
+    #[serde(default = "default_target_weight_i32")]
+    pub weight: i32,
     pub created_at: String,
+}
+
+fn default_target_weight_i32() -> i32 {
+    1
 }
 
 /// One hop in a multi-hop chain rule (entry=position 0, exit=last).
@@ -61,6 +67,11 @@ pub struct ForwardRuleHop {
     pub position: i32,
     pub device_group_id: i64,
     pub listen_port: i32,
+    /// Dedicated authenticated inter-node tunnel port. `None` on pre-v7 rows;
+    /// the panel claims one lazily before enabling UOT so tcp_udp chains never
+    /// have to share their raw TCP socket with the UDP tunnel.
+    #[serde(default)]
+    pub tunnel_port: Option<i32>,
     pub created_at: String,
     /// Display-only: filled when listing rules, not stored on the hop row.
     #[serde(default)]
@@ -112,7 +123,8 @@ pub struct ForwardRule {
     #[sqlx(skip)]
     pub hops: Vec<ForwardRuleHop>,
     /// v0.4.6: multi-target load-balancing strategy.
-    /// "first" | "round_robin" | "failover". Defaults to "first".
+    /// "first" | "round_robin" | "failover" | "weighted" |
+    /// "least_latency" | "least_connections". Defaults to "first".
     #[serde(default = "default_load_balance_strategy")]
     pub load_balance_strategy: String,
     /// v0.4.6: per-rule upload cap in decimal Mbps (1 Mbps = 1,000,000 bit/s).
@@ -239,6 +251,9 @@ pub struct SharedNodeSummary {
     pub config_protocol_version: Option<i64>,
     /// v0.4.14: active connection count.
     pub connections: i64,
+    pub capacity_score: Option<f64>,
+    pub predicted_spare_connections: Option<i64>,
+    pub anomaly_detected: Option<bool>,
     /// v0.4.14: SYSTEM uptime (since OS boot), seconds.
     pub uptime: Option<i64>,
     /// v0.4.14: relay-node process uptime (since binary start), seconds.

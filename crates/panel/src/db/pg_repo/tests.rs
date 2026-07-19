@@ -19,7 +19,12 @@ use sqlx::postgres::PgPoolOptions;
 
 /// Read TEST_PG_URL. Returns None if unset → tests skip.
 fn pg_url() -> Option<String> {
-    std::env::var("TEST_PG_URL").ok().filter(|s| !s.is_empty())
+    let url = std::env::var("TEST_PG_URL").ok().filter(|s| !s.is_empty());
+    assert!(
+        url.is_some() || std::env::var_os("RELAY_REQUIRE_PG_TESTS").is_none(),
+        "RELAY_REQUIRE_PG_TESTS is set but TEST_PG_URL is missing; refusing to skip PostgreSQL tests"
+    );
+    url
 }
 
 /// Replace the database path in a postgres:// URL. Handles
@@ -284,16 +289,19 @@ async fn pg_rule_targets_replace_and_list_enabled_in_order() {
                 host: "a.example.com".into(),
                 port: 1001,
                 enabled: true,
+                weight: 1,
             },
             relay_shared::protocol::RuleTargetRequest {
                 host: "b.example.com".into(),
                 port: 1002,
                 enabled: false,
+                weight: 1,
             },
             relay_shared::protocol::RuleTargetRequest {
                 host: "c.example.com".into(),
                 port: 1003,
                 enabled: true,
+                weight: 1,
             },
         ],
     )
@@ -408,6 +416,96 @@ async fn pg_apply_schema_seeds_baseline_version() {
     crate::db::pg_schema::run_pg_migrations(&db.pool)
         .await
         .expect("baseline migrations must be a no-op");
+    cleanup(&db).await;
+}
+
+/// Exercise the exact PostgreSQL production startup order against a revision-23
+/// database. The baseline batch must not create the tunnel-port index before
+/// revision 24 has added its column, and the migration must preserve every
+/// existing chain hop.
+#[tokio::test]
+async fn pg_upgrade_from_revision_23_preserves_chain_hops() {
+    let Some(db) = repo("upgrade_rev23_tunnel_port").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) VALUES \
+         (10, 'entry', 'in', 'upgrade-entry', 1), \
+         (11, 'exit', 'out', 'upgrade-exit', 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, protocol, route_mode, device_group_in, \
+          device_group_out, target_addr, target_port) \
+         VALUES (10, 'existing-chain', 1, 21000, 'tcp_udp', 'chain', 10, 11, \
+                 '127.0.0.1', 443)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rule_hops \
+         (id, rule_id, position, device_group_id, listen_port) \
+         VALUES (10, 10, 0, 10, 21000), (11, 10, 1, 11, 22000)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    sqlx::query("DROP INDEX idx_forward_rule_hops_group_tunnel_port")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE forward_rule_hops DROP COLUMN tunnel_port")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version >= 24")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Same order as init_pg: baseline first, then ordered migrations.
+    apply_pg_schema(&db.pool)
+        .await
+        .expect("baseline must be safe on a revision-23 hop table");
+    run_pg_migrations(&db.pool)
+        .await
+        .expect("revision 24 must finish atomically");
+
+    let column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'forward_rule_hops' \
+           AND column_name = 'tunnel_port'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(column_count, 1);
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public' \
+         AND indexname = 'idx_forward_rule_hops_group_tunnel_port'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(index_count, 1);
+    let revision: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(revision, crate::db::pg_schema::PG_SCHEMA_VERSION);
+    let tunnel_values: Vec<Option<i32>> = sqlx::query_scalar(
+        "SELECT tunnel_port FROM forward_rule_hops WHERE rule_id = 10 ORDER BY position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(tunnel_values, vec![None, None]);
+
     cleanup(&db).await;
 }
 
@@ -798,6 +896,10 @@ async fn pg_auto_assign_port_errors_when_range_full() {
         "error must name the exhausted range, got {:?}",
         err
     );
+    assert!(
+        auto_assign_port(&db, 1, "tcp_udp").await.is_err(),
+        "tcp_udp inherently needs both socket families and must conflict with TCP"
+    );
     let p = auto_assign_port(&db, 1, "udp").await.unwrap();
     assert_eq!(p, 50000, "udp must reuse the port held only by tcp");
     cleanup(&db).await;
@@ -816,6 +918,112 @@ async fn pg_auto_assign_port_missing_group_uses_default_pool() {
         "missing group must use the default pool, got {}",
         p
     );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_rule_hop_tunnel_port_claim_is_stable_and_reserved() {
+    let Some(db) = repo("hop_tunnel_claim").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) VALUES \
+         (1, 'entry-a', 'in', 'tok-1', 1), \
+         (2, 'exit', 'out', 'tok-2', 1), \
+         (3, 'entry-b', 'in', 'tok-3', 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.insert_quota_guarded(
+        "chain-a",
+        1,
+        20000,
+        "udp",
+        "raw",
+        "raw",
+        "chain",
+        "raw",
+        None,
+        1,
+        Some(2),
+        "chain",
+        "127.0.0.1",
+        53,
+    )
+    .await
+    .unwrap();
+    let rule = db
+        .list_rules(&ResourceScope::All)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|rule| rule.name == "chain-a")
+        .unwrap();
+    db.replace_rule_hops(rule.id, &[(1, 20000), (2, 30000)])
+        .await
+        .unwrap();
+    let exit_hop = db.list_rule_hops(rule.id).await.unwrap()[1].clone();
+
+    assert_eq!(
+        db.claim_rule_hop_tunnel_port(exit_hop.id, 31000)
+            .await
+            .unwrap(),
+        Some(31000)
+    );
+    assert_eq!(
+        db.claim_rule_hop_tunnel_port(exit_hop.id, 31001)
+            .await
+            .unwrap(),
+        Some(31000)
+    );
+    assert!(db
+        .list_group_port_protocols(2)
+        .await
+        .unwrap()
+        .contains(&(31000, "tcp".to_string())));
+    db.replace_rule_hops(rule.id, &[(1, 20001), (2, 30001)])
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_rule_hops(rule.id).await.unwrap()[1].tunnel_port,
+        Some(31000)
+    );
+
+    db.insert_quota_guarded(
+        "chain-b",
+        1,
+        21000,
+        "udp",
+        "raw",
+        "raw",
+        "chain",
+        "raw",
+        None,
+        3,
+        Some(2),
+        "chain",
+        "127.0.0.1",
+        53,
+    )
+    .await
+    .unwrap();
+    let second = db
+        .list_rules(&ResourceScope::All)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|rule| rule.name == "chain-b")
+        .unwrap();
+    db.replace_rule_hops(second.id, &[(3, 21000), (2, 32000)])
+        .await
+        .unwrap();
+    let second_exit = db.list_rule_hops(second.id).await.unwrap()[1].id;
+    assert!(matches!(
+        db.claim_rule_hop_tunnel_port(second_exit, 31000).await,
+        Err(DbError::UniqueViolation)
+    ));
     cleanup(&db).await;
 }
 
@@ -854,7 +1062,9 @@ async fn pg_rule_create_full_cross_group_no_crosstalk() {
                 host: "a.example.com".into(),
                 port: 1001,
                 enabled: true,
+                weight: 1,
             }],
+            &[],
             "first",
             0,
             0,
@@ -886,18 +1096,22 @@ async fn pg_rule_create_full_cross_group_no_crosstalk() {
                     host: "b1.example.com".into(),
                     port: 2001,
                     enabled: true,
+                    weight: 1,
                 },
                 relay_shared::protocol::RuleTargetRequest {
                     host: "b2.example.com".into(),
                     port: 2002,
                     enabled: true,
+                    weight: 1,
                 },
                 relay_shared::protocol::RuleTargetRequest {
                     host: "b3.example.com".into(),
                     port: 2003,
                     enabled: true,
+                    weight: 1,
                 },
             ],
+            &[],
             "round_robin",
             50,
             100,
@@ -974,7 +1188,9 @@ async fn pg_rule_create_full_rollback_on_target_failure() {
                 host: "bad.example.com".into(),
                 port: 0,
                 enabled: true,
+                weight: 1,
             }],
+            &[],
             "first",
             0,
             0,
@@ -990,6 +1206,54 @@ async fn pg_rule_create_full_rollback_on_target_failure() {
     .await
     .unwrap();
     assert_eq!(count, 0, "transaction must roll back, leaving no rule row");
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_rule_create_full_rollback_on_hop_failure() {
+    let Some(db) = repo("rule_full_hop_rollback").await else {
+        return;
+    };
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (1, 'gin', 'in', 'tok-1', 1)")
+        .execute(&db.pool).await.unwrap();
+
+    let result = db
+        .create_rule_full(
+            "doomed-chain",
+            1,
+            31000,
+            "tcp",
+            "raw",
+            "raw",
+            "chain",
+            "raw",
+            None,
+            1,
+            None,
+            "chain",
+            "1.1.1.1",
+            80,
+            &[relay_shared::protocol::RuleTargetRequest {
+                host: "ok.example.com".into(),
+                port: 80,
+                enabled: true,
+                weight: 1,
+            }],
+            &[(999_999, 31001)],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await;
+    assert!(result.is_err(), "invalid hop FK must fail atomic create");
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE listen_port = 31000")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "hop failure must roll back the rule row");
     cleanup(&db).await;
 }
 
@@ -1027,7 +1291,9 @@ async fn pg_rule_create_full_quota_exhausted_returns_none() {
                 host: "a.example.com".into(),
                 port: 80,
                 enabled: true,
+                weight: 1,
             }],
+            &[],
             "first",
             0,
             0,
@@ -1058,7 +1324,9 @@ async fn pg_rule_create_full_quota_exhausted_returns_none() {
                 host: "a.example.com".into(),
                 port: 80,
                 enabled: true,
+                weight: 1,
             }],
+            &[],
             "first",
             0,
             0,
@@ -2034,6 +2302,54 @@ async fn pg_shared_groups_admin_inbound_only() {
     // admin caller gets an empty list.
     let admin_shared = db.list_shared_groups(1, true).await.unwrap();
     assert!(admin_shared.is_empty(), "admin gets no shared groups (PG)");
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_both_groups_are_shared_and_authorized_as_inbound() {
+    let Some(db) = repo("both_groups_authz").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO users (id, username, password, admin) \
+         VALUES (2, 'alice', 'x', FALSE)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    for (id, group_type) in [(10_i64, "in"), (11, "both"), (12, "out")] {
+        sqlx::query(
+            "INSERT INTO device_groups \
+             (id, name, group_type, token, connect_host, uid) \
+             VALUES ($1, $2, $3, $4, '1.2.3.4', 1)",
+        )
+        .bind(id)
+        .bind(format!("g{id}"))
+        .bind(group_type)
+        .bind(format!("t{id}"))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let shared = db.list_shared_groups(2, false).await.unwrap();
+    assert_eq!(
+        shared.iter().map(|group| group.id).collect::<Vec<_>>(),
+        vec![10, 11]
+    );
+    assert_eq!(db.list_all_inbound_group_ids().await.unwrap(), vec![10, 11]);
+
+    db.set_user_device_groups(2, &[11, 12]).await.unwrap();
+    assert_eq!(db.authorized_device_group_ids(2).await.unwrap(), vec![11]);
+
+    sqlx::query("UPDATE users SET all_device_groups = TRUE WHERE id = 2")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.authorized_device_group_ids(2).await.unwrap(),
+        vec![10, 11]
+    );
     cleanup(&db).await;
 }
 

@@ -251,6 +251,11 @@ fn aggregate_shared_node_summaries(
                 // connections defaults to 0 (not None) — a placeholder/old node
                 // simply has no active connections.
                 connections: i("connections").unwrap_or(0),
+                capacity_score: f("capacity_score"),
+                predicted_spare_connections: i("predicted_spare_connections"),
+                anomaly_detected: json
+                    .and_then(|j| j.get("anomaly_detected"))
+                    .and_then(|v| v.as_bool()),
                 uptime: i("uptime"),
                 process_uptime: i("process_uptime"),
                 network_interface: s("network_interface"),

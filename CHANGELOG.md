@@ -10,6 +10,56 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-19
+
+### Added
+
+- **Advanced target selection and health management.** Multi-target rules now
+  support weighted, round-robin, random, lowest-latency, least-connections, and
+  failover selection. Nodes actively probe TCP reachability and latency, track
+  DNS health, apply circuit breakers, and feed connection/capacity/anomaly
+  telemetry back into routing decisions.
+- **Authenticated UOT for multi-hop UDP and `tcp_udp` rules.** UDP-over-TCP is
+  available on every inter-node hop, including mixed TCP/UDP rules. Each tunnel
+  uses a dedicated persisted port and HMAC challenge-response authentication;
+  the derived token is never transmitted on the wire.
+- **TCP Fast Open on inter-node TCP paths.** TCP and the TCP half of `tcp_udp`
+  chains can carry initial data in the SYN when Linux and the route support it,
+  with a safe ordinary-TCP fallback when they do not.
+
+### Changed
+
+- **UOT and TCP Fast Open default to enabled.** Operators can independently
+  roll either path back with `RELAY_ENABLE_UOT=false` or
+  `RELAY_ENABLE_TCP_0RTT=false` during a mixed-version or emergency rollout.
+- **TCP listener queues are consistently sized to 4096.** Ordinary listeners
+  and Fast Open listeners now use the same backlog, avoiding the previous
+  1024/4096 mismatch under connection bursts.
+- **Config protocol version is now 7.** Panel and node must be upgraded
+  together for the new routing, UOT, and Fast Open configuration.
+
+### Fixed
+
+- **Existing SQLite and PostgreSQL installations migrate safely.** Schema
+  changes for target health, routing state, and UOT ports are ordered so an old
+  database can start and upgrade without an index referencing a not-yet-added
+  column. Migration regressions cover both repositories.
+- **Rule and hop writes are atomic.** Failed multi-hop creation or replanning no
+  longer leaves partial rules, ports, or hop rows behind.
+- **UOT tunnel cancellation cannot desynchronize later frames.** A cancelled
+  request drains its frame before the shared stream is reused, and slow or
+  unauthenticated peers are bounded so they cannot consume tunnel capacity
+  indefinitely.
+- **Authentication throttling is preserved and hardened.** Login rate limits
+  remain effective across router state rebuilds, while expensive password
+  verification is globally bounded.
+
+### Tests
+
+- Main-branch CI now requires PostgreSQL migration/contract tests, debug and
+  release end-to-end runs, and a Linux TCP Fast Open assertion that verifies
+  SYN data on both the userspace and zero-copy forwarding paths.
+
 ## [1.2.3] - 2026-07-18
 
 ### Fixed

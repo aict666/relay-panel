@@ -238,6 +238,9 @@ pub async fn report_status(
             "cpu": req.cpu_usage,
             "mem": req.mem_usage,
             "connections": req.active_connections,
+            "capacity_score": req.capacity_score,
+            "predicted_spare_connections": req.predicted_spare_connections,
+            "anomaly_detected": req.anomaly_detected,
             // v0.3.2: "uptime" is SYSTEM uptime (since OS boot). process uptime
             // is separate below; older nodes don't send it and it renders as "-".
             "uptime": req.uptime_secs,
@@ -652,6 +655,9 @@ mod tests {
             cpu_usage: 0.0,
             mem_usage: 0.0,
             active_connections: 0,
+            capacity_score: None,
+            predicted_spare_connections: None,
+            anomaly_detected: None,
             uptime_secs: 0,
             public_ip: None,
             public_ipv4: None,
@@ -705,6 +711,36 @@ mod tests {
         );
     }
 
+    /// During a panel-first rolling upgrade an old node must receive 426, never
+    /// a v6 config it cannot understand. The node interprets 426 as "keep the
+    /// cached forwarding config", which is the no-outage compatibility gate.
+    #[tokio::test]
+    async fn config_protocol_mismatch_returns_426_before_config_build() {
+        let (state, _pool) = seeded_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Config-Protocol-Version",
+            (relay_shared::protocol::CONFIG_PROTOCOL_VERSION - 1)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        let response = get_config(State(state), headers).await;
+        assert_eq!(response.status(), axum::http::StatusCode::UPGRADE_REQUIRED);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["required"],
+            relay_shared::protocol::CONFIG_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            value["received"],
+            relay_shared::protocol::CONFIG_PROTOCOL_VERSION - 1
+        );
+    }
+
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one
     /// exception to the "business code in JSON" rule — WS upgrades must fail at
     /// the HTTP layer). We assert via node_ws_handler's IntoResponse output,
@@ -742,6 +778,9 @@ mod tests {
             cpu_usage: 0.0,
             mem_usage: 0.0,
             active_connections: 0,
+            capacity_score: None,
+            predicted_spare_connections: None,
+            anomaly_detected: None,
             uptime_secs: 0,
             public_ip: None,
             public_ipv4: None,

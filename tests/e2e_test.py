@@ -19,6 +19,7 @@ Requires: the panel/node binaries already built (cargo build).
 
 import json
 import os
+import re
 import socket
 import socketserver
 import subprocess
@@ -37,9 +38,27 @@ except (AttributeError, ValueError):
 
 BASE_URL = "http://127.0.0.1:18888/api/v1"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PANEL_BIN = os.path.join(PROJECT_ROOT, "target", "debug", "relay-panel.exe")
-NODE_BIN = os.path.join(PROJECT_ROOT, "target", "debug", "relay-node.exe")
+E2E_PROFILE = os.environ.get("RELAY_E2E_PROFILE", "debug")
+if E2E_PROFILE not in ("debug", "release"):
+    raise ValueError("RELAY_E2E_PROFILE must be 'debug' or 'release'")
+PANEL_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-panel.exe")
+NODE_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-node.exe")
 DB_PATH = os.path.join(PROJECT_ROOT, "data.db")
+
+
+def config_protocol_version():
+    """Read the shared wire-version constant so this gate cannot drift silently."""
+    protocol_source = os.path.join(
+        PROJECT_ROOT, "crates", "shared", "src", "protocol.rs"
+    )
+    with open(protocol_source, encoding="utf-8") as source:
+        match = re.search(
+            r"pub const CONFIG_PROTOCOL_VERSION:\s*u32\s*=\s*(\d+)\s*;",
+            source.read(),
+        )
+    if match is None:
+        raise AssertionError("CONFIG_PROTOCOL_VERSION constant not found")
+    return int(match.group(1))
 
 # Test topology
 TCP_LISTEN_PORT = 19999
@@ -245,9 +264,12 @@ def main():
         # 4b. WITH the header but wrong token → empty listeners (gate passes,
         #     token check returns empty). This confirms the gate is before the
         #     token check but both work.
-        # CONFIG_PROTOCOL_VERSION is 5 (multi-hop chain / count_traffic).
+        # Read the exact shared constant used to compile both binaries. A
+        # hard-coded value previously let this test exercise stale binaries
+        # after the protocol was bumped, masking the real current data path.
+        protocol_version = config_protocol_version()
         with_auth = api("GET", "/node/config", token=in_g1_token,
-                        extra_headers={"X-Config-Protocol-Version": "5"})
+                        extra_headers={"X-Config-Protocol-Version": str(protocol_version)})
         assert with_auth["listeners"] != [], \
             "config pull with valid header + token should return listeners"
         print("[ok] config pull with valid header + token returns listeners")

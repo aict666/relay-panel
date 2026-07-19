@@ -115,14 +115,15 @@ impl RuleRepository for PgRepository {
             .await?;
         for (idx, target) in targets.iter().enumerate() {
             sqlx::query(
-                "INSERT INTO forward_rule_targets (rule_id, host, port, position, enabled) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO forward_rule_targets (rule_id, host, port, position, enabled, weight) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
             )
             .bind(rule_id)
             .bind(target.host.trim())
             .bind(target.port as i32)
             .bind(idx as i32 + 1)
             .bind(target.enabled)
+            .bind(target.weight.clamp(1, 100) as i32)
             .execute(&mut *tx)
             .await?;
         }
@@ -254,7 +255,8 @@ impl RuleRepository for PgRepository {
         .fetch_all(&self.pool)
         .await?;
         let hop_rows: Vec<(i32, String)> = sqlx::query_as(
-            "SELECT h.listen_port, fr.protocol FROM forward_rule_hops h \
+            "SELECT h.listen_port, fr.protocol \
+             FROM forward_rule_hops h \
              JOIN forward_rules fr ON fr.id = h.rule_id \
              WHERE h.device_group_id = $1",
         )
@@ -262,6 +264,14 @@ impl RuleRepository for PgRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.extend(hop_rows);
+        let tunnel_rows: Vec<(i32, String)> = sqlx::query_as(
+            "SELECT tunnel_port, 'tcp' FROM forward_rule_hops \
+             WHERE device_group_id = $1 AND tunnel_port IS NOT NULL",
+        )
+        .bind(device_group_in)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.extend(tunnel_rows);
         Ok(rows)
     }
 
@@ -435,6 +445,7 @@ impl RuleRepository for PgRepository {
         target_addr: &str,
         target_port: i32,
         targets: &[relay_shared::protocol::RuleTargetRequest],
+        hops: &[(i64, i32)],
         load_balance_strategy: &str,
         upload_limit_mbps: i32,
         download_limit_mbps: i32,
@@ -560,14 +571,32 @@ impl RuleRepository for PgRepository {
             try_!(
                 tx,
                 sqlx::query(
-                    "INSERT INTO forward_rule_targets (rule_id, host, port, position, enabled) \
-                     VALUES ($1, $2, $3, $4, $5)",
+                    "INSERT INTO forward_rule_targets (rule_id, host, port, position, enabled, weight) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
                 )
                 .bind(rule_id)
                 .bind(target.host.trim())
                 .bind(target.port as i32)
                 .bind(idx as i32 + 1)
                 .bind(target.enabled)
+                .bind(target.weight.clamp(1, 100) as i32)
+                .execute(&mut *tx)
+                .await
+            );
+        }
+
+        for (position, (group_id, hop_port)) in hops.iter().enumerate() {
+            try_!(
+                tx,
+                sqlx::query(
+                    "INSERT INTO forward_rule_hops \
+                     (rule_id, position, device_group_id, listen_port) \
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(rule_id)
+                .bind(position as i32)
+                .bind(group_id)
+                .bind(hop_port)
                 .execute(&mut *tx)
                 .await
             );
@@ -873,24 +902,56 @@ impl RuleRepository for PgRepository {
 
     async fn replace_rule_hops(&self, rule_id: i64, hops: &[(i64, i32)]) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
+        let old_tunnel_ports: std::collections::HashMap<i64, Option<i32>> =
+            sqlx::query_as::<_, (i64, Option<i32>)>(
+                "SELECT device_group_id, tunnel_port FROM forward_rule_hops WHERE rule_id = $1",
+            )
+            .bind(rule_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect();
         sqlx::query("DELETE FROM forward_rule_hops WHERE rule_id = $1")
             .bind(rule_id)
             .execute(&mut *tx)
             .await?;
         for (pos, (gid, port)) in hops.iter().enumerate() {
             sqlx::query(
-                "INSERT INTO forward_rule_hops (rule_id, position, device_group_id, listen_port) \
-                 VALUES ($1, $2, $3, $4)",
+                "INSERT INTO forward_rule_hops \
+                 (rule_id, position, device_group_id, listen_port, tunnel_port) \
+                 VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(rule_id)
             .bind(pos as i32)
             .bind(gid)
             .bind(port)
+            .bind(old_tunnel_ports.get(gid).copied().flatten())
             .execute(&mut *tx)
             .await?;
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn claim_rule_hop_tunnel_port(
+        &self,
+        hop_id: i64,
+        port: i32,
+    ) -> Result<Option<i32>, DbError> {
+        sqlx::query(
+            "UPDATE forward_rule_hops SET tunnel_port = $1 \
+             WHERE id = $2 AND tunnel_port IS NULL",
+        )
+        .bind(port)
+        .bind(hop_id)
+        .execute(&self.pool)
+        .await?;
+        let stored = sqlx::query_scalar("SELECT tunnel_port FROM forward_rule_hops WHERE id = $1")
+            .bind(hop_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten();
+        Ok(stored)
     }
 
     async fn list_rule_hops(

@@ -611,6 +611,18 @@ RELEASE_COMPOSE="docker-compose.release.yaml"
 # is a separate --profile argument, avoiding whitespace/order bugs.
 PROFILE_ARGS=()
 
+# Bash 3.2 (still the system Bash on macOS) treats "${empty_array[@]}" as an
+# unbound variable under `set -u`. Keep the empty-array branch out of the
+# expansion entirely so the offline harness and Docker Desktop callers work
+# without requiring a newer shell.
+compose_with_profiles() {
+    if [ "${#PROFILE_ARGS[@]}" -gt 0 ]; then
+        docker compose -f "$COMPOSE_FILE" "${PROFILE_ARGS[@]}" "$@"
+    else
+        docker compose -f "$COMPOSE_FILE" "$@"
+    fi
+}
+
 # Node profile: off by default. Most deployments run relay-node on a separate
 # server. Set RELAYPANEL_WITH_NODE=1 to also start the node container here.
 if [ "${RELAYPANEL_WITH_NODE:-0}" = "1" ]; then
@@ -649,7 +661,7 @@ elif [ -f "$RELEASE_COMPOSE" ]; then
     info "Pulling pre-built panel image from GHCR ..."
     COMPOSE_FILE="$RELEASE_COMPOSE"
     COMPOSE_FLAGS=""
-    if ! docker compose -f "$COMPOSE_FILE" "${PROFILE_ARGS[@]}" pull; then
+    if ! compose_with_profiles pull; then
         fail "Failed to pull images from GHCR. Check your internet connection, or build from source with: RELAYPANEL_BUILD_LOCAL=1 ./deploy.sh"
     fi
 else
@@ -660,8 +672,12 @@ else
 fi
 
 # ---------- 4. Start ----------
-info "Starting services (docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} up -d $COMPOSE_FLAGS) ..."
-docker compose -f "$COMPOSE_FILE" "${PROFILE_ARGS[@]}" up -d $COMPOSE_FLAGS
+PROFILE_DISPLAY=""
+if [ "${#PROFILE_ARGS[@]}" -gt 0 ]; then
+    PROFILE_DISPLAY="${PROFILE_ARGS[*]}"
+fi
+info "Starting services (docker compose -f $COMPOSE_FILE $PROFILE_DISPLAY up -d $COMPOSE_FLAGS) ..."
+compose_with_profiles up -d $COMPOSE_FLAGS
 
 # ---------- 5. Verify ----------
 # Deployment success is decided by the CONTAINER + PORT + a real health
@@ -721,13 +737,13 @@ fi
 
 if [ "$RELAYPANEL_WEB_MODE" = "caddy" ]; then
     info "Verifying Caddy container state ..."
-    caddy_id=$(docker compose -f "$COMPOSE_FILE" "${PROFILE_ARGS[@]}" ps -q caddy 2>/dev/null || true)
+    caddy_id=$(compose_with_profiles ps -q caddy 2>/dev/null || true)
     if [ -z "$caddy_id" ]; then
-        fail "Caddy container is not running. Check: docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} logs caddy"
+        fail "Caddy container is not running. Check: docker compose -f $COMPOSE_FILE $PROFILE_DISPLAY logs caddy"
     fi
     caddy_state=$(docker inspect --format='{{.State.Status}}' "$caddy_id" 2>/dev/null || echo unknown)
     if [ "$caddy_state" != "running" ]; then
-        fail "Caddy container state is $caddy_state, expected running. Check: docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} logs caddy"
+        fail "Caddy container state is $caddy_state, expected running. Check: docker compose -f $COMPOSE_FILE $PROFILE_DISPLAY logs caddy"
     fi
     info "Caddy container is running"
 
@@ -741,7 +757,7 @@ if [ "$RELAYPANEL_WEB_MODE" = "caddy" ]; then
         sleep 2
     done
     if [ "$caddy_https_ok" != "1" ]; then
-        fail "Caddy HTTPS check failed for https://${RELAYPANEL_DOMAIN}/ after 60s. Ensure DNS points to this server, ports 80/443 are reachable, and check: docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} logs caddy"
+        fail "Caddy HTTPS check failed for https://${RELAYPANEL_DOMAIN}/ after 60s. Ensure DNS points to this server, ports 80/443 are reachable, and check: docker compose -f $COMPOSE_FILE $PROFILE_DISPLAY logs caddy"
     fi
     info "Caddy HTTPS endpoint OK"
 fi
@@ -783,6 +799,6 @@ if [ "${RELAYPANEL_WITH_NODE:-0}" != "1" ]; then
     echo "  To ALSO run node on this host: RELAYPANEL_WITH_NODE=1 ./deploy.sh"
 fi
 echo ""
-echo "  Logs:      docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} logs -f"
-echo "  Stop:      docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} down"
+echo "  Logs:      docker compose -f $COMPOSE_FILE $PROFILE_DISPLAY logs -f"
+echo "  Stop:      docker compose -f $COMPOSE_FILE $PROFILE_DISPLAY down"
 echo "  Update:    git pull --quiet && ./deploy.sh"

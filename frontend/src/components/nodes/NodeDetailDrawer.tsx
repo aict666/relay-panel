@@ -4,7 +4,7 @@ import { DeleteOutlined } from '@ant-design/icons';
 import { formatPercent, formatBytes, formatBps, formatUptime } from '../../utils/format';
 import { useI18n } from '../../i18n/context';
 import { CountryFlag } from './CountryFlag';
-import type { NodeDisplayRow } from '../../api/types';
+import type { ApiEnvelope, NodeDisplayRow } from '../../api/types';
 import api from '../../api/client';
 
 interface Props {
@@ -32,7 +32,11 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
       ? `/nodes/${gid}?node_id=${encodeURIComponent(nid)}`
       : `/nodes/${gid}`;
     try {
-      await api.delete(url);
+      const res = await api.delete<unknown, ApiEnvelope<null>>(url);
+      if (res.code !== 0) {
+        message.error(res.message || t('nodeStatusDeleteFailed'));
+        return;
+      }
       message.success(t('nodeStatusDeleted'));
       onDeleted?.();
       onClose();
@@ -73,6 +77,23 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
 
           <Descriptions.Item label={t('nodeVersion')}>{row.node_version || '-'}</Descriptions.Item>
           <Descriptions.Item label={t('connections')}>{row.connections || 0}</Descriptions.Item>
+          <Descriptions.Item label={t('capacityScore')}>
+            {row.capacity_score == null ? '-' : (
+              <Tag color={row.capacity_score >= 50 ? 'green' : row.capacity_score >= 20 ? 'orange' : 'red'}>
+                {row.capacity_score.toFixed(1)} / 100
+              </Tag>
+            )}
+          </Descriptions.Item>
+          <Descriptions.Item label={t('predictedSpareConnections')}>
+            {row.predicted_spare_connections ?? '-'}
+          </Descriptions.Item>
+          <Descriptions.Item label={t('anomalyStatus')}>
+            {row.anomaly_detected == null
+              ? '-'
+              : row.anomaly_detected
+                ? <Tag color="red">{t('anomalyDetected')}</Tag>
+                : <Tag color="green">{t('normal')}</Tag>}
+          </Descriptions.Item>
           <Descriptions.Item label="CPU">{formatPercent(row.cpu)}</Descriptions.Item>
           <Descriptions.Item label={t('mem')}>{formatPercent(row.mem)}</Descriptions.Item>
           <Descriptions.Item label={t('disk')}>

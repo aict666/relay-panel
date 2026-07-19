@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS forward_rule_targets (
     port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
     position INTEGER NOT NULL CHECK (position >= 1),
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    weight INTEGER NOT NULL DEFAULT 1 CHECK (weight >= 1 AND weight <= 100),
     created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
 );
 
@@ -167,12 +168,17 @@ CREATE TABLE IF NOT EXISTS forward_rule_hops (
     position INTEGER NOT NULL CHECK (position >= 0),
     device_group_id BIGINT NOT NULL REFERENCES device_groups(id),
     listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+    tunnel_port INTEGER CHECK (tunnel_port >= 1 AND tunnel_port <= 65535),
     created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
     UNIQUE (rule_id, position)
 );
 CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_rule_id ON forward_rule_hops (rule_id);
 CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_group_port
     ON forward_rule_hops (device_group_id, listen_port);
+-- Deliberately created by revision 24, not by this baseline batch. On a
+-- revision-23 database CREATE TABLE IF NOT EXISTS leaves the old hop table
+-- unchanged; creating an index on tunnel_port here would fail before the
+-- migration can add that column.
 
 CREATE TABLE IF NOT EXISTS statistics (
     id BIGSERIAL PRIMARY KEY,
@@ -299,7 +305,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 21;
+pub const PG_SCHEMA_VERSION: i32 = 24;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1161,6 +1167,47 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
         tracing::info!("PG migration 22: forward_rule_hops table present");
+    }
+
+    // ── Revision 23: weighted target selection ──
+    if current < 23 {
+        sqlx::query(
+            "ALTER TABLE forward_rule_targets ADD COLUMN IF NOT EXISTS \
+             weight INTEGER NOT NULL DEFAULT 1 CHECK (weight >= 1 AND weight <= 100)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (23) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+        tracing::info!("PG migration 23: forward_rule_targets.weight present");
+    }
+
+    // ── Revision 24: dedicated authenticated chain tunnel port ──
+    if current < 24 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE forward_rule_hops ADD COLUMN IF NOT EXISTS \
+             tunnel_port INTEGER CHECK (tunnel_port >= 1 AND tunnel_port <= 65535)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_forward_rule_hops_group_tunnel_port \
+             ON forward_rule_hops (device_group_id, tunnel_port) \
+             WHERE tunnel_port IS NOT NULL",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (24) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 24: forward_rule_hops.tunnel_port present");
     }
 
     Ok(())

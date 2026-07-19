@@ -34,6 +34,7 @@ pub async fn serve_tcp_listener(
     source_ipv4: Option<Ipv4Addr>,
     gate: RuleGate,
     count_traffic: bool,
+    tcp_fast_open: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr = listener
         .local_addr()
@@ -132,6 +133,7 @@ pub async fn serve_tcp_listener(
                             rule_id,
                             source_ipv4,
                             count_traffic,
+                            tcp_fast_open,
                         ) => {
                             if let Err(e) = r {
                                 tracing::debug!("TCP connection error: {}", e);
@@ -191,7 +193,22 @@ async fn handle_tcp_connection(
     rule_id: i64,
     source_ipv4: Option<Ipv4Addr>,
     count_traffic: bool,
+    tcp_fast_open: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // TCP_FASTOPEN_CONNECT defers the SYN until the first write when a cookie
+    // exists. That is ideal for client-first traffic, but blindly using it for
+    // server-first protocols (SSH/SMTP banners) would deadlock: the relay waits
+    // to read the target while the kernel waits for client data before sending
+    // SYN. Only choose TFO when at least one client byte is already pending;
+    // otherwise preserve the ordinary connect-before-read path.
+    let target_order = selector.order();
+    // A cookie hit returns before the SYN outcome is known, so that connection
+    // cannot safely participate in this attempt's fallback loop. Preserve
+    // deterministic multi-target failover by using TFO only when the selector
+    // has exactly one candidate.
+    let tcp_fast_open =
+        fast_open_has_client_data(&inbound, tcp_fast_open && target_order.len() == 1).await;
+
     // v0.4.6: pick targets per the rule's load-balancing strategy. The selector
     // returns the ordered indices to attempt; we connect to the first reachable.
     //
@@ -200,19 +217,22 @@ async fn handle_tcp_connection(
     // On a multi-NIC server a silent failure is impossible to diagnose, so we
     // accumulate per-target reasons and log them together when nothing connects.
     let mut outbound = None;
+    let mut target_lease = None;
     let mut failures: Vec<String> = Vec::new();
-    for idx in selector.order() {
+    for idx in target_order {
         let Some(target) = targets.get(idx) else {
             continue;
         };
+        let started = std::time::Instant::now();
         match tokio::time::timeout(
             Duration::from_secs(5),
-            super::outbound::tcp_connect(target, source_ipv4, 5),
+            super::outbound::tcp_connect_with_fast_open(target, source_ipv4, 5, tcp_fast_open),
         )
         .await
         {
             Ok(Ok(stream)) => {
-                selector.report(idx, true);
+                selector.report_timed(idx, true, Some(started.elapsed()));
+                target_lease = selector.acquire(idx);
                 outbound = Some(stream);
                 break;
             }
@@ -248,8 +268,20 @@ async fn handle_tcp_connection(
             return Err(format!("no target available: {}", detail).into());
         }
     };
+    // Keep the least-connections count until this forwarded connection ends.
+    let _target_lease = target_lease;
 
-    tracing::debug!("TCP: {} -> {}", client_addr, outbound.peer_addr()?);
+    // getpeername may transiently report ENOTCONN on a cookie-hit TFO socket
+    // before the first payload triggers SYN. Logging must never turn that
+    // harmless deferred state into a failed forwarded connection.
+    match outbound.peer_addr() {
+        Ok(peer) => tracing::debug!("TCP: {} -> {}", client_addr, peer),
+        Err(error) => tracing::debug!(
+            "TCP: {} -> deferred TFO peer (getpeername: {})",
+            client_addr,
+            error
+        ),
+    }
 
     // v1.0.8: ZERO-COPY fast path. An UNLIMITED rule on Linux is forwarded with
     // splice(2) — bytes move inside the kernel via a pipe and are never copied
@@ -345,6 +377,25 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
+async fn fast_open_has_client_data(inbound: &TcpStream, requested: bool) -> bool {
+    if !requested {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut first_byte = [0u8; 1];
+        matches!(
+            tokio::time::timeout(Duration::from_millis(5), inbound.peek(&mut first_byte)).await,
+            Ok(Ok(n)) if n > 0
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = inbound;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +440,7 @@ mod tests {
             None,
             runtime.gate(None),
             true,
+            false,
         ));
         // Keep the runtime alive for the duration of the test: dropping it would
         // cancel the connection we are about to make.
@@ -407,6 +459,204 @@ mod tests {
             b"ping-through-relay",
             "relay must echo the target"
         );
+    }
+
+    /// TFO must never deadlock server-first protocols. With no client payload
+    /// pending, the relay deliberately falls back to the ordinary handshake so
+    /// an SSH/SMTP-style target can send its banner immediately.
+    #[tokio::test]
+    async fn tcp_fast_open_falls_back_for_server_first_protocols() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            stream.write_all(b"server-banner").await.unwrap();
+        });
+
+        let listener = bind_tcp_listener(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let runtime = crate::forwarder::gate::RuleRuntime::new();
+        tokio::spawn(serve_tcp_listener(
+            listener,
+            vec![target_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            RateLimit::Unlimited,
+            Arc::new(TrafficCounter::new()),
+            Arc::new(ConnectionTracker::new()),
+            2,
+            None,
+            runtime.gate(None),
+            true,
+            true,
+        ));
+        let _runtime = runtime;
+
+        let mut client = TcpStream::connect(listen_addr).await.unwrap();
+        let mut banner = [0u8; 13];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut banner))
+            .await
+            .expect("server-first connection deadlocked under TFO")
+            .unwrap();
+        assert_eq!(&banner, b"server-banner");
+    }
+
+    /// A TFO cookie hit cannot prove connect success before the first payload is
+    /// written. Multi-target rules therefore retain ordinary connect semantics
+    /// so a refused primary still falls through to the healthy backup.
+    #[tokio::test]
+    async fn tcp_fast_open_preserves_multi_target_failover() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_addr = unavailable.local_addr().unwrap();
+        drop(unavailable);
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            stream.write_all(&byte).await.unwrap();
+        });
+
+        let listener = bind_tcp_listener(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let runtime = crate::forwarder::gate::RuleRuntime::new();
+        tokio::spawn(serve_tcp_listener(
+            listener,
+            vec![unavailable_addr.to_string(), target_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::Failover, 2)),
+            RateLimit::Unlimited,
+            Arc::new(TrafficCounter::new()),
+            Arc::new(ConnectionTracker::new()),
+            3,
+            None,
+            runtime.gate(None),
+            true,
+            true,
+        ));
+        let _runtime = runtime;
+
+        let mut client = TcpStream::connect(listen_addr).await.unwrap();
+        client.write_all(b"f").await.unwrap();
+        let mut reply = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut reply))
+            .await
+            .expect("TFO rule did not fail over to the backup")
+            .unwrap();
+        assert_eq!(&reply, b"f");
+    }
+
+    /// The production Linux path uses splice(2) for unlimited rules. Prove that
+    /// its first pipe→socket transfer also triggers TCP_FASTOPEN_CONNECT and
+    /// puts relay payload in SYN; testing TcpStream::write_all alone would miss
+    /// an incompatibility between TFO and the actual zero-copy data path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_fast_open_works_through_linux_splice_path() {
+        use crate::forwarder::outbound::{
+            bind_tcp_listener_with_fast_open, tcp_connect_with_fast_open,
+        };
+        use std::os::fd::AsRawFd;
+
+        const TFO_CLIENT_AND_SERVER: u32 = 0x1 | 0x2;
+        const TCPI_OPT_SYN_DATA: u8 = 32;
+
+        fn tcp_info_options(stream: &TcpStream) -> std::io::Result<u8> {
+            let mut info = std::mem::MaybeUninit::<libc::tcp_info>::zeroed();
+            let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+            let result = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_INFO,
+                    info.as_mut_ptr().cast(),
+                    &mut len,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(unsafe { info.assume_init() }.tcpi_options)
+        }
+
+        let required = std::env::var_os("RELAY_REQUIRE_LINUX_TFO_TEST").is_some();
+        let sysctl = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_fastopen")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        if !matches!(sysctl, Some(value) if value & TFO_CLIENT_AND_SERVER == TFO_CLIENT_AND_SERVER)
+        {
+            assert!(
+                !required,
+                "CI requires client+server TFO sysctl bits (0x3), got {:?}",
+                sysctl
+            );
+            return;
+        }
+
+        let target = bind_tcp_listener_with_fast_open(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, true)
+            .expect("bind TFO target");
+        let target_addr = target.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut warmup, _) = target.accept().await.unwrap();
+            let mut warmup_byte = [0u8; 1];
+            warmup.read_exact(&mut warmup_byte).await.unwrap();
+            warmup.write_all(&warmup_byte).await.unwrap();
+            drop(warmup);
+
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut payload = [0u8; 17];
+            stream.read_exact(&mut payload).await.unwrap();
+            let options = tcp_info_options(&stream).unwrap();
+            stream.write_all(&payload).await.unwrap();
+            (payload, options)
+        });
+
+        // First contact solicits the target's cookie before traffic enters the
+        // relay. The next destination connection is therefore the warm TFO case.
+        let mut warmup = tcp_connect_with_fast_open(&target_addr.to_string(), None, 5, true)
+            .await
+            .expect("warm-up target connection");
+        warmup.write_all(b"w").await.unwrap();
+        let mut warmup_reply = [0u8; 1];
+        warmup.read_exact(&mut warmup_reply).await.unwrap();
+        drop(warmup);
+
+        let relay = bind_tcp_listener(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let runtime = crate::forwarder::gate::RuleRuntime::new();
+        let relay_task = tokio::spawn(serve_tcp_listener(
+            relay,
+            vec![target_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            RateLimit::Unlimited,
+            Arc::new(TrafficCounter::new()),
+            Arc::new(ConnectionTracker::new()),
+            4,
+            None,
+            runtime.gate(None),
+            true,
+            true,
+        ));
+
+        let payload = *b"splice-syn-data!!";
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+        client.write_all(&payload).await.unwrap();
+        let mut reply = [0u8; 17];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut reply))
+            .await
+            .expect("Linux splice + TFO relay timed out")
+            .unwrap();
+        assert_eq!(reply, payload);
+        let (received, options) = target_task.await.unwrap();
+        assert_eq!(received, payload);
+        assert_ne!(
+            options & TCPI_OPT_SYN_DATA,
+            0,
+            "target TCP_INFO proves splice did not send relay payload in SYN (options=0x{options:02x})"
+        );
+
+        relay_task.abort();
+        drop(runtime);
     }
 
     /// v1.2.0: the cap is enforced at accept. Connections up to the cap forward
@@ -452,6 +702,7 @@ mod tests {
             None,
             runtime.gate(Some(2)),
             true,
+            false,
         ));
         let _runtime = runtime;
 

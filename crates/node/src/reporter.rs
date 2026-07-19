@@ -7,7 +7,7 @@ use relay_shared::protocol::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
 use tokio::sync::{Mutex, RwLock};
@@ -805,11 +805,22 @@ pub async fn report_status(
 ) {
     let snap = metrics.snapshot().await;
     let active_connections = connections.current().await;
+    let (capacity_score, predicted_spare_connections, anomaly_detected) = capacity_forecast(
+        snap.cpu,
+        snap.mem_pct,
+        active_connections,
+        snap.upload_bps
+            .unwrap_or(0)
+            .saturating_add(snap.download_bps.unwrap_or(0)),
+    );
 
     let report = StatusReport {
         cpu_usage: snap.cpu,
         mem_usage: snap.mem_pct,
         active_connections,
+        capacity_score: Some(capacity_score),
+        predicted_spare_connections,
+        anomaly_detected: Some(anomaly_detected),
         // v0.3.2: uptime_secs is now SYSTEM uptime (since OS boot), matching
         // what "运行时长" means to users. The process uptime moved to its own
         // field below.
@@ -906,6 +917,49 @@ pub async fn report_status(
         }
         Err(e) => tracing::warn!("report_status error: {}", e),
     }
+}
+
+#[derive(Default)]
+struct CapacityHistory {
+    initialized: bool,
+    ewma_bps: f64,
+    ewma_connections: f64,
+}
+
+/// Estimate headroom and flag sudden local load changes. This deliberately
+/// uses an EWMA instead of a fixed bandwidth ceiling: a 10GbE relay and a small
+/// VPS have very different normal traffic, while a 4x jump relative to each
+/// node's own baseline is meaningful on both.
+fn capacity_forecast(
+    cpu: f32,
+    mem: f32,
+    active_connections: u32,
+    total_bps: u64,
+) -> (f32, Option<u32>, bool) {
+    static HISTORY: OnceLock<StdMutex<CapacityHistory>> = OnceLock::new();
+    let history = HISTORY.get_or_init(|| StdMutex::new(CapacityHistory::default()));
+    let mut history = history.lock().unwrap_or_else(|e| e.into_inner());
+    let used = cpu.max(mem).clamp(0.0, 100.0);
+    let score = (100.0 - used).clamp(0.0, 100.0);
+    let spare = if active_connections > 0 && used >= 1.0 {
+        Some(((active_connections as f64 * score as f64 / used as f64).min(u32::MAX as f64)) as u32)
+    } else {
+        None
+    };
+    let anomalous = used >= 95.0
+        || (history.initialized
+            && ((total_bps as f64 > 10_000_000.0 && total_bps as f64 > history.ewma_bps * 4.0)
+                || (active_connections > 100
+                    && active_connections as f64 > history.ewma_connections * 3.0)));
+    if history.initialized {
+        history.ewma_bps = history.ewma_bps * 0.8 + total_bps as f64 * 0.2;
+        history.ewma_connections = history.ewma_connections * 0.8 + active_connections as f64 * 0.2;
+    } else {
+        history.initialized = true;
+        history.ewma_bps = total_bps as f64;
+        history.ewma_connections = active_connections as f64;
+    }
+    (score, spare, anomalous)
 }
 
 /// How often the public-IP refresher re-checks (long interval so we are not
@@ -1236,11 +1290,17 @@ mod tests {
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
                 targets: vec!["127.0.0.1:1".to_string()],
+                target_weights: vec![],
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
                 count_traffic: true,
+                uot_role: relay_shared::protocol::UotRole::Disabled,
+                uot_token: None,
+                uot_next_token: None,
+                zero_rtt: false,
+                tcp_fast_open: false,
             })
             .collect();
         let cfg = NodeConfigResponse { listeners };
@@ -1281,6 +1341,14 @@ mod tests {
             parse_ip_for_family("  8.8.8.8\n", &IpFamily::V4),
             Some("8.8.8.8".to_string())
         );
+    }
+
+    #[test]
+    fn capacity_forecast_flags_immediate_resource_exhaustion() {
+        let (score, spare, anomaly) = capacity_forecast(97.0, 20.0, 100, 0);
+        assert!(score <= 3.0);
+        assert!(spare.is_some());
+        assert!(anomaly);
     }
 
     #[test]

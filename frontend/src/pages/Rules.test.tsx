@@ -7,12 +7,17 @@ import { describe, expect, it } from 'vitest';
 // Replicate the logic from Rules.tsx to test it independently.
 // These match the actual implementation line-for-line.
 
-const formTargets = (values: { targets?: Array<{ host: string; port: number; enabled?: boolean }>; target_addr?: string; target_port?: number }) => {
+const formTargets = (values: { targets?: Array<{ host: string; port: number; enabled?: boolean; weight?: number }>; target_addr?: string; target_port?: number }) => {
   const targets = values.targets ?? [];
-  return targets.map(t => ({ host: t.host?.trim() ?? '', port: Number(t.port), enabled: t.enabled !== false }));
+  return targets.map(t => ({
+    host: t.host?.trim() ?? '',
+    port: Number(t.port),
+    enabled: t.enabled !== false,
+    weight: Math.max(1, Math.min(100, Number(t.weight ?? 1))),
+  }));
 };
 
-const payloadWithTargets = (values: Record<string, unknown> & { targets?: Array<{ host: string; port: number; enabled?: boolean }> }) => {
+const payloadWithTargets = (values: Record<string, unknown> & { targets?: Array<{ host: string; port: number; enabled?: boolean; weight?: number }> }) => {
   const targets = formTargets(values);
   if (targets.length < 1) {
     throw new Error('targets must have at least one entry');
@@ -40,7 +45,7 @@ describe('formTargets', () => {
 
   it('with 1 target returns it (trim host, Number port)', () => {
     const result = formTargets({ targets: [{ host: ' 1.2.3.4 ', port: 80 }] });
-    expect(result).toEqual([{ host: '1.2.3.4', port: 80, enabled: true }]);
+    expect(result).toEqual([{ host: '1.2.3.4', port: 80, enabled: true, weight: 1 }]);
   });
 
   it('with multiple targets returns all', () => {
@@ -48,6 +53,17 @@ describe('formTargets', () => {
     expect(result).toHaveLength(2);
     expect(result[0].host).toBe('a');
     expect(result[1].host).toBe('b');
+  });
+
+  it('normalizes target weights to the supported 1-100 range', () => {
+    const result = formTargets({
+      targets: [
+        { host: 'a', port: 1, weight: 0 },
+        { host: 'b', port: 2, weight: 250 },
+        { host: 'c', port: 3, weight: 7 },
+      ],
+    });
+    expect(result.map(target => target.weight)).toEqual([1, 100, 7]);
   });
 });
 
@@ -119,15 +135,18 @@ describe('strategyOptions', () => {
     { value: 'first',       label: 'lbFirst' },
     { value: 'round_robin', label: 'lbRoundRobin' },
     { value: 'failover',    label: 'lbFailover' },
+    { value: 'weighted', label: 'lbWeighted' },
+    { value: 'least_latency', label: 'lbLeastLatency' },
+    { value: 'least_connections', label: 'lbLeastConnections' },
   ];
 
-  it('has exactly three strategy options', () => {
-    expect(strategyOptions).toHaveLength(3);
+  it('has all six strategy options', () => {
+    expect(strategyOptions).toHaveLength(6);
   });
 
   it('option values match backend wire/db strings', () => {
     const values = strategyOptions.map(o => o.value);
-    expect(values).toEqual(['first', 'round_robin', 'failover']);
+    expect(values).toEqual(['first', 'round_robin', 'failover', 'weighted', 'least_latency', 'least_connections']);
   });
 
   it('option labels are short (no long descriptions in Select)', () => {

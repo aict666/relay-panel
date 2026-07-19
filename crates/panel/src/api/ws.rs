@@ -37,6 +37,10 @@ type ConnMap = Arc<RwLock<HashMap<i64, GroupConns>>>;
 pub struct NodeConnections {
     next_id: Arc<AtomicU64>,
     inner: ConnMap,
+    /// Per-group authentication generation. Token rotation increments this
+    /// under a lock shared with generation-aware registration, closing the
+    /// validate-before-upgrade race for newly arriving sockets.
+    generations: Arc<RwLock<HashMap<i64, u64>>>,
 }
 
 impl NodeConnections {
@@ -47,6 +51,7 @@ impl NodeConnections {
     /// Register a new connection. Returns (conn_id, receiver) — the caller
     /// owns the receiver and forwards anything it receives to the socket.
     /// `node_id` is the v0.4.14 X-Node-ID (None for older nodes).
+    #[cfg(test)]
     pub async fn register(
         &self,
         group_id: i64,
@@ -61,6 +66,44 @@ impl NodeConnections {
             .or_default()
             .insert(conn_id, ConnEntry { tx, node_id });
         (conn_id, rx)
+    }
+
+    async fn auth_generation(&self, group_id: i64) -> u64 {
+        self.generations
+            .read()
+            .await
+            .get(&group_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Register only if no token rotation occurred since authentication
+    /// started. The generation read lock is held until the sender is inserted;
+    /// close_group takes the write lock before removing connections, so either
+    /// registration wins and is then closed, or rotation wins and registration
+    /// is rejected.
+    async fn register_if_generation(
+        &self,
+        group_id: i64,
+        node_id: Option<String>,
+        expected_generation: u64,
+    ) -> Option<(u64, mpsc::UnboundedReceiver<String>)> {
+        let generations = self.generations.read().await;
+        let current = generations.get(&group_id).copied().unwrap_or(0);
+        if current != expected_generation {
+            return None;
+        }
+
+        let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner
+            .write()
+            .await
+            .entry(group_id)
+            .or_default()
+            .insert(conn_id, ConnEntry { tx, node_id });
+        drop(generations);
+        Some((conn_id, rx))
     }
 
     /// Remove a connection. Called when the socket task exits.
@@ -175,8 +218,14 @@ impl NodeConnections {
     /// since close_group already removed the entry). The node then reconnects
     /// and re-authenticates with the new token.
     pub async fn close_group(&self, group_id: i64) -> usize {
+        let mut generations = self.generations.write().await;
+        let generation = generations.entry(group_id).or_insert(0);
+        *generation = generation.wrapping_add(1);
         let mut map = self.inner.write().await;
-        map.remove(&group_id).map(|conns| conns.len()).unwrap_or(0)
+        let closed = map.remove(&group_id).map(|conns| conns.len()).unwrap_or(0);
+        drop(map);
+        drop(generations);
+        closed
     }
 }
 
@@ -248,7 +297,7 @@ pub async fn node_ws_handler(
     let db = state.db.clone();
 
     ws.on_upgrade(move |socket| {
-        handle_node_ws(socket, group_id, node_id, db, state.node_connections)
+        handle_node_ws(socket, group_id, node_id, token, db, state.node_connections)
     })
 }
 
@@ -256,9 +305,46 @@ async fn handle_node_ws(
     socket: WebSocket,
     group_id: i64,
     node_id: Option<String>,
+    token: String,
     db: std::sync::Arc<dyn crate::db::Repository>,
     node_connections: NodeConnections,
 ) {
+    // Capture the generation before revalidating the credential. If rotation
+    // happens before the lookup, the old token fails; if it happens after the
+    // lookup, register_if_generation observes the increment and refuses the
+    // stale connection.
+    let auth_generation = node_connections.auth_generation(group_id).await;
+    let token_still_valid = match db.find_by_token(&token).await {
+        Ok(Some(group)) => group.id == group_id,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::error!(
+                "websocket post-upgrade token revalidation failed for group {}: {}",
+                group_id,
+                e
+            );
+            false
+        }
+    };
+    if !token_still_valid {
+        tracing::warn!(
+            "websocket rejected after token changed: group_id={}",
+            group_id
+        );
+        return;
+    }
+
+    let Some((conn_id, mut push_rx)) = node_connections
+        .register_if_generation(group_id, node_id.clone(), auth_generation)
+        .await
+    else {
+        tracing::warn!(
+            "websocket registration raced with token rotation: group_id={}",
+            group_id
+        );
+        return;
+    };
+
     tracing::info!(
         "websocket connected: group_id={} node_id={:?}",
         group_id,
@@ -268,7 +354,6 @@ async fn handle_node_ws(
     // Split so we can concurrently read ping/close from the socket AND write
     // broadcast pushes from the channel. Both halves borrow independent state.
     let (mut sender, mut receiver) = socket.split();
-    let (conn_id, mut push_rx) = node_connections.register(group_id, node_id).await;
 
     // Send initial config snapshot so a freshly-connected node has its config
     // immediately, without waiting for the first HTTP poll. None (DB error) →
@@ -475,6 +560,26 @@ mod tests {
         // The real group is untouched.
         conns.broadcast_all("ok").await;
         assert_eq!(rx.recv().await.as_deref(), Some("ok"));
+    }
+
+    /// A socket that authenticated before token rotation must not be able to
+    /// register afterwards, even when close_group saw no live connection yet.
+    #[tokio::test]
+    async fn stale_auth_generation_cannot_register_after_rotation() {
+        let conns = NodeConnections::new();
+        let stale_generation = conns.auth_generation(12).await;
+
+        assert_eq!(conns.close_group(12).await, 0);
+        assert!(conns
+            .register_if_generation(12, Some("stale-node".into()), stale_generation)
+            .await
+            .is_none());
+
+        let current_generation = conns.auth_generation(12).await;
+        assert!(conns
+            .register_if_generation(12, Some("fresh-node".into()), current_generation)
+            .await
+            .is_some());
     }
 
     /// v0.4.14: send_node delivers ONLY to the connection whose X-Node-ID

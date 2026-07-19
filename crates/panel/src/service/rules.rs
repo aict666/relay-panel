@@ -68,6 +68,7 @@ pub fn protocol_to_str(p: &Protocol) -> &'static str {
     match p {
         Protocol::Tcp => "tcp",
         Protocol::Udp => "udp",
+        Protocol::Uot => "uot",
         Protocol::TcpUdp => "tcp_udp",
     }
 }
@@ -94,6 +95,7 @@ pub fn normalize_rule_targets(
             host: legacy_host.to_string(),
             port: legacy_port,
             enabled: true,
+            weight: 1,
         }]
     });
     if out.is_empty() {
@@ -110,6 +112,9 @@ pub fn normalize_rule_targets(
         }
         if target.port == 0 {
             return Err("Target port must be between 1 and 65535");
+        }
+        if !(1..=100).contains(&target.weight) {
+            return Err("Target weight must be between 1 and 100");
         }
         if target.enabled {
             enabled += 1;
@@ -405,6 +410,11 @@ async fn allocate_chain_hop_ports(
         let port = if i == 0 {
             entry_listen_port
         } else {
+            // The native hop keeps the rule's protocol. UOT uses a separate,
+            // persisted TCP tunnel port that node_config claims lazily after
+            // all nodes understand config protocol v7. Keeping these
+            // allocations separate avoids wasting a TCP port for native UDP
+            // and lets tcp_udp carry raw TCP alongside UOT without ambiguity.
             match auto_assign_port(db, gid, protocol).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -426,6 +436,11 @@ pub async fn create_rule(
     caller_admin: bool,
     req: &CreateRuleRequest,
 ) -> Result<(), CreateRuleError> {
+    if req.protocol == Protocol::Uot {
+        return Err(CreateRuleError::BadRequest(
+            "protocol 'uot' is internal-only; create an UDP or TCP+UDP chain instead".into(),
+        ));
+    }
     // v0.4.10: resolve the rule's owner. An admin may specify owner_uid to
     // create on behalf of another user; a non-admin's owner_uid is IGNORED and
     // the rule is attributed to themselves (defense against forgery).
@@ -632,6 +647,16 @@ pub async fn create_rule(
         };
         last_port = Some(port);
 
+        // Resolve chain ports before creating the rule, then hand them to the
+        // repository so the rule, targets and hops are committed atomically.
+        // A range-allocation failure therefore cannot leave a quota-consuming
+        // chain rule without hop rows.
+        let hop_ports = if hop_group_ids.is_empty() {
+            Vec::new()
+        } else {
+            allocate_chain_hop_ports(db, &hop_group_ids, port, protocol_str).await?
+        };
+
         match db
             .create_rule_full(
                 &req.name,
@@ -649,6 +674,7 @@ pub async fn create_rule(
                 &primary_target.host,
                 primary_target.port as i32,
                 &targets,
+                &hop_ports,
                 lb_db,
                 up_mbps,
                 down_mbps,
@@ -684,20 +710,7 @@ pub async fn create_rule(
                 current_count, max_rules
             )))
         }
-        Ok(Some(rule_id)) => {
-            if !hop_group_ids.is_empty() {
-                let entry_port = last_port.unwrap_or(0);
-                let hop_ports =
-                    allocate_chain_hop_ports(db, &hop_group_ids, entry_port, protocol_str).await?;
-                if let Err(e) = db.replace_rule_hops(rule_id, &hop_ports).await {
-                    // Best-effort cleanup so we don't leave a half-configured chain rule.
-                    let _ = db.delete_rule(rule_id, &ResourceScope::All).await;
-                    tracing::error!("create_rule: replace_rule_hops failed: {}", e);
-                    return Err(CreateRuleError::Database(e));
-                }
-            }
-            Ok(())
-        }
+        Ok(Some(_rule_id)) => Ok(()),
         Err(DbError::PortConflict | DbError::UniqueViolation) => {
             Err(CreateRuleError::PortConflict(last_port.unwrap_or(0)))
         }
@@ -722,6 +735,11 @@ pub async fn update_rule(
     scope: &ResourceScope,
     req: &UpdateRuleRequest,
 ) -> Result<(), UpdateRuleError> {
+    if matches!(req.protocol, Some(Protocol::Uot)) {
+        return Err(UpdateRuleError::BadRequest(
+            "protocol 'uot' is internal-only; use an UDP or TCP+UDP chain".into(),
+        ));
+    }
     if let Some(ref mode) = req.forward_mode {
         if mode == "group" {
             return Err(UpdateRuleError::BadRequest(
@@ -1041,6 +1059,69 @@ pub async fn update_rule(
             .map(|s| s as &str)
     });
 
+    // Plan chain placement BEFORE writing scalar rule fields. Port allocation
+    // can fail for a full group range; doing it first prevents a half-applied
+    // topology where route_mode/group ids changed but the old hop rows remain.
+    // Existing chain clients may omit `hops` when the group order is unchanged;
+    // protocol and entry-port changes must still rewrite the hop rows. In
+    // particular, a TCP->UDP change cannot safely reuse a numeric hop port that
+    // may already be occupied by an unrelated UDP listener in the same group.
+    let protocol_str = req
+        .protocol
+        .as_ref()
+        .map(protocol_to_str)
+        .unwrap_or(existing.protocol.as_str());
+    let protocol_unchanged = req
+        .protocol
+        .as_ref()
+        .is_none_or(|p| protocol_to_str(p) == existing.protocol);
+    let needs_existing_chain_replan =
+        existing.route_mode == "chain" && (!protocol_unchanged || req.listen_port.is_some());
+    let existing_hops = if req.hops.is_some() || needs_existing_chain_replan {
+        db.list_rule_hops(id)
+            .await
+            .map_err(UpdateRuleError::Database)?
+    } else {
+        Vec::new()
+    };
+    let hop_gids_to_plan = req.hops.clone().or_else(|| {
+        needs_existing_chain_replan.then(|| {
+            existing_hops
+                .iter()
+                .map(|hop| hop.device_group_id)
+                .collect()
+        })
+    });
+    let planned_hop_ports: Option<Vec<(i64, i32)>> = if switching_to_direct {
+        Some(Vec::new())
+    } else if let Some(ref hop_gids) = hop_gids_to_plan {
+        let entry_port = req.listen_port.unwrap_or(existing.listen_port as u16);
+        let mut planned = Vec::with_capacity(hop_gids.len());
+        for (position, gid) in hop_gids.iter().copied().enumerate() {
+            let port = if position == 0 {
+                entry_port
+            } else if protocol_unchanged {
+                if let Some(old) = existing_hops.iter().find(|h| h.device_group_id == gid) {
+                    old.listen_port as u16
+                } else {
+                    allocate_chain_hop_ports(db, &[hop_gids[0], gid], entry_port, protocol_str)
+                        .await
+                        .map_err(map_create_rule_validation_error)?[1]
+                        .1 as u16
+                }
+            } else {
+                allocate_chain_hop_ports(db, &[hop_gids[0], gid], entry_port, protocol_str)
+                    .await
+                    .map_err(map_create_rule_validation_error)?[1]
+                    .1 as u16
+            };
+            planned.push((gid, port as i32));
+        }
+        Some(planned)
+    } else {
+        None
+    };
+
     let update_result = if has_scalar_field {
         db.update_rule_fields(
             id,
@@ -1068,23 +1149,8 @@ pub async fn update_rule(
     match update_result {
         Ok(0) => Err(UpdateRuleError::NotFound),
         Ok(_) => {
-            if switching_to_direct {
-                // Clear hops when converting chain → direct.
-                if let Err(e) = db.replace_rule_hops(id, &[]).await {
-                    tracing::error!("update_rule {}: clear hops failed: {}", id, e);
-                    return Err(UpdateRuleError::Database(e));
-                }
-            } else if let Some(ref hop_gids) = req.hops {
-                let protocol_str = req
-                    .protocol
-                    .as_ref()
-                    .map(protocol_to_str)
-                    .unwrap_or(existing.protocol.as_str());
-                let entry_port = req.listen_port.unwrap_or(existing.listen_port as u16);
-                let hop_ports = allocate_chain_hop_ports(db, hop_gids, entry_port, protocol_str)
-                    .await
-                    .map_err(map_create_rule_validation_error)?;
-                if let Err(e) = db.replace_rule_hops(id, &hop_ports).await {
+            if let Some(ref hop_ports) = planned_hop_ports {
+                if let Err(e) = db.replace_rule_hops(id, hop_ports).await {
                     tracing::error!("update_rule {}: replace_rule_hops failed: {}", id, e);
                     return Err(UpdateRuleError::Database(e));
                 }
@@ -1109,8 +1175,14 @@ pub async fn update_rule(
                 }
             }
             if req.upload_limit_mbps.is_some() || req.download_limit_mbps.is_some() {
-                let up_mbps = req.upload_limit_mbps.unwrap_or(0).max(0);
-                let down_mbps = req.download_limit_mbps.unwrap_or(0).max(0);
+                let up_mbps = req
+                    .upload_limit_mbps
+                    .unwrap_or(existing.upload_limit_mbps)
+                    .max(0);
+                let down_mbps = req
+                    .download_limit_mbps
+                    .unwrap_or(existing.download_limit_mbps)
+                    .max(0);
                 if let Err(e) = db.set_rule_rate_limits(id, scope, up_mbps, down_mbps).await {
                     tracing::error!("update_rule {}: set_rule_rate_limits failed: {}", id, e);
                     return Err(UpdateRuleError::Database(e));
@@ -1277,6 +1349,7 @@ mod tests {
                 host: "1.2.3.4".into(),
                 port: 80,
                 enabled: true,
+                weight: 1,
             })
             .collect();
         assert!(normalize_rule_targets(Some(many), "x", 1).is_err());
@@ -1286,6 +1359,7 @@ mod tests {
             host: "1.2.3.4".into(),
             port: 80,
             enabled: false,
+            weight: 1,
         }];
         assert!(normalize_rule_targets(Some(disabled), "x", 1).is_err());
 
@@ -1294,6 +1368,7 @@ mod tests {
             host: "http://x".into(),
             port: 80,
             enabled: true,
+            weight: 1,
         }];
         assert!(normalize_rule_targets(Some(bad), "x", 1).is_err());
     }

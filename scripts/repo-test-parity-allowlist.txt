@@ -10,3 +10,4 @@ migration_adds_password_columns  # SQLite-only: Migration 26 idempotency test
 
 # PG-only schema-seed guard — SQLite bootstraps via SCHEMA_SQL without a seed-version table.
 apply_schema_seeds_baseline_version  # PG-only: schema_version seed baseline check
+upgrade_from_revision_23_preserves_chain_hops  # PG-only: real schema_version 23 -> 24 startup-order regression

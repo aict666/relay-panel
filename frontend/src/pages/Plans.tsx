@@ -134,16 +134,15 @@ export default function Plans() {
 
   const handleDelete = async (id: number) => {
     try {
-      await api.delete(`/admin/plans/${id}`);
+      const res = await api.delete<unknown, ApiEnvelope<null>>(`/admin/plans/${id}`);
+      if (res.code !== 0) {
+        message.error(res.code === 409 ? (res.message || t('planInUse')) : (res.message || t('failedDeletePlan')));
+        return;
+      }
       message.success(t('planDeleted'));
       load();
-    } catch (e: unknown) {
-      const err = e as { response?: { data?: { code?: number; message?: string } } };
-      if (err?.response?.data?.code === 409) {
-        message.error(err.response.data.message || t('planInUse'));
-      } else {
-        message.error(t('failedDeletePlan'));
-      }
+    } catch {
+      message.error(t('failedDeletePlan'));
     }
   };
 

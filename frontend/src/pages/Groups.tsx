@@ -114,16 +114,15 @@ export default function Groups() {
 
   const handleDelete = async (id: number) => {
     try {
-      await api.delete(`/groups/${id}`);
+      const res = await api.delete<unknown, ApiEnvelope<null>>(`/groups/${id}`);
+      if (res.code !== 0) {
+        message.error(res.code === 409 ? (res.message || t('groupInUse')) : (res.message || t('failedDeleteGroup')));
+        return;
+      }
       message.success(t('groupDeleted'));
       load();
-    } catch (e: unknown) {
-      const err = e as { response?: { data?: { code?: number; message?: string } } };
-      if (err?.response?.data?.code === 409) {
-        message.error(err.response.data.message || t('groupInUse'));
-      } else {
-        message.error(t('failedDeleteGroup'));
-      }
+    } catch {
+      message.error(t('failedDeleteGroup'));
     }
   };
 
