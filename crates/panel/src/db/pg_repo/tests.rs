@@ -2297,7 +2297,11 @@ async fn pg_shared_groups_admin_inbound_only() {
         vec![10, 13],
         "admin 'in' and 'both' groups are shared (PG)"
     );
-    assert_eq!(db.list_all_inbound_group_ids().await.unwrap(), vec![10, 13]);
+    assert_eq!(
+        db.list_all_inbound_group_ids().await.unwrap(),
+        vec![10, 13, 20],
+        "grant-all includes every inbound-capable group, regardless of owner (PG)"
+    );
 
     // admin caller gets an empty list.
     let admin_shared = db.list_shared_groups(1, true).await.unwrap();
