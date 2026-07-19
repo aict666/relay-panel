@@ -461,5 +461,5 @@ proxy; see [REVERSE-PROXY.md](./REVERSE-PROXY.md)).
 ## See also
 - [NODE.zh-CN.md](./NODE.zh-CN.md) - 中文版本文档 (Chinese version of this doc)
 - [DEPLOYMENT.md](./DEPLOYMENT.md) - deploying the panel itself (Docker Compose)
-- [../README.md](../README.md) - project overview
-- [../CHANGELOG.md](../CHANGELOG.md) - version history
+- [README](https://github.com/aict666/relay-panel#readme) - project overview
+- [Releases](https://github.com/aict666/relay-panel/releases) - version history
