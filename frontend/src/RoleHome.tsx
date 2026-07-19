@@ -1,7 +1,13 @@
 import { Spin } from 'antd';
+import { lazy, Suspense } from 'react';
 import { Navigate } from 'react-router-dom';
 import { useAuth } from './auth/useAuth';
-import Dashboard from './pages/Dashboard';
+
+// Keep the chart-heavy administrator dashboard out of the regular-user path.
+// RoleHome itself is lazy-loaded by the router, then only administrators fetch
+// this second chunk; regular users can redirect to /account without downloading
+// G2 / @ant-design/charts.
+const Dashboard = lazy(() => import('./pages/Dashboard'));
 
 /**
  * v0.4.10: the index-route switch. Renders the admin Dashboard for admins.
@@ -23,5 +29,9 @@ export default function RoleHome() {
       </div>
     );
   }
-  return isAdmin ? <Dashboard /> : <Navigate to="/account" replace />;
+  return isAdmin ? (
+    <Suspense fallback={<div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}><Spin /></div>}>
+      <Dashboard />
+    </Suspense>
+  ) : <Navigate to="/account" replace />;
 }

@@ -16,7 +16,7 @@ use relay_shared::protocol::TrafficEntry;
 /// 30s of silence (Nodes.tsx); we keep the row for 2 min past last_seen before
 /// deleting — long enough to ride out a brief network blip / restart, short
 /// enough that a permanently-offline node doesn't linger as a ghost row.
-const STALE_STATUS_THRESHOLD_SECS: i64 = 120;
+pub(crate) const STALE_STATUS_THRESHOLD_SECS: i64 = 120;
 
 /// Outcome of applying a node traffic report. The handler maps each variant to
 /// the node-compat wire response (business `code` in the JSON body).
@@ -127,8 +127,16 @@ pub async fn cleanup_legacy_status(db: &dyn Repository, group_id: i64, ip: &str)
 /// Also runs on READ (get_node_status), so ghost rows get cleaned even when no
 /// node in the group is still reporting.
 pub async fn sweep_stale_status(db: &dyn Repository) -> Result<(), DbError> {
+    sweep_stale_status_at(db, chrono::Utc::now()).await
+}
+
+/// Time-injected variant used by the dashboard sampler and tests so one pass
+/// uses the same `now` for stale cleanup and online classification.
+pub(crate) async fn sweep_stale_status_at(
+    db: &dyn Repository,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), DbError> {
     let rows: Vec<(String, String)> = db.scan_prefix("node_status:").await?;
-    let now = chrono::Utc::now();
     for (key, value) in &rows {
         let stale = serde_json::from_str::<serde_json::Value>(value)
             .ok()

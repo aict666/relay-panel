@@ -305,7 +305,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 24;
+pub const PG_SCHEMA_VERSION: i32 = 25;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1208,6 +1208,34 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .await?;
         tx.commit().await?;
         tracing::info!("PG migration 24: forward_rule_hops.tunnel_port present");
+    }
+
+    // ── Revision 25: dashboard statistics minute buckets ──
+    if current < 25 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM statistics WHERE id NOT IN (\
+                SELECT MIN(id) FROM statistics GROUP BY stat_type, stat_key, time\
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_statistics_series_time \
+             ON statistics (stat_type, stat_key, time)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_statistics_time ON statistics (time)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (25) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 25: statistics series/time indexes present");
     }
 
     Ok(())

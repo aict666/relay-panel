@@ -10,6 +10,15 @@ const { mockNavigate } = vi.hoisted(() => ({ mockNavigate: vi.fn() }));
 vi.mock('../api/client', () => ({
   default: { get: mockGet },
 }));
+// G2 renders to canvas, which jsdom deliberately does not implement. Dashboard
+// tests verify data flow/layout around charts; pure chart-data transforms have
+// their own tests, so lightweight stand-ins keep this suite deterministic.
+vi.mock('@ant-design/charts', () => ({
+  Area: () => <div data-testid="area-chart" />,
+  Line: () => <div data-testid="line-chart" />,
+  Pie: () => <div data-testid="pie-chart" />,
+  Bar: () => <div data-testid="bar-chart" />,
+}));
 vi.mock('react-router-dom', async () => {
   const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
   return { ...actual, useNavigate: () => mockNavigate };
@@ -45,6 +54,9 @@ function mockAll(nodes: NodeStatus[]) {
     if (url === '/rules') return Promise.resolve(ok([{}]));
     if (url === '/groups') return Promise.resolve(ok([{}]));
     if (url === '/nodes') return Promise.resolve(ok(nodes));
+    if (url.startsWith('/dashboard/history?range=')) {
+      return Promise.resolve(ok({ range: url.split('=').pop(), bucket_seconds: 300, points: [] }));
+    }
     if (url === '/system/version') {
       return Promise.resolve({ current_version: '0.4.17', latest_version: '', has_update: false, is_outdated: false, release_url: '', release_notes: '', published_at: '', check_failed: false, error_message: '' });
     }
@@ -108,5 +120,47 @@ describe('Dashboard group aggregation', () => {
     renderDashboard();
     await flush();
     expect(screen.getByText('noNodesReporting')).toBeInTheDocument();
+  });
+
+  it('loads 24h history by default and reloads when the range changes', async () => {
+    mockAll([]);
+    renderDashboard();
+    await flush();
+    expect(mockGet).toHaveBeenCalledWith('/dashboard/history?range=24h');
+
+    const sevenDays = screen.getByText('7d');
+    await act(async () => {
+      sevenDays.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(mockGet).toHaveBeenCalledWith('/dashboard/history?range=7d');
+  });
+
+  it('stops the history refresh timer after unmount', async () => {
+    mockAll([]);
+    const view = renderDashboard();
+    await flush();
+    const before = mockGet.mock.calls.filter(([url]) => String(url).startsWith('/dashboard/history')).length;
+    view.unmount();
+    await flush(60000);
+    const after = mockGet.mock.calls.filter(([url]) => String(url).startsWith('/dashboard/history')).length;
+    expect(after).toBe(before);
+  });
+
+  it('shows history and live-data failures as independent states', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/dashboard/history?range=24h') return Promise.reject(new Error('history down'));
+      if (url === '/nodes') return Promise.reject(new Error('nodes down'));
+      if (url === '/system/version') {
+        return Promise.resolve({ current_version: '0.4.17', latest_version: '', has_update: false, is_outdated: false, release_url: '', release_notes: '', published_at: '', check_failed: false, error_message: '' });
+      }
+      if (url === '/admin/users' || url === '/rules' || url === '/groups') return Promise.resolve(ok([]));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    renderDashboard();
+    await flush();
+
+    expect(screen.getByText('dashboardHistoryFailed')).toBeInTheDocument();
+    expect(screen.getByText('dashboardLiveFailed')).toBeInTheDocument();
   });
 });

@@ -288,6 +288,24 @@ export interface LoginResponse {
   admin: boolean;
 }
 
+export type DashboardHistoryRange = '1h' | '24h' | '7d' | '30d';
+
+export interface DashboardHistoryPoint {
+  timestamp: string;
+  upload_bps_avg: number;
+  download_bps_avg: number;
+  connections_max: number;
+  online_nodes_min: number;
+  recent_nodes_max: number;
+  sample_count: number;
+}
+
+export interface DashboardHistory {
+  range: DashboardHistoryRange;
+  bucket_seconds: number;
+  points: DashboardHistoryPoint[];
+}
+
 /** v0.4.9: a user's view of their own account (GET /user/me). Mirrors the
  *  backend UserSelf struct — no password hash, only the fields the account
  *  page renders.

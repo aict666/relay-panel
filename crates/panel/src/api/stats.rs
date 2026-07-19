@@ -2,17 +2,23 @@ use crate::api::middleware::{AdminOnly, AuthUser};
 use crate::api::AppState;
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use relay_shared::models::Statistic;
 use relay_shared::protocol::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// v0.4.12 PR1: the single backend source of truth for "is a node online".
-/// A node is online if its last reported `last_seen` is within this many
-/// seconds of now. Both the node-status read path and the shared-node
-/// aggregation use this — frontend pages must NOT compute their own threshold.
-pub(crate) const NODE_ONLINE_WINDOW_SECS: i64 = 30;
+use crate::service::dashboard_metrics::{
+    DASHBOARD_STAT_TYPE, KEY_CONNECTIONS, KEY_DOWNLOAD_BPS, KEY_ONLINE_NODES, KEY_RECENT_NODES,
+    KEY_UPLOAD_BPS,
+};
+
+// Keep these names in this module for the existing node-status callers/tests,
+// while the implementation lives with the dashboard sampler so both paths use
+// exactly one availability threshold and parser.
+pub(crate) use crate::service::dashboard_metrics::{status_is_online, status_last_seen};
 
 /// Parse a node_status kvs key into (group_id, node_id).
 ///
@@ -31,24 +37,6 @@ pub(crate) fn parse_status_key(key: &str) -> Option<(i64, Option<&str>)> {
     };
     let group_id = group_id_str.parse().ok()?;
     Some((group_id, node_id))
-}
-
-/// v0.4.12 PR1: extract `last_seen` (RFC3339) from a stored status JSON value.
-/// Returns None if the value isn't JSON or has no parseable last_seen.
-pub(crate) fn status_last_seen(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    let v: serde_json::Value = serde_json::from_str(value).ok()?;
-    let s = v.get("last_seen").and_then(|s| s.as_str())?;
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|t| t.with_timezone(&chrono::Utc))
-}
-
-/// v0.4.12 PR1: unified online check from a stored status JSON value, relative
-/// to `now`. A row with no parseable last_seen is treated as offline.
-pub(crate) fn status_is_online(value: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
-    status_last_seen(value)
-        .map(|t| (now - t).num_seconds() <= NODE_ONLINE_WINDOW_SECS)
-        .unwrap_or(false)
 }
 
 /// Extract the public IPs from a stored node_status JSON blob.
@@ -107,6 +95,229 @@ pub async fn get_stats(
         });
 
     Json(ApiResponse::success(stats))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DashboardHistoryQuery {
+    pub range: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardRange {
+    OneHour,
+    OneDay,
+    SevenDays,
+    ThirtyDays,
+}
+
+impl DashboardRange {
+    fn parse(value: Option<&str>) -> Option<Self> {
+        match value.unwrap_or("24h") {
+            "1h" => Some(Self::OneHour),
+            "24h" => Some(Self::OneDay),
+            "7d" => Some(Self::SevenDays),
+            "30d" => Some(Self::ThirtyDays),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::OneHour => "1h",
+            Self::OneDay => "24h",
+            Self::SevenDays => "7d",
+            Self::ThirtyDays => "30d",
+        }
+    }
+
+    fn duration(self) -> chrono::Duration {
+        match self {
+            Self::OneHour => chrono::Duration::hours(1),
+            Self::OneDay => chrono::Duration::hours(24),
+            Self::SevenDays => chrono::Duration::days(7),
+            Self::ThirtyDays => chrono::Duration::days(30),
+        }
+    }
+
+    fn bucket_seconds(self) -> i64 {
+        match self {
+            Self::OneHour => 60,
+            Self::OneDay => 5 * 60,
+            Self::SevenDays => 30 * 60,
+            Self::ThirtyDays => 2 * 60 * 60,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DashboardHistoryPoint {
+    pub timestamp: String,
+    pub upload_bps_avg: i64,
+    pub download_bps_avg: i64,
+    pub connections_max: i64,
+    pub online_nodes_min: i64,
+    pub recent_nodes_max: i64,
+    pub sample_count: u32,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DashboardHistoryResponse {
+    pub range: String,
+    pub bucket_seconds: i64,
+    pub points: Vec<DashboardHistoryPoint>,
+}
+
+#[derive(Default)]
+struct RawMinute {
+    upload_bps: Option<i64>,
+    download_bps: Option<i64>,
+    connections: Option<i64>,
+    online_nodes: Option<i64>,
+    recent_nodes: Option<i64>,
+}
+
+#[derive(Default)]
+struct BucketAccumulator {
+    upload_sum: i128,
+    download_sum: i128,
+    connections_max: i64,
+    online_nodes_min: Option<i64>,
+    recent_nodes_max: i64,
+    sample_count: u32,
+}
+
+fn parse_stat_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|t| t.and_utc())
+        })
+}
+
+fn downsample_history(stats: Vec<Statistic>, bucket_seconds: i64) -> Vec<DashboardHistoryPoint> {
+    use std::collections::BTreeMap;
+
+    let mut minutes: BTreeMap<i64, RawMinute> = BTreeMap::new();
+    for stat in stats {
+        let Some(time) = parse_stat_time(&stat.time) else {
+            continue;
+        };
+        let minute = minutes.entry(time.timestamp()).or_default();
+        let value = stat.number.max(0);
+        match stat.stat_key.as_str() {
+            KEY_UPLOAD_BPS => minute.upload_bps = Some(value),
+            KEY_DOWNLOAD_BPS => minute.download_bps = Some(value),
+            KEY_CONNECTIONS => minute.connections = Some(value),
+            KEY_ONLINE_NODES => minute.online_nodes = Some(value),
+            KEY_RECENT_NODES => minute.recent_nodes = Some(value),
+            _ => {}
+        }
+    }
+
+    let mut buckets: BTreeMap<i64, BucketAccumulator> = BTreeMap::new();
+    for (timestamp, minute) in minutes {
+        let (
+            Some(upload_bps),
+            Some(download_bps),
+            Some(connections),
+            Some(online_nodes),
+            Some(recent_nodes),
+        ) = (
+            minute.upload_bps,
+            minute.download_bps,
+            minute.connections,
+            minute.online_nodes,
+            minute.recent_nodes,
+        )
+        else {
+            // A sampler write is atomic, so an incomplete minute means legacy
+            // or corrupt data. Skip it instead of manufacturing zeroes.
+            continue;
+        };
+        let bucket_start = timestamp.div_euclid(bucket_seconds) * bucket_seconds;
+        let bucket = buckets.entry(bucket_start).or_default();
+        bucket.upload_sum += upload_bps as i128;
+        bucket.download_sum += download_bps as i128;
+        bucket.connections_max = bucket.connections_max.max(connections);
+        bucket.online_nodes_min = Some(
+            bucket
+                .online_nodes_min
+                .map_or(online_nodes, |old| old.min(online_nodes)),
+        );
+        bucket.recent_nodes_max = bucket.recent_nodes_max.max(recent_nodes);
+        bucket.sample_count = bucket.sample_count.saturating_add(1);
+    }
+
+    buckets
+        .into_iter()
+        .filter_map(|(timestamp, bucket)| {
+            let time = chrono::DateTime::from_timestamp(timestamp, 0)?;
+            let count = i128::from(bucket.sample_count.max(1));
+            Some(DashboardHistoryPoint {
+                timestamp: time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                upload_bps_avg: (bucket.upload_sum / count).min(i128::from(i64::MAX)) as i64,
+                download_bps_avg: (bucket.download_sum / count).min(i128::from(i64::MAX)) as i64,
+                connections_max: bucket.connections_max,
+                online_nodes_min: bucket.online_nodes_min.unwrap_or(0),
+                recent_nodes_max: bucket.recent_nodes_max,
+                sample_count: bucket.sample_count,
+            })
+        })
+        .collect()
+}
+
+/// GET /dashboard/history — typed, administrator-only historical dashboard
+/// series. The generic `/stats` endpoint remains unchanged for compatibility.
+pub async fn get_dashboard_history(
+    _admin: AdminOnly,
+    State(state): State<AppState>,
+    Query(q): Query<DashboardHistoryQuery>,
+) -> Response {
+    let Some(range) = DashboardRange::parse(q.range.as_deref()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<DashboardHistoryResponse> {
+                code: 400,
+                message: "range must be one of: 1h, 24h, 7d, 30d".into(),
+                data: None,
+            }),
+        )
+            .into_response();
+    };
+
+    let now = chrono::Utc::now();
+    let from = (now - range.duration()).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let to = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    match state
+        .db
+        .query_stats(Some(DASHBOARD_STAT_TYPE), None, Some(&from), Some(&to))
+        .await
+    {
+        Ok(stats) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(DashboardHistoryResponse {
+                range: range.label().into(),
+                bucket_seconds: range.bucket_seconds(),
+                points: downsample_history(stats, range.bucket_seconds()),
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("get_dashboard_history: db error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<DashboardHistoryResponse> {
+                    code: 500,
+                    message: "database error".into(),
+                    data: None,
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub async fn get_node_status(
@@ -432,7 +643,11 @@ pub async fn upgrade_node(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_status_key;
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use tower::ServiceExt;
 
     /// The v0.3.0 per-node key must parse into (group_id, Some(node_id)). This
     /// is what lets two nodes sharing one group token keep separate status rows
@@ -699,5 +914,160 @@ mod tests {
 
         assert!(!exists(&pool, "node_status:5:A").await);
         assert!(exists(&pool, "geoip:1.1.1.1").await);
+    }
+
+    fn metric(id: i64, key: &str, time: &str, number: i64) -> Statistic {
+        Statistic {
+            id,
+            stat_type: DASHBOARD_STAT_TYPE.into(),
+            stat_key: key.into(),
+            time: time.into(),
+            number,
+        }
+    }
+
+    #[test]
+    fn dashboard_range_defaults_and_rejects_unknown_values() {
+        assert_eq!(DashboardRange::parse(None), Some(DashboardRange::OneDay));
+        for (label, range, bucket_seconds) in [
+            ("1h", DashboardRange::OneHour, 60),
+            ("24h", DashboardRange::OneDay, 300),
+            ("7d", DashboardRange::SevenDays, 1_800),
+            ("30d", DashboardRange::ThirtyDays, 7_200),
+        ] {
+            assert_eq!(DashboardRange::parse(Some(label)), Some(range));
+            assert_eq!(range.bucket_seconds(), bucket_seconds);
+        }
+        assert_eq!(DashboardRange::parse(Some("yesterday")), None);
+    }
+
+    #[test]
+    fn dashboard_history_downsamples_average_peak_and_minimum() {
+        let mut rows = Vec::new();
+        for (offset, key, a, b) in [
+            (0, KEY_UPLOAD_BPS, 100, 200),
+            (1, KEY_DOWNLOAD_BPS, 300, 500),
+            (2, KEY_CONNECTIONS, 4, 9),
+            (3, KEY_ONLINE_NODES, 2, 1),
+            (4, KEY_RECENT_NODES, 2, 3),
+        ] {
+            rows.push(metric(offset, key, "2026-07-19T12:01:00Z", a));
+            rows.push(metric(offset + 10, key, "2026-07-19T12:04:00Z", b));
+        }
+        let points = downsample_history(rows, 5 * 60);
+        assert_eq!(
+            points,
+            vec![DashboardHistoryPoint {
+                timestamp: "2026-07-19T12:00:00Z".into(),
+                upload_bps_avg: 150,
+                download_bps_avg: 400,
+                connections_max: 9,
+                online_nodes_min: 1,
+                recent_nodes_max: 3,
+                sample_count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn dashboard_history_skips_incomplete_minutes() {
+        let rows = vec![metric(1, KEY_UPLOAD_BPS, "2026-07-19T12:01:00Z", 100)];
+        assert!(downsample_history(rows, 60).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dashboard_history_is_admin_only() {
+        use crate::api::middleware::Claims;
+        use crate::api::system::ReleaseCache;
+        use crate::api::ws::NodeConnections;
+        use crate::config::Config;
+        use crate::db::schema::SCHEMA_SQL;
+        use crate::db::sqlite_repo::SqliteRepository;
+        use std::sync::Arc;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, password, admin) VALUES (2, 'viewer', 'x', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let secret = "dashboard-history-test-secret";
+        let state = AppState {
+            db: Arc::new(SqliteRepository::new(pool)),
+            config: Config {
+                database_path: "sqlite::memory:".into(),
+                listen: "127.0.0.1:0".into(),
+                key: "test-key".into(),
+                jwt_secret: secret.into(),
+                public_dir: "public".into(),
+                public_panel_url: String::new(),
+                registration_enabled: false,
+                cors_origins: vec![],
+                geoip_enabled: false,
+                geoip_cache_ttl: 604_800,
+            },
+            release_cache: ReleaseCache::new(),
+            node_connections: NodeConnections::new(),
+            diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
+            geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        let token = |sub, admin| {
+            encode(
+                &Header::default(),
+                &Claims {
+                    sub,
+                    admin,
+                    token_version: 0,
+                    exp: (chrono::Utc::now().timestamp() + 60) as usize,
+                },
+                &EncodingKey::from_secret(secret.as_bytes()),
+            )
+            .unwrap()
+        };
+        let app = crate::api::routes().with_state(state);
+
+        let viewer = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/history?range=24h")
+                    .header("Authorization", format!("Bearer {}", token(2, false)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
+
+        let admin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/history?range=24h")
+                    .header("Authorization", format!("Bearer {}", token(1, true)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin.status(), StatusCode::OK);
+
+        let invalid_range = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/history?range=forever")
+                    .header("Authorization", format!("Bearer {}", token(1, true)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_range.status(), StatusCode::BAD_REQUEST);
     }
 }
