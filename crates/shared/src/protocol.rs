@@ -33,7 +33,15 @@ use serde::{Deserialize, Serialize};
 /// v5 = multi-hop chain: `ListenerConfig.count_traffic` so intermediate/exit
 /// hops do not double-count billed bytes. Old nodes ignore the field and would
 /// over-count; the gate forces panel/node to upgrade together.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 5;
+/// v6 = active target health/weighted routing and authenticated UDP-over-TCP
+/// chain tunnels. Nodes must understand `target_weights` and `uot_role`; an old
+/// node would otherwise treat an UOT hop as an ordinary listener and black-hole
+/// UDP, so this is deliberately a lock-step protocol bump.
+/// v7 = dedicated UOT tunnel ports for UDP/tcp_udp chains and per-listener TCP
+/// Fast Open. Old nodes do not understand `tcp_fast_open`, and tcp_udp requires
+/// the dedicated port to keep raw TCP and UOT unambiguous, so panel and nodes
+/// must again upgrade in lockstep before either entry switch is enabled.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 7;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,6 +170,11 @@ pub struct ListenerConfig {
     #[serde(default)]
     pub ws_path: Option<String>,
     pub targets: Vec<String>,
+    /// Optional per-target weights (1..=100). Empty/missing means weight 1 for
+    /// every target. Kept parallel to `targets` so old persisted configs remain
+    /// readable and the hot path can index both without allocating objects.
+    #[serde(default)]
+    pub target_weights: Vec<u16>,
     /// v0.4.6: how the node picks among `targets` for each new connection /
     /// UDP session. Defaults to `First` so old configs and v0.4.5 rows behave
     /// exactly like the legacy ordered single-target path.
@@ -194,6 +207,28 @@ pub struct ListenerConfig {
     /// the entry hop bills once. Defaults to true (direct rules, entry hops).
     #[serde(default = "default_true")]
     pub count_traffic: bool,
+    /// The UDP component of udp/tcp_udp multi-hop chains can use an
+    /// authenticated, multiplexed TCP tunnel between relay nodes. Direct UDP
+    /// remains native; tcp_udp's raw TCP component uses a separate listener.
+    #[serde(default)]
+    pub uot_role: UotRole,
+    /// Authentication key expected by this UOT listener, or used by an ingress
+    /// client for challenge-response with the next hop. The key itself is never
+    /// sent on the wire. It is a per-rule/per-link digest, never a device-group
+    /// control-plane token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uot_token: Option<String>,
+    /// Relay role only: key used to authenticate to the next hop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uot_next_token: Option<String>,
+    /// Keep an UOT connection warm so a new UDP session's first datagram can be
+    /// sent without an extra application handshake (warm-tunnel 0-RTT).
+    #[serde(default)]
+    pub zero_rtt: bool,
+    /// Best-effort Linux TCP Fast Open for chain TCP listeners/outbound hops.
+    /// Unsupported kernels and cold paths fall back to ordinary TCP.
+    #[serde(default)]
+    pub tcp_fast_open: bool,
     // v0.4.7: the placeholder `speed_limit` / `ip_limit` wire fields were
     // removed. They were always None and no node ever read them. The DB columns
     // on users/plans are kept (deprecated) to avoid a pointless migration, but
@@ -273,6 +308,14 @@ pub fn build_listeners_for_rule_with(
             // Per-rule WS path override; None → node uses its built-in "/relay".
             ws_path: rule.ws_path.clone(),
             targets: targets.clone(),
+            target_weights: if rule.targets.is_empty() {
+                Vec::new()
+            } else {
+                rule.targets
+                    .iter()
+                    .map(|t| t.weight.clamp(1, 100) as u16)
+                    .collect()
+            },
             load_balance_strategy: LoadBalanceStrategy::from_db_str(&rule.load_balance_strategy),
             // v0.4.6: convert the user-facing Mbps caps to bytes/sec here so the
             // node never reinterprets the unit. 1 Mbps (decimal) = 1e6 bit/s =
@@ -302,6 +345,11 @@ pub fn build_listeners_for_rule_with(
                 None
             },
             count_traffic,
+            uot_role: UotRole::Disabled,
+            uot_token: None,
+            uot_next_token: None,
+            zero_rtt: false,
+            tcp_fast_open: false,
         })
         .collect()
 }
@@ -314,6 +362,9 @@ pub fn build_listeners_for_rule_with(
 pub enum Protocol {
     Tcp,
     Udp,
+    /// Internal authenticated UDP-over-TCP hop. Never accepted from the public
+    /// rule API; emitted only by the panel's chain config builder.
+    Uot,
     #[serde(rename = "tcp_udp")]
     TcpUdp,
 }
@@ -371,6 +422,9 @@ pub enum LoadBalanceStrategy {
     First,
     RoundRobin,
     Failover,
+    Weighted,
+    LeastLatency,
+    LeastConnections,
 }
 
 impl LoadBalanceStrategy {
@@ -380,6 +434,9 @@ impl LoadBalanceStrategy {
         match s {
             "round_robin" => LoadBalanceStrategy::RoundRobin,
             "failover" => LoadBalanceStrategy::Failover,
+            "weighted" => LoadBalanceStrategy::Weighted,
+            "least_latency" => LoadBalanceStrategy::LeastLatency,
+            "least_connections" => LoadBalanceStrategy::LeastConnections,
             _ => LoadBalanceStrategy::First,
         }
     }
@@ -389,8 +446,25 @@ impl LoadBalanceStrategy {
             LoadBalanceStrategy::First => "first",
             LoadBalanceStrategy::RoundRobin => "round_robin",
             LoadBalanceStrategy::Failover => "failover",
+            LoadBalanceStrategy::Weighted => "weighted",
+            LoadBalanceStrategy::LeastLatency => "least_latency",
+            LoadBalanceStrategy::LeastConnections => "least_connections",
         }
     }
+}
+
+/// Role of a listener in an udp/tcp_udp chain's UOT data path.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UotRole {
+    #[default]
+    Disabled,
+    /// Native UDP ingress -> multiplexed UOT client.
+    Ingress,
+    /// Authenticated UOT server -> authenticated downstream UOT client.
+    Relay,
+    /// Authenticated UOT server -> native final UDP target.
+    Egress,
 }
 
 /// The user-facing ingress protocol (v0.4.0). What the user picks in the UI —
@@ -501,6 +575,17 @@ pub struct StatusReport {
     pub cpu_usage: f32,
     pub mem_usage: f32,
     pub active_connections: u32,
+    /// 0..=100 headroom estimate derived from CPU, memory and recent connection
+    /// growth. Additive/optional so older panels and nodes interoperate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_score: Option<f32>,
+    /// Predicted additional connections the node can admit at its recent
+    /// per-connection resource cost. None until enough samples exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_spare_connections: Option<u32>,
+    /// Node-local traffic/connection anomaly detector state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anomaly_detected: Option<bool>,
     pub uptime_secs: u64,
     // --- Extended metrics (all optional; older nodes that don't report them
     //     still deserialize fine, and the panel renders "-" for missing). ---
@@ -853,10 +938,17 @@ pub struct RuleTargetRequest {
     pub port: u16,
     #[serde(default = "default_target_enabled")]
     pub enabled: bool,
+    /// Relative selection weight for the `weighted` strategy (1..=100).
+    #[serde(default = "default_target_weight")]
+    pub weight: u16,
 }
 
 fn default_target_enabled() -> bool {
     true
+}
+
+fn default_target_weight() -> u16 {
+    1
 }
 
 #[derive(Debug, Serialize, Deserialize)]

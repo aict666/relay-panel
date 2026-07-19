@@ -177,6 +177,18 @@ pub async fn update_user(
         },
     };
 
+    // Authorization-only updates do not pass through update_user_fields, so
+    // their repository calls can legitimately affect zero rows. Verify the
+    // resource once up front to avoid reporting success for a nonexistent id.
+    match state.db.exists_by_id(id).await {
+        Ok(true) => {}
+        Ok(false) => return Json(err(404, "用户不存在")),
+        Err(e) => {
+            tracing::error!("update_user {}: existence lookup failed: {}", id, e);
+            return Json(err(500, "数据库错误"));
+        }
+    }
+
     // Cannot ban an admin user (privilege protection).
     if req.banned == Some(true) {
         let is_admin = match state.db.is_admin(id).await {

@@ -765,6 +765,135 @@ mod tests {
         );
     }
 
+    /// Upload/download caps are independent optional API fields. Updating one
+    /// must preserve the stored value of the omitted counterpart.
+    #[tokio::test]
+    async fn update_rule_partial_rate_limit_does_not_clobber_the_other() {
+        let (state, pool) = test_state().await;
+        seed_rule_and_group(&pool).await;
+        sqlx::query(
+            "UPDATE forward_rules SET upload_limit_mbps = 10, download_limit_mbps = 20 \
+             WHERE id = 200",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(resp) = update_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Path(200),
+            Json(UpdateRuleRequest {
+                upload_limit_mbps: Some(30),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 0, "{}", resp.message);
+
+        let limits: (i64, i64) = sqlx::query_as(
+            "SELECT upload_limit_mbps, download_limit_mbps FROM forward_rules WHERE id = 200",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(limits, (30, 20));
+    }
+
+    #[tokio::test]
+    async fn update_chain_protocol_or_entry_port_replans_omitted_hops() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 10, 1, "entry").await;
+        add_group_typed(&pool, 20, 1, "exit", "out").await;
+        sqlx::query(
+            "UPDATE device_groups SET connect_host = '127.0.0.1', port_range = '20000-20001' \
+             WHERE id = 20",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, protocol, public_transport, node_transport, \
+              entry_transport, forward_mode, route_mode, device_group_in, device_group_out, \
+              target_addr, target_port) \
+             VALUES (200, 'chain', 1, 12000, 'tcp', 'raw', 'raw', 'raw', 'chain', \
+                     'chain', 10, 20, '127.0.0.1', 53)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops \
+             (rule_id, position, device_group_id, listen_port) \
+             VALUES (200, 0, 10, 12000), (200, 1, 20, 20000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The old TCP hop could legally share its numeric port with this UDP
+        // rule. Switching the chain to UDP must therefore allocate 20001 even
+        // when the client omits an unchanged `hops` array.
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, protocol, device_group_in, target_addr, target_port) \
+             VALUES (201, 'udp-occupant', 1, 20000, 'udp', 20, '127.0.0.1', 53)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(protocol_response) = update_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Path(200),
+            Json(UpdateRuleRequest {
+                protocol: Some(Protocol::Udp),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(protocol_response.code, 0, "{}", protocol_response.message);
+        let after_protocol: (String, i64) = sqlx::query_as(
+            "SELECT fr.protocol, h.listen_port FROM forward_rules fr \
+             JOIN forward_rule_hops h ON h.rule_id = fr.id \
+             WHERE fr.id = 200 AND h.position = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after_protocol, ("udp".into(), 20001));
+
+        let Json(port_response) = update_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state),
+            Path(200),
+            Json(UpdateRuleRequest {
+                listen_port: Some(13000),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(port_response.code, 0, "{}", port_response.message);
+        let hop_ports: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT position, listen_port FROM forward_rule_hops \
+             WHERE rule_id = 200 ORDER BY position",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(hop_ports, vec![(0, 13000), (1, 20001)]);
+    }
+
     /// v0.4.8 PR2: changing a rule's protocol to UDP while it's bound to a WS
     /// profile must be rejected, even when tunnel_profile_id is NOT in the
     /// request (the binding is loaded from the stored rule). Without this the
@@ -1546,6 +1675,31 @@ mod tests {
         assert!(row.0, "all_device_groups must be set");
         assert_eq!(row.1, 99, "max_rules must ALSO be applied (not dropped)");
         assert_eq!(row.2, "50.00", "balance must ALSO be applied (not dropped)");
+    }
+
+    #[tokio::test]
+    async fn update_user_authz_only_returns_404_for_missing_user() {
+        let (state, _pool) = test_state().await;
+
+        for request in [
+            UpdateUserRequest {
+                all_device_groups: Some(true),
+                ..Default::default()
+            },
+            UpdateUserRequest {
+                device_group_ids: Some(vec![]),
+                ..Default::default()
+            },
+        ] {
+            let Json(resp) = update_user(
+                AdminOnly { user_id: 1 },
+                State(state.clone()),
+                Path(999_999),
+                Json(request),
+            )
+            .await;
+            assert_eq!(resp.code, 404, "missing authz-only target must be 404");
+        }
     }
 
     /// v0.4.12 PR1: a regular user's OWN historical inbound group is NOT a valid

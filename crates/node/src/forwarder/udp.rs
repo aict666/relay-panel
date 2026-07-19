@@ -19,13 +19,15 @@
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::sync::Notify;
 use tokio::time;
 
 use super::limiter::RateLimit;
-use super::selector::TargetSelector;
+use super::selector::{TargetLease, TargetSelector};
 use crate::reporter::{ConnectionTracker, TrafficCounter, UDP_SESSION_TIMEOUT};
 
 const UDP_BUF_SIZE: usize = 65535;
@@ -37,6 +39,43 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 struct UdpSession {
     outbound: Arc<UdpSocket>,
     last_active: tokio::time::Instant,
+    _target_lease: Option<TargetLease>,
+}
+
+struct ShutdownState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl ShutdownState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        })
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            // Construct the waiter before checking the flag. This closes the
+            // notify-between-check-and-await race: a concurrent shutdown either
+            // flips the flag or advances this waiter's notification epoch.
+            let notified = self.notify.notified();
+            if self.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct ShutdownGuard(Arc<ShutdownState>);
+
+impl Drop for ShutdownGuard {
+    fn drop(&mut self) {
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
+    }
 }
 
 /// v1.0.4: serve an ALREADY-BOUND UDP socket. Binding happens in the manager
@@ -54,6 +93,11 @@ pub async fn serve_udp_listener(
     source_ipv4: Option<Ipv4Addr>,
     count_traffic: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Aborting the listener during a config update must also stop every
+    // detached reply/cleanup task. Otherwise those tasks retain `inbound`, the
+    // old UDP socket stays bound, and the replacement listener gets EADDRINUSE.
+    let shutdown = ShutdownState::new();
+    let _shutdown_guard = ShutdownGuard(shutdown.clone());
     let listen_addr = inbound
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -82,10 +126,14 @@ pub async fn serve_udp_listener(
     // idle UDP state is reclaimed promptly.
     let sessions_clone = sessions.clone();
     let connections_clone = connections.clone();
+    let cleanup_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut interval = time::interval(CLEANUP_INTERVAL);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cleanup_shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             // Prune the tracker's session table (drops expired (addr,rule)
             // entries, which is what the panel's count ultimately reads).
             connections_clone.udp_prune_expired().await;
@@ -159,7 +207,7 @@ pub async fn serve_udp_listener(
             // changes (see select_udp_target). UDP affinity: this happens once
             // per NEW session, so all datagrams from the same client stay pinned
             // to the IP chosen here until the session idles out.
-            let target = match select_udp_target(&targets, &selector, port).await {
+            let (target_idx, target) = match select_udp_target(&targets, &selector, port).await {
                 Some(t) => t,
                 None => {
                     tracing::warn!("UDP port {}: no resolvable target for session", port);
@@ -191,6 +239,7 @@ pub async fn serve_udp_listener(
                     e.insert(UdpSession {
                         outbound: outbound.clone(),
                         last_active: now,
+                        _target_lease: selector.acquire(target_idx),
                     });
                     (outbound.clone(), true)
                 }
@@ -207,7 +256,10 @@ pub async fn serve_udp_listener(
                     rule_id
                 );
                 // Spawn the target -> client reader for OUR socket.
-                let inbound_c = inbound.clone();
+                // A detached session reader must not keep the listening socket
+                // bound after the main listener is aborted for a config update.
+                // Upgrade the weak reference only for an actual reply send.
+                let inbound_c = Arc::downgrade(&inbound);
                 let sessions_c = sessions.clone();
                 let connections_c = connections.clone();
                 let counter_c = counter.clone();
@@ -215,10 +267,15 @@ pub async fn serve_udp_listener(
                 let src_c = src;
                 let outbound_c = outbound.clone();
                 let port_c = port;
+                let reply_shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     let mut rbuf = vec![0u8; UDP_BUF_SIZE];
                     loop {
-                        match outbound_c.recv(&mut rbuf).await {
+                        let received = tokio::select! {
+                            _ = reply_shutdown.cancelled() => break,
+                            result = outbound_c.recv(&mut rbuf) => result,
+                        };
+                        match received {
                             Ok(m) => {
                                 // v0.4.6: throttle target→client (download) bytes
                                 // through the shared per-rule limiter BEFORE
@@ -231,6 +288,9 @@ pub async fn serve_udp_listener(
                                 // (cheap, sharded) and the session's last_active
                                 // so a long request/response flow isn't expired.
                                 connections_c.udp_touch(src_c, rule_id).await;
+                                let Some(inbound_c) = inbound_c.upgrade() else {
+                                    break;
+                                };
                                 if inbound_c.send_to(&rbuf[..m], src_c).await.is_err() {
                                     break;
                                 }
@@ -285,17 +345,19 @@ async fn select_udp_target(
     targets: &[String],
     selector: &TargetSelector,
     port: u16,
-) -> Option<SocketAddr> {
+) -> Option<(usize, SocketAddr)> {
     for idx in selector.order() {
         let Some(t) = targets.get(idx) else { continue };
         match super::outbound::resolve_cached(t).await {
             Ok(addrs) => {
                 if let Some(addr) = addrs.into_iter().next() {
-                    return Some(addr);
+                    selector.report(idx, true);
+                    return Some((idx, addr));
                 }
                 tracing::debug!("UDP port {}: target {} resolved to no address", port, t);
             }
             Err(e) => {
+                selector.report(idx, false);
                 tracing::debug!("UDP port {}: failed to resolve target {}: {}", port, t, e);
             }
         }
@@ -397,7 +459,7 @@ mod tests {
         let targets = vec!["127.0.0.1:9".to_string(), "127.0.0.2:9".to_string()];
         let selector = TargetSelector::new(LoadBalanceStrategy::Failover, 2);
         let got = select_udp_target(&targets, &selector, 5000).await;
-        assert_eq!(got, Some("127.0.0.1:9".parse().unwrap()));
+        assert_eq!(got, Some((0, "127.0.0.1:9".parse().unwrap())));
     }
 
     /// Round-robin advances the shared cursor across successive new sessions,
@@ -406,8 +468,8 @@ mod tests {
     async fn select_udp_target_follows_round_robin() {
         let targets = vec!["127.0.0.1:9".to_string(), "127.0.0.2:9".to_string()];
         let selector = TargetSelector::new(LoadBalanceStrategy::RoundRobin, 2);
-        let a = select_udp_target(&targets, &selector, 5000).await.unwrap();
-        let b = select_udp_target(&targets, &selector, 5000).await.unwrap();
+        let (_, a) = select_udp_target(&targets, &selector, 5000).await.unwrap();
+        let (_, b) = select_udp_target(&targets, &selector, 5000).await.unwrap();
         assert_eq!(a, "127.0.0.1:9".parse().unwrap());
         assert_eq!(b, "127.0.0.2:9".parse().unwrap());
     }
@@ -419,7 +481,7 @@ mod tests {
         let targets = vec!["nocolon-no-port".to_string(), "127.0.0.1:9".to_string()];
         let selector = TargetSelector::new(LoadBalanceStrategy::Failover, 2);
         let got = select_udp_target(&targets, &selector, 5000).await;
-        assert_eq!(got, Some("127.0.0.1:9".parse().unwrap()));
+        assert_eq!(got, Some((1, "127.0.0.1:9".parse().unwrap())));
     }
 
     /// No targets → None (the caller drops the datagram and warns).

@@ -23,7 +23,13 @@ use crate::db::error::DbError;
 use crate::db::repo::{GroupRepository, ProfileScope, ResourceScope, TunnelProfileRepository};
 use crate::db::Repository;
 use relay_shared::models::{DeviceGroup, ForwardRule};
-use relay_shared::protocol::NodeConfigResponse;
+use relay_shared::protocol::{NodeConfigResponse, Protocol, UotRole};
+use sha2::{Digest, Sha256};
+
+struct ResolvedTargets {
+    addrs: Vec<String>,
+    weights: Vec<u16>,
+}
 
 /// Build the full [`NodeConfigResponse`] for a device group.
 ///
@@ -42,6 +48,57 @@ use relay_shared::protocol::NodeConfigResponse;
 pub async fn build_node_config(
     db: &dyn Repository,
     group_id: i64,
+) -> Result<NodeConfigResponse, DbError> {
+    build_node_config_inner(
+        db,
+        group_id,
+        uot_ingress_enabled(),
+        tcp_zero_rtt_ingress_enabled(),
+    )
+    .await
+}
+
+fn uot_ingress_enabled() -> bool {
+    env_flag("RELAY_ENABLE_UOT")
+}
+
+fn tcp_zero_rtt_ingress_enabled() -> bool {
+    env_flag("RELAY_ENABLE_TCP_0RTT")
+}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        // UOT/TFO are active by default. Operators can still force the native
+        // path during a mixed-version rollout or emergency rollback.
+        Err(std::env::VarError::NotPresent) => parse_env_flag_value(None).unwrap_or(false),
+        Err(std::env::VarError::NotUnicode(_)) => false,
+        Ok(value) => match parse_env_flag_value(Some(&value)) {
+            Some(enabled) => enabled,
+            None => {
+                tracing::warn!(
+                    "{} has invalid boolean value {:?}; disabling the feature",
+                    name,
+                    value
+                );
+                false
+            }
+        },
+    }
+}
+
+fn parse_env_flag_value(value: Option<&str>) -> Option<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("1" | "true" | "yes" | "on") => Some(true),
+        Some("0" | "false" | "no" | "off") => Some(false),
+        Some(_) => None,
+    }
+}
+
+async fn build_node_config_inner(
+    db: &dyn Repository,
+    group_id: i64,
+    enable_uot_ingress: bool,
+    enable_tcp_zero_rtt_ingress: bool,
 ) -> Result<NodeConfigResponse, DbError> {
     // 1. Group gate. `monitor` groups never forward. `in` groups get direct +
     //    chain-entry listeners; `out` (and any other non-monitor) groups get
@@ -77,10 +134,22 @@ pub async fn build_node_config(
             // Entry hop (position 0) for chain rules whose device_group_in is
             // this group. Intermediate/exit hops are emitted below via
             // list_active_chain_hops_for_group (position > 0 only here).
-            let hops = db.list_rule_hops(rule.id).await?;
+            let mut hops = db.list_rule_hops(rule.id).await?;
             if hops.is_empty() {
                 tracing::warn!("chain rule {} has no hops; skipping listeners", rule.id);
                 continue;
+            }
+            let mut uot_ready = false;
+            if matches!(rule.protocol.as_str(), "udp" | "tcp_udp") {
+                if let Some(prepared) = prepare_tunnel_ports(db, rule.id, hops.clone()).await? {
+                    hops = prepared;
+                    uot_ready = true;
+                } else {
+                    tracing::warn!(
+                        "chain rule {}: no safe dedicated tunnel port; keeping native UDP",
+                        rule.id
+                    );
+                }
             }
             let entry = &hops[0];
             if entry.device_group_id != group.id {
@@ -91,20 +160,26 @@ pub async fn build_node_config(
                 Some(t) => t,
                 None => continue,
             };
-            listeners.extend(relay_shared::protocol::build_listeners_for_rule_with(
+            let mut hop_listeners = relay_shared::protocol::build_listeners_for_rule_with(
                 &effective_rule,
-                targets,
+                targets.addrs,
                 entry.listen_port as u16,
                 true, // entry bills traffic
-            ));
+            );
+            set_target_weights(&mut hop_listeners, targets.weights);
+            if uot_ready {
+                apply_uot_role(db, rule, &hops, 0, &mut hop_listeners, enable_uot_ingress).await?;
+            }
+            apply_tcp_fast_open_role(rule, 0, &mut hop_listeners, enable_tcp_zero_rtt_ingress);
+            listeners.extend(hop_listeners);
             continue;
         }
 
         let targets = resolve_targets(db, rule).await?;
-        listeners.extend(relay_shared::protocol::build_listeners_for_rule(
-            &effective_rule,
-            targets,
-        ));
+        let mut direct_listeners =
+            relay_shared::protocol::build_listeners_for_rule(&effective_rule, targets.addrs);
+        set_target_weights(&mut direct_listeners, targets.weights);
+        listeners.extend(direct_listeners);
     }
 
     // 5. Chain intermediate / exit hops on this group (position > 0).
@@ -124,20 +199,268 @@ pub async fn build_node_config(
         let Some(effective_rule) = apply_tunnel_profile(db, &rule).await? else {
             continue;
         };
-        let hops = db.list_rule_hops(rule.id).await?;
+        let mut hops = db.list_rule_hops(rule.id).await?;
+        let mut uot_ready = false;
+        if matches!(rule.protocol.as_str(), "udp" | "tcp_udp") {
+            if let Some(prepared) = prepare_tunnel_ports(db, rule.id, hops.clone()).await? {
+                hops = prepared;
+                uot_ready = true;
+            } else {
+                tracing::warn!(
+                    "chain rule {}: no safe dedicated tunnel port; keeping native UDP",
+                    rule.id
+                );
+            }
+        }
         let targets = match chain_hop_targets(db, &rule, &hops, hop.position).await? {
             Some(t) => t,
             None => continue,
         };
-        listeners.extend(relay_shared::protocol::build_listeners_for_rule_with(
+        let mut hop_listeners = relay_shared::protocol::build_listeners_for_rule_with(
             &effective_rule,
-            targets,
+            targets.addrs,
             hop.listen_port as u16,
             false, // only entry bills
-        ));
+        );
+        set_target_weights(&mut hop_listeners, targets.weights);
+        if uot_ready {
+            apply_uot_role(
+                db,
+                &rule,
+                &hops,
+                hop.position,
+                &mut hop_listeners,
+                enable_uot_ingress,
+            )
+            .await?;
+        }
+        apply_tcp_fast_open_role(
+            &rule,
+            hop.position,
+            &mut hop_listeners,
+            enable_tcp_zero_rtt_ingress,
+        );
+        listeners.extend(hop_listeners);
     }
 
     Ok(NodeConfigResponse { listeners })
+}
+
+fn set_target_weights(listeners: &mut [relay_shared::protocol::ListenerConfig], weights: Vec<u16>) {
+    for listener in listeners {
+        listener.target_weights = weights.clone();
+    }
+}
+
+/// Turn the UDP component of an udp/tcp_udp chain into the authenticated UOT
+/// data path. The public entry remains a UDP socket; every later hop listens on
+/// its dedicated TCP/UOT tunnel port. Link tokens
+/// are SHA-256 digests over both adjacent group secrets plus rule/position, so
+/// a data-plane node never receives a reusable control-plane credential.
+async fn apply_uot_role(
+    db: &dyn Repository,
+    rule: &ForwardRule,
+    hops: &[relay_shared::models::ForwardRuleHop],
+    position: i32,
+    listeners: &mut Vec<relay_shared::protocol::ListenerConfig>,
+    enable_ingress: bool,
+) -> Result<(), DbError> {
+    let pos = position as usize;
+    if hops.len() < 2 || pos >= hops.len() {
+        return Ok(());
+    }
+    // Rollout stage 1: every later v7 hop prepares both legacy UDP and UOT,
+    // while the entry keeps using native UDP. Stage 2 explicitly enables the
+    // entry only after all downstream nodes have upgraded.
+    if pos == 0 && !enable_ingress {
+        return Ok(());
+    }
+    let inbound_token = if pos > 0 {
+        Some(uot_link_token(db, rule.id, &hops[pos - 1], &hops[pos], pos - 1).await?)
+    } else {
+        None
+    };
+    let outbound_token = if pos + 1 < hops.len() {
+        Some(uot_link_token(db, rule.id, &hops[pos], &hops[pos + 1], pos).await?)
+    } else {
+        None
+    };
+
+    let Some(udp_index) = listeners
+        .iter()
+        .position(|listener| listener.protocol == Protocol::Udp)
+    else {
+        return Ok(());
+    };
+
+    if pos == 0 {
+        let Some(target) = tunnel_next_target(db, rule.id, hops, pos).await? else {
+            return Ok(());
+        };
+        let listener = &mut listeners[udp_index];
+        listener.targets = vec![target];
+        listener.target_weights = vec![1];
+        listener.zero_rtt = true;
+        listener.uot_role = UotRole::Ingress;
+        listener.uot_token = outbound_token;
+    } else {
+        let Some(tunnel_port) = hops[pos].tunnel_port else {
+            return Ok(());
+        };
+        let mut tunnel_listener = listeners[udp_index].clone();
+        tunnel_listener.port = tunnel_port as u16;
+        tunnel_listener.protocol = Protocol::Uot;
+        tunnel_listener.zero_rtt = true;
+        if pos + 1 == hops.len() {
+            tunnel_listener.uot_role = UotRole::Egress;
+            tunnel_listener.uot_token = inbound_token;
+        } else {
+            let Some(target) = tunnel_next_target(db, rule.id, hops, pos).await? else {
+                return Ok(());
+            };
+            tunnel_listener.targets = vec![target];
+            tunnel_listener.target_weights = vec![1];
+            tunnel_listener.uot_role = UotRole::Relay;
+            tunnel_listener.uot_token = inbound_token;
+            tunnel_listener.uot_next_token = outbound_token;
+        }
+        listeners.push(tunnel_listener);
+    }
+    Ok(())
+}
+
+/// Claim one dedicated TCP tunnel port for every non-entry hop. The claim is
+/// persisted so all nodes/config paths converge on the same address. Existing
+/// listen ports remain untouched and keep carrying native TCP/UDP during the
+/// staged rollout.
+async fn prepare_tunnel_ports(
+    db: &dyn Repository,
+    rule_id: i64,
+    mut hops: Vec<relay_shared::models::ForwardRuleHop>,
+) -> Result<Option<Vec<relay_shared::models::ForwardRuleHop>>, DbError> {
+    for hop in hops.iter_mut().skip(1) {
+        if hop.tunnel_port.is_none() {
+            let mut claimed = None;
+            for _ in 0..8 {
+                let candidate =
+                    match crate::service::rules::auto_assign_port(db, hop.device_group_id, "tcp")
+                        .await
+                    {
+                        Ok(port) => port,
+                        Err(error) => {
+                            tracing::warn!(
+                                "chain rule {} hop {}: cannot allocate tunnel port: {}",
+                                rule_id,
+                                hop.position,
+                                error
+                            );
+                            return Ok(None);
+                        }
+                    };
+                match db
+                    .claim_rule_hop_tunnel_port(hop.id, candidate as i32)
+                    .await
+                {
+                    Ok(Some(port)) => {
+                        claimed = Some(port);
+                        break;
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(DbError::UniqueViolation) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            let Some(port) = claimed else {
+                return Ok(None);
+            };
+            hop.tunnel_port = Some(port);
+        }
+
+        let tunnel_port = hop.tunnel_port.expect("tunnel port claimed above");
+        let occupants = db.list_group_port_protocols(hop.device_group_id).await?;
+        let tcp_occupants = occupants
+            .iter()
+            .filter(|(port, protocol)| {
+                *port == tunnel_port && matches!(protocol.as_str(), "tcp" | "tcp_udp")
+            })
+            .count();
+        if tcp_occupants != 1 {
+            tracing::warn!(
+                "chain rule {}: hop group {} tunnel port {} has {} TCP occupants; keeping native UDP",
+                rule_id,
+                hop.device_group_id,
+                tunnel_port,
+                tcp_occupants,
+            );
+            return Ok(None);
+        }
+    }
+    Ok(Some(hops))
+}
+
+async fn tunnel_next_target(
+    db: &dyn Repository,
+    rule_id: i64,
+    hops: &[relay_shared::models::ForwardRuleHop],
+    pos: usize,
+) -> Result<Option<String>, DbError> {
+    let Some(next) = hops.get(pos + 1) else {
+        return Ok(None);
+    };
+    let Some(port) = next.tunnel_port else {
+        return Ok(None);
+    };
+    let next_group =
+        GroupRepository::find_by_id(db, next.device_group_id, &ResourceScope::All).await?;
+    let Some(group) = next_group.filter(|group| !group.connect_host.trim().is_empty()) else {
+        tracing::warn!(
+            "chain rule {}: next group {} has no connect_host",
+            rule_id,
+            next.device_group_id
+        );
+        return Ok(None);
+    };
+    Ok(Some(format!("{}:{}", group.connect_host, port)))
+}
+
+fn apply_tcp_fast_open_role(
+    rule: &ForwardRule,
+    position: i32,
+    listeners: &mut [relay_shared::protocol::ListenerConfig],
+    enable_ingress: bool,
+) {
+    if !matches!(rule.protocol.as_str(), "tcp" | "tcp_udp") {
+        return;
+    }
+    let enabled = position > 0 || enable_ingress;
+    for listener in listeners {
+        if listener.protocol == Protocol::Tcp {
+            listener.tcp_fast_open = enabled;
+        }
+    }
+}
+
+async fn uot_link_token(
+    db: &dyn Repository,
+    rule_id: i64,
+    from: &relay_shared::models::ForwardRuleHop,
+    to: &relay_shared::models::ForwardRuleHop,
+    position: usize,
+) -> Result<String, DbError> {
+    let from_group = GroupRepository::find_by_id(db, from.device_group_id, &ResourceScope::All)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let to_group = GroupRepository::find_by_id(db, to.device_group_id, &ResourceScope::All)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"relay-panel-uot-v1\0");
+    hasher.update(rule_id.to_be_bytes());
+    hasher.update((position as u64).to_be_bytes());
+    hasher.update(from_group.token.as_bytes());
+    hasher.update([0]);
+    hasher.update(to_group.token.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Apply tunnel profile overrides onto a cloned rule, or None to skip the rule.
@@ -183,7 +506,7 @@ async fn chain_hop_targets(
     rule: &ForwardRule,
     hops: &[relay_shared::models::ForwardRuleHop],
     position: i32,
-) -> Result<Option<Vec<String>>, DbError> {
+) -> Result<Option<ResolvedTargets>, DbError> {
     let pos = position as usize;
     if pos >= hops.len() {
         return Ok(None);
@@ -204,7 +527,10 @@ async fn chain_hop_targets(
                 return Ok(None);
             }
         };
-        Ok(Some(vec![format!("{}:{}", host, next.listen_port)]))
+        Ok(Some(ResolvedTargets {
+            addrs: vec![format!("{}:{}", host, next.listen_port)],
+            weights: vec![1],
+        }))
     } else {
         // Exit hop → final targets.
         Ok(Some(resolve_final_targets(db, rule).await?))
@@ -214,7 +540,7 @@ async fn chain_hop_targets(
 async fn resolve_final_targets(
     db: &dyn Repository,
     rule: &ForwardRule,
-) -> Result<Vec<String>, DbError> {
+) -> Result<ResolvedTargets, DbError> {
     let mut targets = db
         .list_enabled_rule_targets(rule.id, &ResourceScope::All)
         .await?;
@@ -226,13 +552,20 @@ async fn resolve_final_targets(
             port: rule.target_port,
             position: 1,
             enabled: true,
+            weight: 1,
             created_at: String::new(),
         });
     }
-    Ok(targets
-        .into_iter()
-        .map(|t| format!("{}:{}", t.host, t.port))
-        .collect())
+    Ok(ResolvedTargets {
+        addrs: targets
+            .iter()
+            .map(|t| format!("{}:{}", t.host, t.port))
+            .collect(),
+        weights: targets
+            .iter()
+            .map(|t| t.weight.clamp(1, 100) as u16)
+            .collect(),
+    })
 }
 
 /// Resolve a rule's target address list.
@@ -245,7 +578,10 @@ async fn resolve_final_targets(
 ///
 /// `targets` is the single place target resolution happens — both config paths
 /// used to duplicate this `match` block.
-async fn resolve_targets(db: &dyn Repository, rule: &ForwardRule) -> Result<Vec<String>, DbError> {
+async fn resolve_targets(
+    db: &dyn Repository,
+    rule: &ForwardRule,
+) -> Result<ResolvedTargets, DbError> {
     let mut targets = db
         .list_enabled_rule_targets(rule.id, &ResourceScope::All)
         .await?;
@@ -257,19 +593,28 @@ async fn resolve_targets(db: &dyn Repository, rule: &ForwardRule) -> Result<Vec<
             port: rule.target_port,
             position: 1,
             enabled: true,
+            weight: 1,
             created_at: String::new(),
         });
     }
 
+    let weights: Vec<u16> = targets
+        .iter()
+        .map(|t| t.weight.clamp(1, 100) as u16)
+        .collect();
+
     match (rule.forward_mode.as_str(), rule.device_group_out) {
-        ("direct", _) | (_, None) => Ok(targets
-            .into_iter()
-            .map(|t| format!("{}:{}", t.host, t.port))
-            .collect()),
+        ("direct", _) | (_, None) => Ok(ResolvedTargets {
+            addrs: targets
+                .into_iter()
+                .map(|t| format!("{}:{}", t.host, t.port))
+                .collect(),
+            weights,
+        }),
         (_, Some(out_id)) => {
             // Qualify: find_by_id is on both UserRepository and GroupRepository.
             let og = GroupRepository::find_by_id(db, out_id, &ResourceScope::All).await?;
-            Ok(match og {
+            let addrs = match og {
                 Some(DeviceGroup { connect_host, .. }) if !connect_host.is_empty() => targets
                     .into_iter()
                     .map(|t| format!("{}:{}", connect_host, t.port))
@@ -278,7 +623,8 @@ async fn resolve_targets(db: &dyn Repository, rule: &ForwardRule) -> Result<Vec<
                     .into_iter()
                     .map(|t| format!("{}:{}", t.host, t.port))
                     .collect(),
-            })
+            };
+            Ok(ResolvedTargets { addrs, weights })
         }
     }
 }
@@ -286,10 +632,24 @@ async fn resolve_targets(db: &dyn Repository, rule: &ForwardRule) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::repo::RuleRepository;
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
+
+    #[test]
+    fn transport_features_default_on_and_allow_explicit_opt_out() {
+        assert_eq!(parse_env_flag_value(None), Some(true));
+        for value in ["1", "true", "yes", "on", " TRUE "] {
+            assert_eq!(parse_env_flag_value(Some(value)), Some(true), "{value}");
+        }
+        for value in ["0", "false", "no", "off", " OFF "] {
+            assert_eq!(parse_env_flag_value(Some(value)), Some(false), "{value}");
+        }
+        assert_eq!(parse_env_flag_value(Some("enabled")), None);
+        assert_eq!(parse_env_flag_value(Some("")), None);
+    }
 
     async fn pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -481,6 +841,310 @@ mod tests {
             vec!["9.9.9.9:443".to_string()]
         );
         assert!(!exit_cfg.listeners[0].count_traffic);
+    }
+
+    #[tokio::test]
+    async fn pure_udp_chain_uses_authenticated_uot_and_warm_zero_rtt() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (10, 'entry', 'in', 'entry-secret', 2, '1.1.1.1'), \
+                    (20, 'exit', 'out', 'exit-secret', 2, '2.2.2.2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, protocol, device_group_in, device_group_out, \
+              forward_mode, route_mode, target_addr, target_port) \
+             VALUES (101, 'udp-chain', 2, 20001, 'udp', 10, 20, 'chain', 'chain', \
+                     '9.9.9.9', 53)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops (rule_id, position, device_group_id, listen_port) \
+             VALUES (101, 0, 10, 20001), (101, 1, 20, 30001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Stage 1 is the safe upgrade default: entry remains native UDP, while
+        // later hops prepare both native UDP and UOT listeners.
+        let staged_entry = build_node_config_inner(&repo(&pool), 10, false, false)
+            .await
+            .unwrap();
+        let staged_exit = build_node_config_inner(&repo(&pool), 20, false, false)
+            .await
+            .unwrap();
+        assert_eq!(staged_entry.listeners.len(), 1);
+        assert_eq!(staged_entry.listeners[0].uot_role, UotRole::Disabled);
+        assert!(staged_exit
+            .listeners
+            .iter()
+            .any(|listener| listener.protocol == Protocol::Udp));
+        assert!(staged_exit
+            .listeners
+            .iter()
+            .any(|listener| listener.protocol == Protocol::Uot));
+
+        // Stage 2 switches only the entry after every downstream v7 node has
+        // already prepared its compatibility listeners.
+        let entry = build_node_config_inner(&repo(&pool), 10, true, false)
+            .await
+            .unwrap();
+        let exit = build_node_config_inner(&repo(&pool), 20, true, false)
+            .await
+            .unwrap();
+        assert_eq!(entry.listeners[0].protocol, Protocol::Udp);
+        assert_eq!(entry.listeners[0].uot_role, UotRole::Ingress);
+        assert!(entry.listeners[0].zero_rtt);
+        let exit_uot = exit
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Uot)
+            .unwrap();
+        assert_eq!(exit_uot.uot_role, UotRole::Egress);
+        assert_eq!(entry.listeners[0].uot_token, exit_uot.uot_token);
+        assert_eq!(
+            entry.listeners[0].uot_token.as_deref().map(str::len),
+            Some(64)
+        );
+        assert_ne!(
+            entry.listeners[0].uot_token.as_deref(),
+            Some("entry-secret")
+        );
+        assert_ne!(entry.listeners[0].uot_token.as_deref(), Some("exit-secret"));
+        let occupied = repo(&pool).list_group_port_protocols(20).await.unwrap();
+        assert!(occupied.contains(&(30001, "udp".to_string())));
+        let tunnel_port: i64 = sqlx::query_scalar(
+            "SELECT tunnel_port FROM forward_rule_hops WHERE rule_id = 101 AND position = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(exit_uot.port, tunnel_port as u16);
+        assert_eq!(
+            entry.listeners[0].targets,
+            vec![format!("2.2.2.2:{tunnel_port}")]
+        );
+        assert!(occupied.contains(&(tunnel_port as i32, "tcp".to_string())));
+    }
+
+    #[tokio::test]
+    async fn existing_tcp_port_collision_gets_a_dedicated_uot_port() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (10, 'entry', 'in', 'entry-secret', 2, '1.1.1.1'), \
+                    (20, 'exit', 'out', 'exit-secret', 2, '2.2.2.2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, protocol, device_group_in, device_group_out, \
+              forward_mode, route_mode, target_addr, target_port) VALUES \
+             (101, 'udp-chain', 2, 20001, 'udp', 10, 20, 'chain', 'chain', '9.9.9.9', 53), \
+             (102, 'existing-tcp', 2, 30001, 'tcp', 20, NULL, 'direct', 'direct', '8.8.8.8', 443)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops (rule_id, position, device_group_id, listen_port) \
+             VALUES (101, 0, 10, 20001), (101, 1, 20, 30001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let entry = build_node_config_inner(&repo(&pool), 10, true, false)
+            .await
+            .unwrap();
+        assert_eq!(entry.listeners[0].uot_role, UotRole::Ingress);
+        let exit = build_node_config_inner(&repo(&pool), 20, true, false)
+            .await
+            .unwrap();
+        let chain_listeners: Vec<_> = exit
+            .listeners
+            .iter()
+            .filter(|listener| listener.rule_id == 101)
+            .collect();
+        assert_eq!(chain_listeners.len(), 2);
+        let uot = chain_listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Uot)
+            .unwrap();
+        assert_ne!(uot.port, 30001);
+        assert_eq!(uot.uot_role, UotRole::Egress);
+    }
+
+    #[tokio::test]
+    async fn tcp_udp_chain_stages_uot_and_tcp_fast_open_independently() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        sqlx::query(
+            "INSERT INTO device_groups \
+             (id, name, group_type, token, uid, connect_host, port_range) VALUES \
+             (10, 'entry', 'in', 'entry-secret', 2, '1.1.1.1', '20000-20010'), \
+             (20, 'exit', 'out', 'exit-secret', 2, '2.2.2.2', '30000-30010')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, protocol, device_group_in, device_group_out, \
+              forward_mode, route_mode, target_addr, target_port) \
+             VALUES (103, 'both-chain', 2, 20003, 'tcp_udp', 10, 20, 'chain', 'chain', \
+                     '9.9.9.9', 443)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops \
+             (rule_id, position, device_group_id, listen_port) \
+             VALUES (103, 0, 10, 20003), (103, 1, 20, 30003)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Stage 1: public entry remains native. The upgraded exit prepares
+        // raw TCP+UDP on the legacy port, UOT on a distinct TCP port, and TFO
+        // on its raw TCP listener for upgraded upstream hops.
+        let entry_stage1 = build_node_config_inner(&repo(&pool), 10, false, false)
+            .await
+            .unwrap();
+        let exit_stage1 = build_node_config_inner(&repo(&pool), 20, false, false)
+            .await
+            .unwrap();
+        assert_eq!(entry_stage1.listeners.len(), 2);
+        assert!(entry_stage1
+            .listeners
+            .iter()
+            .all(|listener| listener.uot_role == UotRole::Disabled));
+        assert!(!entry_stage1
+            .listeners
+            .iter()
+            .any(|listener| listener.tcp_fast_open));
+        let exit_tcp = exit_stage1
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Tcp)
+            .unwrap();
+        let exit_udp = exit_stage1
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Udp)
+            .unwrap();
+        let exit_uot = exit_stage1
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Uot)
+            .unwrap();
+        assert_eq!(exit_tcp.port, 30003);
+        assert_eq!(exit_udp.port, 30003);
+        assert!(exit_tcp.tcp_fast_open);
+        assert_ne!(exit_uot.port, 30003);
+
+        // Stage 2 independently enables the UDP ingress tunnel and entry-side
+        // TFO. TCP still targets the native hop port; only UDP targets UOT.
+        let entry = build_node_config_inner(&repo(&pool), 10, true, true)
+            .await
+            .unwrap();
+        let entry_tcp = entry
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Tcp)
+            .unwrap();
+        let entry_udp = entry
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Udp)
+            .unwrap();
+        assert!(entry_tcp.tcp_fast_open);
+        assert_eq!(entry_tcp.targets, vec!["2.2.2.2:30003".to_string()]);
+        assert_eq!(entry_udp.uot_role, UotRole::Ingress);
+        assert_eq!(
+            entry_udp.targets,
+            vec![format!("2.2.2.2:{}", exit_uot.port)]
+        );
+        assert_eq!(entry_udp.uot_token, exit_uot.uot_token);
+    }
+
+    #[tokio::test]
+    async fn exhausted_tunnel_pool_keeps_tcp_udp_chain_native() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        sqlx::query(
+            "INSERT INTO device_groups \
+             (id, name, group_type, token, uid, connect_host, port_range) VALUES \
+             (10, 'entry', 'in', 'entry-secret', 2, '1.1.1.1', '20000-20010'), \
+             (20, 'exit', 'out', 'exit-secret', 2, '2.2.2.2', '30001-30001')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, protocol, device_group_in, device_group_out, \
+              forward_mode, route_mode, target_addr, target_port) \
+             VALUES (104, 'full-pool', 2, 20004, 'tcp_udp', 10, 20, 'chain', 'chain', \
+                     '9.9.9.9', 443)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops \
+             (rule_id, position, device_group_id, listen_port) \
+             VALUES (104, 0, 10, 20004), (104, 1, 20, 30001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The only port in the exit pool is already occupied by the raw TCP
+        // component. Even with both feature flags enabled, UOT must fail closed
+        // to the native UDP path instead of removing or half-switching it.
+        let entry = build_node_config_inner(&repo(&pool), 10, true, true)
+            .await
+            .unwrap();
+        let entry_udp = entry
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Udp)
+            .unwrap();
+        assert_eq!(entry_udp.uot_role, UotRole::Disabled);
+        assert_eq!(entry_udp.targets, vec!["2.2.2.2:30001".to_string()]);
+
+        let exit = build_node_config_inner(&repo(&pool), 20, true, true)
+            .await
+            .unwrap();
+        assert!(exit
+            .listeners
+            .iter()
+            .all(|listener| listener.protocol != Protocol::Uot));
+        assert!(exit
+            .listeners
+            .iter()
+            .any(|listener| listener.protocol == Protocol::Udp));
+        let tunnel_port: Option<i64> = sqlx::query_scalar(
+            "SELECT tunnel_port FROM forward_rule_hops WHERE rule_id = 104 AND position = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tunnel_port, None);
     }
 
     /// One `both` group represents one relay-node registration that can serve

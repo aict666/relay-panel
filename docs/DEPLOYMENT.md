@@ -118,6 +118,10 @@ PUBLIC_PANEL_URL=https://panel.example.com
 # DATABASE_URL controls the database backend.  Defaults to SQLite.
 # See "Database modes" section below.
 DATABASE_URL=sqlite:/app/data/data.db?mode=rwc
+# UOT and TCP Fast Open are enabled by default. Set either to false only for a
+# mixed-version rolling upgrade or emergency native-path rollback.
+RELAY_ENABLE_UOT=true
+RELAY_ENABLE_TCP_0RTT=true
 EOF
     chmod 600 .env
     ```
@@ -172,6 +176,16 @@ embeds it into the one-line install command.
   shows. Also used to derive the WebSocket URL (`wss://...`).
 - A `localhost` / `127.0.0.1` / `0.0.0.0` value triggers a warning in the
   install-command modal, since nodes on other hosts cannot connect to those.
+
+    #### UOT and TCP Fast Open rollout
+
+`RELAY_ENABLE_UOT` and `RELAY_ENABLE_TCP_0RTT` both default to `true`. A normal
+maintenance-window upgrade therefore activates both features after the panel
+and nodes are upgraded. For a mixed-version rolling upgrade, explicitly set
+both to `false` first, upgrade every node to config protocol v7, verify native
+forwarding/listener health, then canary them separately. The complete ordering,
+firewall requirements, rollback steps, and TCP 0-RTT limits are in
+[ADVANCED-ROUTING-UOT.md](ADVANCED-ROUTING-UOT.md).
 
     #### GeoIP — node region resolution
 

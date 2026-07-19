@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -37,6 +40,9 @@ jobs:
 
     env:
       TEST_PG_URL: postgres://relaytest:relaytest@localhost:5432/relaytest
+      # A missing test database must fail CI instead of silently skipping all
+      # PostgreSQL contract and migration tests.
+      RELAY_REQUIRE_PG_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -66,11 +72,23 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Enable and verify Linux TCP Fast Open data path
+        run: |
+          sudo sysctl -w net.ipv4.tcp_fastopen=3
+          test "$(sysctl -n net.ipv4.tcp_fastopen)" = "3"
+
       - name: cargo test
         run: cargo test --workspace
+        env:
+          # The Linux-only test checks TCP_INFO/TCPI_OPT_SYN_DATA on both ends;
+          # an ordinary TCP fallback is a failure in CI, not a pass.
+          RELAY_REQUIRE_LINUX_TFO_TEST: "1"
 
       - name: repo test parity
         run: bash scripts/check-repo-test-parity.sh
+
+      - name: cargo build (release profile)
+        run: cargo build --workspace --release
 
       - name: cargo build (debug, for e2e)
         run: cargo build
@@ -99,5 +117,10 @@ jobs:
         run: npm run build
         working-directory: frontend
 
-      - name: e2e test
+      - name: e2e test (debug profile)
         run: python3 tests/e2e_test.py
+
+      - name: e2e test (release profile)
+        run: python3 tests/e2e_test.py
+        env:
+          RELAY_E2E_PROFILE: release

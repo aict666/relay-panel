@@ -42,6 +42,10 @@ services:
       # Leave empty to fall back to the browser's window.location.origin.
       # Example: - PUBLIC_PANEL_URL=https://panel.example.com
       - PUBLIC_PANEL_URL=${PUBLIC_PANEL_URL:-}
+      # UOT and TCP Fast Open are active by default. Set either value to false
+      # for a mixed-version rolling upgrade or emergency native-path rollback.
+      - RELAY_ENABLE_UOT=${RELAY_ENABLE_UOT:-true}
+      - RELAY_ENABLE_TCP_0RTT=${RELAY_ENABLE_TCP_0RTT:-true}
       # v0.4.19 — node-level GeoIP is now ON by default. The panel resolves
       # each node's public IP to a country flag via built-in providers
       # (primary ipinfo.io Lite → fallback ipwho.is). Failures degrade to

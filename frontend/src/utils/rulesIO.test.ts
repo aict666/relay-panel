@@ -43,14 +43,14 @@ describe('ruleTargets', () => {
       ],
     });
     expect(ruleTargets(r)).toEqual([
-      { host: 'a.com', port: 1, enabled: true },
-      { host: 'b.com', port: 2, enabled: false },
+      { host: 'a.com', port: 1, enabled: true, weight: 1 },
+      { host: 'b.com', port: 2, enabled: false, weight: 1 },
     ]);
   });
 
   it('falls back to the legacy target_addr/target_port when targets[] is empty', () => {
     const r = mkRule({ targets: [], target_addr: 'legacy.host', target_port: 9999 });
-    expect(ruleTargets(r)).toEqual([{ host: 'legacy.host', port: 9999, enabled: true }]);
+    expect(ruleTargets(r)).toEqual([{ host: 'legacy.host', port: 9999, enabled: true, weight: 1 }]);
   });
 });
 

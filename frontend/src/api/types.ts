@@ -37,6 +37,7 @@ export interface ForwardRuleTarget {
   port: number;
   position: number;
   enabled: boolean;
+  weight?: number;
   created_at: string;
 }
 
@@ -44,6 +45,7 @@ export interface RuleTargetInput {
   host: string;
   port: number;
   enabled: boolean;
+  weight?: number;
 }
 
 /** One hop in a multi-hop chain rule (position 0 = entry). */
@@ -53,6 +55,8 @@ export interface ForwardRuleHop {
   position: number;
   device_group_id: number;
   listen_port: number;
+  /** Dedicated authenticated TCP/UOT tunnel port for non-entry chain hops. */
+  tunnel_port?: number | null;
   created_at: string;
   group_name?: string | null;
   connect_host?: string | null;
@@ -85,7 +89,8 @@ export interface ForwardRule {
   /** Multi-hop chain hops (ordered: entry first, exit last). Empty for direct. */
   hops?: ForwardRuleHop[];
   /** v0.4.6: multi-target load-balancing strategy.
-   *  "first" | "round_robin" | "failover". Defaults to "first". */
+   *  "first" | "round_robin" | "failover" | "weighted" |
+   *  "least_latency" | "least_connections". Defaults to "first". */
   load_balance_strategy?: string;
   /** v0.4.6: per-rule upload cap in Mbps (0 = unlimited). */
   upload_limit_mbps?: number;
@@ -241,6 +246,9 @@ export interface NodeStatus {
   cpu: number;
   mem: number;
   connections: number;
+  capacity_score?: number | null;
+  predicted_spare_connections?: number | null;
+  anomaly_detected?: boolean | null;
   /** v0.3.2: SYSTEM uptime (since OS boot). Was process uptime before v0.3.2. */
   uptime: number;
   /** v0.3.2: relay-node process uptime (since this binary started). Optional —
@@ -428,6 +436,9 @@ export interface SharedNodeSummary {
   node_version?: string | null;
   config_protocol_version?: number | null;
   connections: number;
+  capacity_score?: number | null;
+  predicted_spare_connections?: number | null;
+  anomaly_detected?: boolean | null;
   uptime?: number | null;
   process_uptime?: number | null;
   network_interface?: string | null;
@@ -462,6 +473,9 @@ export interface NodeDisplayRow {
   install_method?: string | null;
   config_protocol_version?: number | null;
   connections?: number | null;
+  capacity_score?: number | null;
+  predicted_spare_connections?: number | null;
+  anomaly_detected?: boolean | null;
   cpu?: number | null;
   mem?: number | null;
   uptime?: number | null;

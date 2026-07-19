@@ -164,7 +164,7 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     target_addr TEXT NOT NULL,
     target_port INTEGER NOT NULL,
     -- v0.4.6: multi-target load-balancing strategy.
-    -- 'first' (default) | 'round_robin' | 'failover'.
+    -- first | round_robin | failover | weighted | least_latency | least_connections.
     load_balance_strategy TEXT NOT NULL DEFAULT 'first',
     -- v0.4.6: per-rule upload/download caps in decimal Mbps (0 = unlimited).
     -- Shared across all connections of the rule.
@@ -190,6 +190,7 @@ CREATE TABLE IF NOT EXISTS forward_rule_targets (
     port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
     position INTEGER NOT NULL CHECK (position >= 1),
     enabled INTEGER NOT NULL DEFAULT 1,
+    weight INTEGER NOT NULL DEFAULT 1 CHECK (weight >= 1 AND weight <= 100),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -203,12 +204,18 @@ CREATE TABLE IF NOT EXISTS forward_rule_hops (
     position INTEGER NOT NULL CHECK (position >= 0),
     device_group_id INTEGER NOT NULL REFERENCES device_groups(id),
     listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+    tunnel_port INTEGER CHECK (tunnel_port >= 1 AND tunnel_port <= 65535),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (rule_id, position)
 );
 CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_rule_id ON forward_rule_hops (rule_id);
 CREATE INDEX IF NOT EXISTS idx_forward_rule_hops_group_port
     ON forward_rule_hops (device_group_id, listen_port);
+-- Do not create the tunnel_port index in the baseline batch. On an existing
+-- pre-Migration-41 database CREATE TABLE IF NOT EXISTS does not add the new
+-- column, so an index that references it would abort startup before
+-- run_migrations gets a chance to add it. Migration 41 creates this index for
+-- both fresh and upgraded databases.
 
 CREATE TABLE IF NOT EXISTS statistics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1466,6 +1473,35 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 39: forward_rule_hops table present");
 
+    // ── Migration 40: weighted target selection ──
+    add_column_if_missing(
+        pool,
+        "forward_rule_targets",
+        "weight",
+        "INTEGER NOT NULL DEFAULT 1 CHECK (weight >= 1 AND weight <= 100)",
+    )
+    .await?;
+    tracing::info!("Migration 40: forward_rule_targets.weight present");
+
+    // ── Migration 41: dedicated authenticated chain tunnel port ──
+    // Nullable keeps old chains on their native data path until the service
+    // layer safely claims a free TCP port from the hop group's configured pool.
+    add_column_if_missing(
+        pool,
+        "forward_rule_hops",
+        "tunnel_port",
+        "INTEGER CHECK (tunnel_port >= 1 AND tunnel_port <= 65535)",
+    )
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_forward_rule_hops_group_tunnel_port \
+         ON forward_rule_hops (device_group_id, tunnel_port) \
+         WHERE tunnel_port IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 41: forward_rule_hops.tunnel_port present");
+
     Ok(())
 }
 
@@ -1654,6 +1690,93 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 1, "tunnel_profiles table must exist");
+        assert_column(&pool, "forward_rule_hops", "tunnel_port").await;
+        let (tunnel_index,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type='index' AND name='idx_forward_rule_hops_group_tunnel_port'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tunnel_index, 1, "unique tunnel-port index must exist");
+    }
+
+    /// Regression for the real startup order. `init_db` executes SCHEMA_SQL
+    /// before run_migrations. A pre-Migration-41 hop table therefore must not
+    /// make the baseline batch reference `tunnel_port` before that column has
+    /// been added. Existing chain rows must survive the upgrade unchanged.
+    #[tokio::test]
+    async fn old_hop_table_survives_production_startup_order() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) VALUES \
+             (10, 'entry', 'in', 'upgrade-entry', 1), \
+             (11, 'exit', 'out', 'upgrade-exit', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, protocol, route_mode, device_group_in, \
+              device_group_out, target_addr, target_port) \
+             VALUES (10, 'existing-chain', 1, 21000, 'tcp_udp', 'chain', 10, 11, \
+                     '127.0.0.1', 443)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops \
+             (id, rule_id, position, device_group_id, listen_port) \
+             VALUES (10, 10, 0, 10, 21000), (11, 10, 1, 11, 22000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Reconstruct the exact relevant part of a pre-Migration-41 database.
+        sqlx::query("DROP INDEX idx_forward_rule_hops_group_tunnel_port")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE forward_rule_hops DROP COLUMN tunnel_port")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // This is the production sequence in init_db. The first statement used
+        // to fail while trying to create an index on the absent column.
+        sqlx::query(SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .expect("baseline must be safe on the old hop table");
+        run_migrations(&pool)
+            .await
+            .expect("Migration 41 must finish the upgrade");
+
+        assert_column(&pool, "forward_rule_hops", "tunnel_port").await;
+        let hop_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id = 10")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hop_count, 2, "existing chain hops must not be lost");
+        let tunnel_values: Vec<Option<i64>> = sqlx::query_scalar(
+            "SELECT tunnel_port FROM forward_rule_hops WHERE rule_id = 10 ORDER BY position",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tunnel_values, vec![None, None]);
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_forward_rule_hops_group_tunnel_port'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(index_count, 1, "Migration 41 must create the unique index");
     }
 
     /// The six builtin tunnel profiles must be seeded (is_builtin=1), owned by
@@ -1822,6 +1945,7 @@ mod tests {
             ("device_groups", "region"),
             ("device_groups", "line_type"),
             ("device_groups", "remark"),
+            ("forward_rule_hops", "tunnel_port"),
         ] {
             assert_column(&pool, table, col).await;
         }

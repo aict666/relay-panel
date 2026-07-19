@@ -17,6 +17,11 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
 
+/// Maximum number of fully-established TCP connections waiting for accept(2).
+/// Linux still caps this value by net.core.somaxconn. Keep the TFO pending
+/// request queue aligned with the ordinary listener backlog below.
+const TCP_LISTEN_BACKLOG: libc::c_int = 4096;
+
 // ── errors ──
 
 #[allow(dead_code)]
@@ -174,7 +179,18 @@ fn interface_ipv4(name: &str) -> Result<Ipv4Addr, OutboundError> {
 pub async fn tcp_connect(
     target: &str,
     source_ipv4: Option<Ipv4Addr>,
+    timeout_secs: u64,
+) -> Result<TcpStream, OutboundError> {
+    tcp_connect_with_fast_open(target, source_ipv4, timeout_secs, false).await
+}
+
+/// Connect with best-effort Linux TCP Fast Open. Missing kernel/sysctl/network
+/// support is deliberately non-fatal and preserves the ordinary TCP path.
+pub async fn tcp_connect_with_fast_open(
+    target: &str,
+    source_ipv4: Option<Ipv4Addr>,
     _timeout_secs: u64,
+    fast_open: bool,
 ) -> Result<TcpStream, OutboundError> {
     // v1.0.9: resolve through the DNS cache instead of re-resolving on every
     // connection. The caller (tcp.rs) still wraps this in a per-attempt timeout.
@@ -187,9 +203,15 @@ pub async fn tcp_connect(
             "could not resolve target",
         )));
     }
+    // A cookie-hit TFO connect reports success before the SYN result is known,
+    // so it cannot safely fall through to a later DNS address on failure.
+    // Keep normal multi-address failover; use TFO only for an unambiguous
+    // single resolved endpoint.
+    let fast_open = fast_open && addrs.len() == 1;
     let stream = match source_ipv4 {
+        None if fast_open => connect_first_fast_open(&addrs).await?,
         None => connect_first(&addrs).await?,
-        Some(src) => tcp_connect_bound(&addrs, src).await?,
+        Some(src) => tcp_connect_bound(&addrs, src, fast_open).await?,
     };
     // Non-fatal: a socket that just connected virtually never rejects this.
     if let Err(e) = stream.set_nodelay(true) {
@@ -249,31 +271,142 @@ async fn connect_first(addrs: &[SocketAddr]) -> Result<TcpStream, OutboundError>
     })))
 }
 
+async fn connect_first_fast_open(addrs: &[SocketAddr]) -> Result<TcpStream, OutboundError> {
+    let mut last_err = None;
+    for &addr in addrs {
+        match connect_addr_fast_open(addr, None).await {
+            Ok(stream) => return Ok(stream),
+            Err(OutboundError::Connect(error)) => last_err = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(OutboundError::Connect(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address")
+    })))
+}
+
 async fn tcp_connect_bound(
     addrs: &[SocketAddr],
     src: Ipv4Addr,
+    fast_open: bool,
 ) -> Result<TcpStream, OutboundError> {
-    // Use the first resolved address (matches the previous behavior). An IPv4
-    // target uses the source bind; an IPv6 target can't (the source is IPv4),
-    // so it falls back to a plain connect.
-    let Some(&addr) = addrs.first() else {
-        return Err(OutboundError::Connect(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "could not resolve target",
-        )));
-    };
-    match addr {
-        SocketAddr::V4(v4) => {
-            let sock = TcpSocket::new_v4().map_err(OutboundError::Bind)?;
-            sock.bind(SocketAddrV4::new(src, 0).into())
-                .map_err(OutboundError::Bind)?;
-            sock.connect(SocketAddr::from(v4))
+    // Try every DNS answer, just like the unbound path. Previously a configured
+    // source IPv4 pinned the connection to addrs[0], so one unhealthy A record
+    // incorrectly made an otherwise healthy hostname unavailable.
+    let mut last_connect_error = None;
+    for &addr in addrs {
+        let result = match addr {
+            SocketAddr::V4(_) if fast_open => connect_addr_fast_open(addr, Some(src)).await,
+            SocketAddr::V4(v4) => {
+                let sock = TcpSocket::new_v4().map_err(OutboundError::Bind)?;
+                sock.bind(SocketAddrV4::new(src, 0).into())
+                    .map_err(OutboundError::Bind)?;
+                sock.connect(SocketAddr::from(v4))
+                    .await
+                    .map_err(OutboundError::Connect)
+            }
+            // An IPv4 source cannot bind an IPv6 socket; preserve the existing
+            // fallback to the system-selected IPv6 source for mixed answers.
+            SocketAddr::V6(_) if fast_open => connect_addr_fast_open(addr, None).await,
+            SocketAddr::V6(_) => TcpStream::connect(addr)
                 .await
-                .map_err(OutboundError::Connect)
+                .map_err(OutboundError::Connect),
+        };
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(OutboundError::Connect(error)) => last_connect_error = Some(error),
+            Err(error) => return Err(error),
         }
-        SocketAddr::V6(_) => TcpStream::connect(addr)
-            .await
-            .map_err(OutboundError::Connect),
+    }
+    Err(OutboundError::Connect(last_connect_error.unwrap_or_else(
+        || std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address"),
+    )))
+}
+
+/// Perform the exact Linux TCP_FASTOPEN_CONNECT call sequence:
+///
+/// 1. set the socket option before connect(2);
+/// 2. when a cached cookie makes connect(2) return 0 immediately, return the
+///    stream WITHOUT waiting for handshake writability, so the forwarder's
+///    first write triggers SYN+data;
+/// 3. when connect reports EINPROGRESS (cold cookie / ordinary fallback), wait
+///    for the normal non-blocking handshake and surface SO_ERROR.
+///
+/// Tokio's general TcpSocket::connect always waits for writable after calling
+/// connect(2). Handling the syscall result here makes the TFO fast path
+/// explicit while preserving Tokio readiness for the cold path.
+async fn connect_addr_fast_open(
+    addr: SocketAddr,
+    source_ipv4: Option<Ipv4Addr>,
+) -> Result<TcpStream, OutboundError> {
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket =
+        Socket::new(domain, Type::STREAM, Some(S2Protocol::TCP)).map_err(OutboundError::Bind)?;
+    socket.set_nonblocking(true).map_err(OutboundError::Bind)?;
+    if let (SocketAddr::V4(_), Some(source)) = (addr, source_ipv4) {
+        socket
+            .bind(&SocketAddrV4::new(source, 0).into())
+            .map_err(OutboundError::Bind)?;
+    }
+    enable_tcp_fast_open_connect(&socket);
+
+    let connect_result = socket.connect(&addr.into());
+    let std_stream: std::net::TcpStream = socket.into();
+    let stream = TcpStream::from_std(std_stream).map_err(OutboundError::Bind)?;
+    match connect_result {
+        Ok(()) => Ok(stream),
+        Err(error) if connect_is_in_progress(&error) => {
+            stream.writable().await.map_err(OutboundError::Connect)?;
+            if let Some(error) = stream.take_error().map_err(OutboundError::Connect)? {
+                return Err(OutboundError::Connect(error));
+            }
+            Ok(stream)
+        }
+        Err(error) => Err(OutboundError::Connect(error)),
+    }
+}
+
+fn connect_is_in_progress(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EINPROGRESS)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn enable_tcp_fast_open_connect(socket: &Socket) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let value: libc::c_int = 1;
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN_CONNECT,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            tracing::debug!(
+                "TCP Fast Open connect unavailable; using normal TCP: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket;
     }
 }
 
@@ -337,6 +470,23 @@ pub(super) async fn resolve_cached(target: &str) -> std::io::Result<Vec<SocketAd
     }
 }
 
+/// Force a resolver lookup for active DNS health checks. Successful answers
+/// refresh the shared cache immediately; failures are returned (no stale
+/// fallback) so the selector can move new sessions to a healthy hostname.
+pub(super) async fn resolve_fresh(target: &str) -> std::io::Result<Vec<SocketAddr>> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(target).await?.collect();
+    if !addrs.is_empty() {
+        dns_cache().lock().await.insert(
+            target.to_string(),
+            CachedDns {
+                addrs: addrs.clone(),
+                at: Instant::now(),
+            },
+        );
+    }
+    Ok(addrs)
+}
+
 // ── UDP ──
 
 /// v1.0.9: requested UDP socket buffer size (bytes) for both send and receive.
@@ -377,6 +527,14 @@ pub async fn udp_outbound_socket(
 /// The address is constructed via SocketAddr::new — NEVER string-formatted —
 /// so "::" + port can never produce the broken ":::port" form.
 pub fn bind_tcp_listener(ip: IpAddr, port: u16) -> Result<TcpListener, OutboundError> {
+    bind_tcp_listener_with_fast_open(ip, port, false)
+}
+
+pub fn bind_tcp_listener_with_fast_open(
+    ip: IpAddr,
+    port: u16,
+    fast_open: bool,
+) -> Result<TcpListener, OutboundError> {
     let addr = SocketAddr::new(ip, port);
     let domain = match ip {
         IpAddr::V4(_) => Domain::IPV4,
@@ -390,9 +548,40 @@ pub fn bind_tcp_listener(ip: IpAddr, port: u16) -> Result<TcpListener, OutboundE
     sock.set_reuse_address(true).map_err(OutboundError::Bind)?;
     sock.set_nonblocking(true).map_err(OutboundError::Bind)?;
     sock.bind(&addr.into()).map_err(OutboundError::Bind)?;
-    sock.listen(1024).map_err(OutboundError::Bind)?;
+    if fast_open {
+        enable_tcp_fast_open_listener(&sock);
+    }
+    sock.listen(TCP_LISTEN_BACKLOG)
+        .map_err(OutboundError::Bind)?;
     let std_listener: std::net::TcpListener = sock.into();
     TcpListener::from_std(std_listener).map_err(OutboundError::Bind)
+}
+
+fn enable_tcp_fast_open_listener(socket: &Socket) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let queue_len = TCP_LISTEN_BACKLOG;
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                (&queue_len as *const libc::c_int).cast(),
+                std::mem::size_of_val(&queue_len) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            tracing::debug!(
+                "TCP Fast Open listener unavailable; using normal TCP: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket;
+    }
 }
 
 /// Build a UDP socket bound to the given IP + port (for inbound listeners).
@@ -569,6 +758,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_fast_open_path_roundtrips_or_safely_falls_back() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = bind_tcp_listener_with_fast_open(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, true)
+            .expect("TFO request must never make bind fail");
+        let target = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(&buf).await.unwrap();
+        });
+
+        let mut client = tcp_connect_with_fast_open(&target, None, 5, true)
+            .await
+            .expect("TFO connect must roundtrip or fall back to ordinary TCP");
+        client.write_all(b"tfo-test").await.unwrap();
+        let mut reply = [0u8; 8];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"tfo-test");
+        server.await.unwrap();
+    }
+
+    /// Linux-only proof that the optimized path really carried payload in the
+    /// opening SYN. A plain round-trip is insufficient because TFO is designed
+    /// to fall back to ordinary TCP when the kernel or sysctl does not support
+    /// it. CI sets RELAY_REQUIRE_LINUX_TFO_TEST=1 and enables both sysctl bits,
+    /// turning any skip/fallback into a hard failure.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_fast_open_warm_connection_sends_syn_data() {
+        use std::os::fd::AsRawFd;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TFO_CLIENT_AND_SERVER: u32 = 0x1 | 0x2;
+        const TCPI_OPT_SYN_DATA: u8 = 32;
+
+        fn tcp_info_options(stream: &TcpStream) -> std::io::Result<u8> {
+            let mut info = std::mem::MaybeUninit::<libc::tcp_info>::zeroed();
+            let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+            let result = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_INFO,
+                    info.as_mut_ptr().cast(),
+                    &mut len,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let info = unsafe { info.assume_init() };
+            Ok(info.tcpi_options)
+        }
+
+        let required = std::env::var_os("RELAY_REQUIRE_LINUX_TFO_TEST").is_some();
+        let sysctl = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_fastopen")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        if !matches!(sysctl, Some(value) if value & TFO_CLIENT_AND_SERVER == TFO_CLIENT_AND_SERVER)
+        {
+            assert!(
+                !required,
+                "CI requires client+server TFO sysctl bits (0x3), got {:?}",
+                sysctl
+            );
+            return;
+        }
+
+        let listener = bind_tcp_listener_with_fast_open(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, true)
+            .expect("bind TFO listener");
+        let target = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let mut second_options = None;
+            for connection_index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8];
+                stream.read_exact(&mut buf).await.unwrap();
+                stream.write_all(&buf).await.unwrap();
+                if connection_index == 1 {
+                    second_options = Some(tcp_info_options(&stream).unwrap());
+                }
+            }
+            second_options.unwrap()
+        });
+
+        // First contact solicits and caches the server's TFO cookie.
+        let mut warmup = tcp_connect_with_fast_open(&target, None, 5, true)
+            .await
+            .expect("TFO cookie warm-up connect");
+        warmup.write_all(b"warm-up!").await.unwrap();
+        let mut reply = [0u8; 8];
+        warmup.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"warm-up!");
+        drop(warmup);
+
+        // With the cached cookie, connect(2) returns before the handshake and
+        // this first write must trigger SYN+data.
+        let mut client = tcp_connect_with_fast_open(&target, None, 5, true)
+            .await
+            .expect("warm TFO connect");
+        client.write_all(b"syn-data").await.unwrap();
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"syn-data");
+        let client_options = tcp_info_options(&client).unwrap();
+        let server_options = server.await.unwrap();
+
+        assert_ne!(
+            client_options & TCPI_OPT_SYN_DATA,
+            0,
+            "client TCP_INFO proves no payload was acknowledged from the SYN (options=0x{client_options:02x})"
+        );
+        assert_ne!(
+            server_options & TCPI_OPT_SYN_DATA,
+            0,
+            "server TCP_INFO proves no payload was received in the SYN (options=0x{server_options:02x})"
+        );
+    }
+
+    #[tokio::test]
     async fn udp_binds_both_v4_and_v6_same_port() {
         let v4 = bind_udp_socket(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
         let port = v4.local_addr().unwrap().port();
@@ -614,6 +924,20 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST)
         );
         assert!(accept.await.unwrap().is_ok(), "server must accept it");
+    }
+
+    #[tokio::test]
+    async fn source_bound_connect_tries_later_dns_addresses() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy = listener.local_addr().unwrap();
+        let answers = [SocketAddr::from(([127, 0, 0, 1], 0)), healthy];
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        let stream = tcp_connect_bound(&answers, Ipv4Addr::LOCALHOST, false)
+            .await
+            .expect("a failed first DNS answer must fall through to the healthy one");
+        assert_eq!(stream.peer_addr().unwrap(), healthy);
+        assert!(accept.await.unwrap().is_ok());
     }
 
     #[tokio::test]

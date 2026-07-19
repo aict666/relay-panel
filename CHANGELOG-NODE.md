@@ -13,6 +13,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-19
+
+### Added
+
+- **Authenticated UOT across every UDP inter-node hop.** Both UDP-only and
+  `tcp_udp` multi-hop rules can reuse a framed TCP tunnel with a dedicated,
+  persisted listener port. HMAC challenge-response proves knowledge of the
+  derived tunnel key without sending that key over the network.
+- **TCP Fast Open for chained TCP traffic.** Inter-node dials can send initial
+  payload bytes in the SYN and fall back to normal TCP when TFO is unavailable.
+- **Health-aware routing telemetry.** Active reachability/latency probes, DNS
+  health, circuit-breaker state, connection counts, capacity pressure, and
+  anomalous traffic signals drive the new target selection strategies.
+
+### Changed
+
+- **UOT and TCP Fast Open are enabled by default** and can be disabled
+  independently through `RELAY_ENABLE_UOT=false` and
+  `RELAY_ENABLE_TCP_0RTT=false`.
+- **All TCP listener backlogs are 4096,** including the Fast Open queue.
+- **Config protocol version is now 7;** use this node with panel 1.3.0 or newer.
+
+### Fixed
+
+- **UOT cancellation is frame-safe.** Cancelling one request cannot leave a
+  partial frame for the next request to consume, and tunnel authentication has
+  explicit time/capacity bounds.
+- **Hot configuration changes preserve stable UOT ports** while safely
+  replacing listeners whose routing or security fingerprint changed.
+
+### Tests
+
+- Added multi-hop UOT coverage for UDP and `tcp_udp`, challenge-response and
+  malformed-frame regressions, and Linux-only TCP Fast Open tests that require
+  observed SYN data on normal and `splice(2)` forwarding paths.
+
 ## [1.2.1] - 2026-07-18
 
 ### Fixed

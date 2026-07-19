@@ -266,4 +266,28 @@ mod tests {
         assert_eq!(id, "my-fixed-id-12345");
         let _ = std::fs::remove_file(&path);
     }
+
+    /// A v7 node must be able to boot from an older cache while panel/node
+    /// binaries are being rolled. All newly-added routing/UOT/TFO fields have
+    /// safe defaults, so the cached listener stays native instead of
+    /// disappearing or changing its TCP handshake behaviour.
+    #[test]
+    fn v5_cache_deserializes_as_native_forwarding() {
+        let cached = r#"{
+            "listeners": [{
+                "rule_id": 7,
+                "port": 20000,
+                "protocol": "udp",
+                "node_transport": "raw",
+                "targets": ["127.0.0.1:53"],
+                "count_traffic": true
+            }]
+        }"#;
+        let config: NodeConfigResponse = serde_json::from_str(cached).unwrap();
+        let listener = &config.listeners[0];
+        assert!(listener.target_weights.is_empty());
+        assert_eq!(listener.uot_role, relay_shared::protocol::UotRole::Disabled);
+        assert!(!listener.zero_rtt);
+        assert!(!listener.tcp_fast_open);
+    }
 }

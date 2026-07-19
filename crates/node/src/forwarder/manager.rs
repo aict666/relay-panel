@@ -4,10 +4,12 @@ use super::selector::TargetSelector;
 use super::tcp;
 use super::tls;
 use super::udp;
+use super::uot;
 use super::ws;
 use crate::reporter::{ConnectionTracker, TrafficCounter};
 use relay_shared::protocol::{
-    ListenerConfig, ListenerError, LoadBalanceStrategy, NodeConfigResponse, NodeTransport, Protocol,
+    ListenerConfig, ListenerError, LoadBalanceStrategy, NodeConfigResponse, NodeTransport,
+    Protocol, UotRole,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -51,6 +53,7 @@ type ListenerKey = (u16, Protocol, NodeTransport);
 struct ListenerFingerprint {
     rule_id: i64,
     targets: Vec<String>,
+    target_weights: Vec<u16>,
     ws_path: Option<String>,
     /// v0.4.6: a strategy change must restart the listener so the new selector
     /// (and its cursor) takes effect.
@@ -73,6 +76,11 @@ struct ListenerFingerprint {
     /// existing connections keep running and the new cap governs admissions
     /// from that point on. A lowered cap takes effect by attrition.
     max_connections: Option<u32>,
+    uot_role: UotRole,
+    uot_token: Option<String>,
+    uot_next_token: Option<String>,
+    zero_rtt: bool,
+    tcp_fast_open: bool,
 }
 
 impl ListenerFingerprint {
@@ -80,14 +88,29 @@ impl ListenerFingerprint {
         Self {
             rule_id: l.rule_id,
             targets: l.targets.clone(),
+            target_weights: l.target_weights.clone(),
             ws_path: l.ws_path.clone(),
             load_balance_strategy: l.load_balance_strategy,
             node_transport: l.node_transport,
             upload_limit_bps: l.upload_limit_bps,
             download_limit_bps: l.download_limit_bps,
             max_connections: l.max_connections,
+            uot_role: l.uot_role,
+            uot_token: l.uot_token.clone(),
+            uot_next_token: l.uot_next_token.clone(),
+            zero_rtt: l.zero_rtt,
+            tcp_fast_open: l.tcp_fast_open,
         }
     }
+}
+
+/// Decide how to probe the listener's downstream target. UOT ingress/relay
+/// targets are relay TCP sockets, but an UOT egress targets the user's native
+/// UDP service and must never be judged by whether that numeric port accepts
+/// TCP connections.
+fn target_probe_uses_tcp(listener: &ListenerConfig) -> bool {
+    listener.protocol == Protocol::Tcp
+        || matches!(listener.uot_role, UotRole::Ingress | UotRole::Relay)
 }
 
 struct ManagedListener {
@@ -361,9 +384,10 @@ impl ForwarderManager {
             let targets = listener.targets.clone();
             // v0.4.6: one selector per listener, shared across all of its
             // connections/sessions so a round-robin cursor advances globally.
-            let selector = Arc::new(TargetSelector::new(
+            let selector = Arc::new(TargetSelector::with_weights(
                 listener.load_balance_strategy,
                 targets.len(),
+                listener.target_weights.clone(),
             ));
             // v0.4.6: shared per-rule limiter. Both expanded listeners of a
             // tcp_udp rule reuse the same Arc so the budget isn't doubled.
@@ -383,6 +407,7 @@ impl ForwarderManager {
             let proto_str = match listener.protocol {
                 Protocol::Tcp => "tcp",
                 Protocol::Udp => "udp",
+                Protocol::Uot => "uot",
                 Protocol::TcpUdp => "tcpudp",
             }
             .to_string();
@@ -427,6 +452,44 @@ impl ForwarderManager {
                 });
                 continue;
             }
+            let uot_config_valid = match listener.uot_role {
+                UotRole::Ingress => {
+                    listener.protocol == Protocol::Udp
+                        && listener.uot_token.as_deref().is_some_and(|t| t.len() == 64)
+                }
+                UotRole::Relay => {
+                    listener.protocol == Protocol::Uot
+                        && listener.uot_token.as_deref().is_some_and(|t| t.len() == 64)
+                        && listener
+                            .uot_next_token
+                            .as_deref()
+                            .is_some_and(|t| t.len() == 64)
+                }
+                UotRole::Egress => {
+                    listener.protocol == Protocol::Uot
+                        && listener.uot_token.as_deref().is_some_and(|t| t.len() == 64)
+                }
+                UotRole::Disabled => listener.protocol != Protocol::Uot,
+            };
+            if !uot_config_valid {
+                tracing::error!(
+                    "rule {}: invalid UOT role/token configuration on port {}; refusing listener",
+                    rule_id,
+                    port
+                );
+                errors.lock().await.push(ListenerError {
+                    port,
+                    protocol: proto_str.clone(),
+                    error: "invalid UOT role/token configuration".into(),
+                });
+                continue;
+            }
+            super::selector::spawn_active_probes(
+                Arc::downgrade(&selector),
+                targets.clone(),
+                self.source_ipv4,
+                target_probe_uses_tcp(listener),
+            );
 
             let handle: tokio::task::JoinHandle<()> = match (
                 listener.protocol,
@@ -437,11 +500,16 @@ impl ForwarderManager {
                 // with select! so if either dies the task ends and the manager's
                 // dead-listener detection restarts it.
                 (Protocol::Tcp, NodeTransport::Raw) => {
-                    use crate::forwarder::outbound::bind_tcp_listener;
+                    use crate::forwarder::outbound::bind_tcp_listener_with_fast_open;
+                    // tcp_fast_open controls outbound dialing on every chain
+                    // hop. Only non-billing downstream hops enable TFO on the
+                    // listening socket; the public entry must not unexpectedly
+                    // accept replayable Fast Open data from arbitrary clients.
+                    let listener_fast_open = listener.tcp_fast_open && !listener.count_traffic;
                     let mut v4_listener = None;
                     let mut v6_listener = None;
                     if let Some(ip4) = ip_v4 {
-                        match bind_tcp_listener(ip4, port) {
+                        match bind_tcp_listener_with_fast_open(ip4, port, listener_fast_open) {
                             Ok(l) => {
                                 tracing::info!(
                                     "TCP bound {} (rule {})",
@@ -461,7 +529,7 @@ impl ForwarderManager {
                         }
                     }
                     if let Some(ip6) = ip_v6 {
-                        match bind_tcp_listener(ip6, port) {
+                        match bind_tcp_listener_with_fast_open(ip6, port, listener_fast_open) {
                             Ok(l) => {
                                 tracing::info!(
                                     "TCP bound {} (rule {})",
@@ -502,6 +570,7 @@ impl ForwarderManager {
                     let rid = rule_id;
                     let ipv4_src = src_ipv4;
                     let count_traffic = listener.count_traffic;
+                    let tcp_fast_open = listener.tcp_fast_open;
                     // v1.2.0: both families get a gate cloned from the SAME
                     // RuleRuntime, so `max_connections` is a per-rule total
                     // rather than a per-family allowance.
@@ -533,6 +602,7 @@ impl ForwarderManager {
                                     ipv4_src,
                                     gate4,
                                     count_traffic,
+                                    tcp_fast_open,
                                 )
                                 .await
                             } else {
@@ -552,6 +622,7 @@ impl ForwarderManager {
                                     ipv4_src,
                                     gate6,
                                     count_traffic,
+                                    tcp_fast_open,
                                 )
                                 .await
                             } else {
@@ -631,6 +702,10 @@ impl ForwarderManager {
                     let rid = rule_id;
                     let ipv4_src = src_ipv4;
                     let count_traffic = listener.count_traffic;
+                    let uot_role = listener.uot_role;
+                    let uot_token4 = listener.uot_token.clone();
+                    let uot_token6 = listener.uot_token.clone();
+                    let zero_rtt = listener.zero_rtt;
                     tokio::spawn(async move {
                         type SrvResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
                         let (tgt4, sel4, rl4, ctr4, cn4) = (
@@ -642,36 +717,70 @@ impl ForwarderManager {
                         );
                         let v4_fut = async move {
                             if let Some(s) = v4_sock {
-                                udp::serve_udp_listener(
-                                    s,
-                                    tgt4,
-                                    sel4,
-                                    rl4,
-                                    ctr4,
-                                    cn4,
-                                    rid,
-                                    ipv4_src,
-                                    count_traffic,
-                                )
-                                .await
+                                if uot_role == UotRole::Ingress {
+                                    uot::serve_ingress(
+                                        s,
+                                        tgt4,
+                                        sel4,
+                                        uot_token4.unwrap_or_default(),
+                                        zero_rtt,
+                                        rl4,
+                                        ctr4,
+                                        cn4,
+                                        rid,
+                                        ipv4_src,
+                                        count_traffic,
+                                    )
+                                    .await
+                                } else {
+                                    udp::serve_udp_listener(
+                                        s,
+                                        tgt4,
+                                        sel4,
+                                        rl4,
+                                        ctr4,
+                                        cn4,
+                                        rid,
+                                        ipv4_src,
+                                        count_traffic,
+                                    )
+                                    .await
+                                }
                             } else {
                                 std::future::pending::<SrvResult>().await
                             }
                         };
                         let v6_fut = async move {
                             if let Some(s) = v6_sock {
-                                udp::serve_udp_listener(
-                                    s,
-                                    tgt,
-                                    sel,
-                                    rl,
-                                    ctr,
-                                    cn,
-                                    rid,
-                                    ipv4_src,
-                                    count_traffic,
-                                )
-                                .await
+                                if uot_role == UotRole::Ingress {
+                                    uot::serve_ingress(
+                                        s,
+                                        tgt,
+                                        sel,
+                                        uot_token6.unwrap_or_default(),
+                                        zero_rtt,
+                                        rl,
+                                        ctr,
+                                        cn,
+                                        rid,
+                                        ipv4_src,
+                                        count_traffic,
+                                    )
+                                    .await
+                                } else {
+                                    udp::serve_udp_listener(
+                                        s,
+                                        tgt,
+                                        sel,
+                                        rl,
+                                        ctr,
+                                        cn,
+                                        rid,
+                                        ipv4_src,
+                                        count_traffic,
+                                    )
+                                    .await
+                                }
                             } else {
                                 std::future::pending::<SrvResult>().await
                             }
@@ -679,6 +788,83 @@ impl ForwarderManager {
                         tokio::select! {
                             r = v4_fut => { if let Err(e) = r { tracing::error!("UDP v4 serve ended (rule {}): {}", rid, e); } }
                             r = v6_fut => { if let Err(e) = r { tracing::error!("UDP v6 serve ended (rule {}): {}", rid, e); } }
+                        }
+                    })
+                }
+                // Internal UOT server for intermediate/exit hops. It is always
+                // raw TCP on the wire and authenticated before any frame is
+                // accepted; the public rule API cannot create this protocol.
+                (Protocol::Uot, NodeTransport::Raw) => {
+                    use crate::forwarder::outbound::bind_tcp_listener;
+                    let mut v4_listener = None;
+                    let mut v6_listener = None;
+                    if let Some(ip4) = ip_v4 {
+                        match bind_tcp_listener(ip4, port) {
+                            Ok(listener) => v4_listener = Some(listener),
+                            Err(error) => errors.lock().await.push(ListenerError {
+                                port,
+                                protocol: proto_str.clone(),
+                                error: format!("IPv4: {}", error),
+                            }),
+                        }
+                    }
+                    if let Some(ip6) = ip_v6 {
+                        match bind_tcp_listener(ip6, port) {
+                            Ok(listener) => v6_listener = Some(listener),
+                            Err(error) => errors.lock().await.push(ListenerError {
+                                port,
+                                protocol: proto_str.clone(),
+                                error: format!("IPv6: {}", error),
+                            }),
+                        }
+                    }
+                    if v4_listener.is_none() && v6_listener.is_none() {
+                        continue;
+                    }
+                    let inbound_token = listener.uot_token.clone().unwrap_or_default();
+                    let downstream_token = listener.uot_next_token.clone();
+                    let relay = listener.uot_role == UotRole::Relay;
+                    let (tgt4, sel4, token4, next4) = (
+                        targets.clone(),
+                        selector.clone(),
+                        inbound_token.clone(),
+                        downstream_token.clone(),
+                    );
+                    tokio::spawn(async move {
+                        type SrvResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+                        let v4_fut = async move {
+                            if let Some(listener) = v4_listener {
+                                uot::serve_listener(
+                                    listener, tgt4, sel4, token4, next4, relay, src_ipv4,
+                                )
+                                .await
+                            } else {
+                                std::future::pending::<SrvResult>().await
+                            }
+                        };
+                        let v6_fut = async move {
+                            if let Some(listener) = v6_listener {
+                                uot::serve_listener(
+                                    listener,
+                                    targets,
+                                    selector,
+                                    inbound_token,
+                                    downstream_token,
+                                    relay,
+                                    src_ipv4,
+                                )
+                                .await
+                            } else {
+                                std::future::pending::<SrvResult>().await
+                            }
+                        };
+                        tokio::select! {
+                            result = v4_fut => if let Err(error) = result {
+                                tracing::error!("UOT v4 serve ended (rule {}): {}", rule_id, error);
+                            },
+                            result = v6_fut => if let Err(error) = result {
+                                tracing::error!("UOT v6 serve ended (rule {}): {}", rule_id, error);
+                            },
                         }
                     })
                 }
@@ -906,10 +1092,16 @@ mod tests {
                 node_transport: transport,
                 ws_path: None,
                 targets: vec!["127.0.0.1:1".into()],
+                target_weights: vec![],
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                uot_role: UotRole::Disabled,
+                uot_token: None,
+                uot_next_token: None,
+                zero_rtt: false,
+                tcp_fast_open: false,
                 count_traffic: true,
             }],
         }
@@ -930,10 +1122,16 @@ mod tests {
                 node_transport: transport,
                 ws_path: ws_path.map(str::to_string),
                 targets: targets.into_iter().map(String::from).collect(),
+                target_weights: vec![],
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                uot_role: UotRole::Disabled,
+                uot_token: None,
+                uot_next_token: None,
+                zero_rtt: false,
+                tcp_fast_open: false,
                 count_traffic: true,
             }],
         }
@@ -999,6 +1197,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tcp_fast_open_change_alters_fingerprint() {
+        let mut listener = one_rule(40051, Protocol::Tcp, NodeTransport::Raw)
+            .listeners
+            .pop()
+            .unwrap();
+        let ordinary = ListenerFingerprint::from_listener(&listener);
+        listener.tcp_fast_open = true;
+        let fast_open = ListenerFingerprint::from_listener(&listener);
+        assert_ne!(
+            ordinary, fast_open,
+            "enabling TFO must hot-reload the captured TCP listener/dialer"
+        );
+    }
+
+    #[test]
+    fn uot_egress_does_not_tcp_probe_the_final_udp_target() {
+        let mut ingress = one_rule(40052, Protocol::Udp, NodeTransport::Raw)
+            .listeners
+            .pop()
+            .unwrap();
+        ingress.uot_role = UotRole::Ingress;
+        assert!(target_probe_uses_tcp(&ingress));
+
+        let mut relay = one_rule(40053, Protocol::Uot, NodeTransport::Raw)
+            .listeners
+            .pop()
+            .unwrap();
+        relay.uot_role = UotRole::Relay;
+        assert!(target_probe_uses_tcp(&relay));
+
+        let mut egress = relay;
+        egress.uot_role = UotRole::Egress;
+        assert!(!target_probe_uses_tcp(&egress));
+    }
+
     /// Spawn an echo server and return its address. Used by the restart tests to
     /// prove a forwarded connection is really carrying data.
     async fn echo_target() -> SocketAddr {
@@ -1023,6 +1257,20 @@ mod tests {
                         }
                     }
                 });
+            }
+        });
+        addr
+    }
+
+    async fn tagged_udp_target(tag: u8) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((_n, peer)) = socket.recv_from(&mut buf).await {
+                if socket.send_to(&[tag], peer).await.is_err() {
+                    return;
+                }
             }
         });
         addr
@@ -1193,10 +1441,16 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
+                    target_weights: vec![],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
                 ListenerConfig {
@@ -1206,10 +1460,16 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
+                    target_weights: vec![],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
             ],
@@ -1275,10 +1535,16 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
+                    target_weights: vec![],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
                 ListenerConfig {
@@ -1288,16 +1554,226 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
+                    target_weights: vec![],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
             ],
         };
         mgr.apply_config(&c).await;
         assert_eq!(mgr.listener_keys().len(), 2);
+    }
+
+    /// End-to-end regression for a tcp_udp chain after both staged switches:
+    /// raw TCP keeps the legacy hop port while UDP travels through the
+    /// dedicated authenticated UOT port. This exercises the real manager,
+    /// TCP forwarder, UOT client/server, and final TCP+UDP targets together.
+    #[tokio::test]
+    async fn tcp_udp_chain_runs_tcp_fast_open_and_dedicated_uot_together() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tcp_target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = tcp_target.local_addr().unwrap().port();
+        let udp_target = tokio::net::UdpSocket::bind(("127.0.0.1", target_port))
+            .await
+            .unwrap();
+        let tcp_echo = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = tcp_target.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let udp_echo = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = udp_target.recv_from(&mut buf).await {
+                if udp_target.send_to(&buf[..n], peer).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let reserve_pair = || {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = tcp.local_addr().unwrap().port();
+            let udp = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+            drop((tcp, udp));
+            port
+        };
+        let entry_port = reserve_pair();
+        let exit_port = reserve_pair();
+        let tunnel_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tunnel_port = tunnel_reservation.local_addr().unwrap().port();
+        drop(tunnel_reservation);
+        assert_ne!(exit_port, tunnel_port);
+
+        let token = "c".repeat(64);
+        let target = format!("127.0.0.1:{target_port}");
+        let exit_config = NodeConfigResponse {
+            listeners: vec![
+                ListenerConfig {
+                    rule_id: 42,
+                    port: exit_port,
+                    protocol: Protocol::Tcp,
+                    node_transport: NodeTransport::Raw,
+                    ws_path: None,
+                    targets: vec![target.clone()],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                    upload_limit_bps: None,
+                    download_limit_bps: None,
+                    max_connections: None,
+                    count_traffic: false,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: true,
+                },
+                ListenerConfig {
+                    rule_id: 42,
+                    port: exit_port,
+                    protocol: Protocol::Udp,
+                    node_transport: NodeTransport::Raw,
+                    ws_path: None,
+                    targets: vec![target.clone()],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                    upload_limit_bps: None,
+                    download_limit_bps: None,
+                    max_connections: None,
+                    count_traffic: false,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
+                },
+                ListenerConfig {
+                    rule_id: 42,
+                    port: tunnel_port,
+                    protocol: Protocol::Uot,
+                    node_transport: NodeTransport::Raw,
+                    ws_path: None,
+                    targets: vec![target],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                    upload_limit_bps: None,
+                    download_limit_bps: None,
+                    max_connections: None,
+                    count_traffic: false,
+                    uot_role: UotRole::Egress,
+                    uot_token: Some(token.clone()),
+                    uot_next_token: None,
+                    zero_rtt: true,
+                    tcp_fast_open: false,
+                },
+            ],
+        };
+
+        let mut exit = fresh_mgr();
+        exit.listen_ipv6 = String::new();
+        exit.apply_config(&exit_config).await;
+        assert!(exit.take_listener_errors().await.is_empty());
+
+        let entry_config = NodeConfigResponse {
+            listeners: vec![
+                ListenerConfig {
+                    rule_id: 42,
+                    port: entry_port,
+                    protocol: Protocol::Tcp,
+                    node_transport: NodeTransport::Raw,
+                    ws_path: None,
+                    targets: vec![format!("127.0.0.1:{exit_port}")],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                    upload_limit_bps: None,
+                    download_limit_bps: None,
+                    max_connections: None,
+                    count_traffic: true,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: true,
+                },
+                ListenerConfig {
+                    rule_id: 42,
+                    port: entry_port,
+                    protocol: Protocol::Udp,
+                    node_transport: NodeTransport::Raw,
+                    ws_path: None,
+                    targets: vec![format!("127.0.0.1:{tunnel_port}")],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                    upload_limit_bps: None,
+                    download_limit_bps: None,
+                    max_connections: None,
+                    count_traffic: true,
+                    uot_role: UotRole::Ingress,
+                    uot_token: Some(token),
+                    uot_next_token: None,
+                    zero_rtt: true,
+                    tcp_fast_open: false,
+                },
+            ],
+        };
+        let mut entry = fresh_mgr();
+        entry.listen_ipv6 = String::new();
+        entry.apply_config(&entry_config).await;
+        assert!(entry.take_listener_errors().await.is_empty());
+
+        let tcp_roundtrip = async {
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", entry_port)).await?;
+            client.write_all(b"tcp-fast-open-chain").await?;
+            let mut reply = [0u8; 19];
+            client.read_exact(&mut reply).await?;
+            std::io::Result::Ok(reply)
+        };
+        let tcp_reply = tokio::time::timeout(Duration::from_secs(5), tcp_roundtrip)
+            .await
+            .expect("TCP chain timed out")
+            .unwrap();
+        assert_eq!(&tcp_reply, b"tcp-fast-open-chain");
+
+        let udp_client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_client
+            .send_to(b"udp-over-dedicated-uot", ("127.0.0.1", entry_port))
+            .await
+            .unwrap();
+        let mut reply = [0u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp_client.recv_from(&mut reply))
+            .await
+            .expect("UOT chain timed out")
+            .unwrap();
+        assert_eq!(&reply[..n], b"udp-over-dedicated-uot");
+
+        entry
+            .apply_config(&NodeConfigResponse { listeners: vec![] })
+            .await;
+        exit.apply_config(&NodeConfigResponse { listeners: vec![] })
+            .await;
+        tcp_echo.abort();
+        udp_echo.abort();
     }
 
     // ── v0.3.6: hot update + finished recovery ──
@@ -1367,6 +1843,61 @@ mod tests {
         );
     }
 
+    /// A live UDP session owns a detached target-reply task. Updating the
+    /// target must still release and re-bind the same listening port; otherwise
+    /// the old task's socket reference causes EADDRINUSE and silently leaves the
+    /// rule absent until the next config push.
+    #[tokio::test]
+    async fn udp_target_change_rebinds_same_port_after_live_session() {
+        let target_a = tagged_udp_target(b'a').await;
+        let target_b = tagged_udp_target(b'b').await;
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+
+        let mut mgr = fresh_mgr();
+        mgr.listen_ipv6 = String::new();
+        let c1 = cfg(
+            port,
+            Protocol::Udp,
+            NodeTransport::Raw,
+            vec![&target_a.to_string()],
+            None,
+        );
+        mgr.apply_config(&c1).await;
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener = SocketAddr::from(([127, 0, 0, 1], port));
+        client.send_to(b"first", listener).await.unwrap();
+        let mut reply = [0u8; 8];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut reply))
+            .await
+            .expect("first UDP reply timed out")
+            .unwrap();
+        assert_eq!(&reply[..n], b"a");
+
+        let c2 = cfg(
+            port,
+            Protocol::Udp,
+            NodeTransport::Raw,
+            vec![&target_b.to_string()],
+            None,
+        );
+        mgr.apply_config(&c2).await;
+        assert!(
+            mgr.fingerprint(&(port, Protocol::Udp, NodeTransport::Raw))
+                .is_some(),
+            "updated UDP listener must be registered after same-port rebind"
+        );
+
+        client.send_to(b"second", listener).await.unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut reply))
+            .await
+            .expect("second UDP reply timed out")
+            .unwrap();
+        assert_eq!(&reply[..n], b"b", "traffic must use the updated target");
+    }
+
     /// Target ORDER matters (primary vs secondary). Reordering without changing
     /// the set must still count as a change — we must not sort before comparing.
     #[tokio::test]
@@ -1410,10 +1941,16 @@ mod tests {
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
                 targets: vec!["127.0.0.1:9".into(), "127.0.0.1:10".into()],
+                target_weights: vec![],
                 load_balance_strategy: strategy,
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                uot_role: UotRole::Disabled,
+                uot_token: None,
+                uot_next_token: None,
+                zero_rtt: false,
+                tcp_fast_open: false,
                 count_traffic: true,
             }],
         };
@@ -1444,10 +1981,16 @@ mod tests {
                 node_transport: transport,
                 ws_path: None,
                 targets: vec!["127.0.0.1:9".into()],
+                target_weights: vec![],
                 load_balance_strategy: LoadBalanceStrategy::First,
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                uot_role: UotRole::Disabled,
+                uot_token: None,
+                uot_next_token: None,
+                zero_rtt: false,
+                tcp_fast_open: false,
                 count_traffic: true,
             }],
         };
@@ -1508,10 +2051,16 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:9".into()],
+                    target_weights: vec![],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
                 ListenerConfig {
@@ -1521,10 +2070,16 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:9".into()],
+                    target_weights: vec![],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
             ],
@@ -1543,10 +2098,16 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:9".into()],
+                    target_weights: vec![],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
                 ListenerConfig {
@@ -1556,10 +2117,16 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:10".into()], // changed
+                    target_weights: vec![],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
             ],
@@ -1611,11 +2178,17 @@ mod tests {
                     rule_id: 1,
                     targets: vec!["stale".into()],
                     ws_path: None,
+                    target_weights: vec![],
                     load_balance_strategy: LoadBalanceStrategy::First,
                     node_transport: NodeTransport::Raw,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                 },
             },
         );
@@ -1671,11 +2244,17 @@ mod tests {
                     rule_id: 7,
                     targets: vec!["tcp-target".into()],
                     ws_path: None,
+                    target_weights: vec![],
                     load_balance_strategy: LoadBalanceStrategy::First,
                     node_transport: NodeTransport::Raw,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                 },
             },
         );
@@ -1687,11 +2266,17 @@ mod tests {
                     rule_id: 7,
                     targets: vec!["udp-target".into()],
                     ws_path: None,
+                    target_weights: vec![],
                     load_balance_strategy: LoadBalanceStrategy::First,
                     node_transport: NodeTransport::Raw,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                 },
             },
         );
@@ -1726,11 +2311,17 @@ mod tests {
                     rule_id: 9,
                     targets: vec!["udp-target".into()],
                     ws_path: None,
+                    target_weights: vec![],
                     load_balance_strategy: LoadBalanceStrategy::First,
                     node_transport: NodeTransport::Raw,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                 },
             },
         );
@@ -1823,10 +2414,16 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
+                    target_weights: vec![],
                     load_balance_strategy: LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
                 ListenerConfig {
@@ -1836,10 +2433,16 @@ mod tests {
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
                     targets: vec!["127.0.0.1:1".into()],
+                    target_weights: vec![],
                     load_balance_strategy: LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    uot_role: UotRole::Disabled,
+                    uot_token: None,
+                    uot_next_token: None,
+                    zero_rtt: false,
+                    tcp_fast_open: false,
                     count_traffic: true,
                 },
             ],
@@ -1857,10 +2460,16 @@ mod tests {
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
                 targets: vec!["127.0.0.1:2".into()],
+                target_weights: vec![],
                 load_balance_strategy: LoadBalanceStrategy::First,
                 upload_limit_bps: None,
                 download_limit_bps: None,
                 max_connections: None,
+                uot_role: UotRole::Disabled,
+                uot_token: None,
+                uot_next_token: None,
+                zero_rtt: false,
+                tcp_fast_open: false,
                 count_traffic: true,
             }],
         };

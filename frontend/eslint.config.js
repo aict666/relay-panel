@@ -6,7 +6,10 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  // vite.config.online.ts is a gitignored, machine-local deployment override.
+  // It must not make the repository-wide `eslint .` gate depend on a user's
+  // local file contents.
+  globalIgnores(['dist', 'vite.config.online.ts']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [

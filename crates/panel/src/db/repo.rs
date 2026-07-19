@@ -350,7 +350,9 @@ pub trait RuleRepository: Send + Sync {
     /// `load_balance_strategy` is the stable DB string ("first"/"round_robin"/
     /// "failover"); it is only written when it differs from "first" (mirrors
     /// the service's existing behaviour, since "first" is the column default).
-    /// `upload_limit_mbps` / `download_limit_mbps` are only written when either
+    /// `hops` are inserted in the same transaction as the rule and its targets,
+    /// so a hop write failure rolls the entire creation back. `upload_limit_mbps`
+    /// / `download_limit_mbps` are only written when either
     /// is non-zero (0 = unlimited = the column default). `tunnel_profile_id` is
     /// only written when `Some`.
     #[allow(clippy::too_many_arguments)]
@@ -371,6 +373,7 @@ pub trait RuleRepository: Send + Sync {
         target_addr: &str,
         target_port: i32,
         targets: &[RuleTargetRequest],
+        hops: &[(i64, i32)],
         load_balance_strategy: &str,
         upload_limit_mbps: i32,
         download_limit_mbps: i32,
@@ -436,6 +439,15 @@ pub trait RuleRepository: Send + Sync {
     /// Replace all hops for a chain rule (delete + insert in order).
     /// `hops` is `(device_group_id, listen_port)` ordered by position 0..n-1.
     async fn replace_rule_hops(&self, rule_id: i64, hops: &[(i64, i32)]) -> Result<(), DbError>;
+
+    /// Atomically claim a dedicated TCP tunnel port for one hop if it does not
+    /// have one yet, then return the stored value. Concurrent config builds for
+    /// the same hop converge on the first successful claim.
+    async fn claim_rule_hop_tunnel_port(
+        &self,
+        hop_id: i64,
+        port: i32,
+    ) -> Result<Option<i32>, DbError>;
 
     /// List hops for a rule ordered by position ascending.
     async fn list_rule_hops(

@@ -25,6 +25,9 @@ async fn repo() -> SqliteRepository {
         .await
         .unwrap();
     sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+    crate::db::schema::run_migrations(&pool)
+        .await
+        .expect("apply migrations like production init_db");
     SqliteRepository::new(pool)
 }
 
@@ -245,16 +248,19 @@ async fn rule_targets_replace_and_list_enabled_in_order() {
                 host: "a.example.com".into(),
                 port: 1001,
                 enabled: true,
+                weight: 1,
             },
             relay_shared::protocol::RuleTargetRequest {
                 host: "b.example.com".into(),
                 port: 1002,
                 enabled: false,
+                weight: 1,
             },
             relay_shared::protocol::RuleTargetRequest {
                 host: "c.example.com".into(),
                 port: 1003,
                 enabled: true,
+                weight: 1,
             },
         ],
     )
@@ -763,7 +769,9 @@ async fn rule_create_full_cross_group_no_crosstalk() {
                 host: "a.example.com".into(),
                 port: 1001,
                 enabled: true,
+                weight: 1,
             }],
+            &[],
             "first",
             0,
             0,
@@ -796,18 +804,22 @@ async fn rule_create_full_cross_group_no_crosstalk() {
                     host: "b1.example.com".into(),
                     port: 2001,
                     enabled: true,
+                    weight: 1,
                 },
                 relay_shared::protocol::RuleTargetRequest {
                     host: "b2.example.com".into(),
                     port: 2002,
                     enabled: true,
+                    weight: 1,
                 },
                 relay_shared::protocol::RuleTargetRequest {
                     host: "b3.example.com".into(),
                     port: 2003,
                     enabled: true,
+                    weight: 1,
                 },
             ],
+            &[],
             "round_robin",
             50,
             100,
@@ -885,7 +897,9 @@ async fn rule_create_full_rollback_on_target_failure() {
                 host: "bad.example.com".into(),
                 port: 0,
                 enabled: true,
+                weight: 1,
             }],
+            &[],
             "first",
             0,
             0,
@@ -911,6 +925,50 @@ async fn rule_create_full_rollback_on_target_failure() {
     .await
     .unwrap();
     assert_eq!(target_count, 0, "no orphan target rows");
+}
+
+#[tokio::test]
+async fn rule_create_full_rollback_on_hop_failure() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+
+    let result = db
+        .create_rule_full(
+            "doomed-chain",
+            1,
+            31000,
+            "tcp",
+            "raw",
+            "raw",
+            "chain",
+            "raw",
+            None,
+            1,
+            None,
+            "chain",
+            "1.1.1.1",
+            80,
+            &[relay_shared::protocol::RuleTargetRequest {
+                host: "ok.example.com".into(),
+                port: 80,
+                enabled: true,
+                weight: 1,
+            }],
+            &[(999_999, 31001)],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await;
+    assert!(result.is_err(), "invalid hop FK must fail atomic create");
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE listen_port = 31000")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "hop failure must roll back the rule row");
 }
 
 /// v1.2: create_rule_full reports Ok(None) (not an error, not a row) when the
@@ -945,7 +1003,9 @@ async fn rule_create_full_quota_exhausted_returns_none() {
                 host: "a.example.com".into(),
                 port: 80,
                 enabled: true,
+                weight: 1,
             }],
+            &[],
             "first",
             0,
             0,
@@ -978,7 +1038,9 @@ async fn rule_create_full_quota_exhausted_returns_none() {
                 host: "a.example.com".into(),
                 port: 80,
                 enabled: true,
+                weight: 1,
             }],
+            &[],
             "first",
             0,
             0,
@@ -1159,6 +1221,10 @@ async fn auto_assign_port_errors_when_range_full() {
         "error must name the exhausted range, got {:?}",
         err
     );
+    assert!(
+        auto_assign_port(&db, 1, "tcp_udp").await.is_err(),
+        "tcp_udp inherently needs both socket families and must conflict with TCP"
+    );
     // A UDP-bearing rule doesn't conflict with the TCP occupant → still fits.
     let p = auto_assign_port(&db, 1, "udp").await.unwrap();
     assert_eq!(p, 50000, "udp must reuse the port held only by tcp");
@@ -1176,6 +1242,106 @@ async fn auto_assign_port_missing_group_uses_default_pool() {
         "missing group must use the default pool, got {}",
         p
     );
+}
+
+#[tokio::test]
+async fn rule_hop_tunnel_port_claim_is_stable_and_reserved() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    seed_group(&db, 2).await;
+    seed_group(&db, 3).await;
+
+    db.insert_quota_guarded(
+        "chain-a",
+        1,
+        20000,
+        "udp",
+        "raw",
+        "raw",
+        "chain",
+        "raw",
+        None,
+        1,
+        Some(2),
+        "chain",
+        "127.0.0.1",
+        53,
+    )
+    .await
+    .unwrap();
+    let rule = db
+        .list_rules(&ResourceScope::All)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|rule| rule.name == "chain-a")
+        .unwrap();
+    db.replace_rule_hops(rule.id, &[(1, 20000), (2, 30000)])
+        .await
+        .unwrap();
+    let exit_hop = db.list_rule_hops(rule.id).await.unwrap()[1].clone();
+
+    assert_eq!(
+        db.claim_rule_hop_tunnel_port(exit_hop.id, 31000)
+            .await
+            .unwrap(),
+        Some(31000)
+    );
+    assert_eq!(
+        db.claim_rule_hop_tunnel_port(exit_hop.id, 31001)
+            .await
+            .unwrap(),
+        Some(31000),
+        "the first atomic claim must remain stable"
+    );
+    assert!(db
+        .list_group_port_protocols(2)
+        .await
+        .unwrap()
+        .contains(&(31000, "tcp".to_string())));
+
+    db.replace_rule_hops(rule.id, &[(1, 20001), (2, 30001)])
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_rule_hops(rule.id).await.unwrap()[1].tunnel_port,
+        Some(31000),
+        "topology edits that keep the group must preserve its tunnel port"
+    );
+
+    db.insert_quota_guarded(
+        "chain-b",
+        1,
+        21000,
+        "udp",
+        "raw",
+        "raw",
+        "chain",
+        "raw",
+        None,
+        3,
+        Some(2),
+        "chain",
+        "127.0.0.1",
+        53,
+    )
+    .await
+    .unwrap();
+    let second = db
+        .list_rules(&ResourceScope::All)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|rule| rule.name == "chain-b")
+        .unwrap();
+    db.replace_rule_hops(second.id, &[(3, 21000), (2, 32000)])
+        .await
+        .unwrap();
+    let second_exit = db.list_rule_hops(second.id).await.unwrap()[1].id;
+    assert!(matches!(
+        db.claim_rule_hop_tunnel_port(second_exit, 31000).await,
+        Err(DbError::UniqueViolation)
+    ));
 }
 
 #[tokio::test]

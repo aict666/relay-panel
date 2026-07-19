@@ -19,8 +19,8 @@ import type { ForwardRule, RuleTargetInput } from '../api/types';
  *  to the legacy target_addr/target_port pair when the targets[] array is empty. */
 export function ruleTargets(rule: ForwardRule): RuleTargetInput[] {
   const targets = rule.targets?.length
-    ? rule.targets.map(t => ({ host: t.host, port: t.port, enabled: t.enabled }))
-    : [{ host: rule.target_addr, port: rule.target_port, enabled: true }];
+    ? rule.targets.map(t => ({ host: t.host, port: t.port, enabled: t.enabled, weight: t.weight ?? 1 }))
+    : [{ host: rule.target_addr, port: rule.target_port, enabled: true, weight: 1 }];
   return targets;
 }
 

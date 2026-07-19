@@ -24,7 +24,12 @@ function targetSummary(rule: ForwardRule): string {
 
 function formTargets(values: { targets?: RuleTargetInput[]; target_addr?: string; target_port?: number }): RuleTargetInput[] {
   const targets = values.targets ?? [];
-  return targets.map(t => ({ host: t.host?.trim() ?? '', port: Number(t.port), enabled: t.enabled !== false }));
+  return targets.map(t => ({
+    host: t.host?.trim() ?? '',
+    port: Number(t.port),
+    enabled: t.enabled !== false,
+    weight: Math.max(1, Math.min(100, Number(t.weight ?? 1))),
+  }));
 }
 
 function payloadWithTargets<T extends Record<string, unknown>>(values: T & { targets?: RuleTargetInput[]; target_addr?: string; target_port?: number }) {
@@ -338,7 +343,7 @@ const IMPORT_DEFAULTS = {
         // validateImportEntry already rejected any unparseable dest above, so
         // parseDest is non-null here; fall back to a safe default defensively.
         const p = parseDest(d) ?? { host: '', port: 0 };
-        return { host: p.host, port: p.port, enabled: true };
+        return { host: p.host, port: p.port, enabled: true, weight: 1 };
       });
       const first = targets[0];
       try {
@@ -389,11 +394,14 @@ const IMPORT_DEFAULTS = {
         message.error(t('chainHopsHint'));
         return;
       }
-      payload.route_mode = 'chain';
-      payload.forward_mode = 'chain';
-      payload.hops = hops;
-      payload.device_group_in = hops[0];
-      payload.device_group_out = hops[hops.length - 1];
+      const oldHops = (editing.hops ?? []).map(h => h.device_group_id);
+      if (!wasChain || JSON.stringify(hops) !== JSON.stringify(oldHops)) {
+        payload.route_mode = 'chain';
+        payload.forward_mode = 'chain';
+        payload.hops = hops;
+        payload.device_group_in = hops[0];
+        payload.device_group_out = hops[hops.length - 1];
+      }
     } else if (wasChain) {
       payload.route_mode = 'direct';
       payload.forward_mode = 'direct';
@@ -440,9 +448,17 @@ const IMPORT_DEFAULTS = {
   };
 
   const handleDelete = async (id: number) => {
-    await api.delete(`/rules/${id}`);
-    message.success(t('ruleDeleted'));
-    load();
+    try {
+      const res = await api.delete<unknown, ApiEnvelope<null>>(`/rules/${id}`);
+      if (res.code !== 0) {
+        message.error(res.message || t('deleteFailed'));
+        return;
+      }
+      message.success(t('ruleDeleted'));
+      load();
+    } catch {
+      message.error(t('deleteFailed'));
+    }
   };
 
   const handleBatchDelete = async () => {
@@ -718,7 +734,16 @@ const IMPORT_DEFAULTS = {
               </Tooltip>
             ) : summary}
             {r.load_balance_strategy && r.load_balance_strategy !== 'first' && (
-              <Tag color="cyan">{r.load_balance_strategy === 'round_robin' ? t('lbRoundRobin') : t('lbFailover')}</Tag>
+              <Tag color="cyan">{{
+                round_robin: t('lbRoundRobin'),
+                failover: t('lbFailover'),
+                weighted: t('lbWeighted'),
+                least_latency: t('lbLeastLatency'),
+                least_connections: t('lbLeastConnections'),
+              }[r.load_balance_strategy] ?? r.load_balance_strategy}</Tag>
+            )}
+            {(r.protocol === 'udp' || r.protocol === 'tcp_udp') && (r.route_mode === 'chain' || r.forward_mode === 'chain') && (
+              <Tooltip title={t('uotAutoHint')}><Tag color="purple">UOT Ready</Tag></Tooltip>
             )}
           </Space>
         );
@@ -772,6 +797,9 @@ const IMPORT_DEFAULTS = {
     { value: 'first', label: t('lbFirst') },
     { value: 'round_robin', label: t('lbRoundRobin') },
     { value: 'failover', label: t('lbFailover') },
+    { value: 'weighted', label: t('lbWeighted') },
+    { value: 'least_latency', label: t('lbLeastLatency') },
+    { value: 'least_connections', label: t('lbLeastConnections') },
   ];
   const isUdp = (p?: string) => p === 'udp' || p === 'tcp_udp';
 
@@ -848,7 +876,7 @@ const IMPORT_DEFAULTS = {
   };
 
   const renderTargetsEditor = () => (
-    <Form.List name="targets" initialValue={[{ host: '', port: undefined as unknown as number, enabled: true }]}>
+    <Form.List name="targets" initialValue={[{ host: '', port: undefined as unknown as number, enabled: true, weight: 1 }]}>
       {(fields, { add, remove, move }) => (
         <Space orientation="vertical" style={{ width: '100%' }} className="rp-target-editor">
           <Text strong>{t('targets')}</Text>
@@ -863,6 +891,16 @@ const IMPORT_DEFAULTS = {
                 className="rp-target-host"
               >
                 <Input placeholder={t('targetAddress')} />
+              </Form.Item>
+              <Form.Item
+                {...field}
+                name={[field.name, 'weight']}
+                label={t('targetWeight')}
+                initialValue={1}
+                rules={[{ required: true }]}
+                style={{ marginBottom: 8, width: 92 }}
+              >
+                <InputNumber min={1} max={100} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item
                 {...field}
@@ -898,7 +936,7 @@ const IMPORT_DEFAULTS = {
               <Button size="small" danger icon={<DeleteOutlined />} aria-label={t('deleteTarget')} disabled={fields.length <= 1} onClick={() => remove(field.name)} />
             </Space>
           ))}
-          <Button size="small" icon={<PlusOutlined />} onClick={() => add({ host: '', port: undefined as unknown as number, enabled: true })}>{t('addTarget')}</Button>
+          <Button size="small" icon={<PlusOutlined />} onClick={() => add({ host: '', port: undefined as unknown as number, enabled: true, weight: 1 })}>{t('addTarget')}</Button>
         </Space>
       )}
     </Form.List>
@@ -1221,6 +1259,9 @@ const IMPORT_DEFAULTS = {
                       <div>• {t('lbFirstDesc')}</div>
                       <div>• {t('lbRoundRobinDesc')}</div>
                       <div>• {t('lbFailoverDesc')}</div>
+                      <div>• {t('lbWeightedDesc')}</div>
+                      <div>• {t('lbLeastLatencyDesc')}</div>
+                      <div>• {t('lbLeastConnectionsDesc')}</div>
                       <div style={{ marginTop: 8, color: '#888' }}>{t('lbStrategyBlockFooter')}</div>
                     </div>
                   }
@@ -1332,6 +1373,9 @@ const IMPORT_DEFAULTS = {
                       <div>• {t('lbFirstDesc')}</div>
                       <div>• {t('lbRoundRobinDesc')}</div>
                       <div>• {t('lbFailoverDesc')}</div>
+                      <div>• {t('lbWeightedDesc')}</div>
+                      <div>• {t('lbLeastLatencyDesc')}</div>
+                      <div>• {t('lbLeastConnectionsDesc')}</div>
                       <div style={{ marginTop: 8, color: '#888' }}>{t('lbStrategyBlockFooter')}</div>
                     </div>
                   }

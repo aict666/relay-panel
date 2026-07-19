@@ -10,13 +10,14 @@ use relay_shared::models::User;
 use relay_shared::protocol::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
-/// Simple in-memory login rate limiter. Tracks per-username attempt counts
-/// within a 1-minute window. Limits brute-force attacks without needing a
-/// Redis/external store. Reset on process restart (acceptable: the attacker
-/// has to re-establish state each time).
+/// In-memory login rate-limit state. Per-username counters protect accounts;
+/// the separate global counter bounds work from fabricated usernames. State
+/// resets on process restart, which is acceptable for this single-process
+/// deployment model.
 struct LoginAttempt {
     count: u32,
     window_start: Instant,
@@ -25,15 +26,26 @@ struct LoginAttempt {
 static LOGIN_LIMITER: Lazy<Mutex<HashMap<String, LoginAttempt>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+static GLOBAL_LOGIN_LIMITER: Lazy<Mutex<LoginAttempt>> = Lazy::new(|| {
+    Mutex::new(LoginAttempt {
+        count: 0,
+        window_start: Instant::now(),
+    })
+});
+
+/// Keep expensive bcrypt work out of Tokio's async worker threads and bound
+/// the number of blocking jobs that can be queued by the public auth routes.
+static BCRYPT_SLOTS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
+
 const MAX_LOGIN_ATTEMPTS: u32 = 5;
+const MAX_GLOBAL_LOGIN_ATTEMPTS: u32 = 120;
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
+const LOGIN_LIMITER_CAP: usize = 10_000;
 
 /// Returns true if the login attempt should be blocked (too many attempts).
-/// Resets the window if it has elapsed. Also prunes expired entries when the
-/// map grows beyond CAP to prevent unbounded memory growth from crafted
-/// usernames that never succeed (and thus never get remove()d).
-fn check_rate_limit(username: &str) -> bool {
-    const CAP: usize = 10_000;
+/// Resets the window if it has elapsed. Before reaching capacity, expired
+/// entries are pruned; if the map is still full, new keys are rejected.
+fn check_username_rate_limit(username: &str) -> bool {
     let now = Instant::now();
     let mut map = LOGIN_LIMITER.lock().unwrap();
     match map.get_mut(username) {
@@ -42,6 +54,15 @@ fn check_rate_limit(username: &str) -> bool {
             entry.count > MAX_LOGIN_ATTEMPTS
         }
         _ => {
+            // Prune before inserting and enforce a real hard cap. Merely
+            // retaining unexpired entries after insertion does not cap a burst
+            // of distinct usernames inside the active window.
+            if map.len() >= LOGIN_LIMITER_CAP {
+                map.retain(|_, v| now.duration_since(v.window_start) < LOGIN_WINDOW);
+                if map.len() >= LOGIN_LIMITER_CAP {
+                    return true;
+                }
+            }
             // New window (first attempt, or window expired)
             map.insert(
                 username.to_string(),
@@ -50,13 +71,23 @@ fn check_rate_limit(username: &str) -> bool {
                     window_start: now,
                 },
             );
-            // GC: drop entries whose window has expired to bound memory.
-            if map.len() > CAP {
-                map.retain(|_, v| now.duration_since(v.window_start) < LOGIN_WINDOW);
-            }
             false
         }
     }
+}
+
+/// A process-wide budget prevents an attacker from bypassing the per-account
+/// limiter with an unlimited stream of fabricated usernames.
+fn check_global_rate_limit() -> bool {
+    let now = Instant::now();
+    let mut entry = GLOBAL_LOGIN_LIMITER.lock().unwrap();
+    if now.duration_since(entry.window_start) >= LOGIN_WINDOW {
+        entry.count = 1;
+        entry.window_start = now;
+        return false;
+    }
+    entry.count += 1;
+    entry.count > MAX_GLOBAL_LOGIN_ATTEMPTS
 }
 
 /// Clear the rate-limit counter for a username on successful login.
@@ -85,8 +116,20 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Json<ApiResponse<LoginResponse>> {
-    // Rate limit: max 5 attempts per username per 60s.
-    if check_rate_limit(&req.username) {
+    // Reject malformed/unbounded identifiers before they can become limiter
+    // keys or reach the database.
+    if !validate_username(&req.username) {
+        return Json(ApiResponse {
+            code: 400,
+            message: "Username must be 1-64 chars, ASCII letters/digits/underscore only".into(),
+            data: None,
+        });
+    }
+
+    // Per-account protection plus a process-wide bcrypt budget. A blocked
+    // account does not consume the global budget, so repeatedly attacking one
+    // known username cannot lock every other user out by itself.
+    if check_username_rate_limit(&req.username) || check_global_rate_limit() {
         return Json(ApiResponse {
             code: 429,
             message: "Too many login attempts. Please wait a minute and try again.".into(),
@@ -103,13 +146,34 @@ pub async fn login(
     };
 
     // Always perform a bcrypt verification to prevent timing attacks that
-    // reveal whether a username exists. When the user is None we verify
-    // against a pre-computed dummy hash so the CPU cost is identical.
-    let (verified, user) = match user {
-        Some(u) => (verify_password(&req.password, &u.password), Some(u)),
-        None => {
-            let _ = verify_password(&req.password, DUMMY_HASH);
-            (false, None)
+    // reveal whether a username exists. Run it on the blocking pool and cap
+    // concurrency so public requests cannot occupy every async runtime worker
+    // or enqueue an unbounded number of expensive jobs.
+    let permit = match BCRYPT_SLOTS.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return Json(ApiResponse {
+                code: 429,
+                message: "Too many login attempts. Please try again shortly.".into(),
+                data: None,
+            });
+        }
+    };
+    let password = req.password.clone();
+    let hash = user
+        .as_ref()
+        .map(|u| u.password.clone())
+        .unwrap_or_else(|| DUMMY_HASH.to_string());
+    let verified = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_password(&password, &hash)
+    })
+    .await
+    {
+        Ok(value) => value && user.is_some(),
+        Err(e) => {
+            tracing::error!("login: bcrypt worker failed: {}", e);
+            false
         }
     };
 
@@ -331,5 +395,34 @@ async fn default_password_change_required(db: &dyn crate::db::repo::Repository) 
         Ok(Some((_banned, _version, must_change))) => must_change,
         // User doesn't exist (fresh DB before seed) or DB error → no banner.
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn username_limiter_has_a_real_hard_capacity() {
+        LOGIN_LIMITER.lock().unwrap().clear();
+        for index in 0..LOGIN_LIMITER_CAP {
+            assert!(!check_username_rate_limit(&format!("user_{index}")));
+        }
+        assert!(check_username_rate_limit("one_user_too_many"));
+        assert_eq!(LOGIN_LIMITER.lock().unwrap().len(), LOGIN_LIMITER_CAP);
+        LOGIN_LIMITER.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn global_limiter_stops_distinct_username_bypass() {
+        {
+            let mut entry = GLOBAL_LOGIN_LIMITER.lock().unwrap();
+            entry.count = 0;
+            entry.window_start = Instant::now();
+        }
+        for _ in 0..MAX_GLOBAL_LOGIN_ATTEMPTS {
+            assert!(!check_global_rate_limit());
+        }
+        assert!(check_global_rate_limit());
     }
 }

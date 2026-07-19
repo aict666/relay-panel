@@ -92,6 +92,29 @@ cd "$ROOT"
 echo "Release pre-flight check for ${TRACK} version: $VERSION (tag: $TAG)"
 echo "Repo root: $ROOT"
 
+# A release tag is immutable public state. Refuse to recommend a tag that is
+# already present locally or on origin; previously this script could report
+# "OK to tag" for an existing release and the final push would fail too late.
+section "Tag availability"
+if git show-ref --verify --quiet "refs/tags/${TAG}"; then
+    fail "tag ${TAG} already exists locally"
+else
+    ok "tag ${TAG} does not exist locally"
+fi
+if git remote get-url origin >/dev/null 2>&1; then
+    if REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/${TAG}" 2>/dev/null); then
+        if [ -n "$REMOTE_TAG" ]; then
+            fail "tag ${TAG} already exists on origin"
+        else
+            ok "tag ${TAG} does not exist on origin"
+        fi
+    else
+        warn "could not query origin for tag ${TAG}; verify network access before tagging"
+    fi
+else
+    warn "origin remote is not configured; remote tag availability was not checked"
+fi
+
 # ---------- Helper: read a single value from a TOML file ----------
 # Reads `key = "value"` or `key = value`. First match wins. Returns empty if
 # not found. Pure grep/sed — no python / no awk script-blocks (Windows Git

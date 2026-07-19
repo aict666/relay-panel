@@ -28,21 +28,28 @@ fi
 # Excludes helper functions (repo, cleanup, seed_*, pg_url, replace_db_in_url).
 extract_tests() {
   local file="$1"
-  grep -oP '^\s*async fn\s+\K[a-z_][a-z0-9_]*(?=\s*\()' "$file" \
-	    | grep -vE '^(repo|cleanup|seed_group|seed_group_typed|seed_user|pg_url|replace_db_in_url|placeholders|_placeholders_unused)$' \
-    || true
+  # POSIX character classes + sed -E work with both BSD/macOS and GNU tools;
+  # grep -P is unavailable in the macOS system grep and previously got hidden
+  # by `|| true`, turning a parser failure into a false "0 tests" success.
+  sed -nE 's/^[[:space:]]*async fn[[:space:]]+([a-z_][a-z0-9_]*)[[:space:]]*\(.*/\1/p' "$file" \
+    | grep -vE '^(repo|cleanup|seed_group|seed_group_typed|seed_user|pg_url|replace_db_in_url|placeholders|_placeholders_unused)$'
 }
 
 # ── Load allowlist ──
 load_allowlist() {
   if [[ -f "$ALLOWLIST_FILE" ]]; then
-    grep -oP '^[a-z_][a-z0-9_]*' "$ALLOWLIST_FILE" | grep -v '^#' || true
+    sed -nE 's/^([a-z_][a-z0-9_]*).*/\1/p' "$ALLOWLIST_FILE"
   fi
 }
 
 sqlite_names=$(extract_tests "$SQLITE_FILE" | sort -u)
 pg_raw=$(extract_tests "$PG_FILE" | sort -u)
 allowlist=$(load_allowlist | sort -u)
+
+if [[ -z "$sqlite_names" || -z "$pg_raw" ]]; then
+  echo "ERROR: test parser returned an empty set; refusing a false parity success" >&2
+  exit 2
+fi
 
 # Normalise PG names: drop `pg_` prefix.
 pg_names=$(echo "$pg_raw" | sed 's/^pg_//' | sort -u)
