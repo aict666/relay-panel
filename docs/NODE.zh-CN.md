@@ -386,5 +386,5 @@ curl -fL -o relay-node \
 ## 相关文档
 - [DEPLOYMENT.md](./DEPLOYMENT.md) —— 面板本身的部署（Docker Compose）
 - [NODE.md](./NODE.md) —— 本文档的英文版
-- [../README.md](../README.md) —— 项目总览（中文）
-- [../CHANGELOG.md](../CHANGELOG.md) —— 版本历史
+- [README](https://github.com/aict666/relay-panel#readme) —— 项目总览（中文）
+- [Releases](https://github.com/aict666/relay-panel/releases) —— 版本历史

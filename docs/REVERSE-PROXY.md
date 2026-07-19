@@ -68,7 +68,7 @@ location / {
 
 If you run Caddy on the host (not via the Compose profile):
 
-```caddyfile
+```text
 panel.example.com {
     encode gzip zstd
     reverse_proxy 127.0.0.1:18888
@@ -159,7 +159,7 @@ Compose Caddy profile).
 
 `RELAYPANEL_WEB_MODE=reverse-proxy` defaults to the safe same-host layout:
 
-```env
+```ini
 RELAYPANEL_WEB_MODE=reverse-proxy
 PUBLIC_PANEL_URL=https://panel.example.com
 # panel binds 127.0.0.1:18888
@@ -168,7 +168,7 @@ PUBLIC_PANEL_URL=https://panel.example.com
 If Nginx/Caddy runs on another server, it cannot reach `127.0.0.1` on the
 panel host. In that case explicitly opt into the separate-host layout:
 
-```env
+```ini
 RELAYPANEL_WEB_MODE=reverse-proxy
 REVERSE_PROXY_EXTERNAL=1
 PUBLIC_PANEL_URL=https://panel.example.com

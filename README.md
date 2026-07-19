@@ -15,6 +15,7 @@
 <p align="center">
   <a href="https://github.com/aict666/relay-panel/releases/latest"><img src="https://img.shields.io/github/v/release/aict666/relay-panel?style=flat-square&label=Release&color=blue" alt="Release" /></a>
   <a href="https://github.com/aict666/relay-panel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/aict666/relay-panel/ci.yml?style=flat-square&label=CI" alt="CI" /></a>
+  <a href="https://aict666.github.io/relay-panel/"><img src="https://img.shields.io/badge/Docs-%E4%B8%AD%E6%96%87%E6%8C%87%E5%8D%97-0f766e?style=flat-square" alt="Documentation" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/aict666/relay-panel?style=flat-square&label=License&color=red" alt="License" /></a>
 </p>
 
@@ -73,7 +74,9 @@ curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/install.sh
 
 > 🖥️ **平台支持**：面板镜像与节点均支持 **amd64 / arm64**，ARM 服务器可直接部署；面板镜像为多架构 manifest，`docker pull` 自动选对架构，节点安装脚本 `uname -m` 自动适配，均无需手动指定。
 
-📖 完整指南：**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**
+📖 完整指南：**[RelayPanel 中文使用指南](https://aict666.github.io/relay-panel/)**
+
+包括快速安装、节点接入、规则配置、多跳链、UOT / TCP 0-RTT、安全升级与故障排查。需要离线阅读时，可直接查看仓库中的 [`docs/`](docs/) Markdown 文件。
 
 ---
 

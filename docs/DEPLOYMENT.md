@@ -495,7 +495,7 @@ location / {
 
 ### Caddy
 
-```caddyfile
+```text
 panel.example.com {
     reverse_proxy 127.0.0.1:18888
 }
