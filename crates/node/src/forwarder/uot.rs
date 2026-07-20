@@ -21,6 +21,9 @@ use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use super::limiter::RateLimit;
 use super::selector::{TargetLease, TargetSelector};
 use crate::reporter::{ConnectionTracker, TrafficCounter, UDP_SESSION_TIMEOUT};
+use relay_shared::protocol::TunnelClientConfig;
+
+use super::gate::RuleCancellation;
 
 const MAGIC: &[u8; 8] = b"RPUOT002";
 const TOKEN_LEN: usize = 64;
@@ -61,6 +64,7 @@ struct ClientConfig {
     source_ipv4: Option<Ipv4Addr>,
     reply_tx: mpsc::Sender<Frame>,
     shutdown: Arc<ShutdownState>,
+    preset_tunnel: Option<TunnelClientConfig>,
 }
 
 struct ShutdownState {
@@ -113,6 +117,8 @@ pub async fn serve_ingress(
     rule_id: i64,
     source_ipv4: Option<Ipv4Addr>,
     count_traffic: bool,
+    preset_tunnel: Option<TunnelClientConfig>,
+    mut credential_cancellation: Option<RuleCancellation>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shutdown = ShutdownState::new();
     let _shutdown_guard = ShutdownGuard(shutdown.clone());
@@ -127,6 +133,7 @@ pub async fn serve_ingress(
             source_ipv4,
             reply_tx,
             shutdown: shutdown.clone(),
+            preset_tunnel,
         },
         out_rx,
     ));
@@ -239,7 +246,27 @@ pub async fn serve_ingress(
 
     let mut buf = vec![0u8; u16::MAX as usize];
     loop {
-        let (n, client) = inbound.recv_from(&mut buf).await?;
+        let received = async {
+            match credential_cancellation.as_mut() {
+                Some(cancellation) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => None,
+                        received = inbound.recv_from(&mut buf) => Some(received),
+                    }
+                }
+                None => Some(inbound.recv_from(&mut buf).await),
+            }
+        }
+        .await;
+        let Some(received) = received else {
+            tracing::warn!(
+                rule_id,
+                "preset UDP credential generation revoked; closing warm channel"
+            );
+            return Ok(());
+        };
+        let (n, client) = received?;
         let session_id = if let Some(s) = sessions.get(&client) {
             s.last_ms.store(now_millis(), Ordering::Relaxed);
             s.id
@@ -408,6 +435,26 @@ async fn handle_egress(
     session_slots: Arc<Semaphore>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     authenticate(&mut stream, inbound_token).await?;
+    serve_authenticated_egress(
+        stream,
+        targets.to_vec(),
+        selector,
+        source_ipv4,
+        session_slots,
+    )
+    .await
+}
+
+/// Consume UOT frames after a preset-tunnel v8 header has already authenticated
+/// the connection and selected the rule. Shared tunnel listeners call this at
+/// the final hop so they reuse the mature per-session UDP implementation.
+pub(crate) async fn serve_authenticated_egress(
+    stream: TcpStream,
+    targets: Vec<String>,
+    selector: Arc<TargetSelector>,
+    source_ipv4: Option<Ipv4Addr>,
+    session_slots: Arc<Semaphore>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_shutdown = ShutdownState::new();
     let _session_shutdown_guard = ShutdownGuard(session_shutdown.clone());
     let (mut reader, mut writer) = stream.into_split();
@@ -433,7 +480,7 @@ async fn handle_egress(
                 );
                 continue;
             };
-            let (idx, target) = resolve_udp_target(targets, &selector).await?;
+            let (idx, target) = resolve_udp_target(&targets, &selector).await?;
             let socket = Arc::new(super::outbound::udp_outbound_socket(source_ipv4).await?);
             socket.connect(target).await?;
             let last_ms = Arc::new(AtomicU64::new(now_millis()));
@@ -530,7 +577,12 @@ async fn run_client(config: ClientConfig, mut outbound_rx: mpsc::Receiver<Frame>
                 continue;
             }
         };
-        if send_handshake(&mut stream, &config.token).await.is_err() {
+        let authenticated = if let Some(preset) = &config.preset_tunnel {
+            super::tunnel::write_header(&mut stream, preset, super::tunnel::TunnelMode::Udp).await
+        } else {
+            send_handshake(&mut stream, &config.token).await
+        };
+        if authenticated.is_err() {
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
         }
@@ -901,6 +953,8 @@ mod tests {
             1,
             None,
             true,
+            None,
+            None,
         ));
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -996,6 +1050,8 @@ mod tests {
             1,
             None,
             true,
+            None,
+            None,
         ));
 
         let uot_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1061,6 +1117,7 @@ mod tests {
                 source_ipv4: None,
                 reply_tx,
                 shutdown: shutdown.clone(),
+                preset_tunnel: None,
             },
             out_rx,
         ));

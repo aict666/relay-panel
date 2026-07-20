@@ -23,17 +23,56 @@
 //! generation via `RuleRuntime::cancel_all` wakes them all, they drop their
 //! sockets, and the peers see the connection close.
 //!
-//! ## Why cancellation is NOT wired into `apply_config`
+//! ## When `apply_config` cancels
 //!
 //! A fingerprint change (new targets, new rate cap) tears the listener down and
 //! rebuilds it, but deliberately leaves live connections alone — that has been
 //! the behaviour since v0.3.6 and users rely on editing a rule without kicking
-//! everyone off. Only an EXPLICIT restart cancels. The two paths are separate on
-//! purpose: `apply_config` never touches the generation.
+//! everyone off. An explicit restart cancels, and config protocol v8 adds one
+//! security exception: rotating a preset-tunnel link key is credential
+//! revocation, so `apply_config` also cancels those old authenticated streams.
+//! Ordinary target, path, limit, and listener edits still drain naturally.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::watch;
+
+#[derive(Debug)]
+struct CredentialGeneration {
+    groups: Vec<(i64, Option<i64>)>,
+    cancel: watch::Sender<u64>,
+}
+
+impl CredentialGeneration {
+    fn cancel(&self) {
+        self.cancel.send_modify(|generation| *generation += 1);
+    }
+}
+
+/// Cancellation-only view used by preset UDP ingress. UDP has no accepted TCP
+/// connection to count, but its long-lived UOT warm channel must still close
+/// immediately when a tunnel credential generation is revoked.
+#[derive(Clone)]
+pub struct RuleCancellation {
+    cancel: watch::Receiver<u64>,
+    credential_cancel: Option<watch::Receiver<u64>>,
+    // Keeps this credential generation discoverable for exactly as long as the
+    // UDP listener/warm channel that uses it exists.
+    _credential_generation: Option<Arc<CredentialGeneration>>,
+}
+
+impl RuleCancellation {
+    pub async fn cancelled(&mut self) {
+        if let Some(credential_cancel) = &mut self.credential_cancel {
+            tokio::select! {
+                _ = self.cancel.changed() => {}
+                _ = credential_cancel.changed() => {}
+            }
+        } else {
+            let _ = self.cancel.changed().await;
+        }
+    }
+}
 
 /// The half of a rule's runtime state handed to its listeners. Cheap to clone;
 /// a rule's v4 and v6 listeners each hold one and they share the same counter
@@ -49,6 +88,10 @@ pub struct RuleGate {
     /// Restart signal. The value is a generation counter; any change means
     /// "drop the connection you are driving".
     cancel: watch::Receiver<u64>,
+    credential_cancel: Option<watch::Receiver<u64>>,
+    /// One listener/config generation. When a listener is replaced, its gate
+    /// drops but admitted connections retain this Arc until they finish.
+    credential_generation: Option<Arc<CredentialGeneration>>,
 }
 
 impl RuleGate {
@@ -69,6 +112,7 @@ impl RuleGate {
     pub fn admit(&self) -> Option<ConnGuard> {
         let guard = ConnGuard {
             live: self.live.clone(),
+            _credential_generation: self.credential_generation.clone(),
         };
         // Increment FIRST, then compare, so two accept loops (v4 + v6) racing on
         // the same rule can never both observe "one slot left" and both take it.
@@ -96,7 +140,14 @@ impl RuleGate {
     pub async fn cancelled(&mut self) {
         // `changed()` errors only when the sender dropped; treat that as a
         // cancel rather than parking forever on a dead channel.
-        let _ = self.cancel.changed().await;
+        if let Some(credential_cancel) = &mut self.credential_cancel {
+            tokio::select! {
+                _ = self.cancel.changed() => {}
+                _ = credential_cancel.changed() => {}
+            }
+        } else {
+            let _ = self.cancel.changed().await;
+        }
     }
 }
 
@@ -106,6 +157,7 @@ impl RuleGate {
 pub struct RuleRuntime {
     live: Arc<AtomicU64>,
     cancel: watch::Sender<u64>,
+    credential_generations: Arc<StdMutex<Vec<Weak<CredentialGeneration>>>>,
 }
 
 impl RuleRuntime {
@@ -114,18 +166,141 @@ impl RuleRuntime {
         Self {
             live: Arc::new(AtomicU64::new(0)),
             cancel,
+            credential_generations: Arc::new(StdMutex::new(Vec::new())),
         }
+    }
+
+    fn credential_generation(
+        &self,
+        groups: impl IntoIterator<Item = (i64, Option<i64>)>,
+    ) -> Option<Arc<CredentialGeneration>> {
+        let mut groups: Vec<(i64, Option<i64>)> = groups.into_iter().collect();
+        groups.sort_unstable();
+        groups.dedup();
+        if groups.is_empty() {
+            return None;
+        }
+        let (cancel, _) = watch::channel(0);
+        let generation = Arc::new(CredentialGeneration { groups, cancel });
+        let mut generations = self
+            .credential_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generations.retain(|existing| existing.strong_count() > 0);
+        generations.push(Arc::downgrade(&generation));
+        Some(generation)
     }
 
     /// Build the listener-side handle. `max_connections` is passed per-spawn
     /// rather than stored, because it comes from the config being applied and
     /// changing it restarts the listener anyway (it is part of the fingerprint).
+    #[cfg(test)]
     pub fn gate(&self, max_connections: Option<u32>) -> RuleGate {
+        self.gate_with_credentials(max_connections, std::iter::empty())
+    }
+
+    #[cfg(test)]
+    pub fn gate_with_credential_groups(
+        &self,
+        max_connections: Option<u32>,
+        group_ids: impl IntoIterator<Item = i64>,
+    ) -> RuleGate {
+        self.gate_with_credentials(
+            max_connections,
+            group_ids.into_iter().map(|group_id| (group_id, None)),
+        )
+    }
+
+    pub fn gate_with_credentials(
+        &self,
+        max_connections: Option<u32>,
+        groups: impl IntoIterator<Item = (i64, Option<i64>)>,
+    ) -> RuleGate {
+        let credential_generation = self.credential_generation(groups);
+        let credential_cancel = credential_generation
+            .as_ref()
+            .map(|generation| generation.cancel.subscribe());
         RuleGate {
             max_connections,
             live: self.live.clone(),
             cancel: self.cancel.subscribe(),
+            credential_cancel,
+            credential_generation,
         }
+    }
+
+    pub fn cancellation_with_credentials(
+        &self,
+        groups: impl IntoIterator<Item = (i64, Option<i64>)>,
+    ) -> RuleCancellation {
+        let credential_generation = self.credential_generation(groups);
+        let credential_cancel = credential_generation
+            .as_ref()
+            .map(|generation| generation.cancel.subscribe());
+        RuleCancellation {
+            cancel: self.cancel.subscribe(),
+            credential_cancel,
+            _credential_generation: credential_generation,
+        }
+    }
+
+    pub fn uses_credential_group(&self, group_id: i64) -> bool {
+        let mut generations = self
+            .credential_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut found = false;
+        generations.retain(|generation| {
+            let Some(generation) = generation.upgrade() else {
+                return false;
+            };
+            found |= generation
+                .groups
+                .iter()
+                .any(|(generation_group_id, _)| *generation_group_id == group_id);
+            true
+        });
+        found
+    }
+
+    /// Revoke only credential generations older than `current_revision`.
+    /// `None` is an explicit fail-closed revocation and cancels every
+    /// generation that contains the group.
+    pub fn revoke_credential_group(&self, group_id: i64, current_revision: Option<i64>) {
+        let mut generations = self
+            .credential_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generations.retain(|generation| {
+            let Some(generation) = generation.upgrade() else {
+                return false;
+            };
+            if generation
+                .groups
+                .iter()
+                .any(|(generation_group_id, revision)| {
+                    *generation_group_id == group_id
+                        && current_revision.is_none_or(|current| *revision != Some(current))
+                })
+            {
+                generation.cancel();
+            }
+            true
+        });
+    }
+
+    pub fn uses_tunnel_credentials(&self) -> bool {
+        let mut generations = self
+            .credential_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut found = false;
+        generations.retain(|generation| {
+            let live = generation.strong_count() > 0;
+            found |= live;
+            live
+        });
+        found
     }
 
     /// Drop every in-flight connection of this rule. Returns the number of
@@ -140,6 +315,12 @@ impl RuleRuntime {
         self.cancel.send_modify(|generation| *generation += 1);
         live
     }
+
+    /// True once every connection admitted through this runtime has closed.
+    /// Entry migrations keep the sender alive only until this becomes true.
+    pub fn is_idle(&self) -> bool {
+        self.live.load(Ordering::Relaxed) == 0
+    }
 }
 
 impl Default for RuleRuntime {
@@ -152,6 +333,7 @@ impl Default for RuleRuntime {
 /// ends, however it ends.
 pub struct ConnGuard {
     live: Arc<AtomicU64>,
+    _credential_generation: Option<Arc<CredentialGeneration>>,
 }
 
 impl Drop for ConnGuard {
@@ -202,6 +384,26 @@ mod tests {
         assert_eq!(gate.live(), 1000);
         drop(guards);
         assert_eq!(gate.live(), 0);
+    }
+
+    #[test]
+    fn credential_generation_disappears_after_listener_and_connections_drop() {
+        let runtime = RuleRuntime::new();
+        let old_gate = runtime.gate_with_credential_groups(None, [10, 20]);
+        let old_connection = old_gate.admit().unwrap();
+        assert!(runtime.uses_credential_group(20));
+
+        // Replacing the listener drops its gate, but the old connection keeps
+        // the generation revocable until that connection really ends.
+        drop(old_gate);
+        assert!(runtime.uses_credential_group(20));
+        drop(old_connection);
+        assert!(!runtime.uses_credential_group(20));
+
+        let new_gate = runtime.gate_with_credential_groups(None, [10, 30]);
+        assert!(runtime.uses_credential_group(30));
+        assert!(!runtime.uses_credential_group(20));
+        drop(new_gate);
     }
 
     /// The v4 and v6 listeners of one rule share a counter, so a dual-stack

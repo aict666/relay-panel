@@ -99,6 +99,14 @@ export interface ForwardRule {
   /** v0.4.7: bound tunnel profile (source of transport config).
    *  null/undefined = legacy (use public_transport/ws_path). */
   tunnel_profile_id?: number | null;
+  /** Reusable preset route. This is separate from the legacy transport profile. */
+  tunnel_id?: number | null;
+  tunnel_name?: string | null;
+  tunnel_enabled?: boolean | null;
+  tunnel_shared?: boolean | null;
+  /** Safe path snapshot for an existing preset binding, even after sharing or
+   * entry authorization is revoked. Internal connect addresses are omitted. */
+  tunnel_hops?: TunnelHop[];
   /** v1.2.0: cap on concurrent TCP connections, counted PER NODE (0 = unlimited).
    *  A rule served by 3 nodes admits up to 3x this in total. TCP only. */
   max_connections?: number;
@@ -151,6 +159,32 @@ export interface TunnelProfile {
   is_builtin: boolean;
   uid: number;
   created_at: string;
+}
+
+/** One position in an administrator-managed reusable tunnel route. */
+export interface TunnelHop {
+  id: number;
+  tunnel_id: number;
+  position: number;
+  device_group_id: number;
+  /** Entry is null; each following hop owns one shared internal TCP port. */
+  listen_port: number | null;
+  created_at: string;
+  group_name?: string | null;
+  /** Returned only by administrator endpoints. */
+  connect_host?: string | null;
+}
+
+/** Reusable route preset. Do not confuse this with TunnelProfile. */
+export interface Tunnel {
+  id: number;
+  name: string;
+  enabled: boolean;
+  shared: boolean;
+  uid: number;
+  created_at: string;
+  hops: TunnelHop[];
+  bound_rule_count: number;
 }
 
 export interface DeviceGroup {
@@ -222,6 +256,10 @@ export interface ListenerError {
   protocol: string;
   /** Human-readable reason, e.g. "Address already in use (os error 98)". */
   error: string;
+  /** Shared preset-listener ownership when applicable. */
+  tunnel_id?: number | null;
+  /** Rule ownership for public listeners; null for a whole shared listener. */
+  rule_id?: number | null;
 }
 
 export interface NodeStatus {
@@ -294,6 +332,11 @@ export interface DashboardHistoryPoint {
   timestamp: string;
   upload_bps_avg: number;
   download_bps_avg: number;
+  upload_bps_max: number;
+  download_bps_max: number;
+  /** Actual sample time; absent only while talking to a pre-fix panel. */
+  upload_bps_max_at?: string;
+  download_bps_max_at?: string;
   connections_max: number;
   online_nodes_min: number;
   recent_nodes_max: number;

@@ -13,6 +13,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-07-20
+
+### Added
+
+- **Configuration protocol v8 reusable-tunnel data plane.** Multiple TCP, UDP,
+  and `tcp_udp` rules share one internal TCP listener per non-entry hop while
+  remaining isolated by an authenticated tunnel/rule route header. TCP returns
+  to the raw byte stream after setup; UDP keeps per-rule warm UOT channels on
+  the same shared port.
+- **One-way authenticated diagnosis.** A probe uses the same per-link HMAC
+  protocol, traverses every configured hop, and asks only the exit to connect
+  to a panel-controlled final target.
+
+### Security
+
+- Fixed-length headers cover tunnel id, rule id, mode, hop, timestamp, and a
+  random nonce with HMAC-SHA256. Bounded replay caches, handshake deadlines,
+  unauthenticated connection caps, and route-table checks reject stale,
+  replayed, unknown, paused, or unbound traffic without accepting a caller
+  supplied destination.
+- Device-group token rotation immediately revokes both current and draining
+  credential generations, including paths already removed from the latest
+  configuration snapshot.
+
+### Fixed
+
+- Shared-listener hot updates preserve unrelated routes and selector state,
+  while rule removal, restart, tunnel disablement, and credential revocation
+  cancel only their intended connection generations.
+- Retired entry streams keep reporting tail traffic until drained. Snapshot
+  acknowledgements are bound to the original counter allocation, preventing a
+  rapidly recreated rule id from losing bytes or producing an unsigned counter
+  underflow.
+
+### Compatibility
+
+- Requires RelayPanel **1.3.3+**. Protocol-v8 nodes and panel must be upgraded
+  together; older nodes are rejected by the configuration-version gate rather
+  than applying an incomplete route.
+
+### Tests
+
+- Added two-rule TCP sharing, UDP plus `tcp_udp` shared-port isolation,
+  authenticated three-hop probes, replay/HMAC failures, credential rotation,
+  entry-drain, restart, and real socket round-trip regressions.
+
 ## [1.3.1] - 2026-07-19
 
 ### Fixed

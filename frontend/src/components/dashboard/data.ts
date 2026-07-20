@@ -24,9 +24,11 @@ export interface RuleTrafficRank {
 }
 
 export type ChartHistoryPoint = Omit<DashboardHistoryPoint,
-  'upload_bps_avg' | 'download_bps_avg' | 'connections_max'> & {
+  'upload_bps_avg' | 'download_bps_avg' | 'upload_bps_max' | 'download_bps_max' | 'connections_max'> & {
     upload_bps_avg: number | null;
     download_bps_avg: number | null;
+    upload_bps_max: number | null;
+    download_bps_max: number | null;
     connections_max: number | null;
   };
 
@@ -99,11 +101,16 @@ export function insertHistoryGaps(
       && Number.isFinite(currentMs)
       && currentMs - previousMs > bucketSeconds * 1500
     ) {
+      const gapTimestamp = new Date(previousMs + bucketSeconds * 1000).toISOString();
       output.push({
         ...point,
-        timestamp: new Date(previousMs + bucketSeconds * 1000).toISOString(),
+        timestamp: gapTimestamp,
+        upload_bps_max_at: gapTimestamp,
+        download_bps_max_at: gapTimestamp,
         upload_bps_avg: null,
         download_bps_avg: null,
+        upload_bps_max: null,
+        download_bps_max: null,
         connections_max: null,
         sample_count: 0,
       });

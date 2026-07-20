@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS device_groups (
     name TEXT NOT NULL,
     group_type TEXT NOT NULL,
     token TEXT NOT NULL UNIQUE,
+    credential_revision INTEGER NOT NULL DEFAULT 0,
     uid INTEGER NOT NULL REFERENCES users(id),
     connect_host TEXT NOT NULL DEFAULT '',
     port_range TEXT NOT NULL DEFAULT '1-65535',
@@ -113,6 +114,32 @@ CREATE TABLE IF NOT EXISTS tunnel_profiles (
     uid             INTEGER NOT NULL REFERENCES users(id),
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- v1.3.x: reusable preset routes. This is intentionally separate from the
+-- historical tunnel_profiles transport-template table above.
+CREATE TABLE IF NOT EXISTS tunnels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    shared INTEGER NOT NULL DEFAULT 0,
+    uid INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS tunnel_hops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tunnel_id INTEGER NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    device_group_id INTEGER NOT NULL REFERENCES device_groups(id),
+    listen_port INTEGER CHECK (listen_port >= 1 AND listen_port <= 65535),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (tunnel_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tunnel_hops_tunnel_position
+    ON tunnel_hops (tunnel_id, position);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tunnel_hops_group_port
+    ON tunnel_hops (device_group_id, listen_port) WHERE listen_port IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS forward_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,6 +182,7 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     -- profile (id resolved at config-build time, not stored as a magic number
     -- so re-seeding stays safe).
     tunnel_profile_id INTEGER REFERENCES tunnel_profiles(id),
+    tunnel_id INTEGER REFERENCES tunnels(id),
     -- v0.3.0: optional per-rule WS/TLS metadata. NULL means "use the tunnel
     -- profile default" (or "not applicable" for raw/tcp rules).
     domain TEXT,
@@ -182,6 +210,21 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Rule-scoped entry drain leases. Scoping by rule prevents a node that once
+-- hosted a tunnel entry from gaining accounting access to rules created later.
+CREATE TABLE IF NOT EXISTS forward_rule_retired_entries (
+    rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+    tunnel_id INTEGER NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+    device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Unix timestamp. A draining node renews this while it still owns live TCP
+    -- streams; an expired row is a tombstone, not accounting authorization.
+    expires_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (rule_id, tunnel_id, device_group_id)
+);
+CREATE INDEX IF NOT EXISTS idx_forward_rule_retired_entries_group
+    ON forward_rule_retired_entries (device_group_id, tunnel_id, rule_id);
 
 CREATE TABLE IF NOT EXISTS forward_rule_targets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -848,18 +891,34 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         )
         .fetch_one(&mut *tx)
         .await?;
+        let has_tunnel_id: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pragma_table_info('forward_rules') WHERE name = 'tunnel_id'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         let paused = if has_columns.0 == 2 {
             // SQLite migrations are intentionally idempotent and run on every
             // boot. A v1.2 multi-hop chain is distinguished from the removed
             // pre-v0.4.7 format by its explicit hop rows. Without this guard,
             // every panel restart pauses every current chain rule.
-            let pause_sql = if has_hops_table.0 == 1 {
+            let pause_sql = if has_hops_table.0 == 1 && has_tunnel_id.0 == 1 {
+                r#"UPDATE forward_rules SET paused = 1
+                   WHERE route_mode = 'chain' AND paused = 0
+                     AND tunnel_id IS NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM forward_rule_hops h
+                         WHERE h.rule_id = forward_rules.id
+                     )"#
+            } else if has_hops_table.0 == 1 {
                 r#"UPDATE forward_rules SET paused = 1
                    WHERE route_mode = 'chain' AND paused = 0
                      AND NOT EXISTS (
                          SELECT 1 FROM forward_rule_hops h
                          WHERE h.rule_id = forward_rules.id
                      )"#
+            } else if has_tunnel_id.0 == 1 {
+                r#"UPDATE forward_rules SET paused = 1
+                   WHERE route_mode = 'chain' AND paused = 0 AND tunnel_id IS NULL"#
             } else {
                 // Minimal ancient schemas can predate forward_rule_hops.
                 r#"UPDATE forward_rules SET paused = 1
@@ -1548,6 +1607,108 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 43: app_settings.site_name present");
 
+    // ── Migration 44: reusable preset tunnels + rule binding ──
+    // Create the referenced parent/child tables before adding forward_rules'
+    // nullable FK. All operations are idempotent so repeated startup is safe.
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS tunnels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            shared INTEGER NOT NULL DEFAULT 0,
+            uid INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS tunnel_hops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tunnel_id INTEGER NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL CHECK (position >= 0),
+            device_group_id INTEGER NOT NULL REFERENCES device_groups(id),
+            listen_port INTEGER CHECK (listen_port >= 1 AND listen_port <= 65535),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (tunnel_id, position)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_tunnel_hops_tunnel_position \
+         ON tunnel_hops (tunnel_id, position)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tunnel_hops_group_port \
+         ON tunnel_hops (device_group_id, listen_port) WHERE listen_port IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+    add_column_if_missing(
+        pool,
+        "forward_rules",
+        "tunnel_id",
+        "INTEGER REFERENCES tunnels(id)",
+    )
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_forward_rules_tunnel_id ON forward_rules (tunnel_id)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 44: reusable tunnels + forward_rules.tunnel_id present");
+
+    // ── Migration 45: explicit preset-tunnel sharing ──
+    // Existing tunnels become admin-only. This is the safe upgrade default:
+    // administrators opt in before ordinary users can bind them again.
+    add_column_if_missing(pool, "tunnels", "shared", "INTEGER NOT NULL DEFAULT 0").await?;
+    tracing::info!("Migration 45: tunnels.shared permission gate present");
+
+    // ── Migration 46: device-group credential generations ──
+    add_column_if_missing(
+        pool,
+        "device_groups",
+        "credential_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    tracing::info!("Migration 46: device_groups.credential_revision present");
+
+    // ── Migration 47: durable entry-drain leases ──
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS forward_rule_retired_entries (
+            rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+            tunnel_id INTEGER NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+            device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (rule_id, tunnel_id, device_group_id)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_forward_rule_retired_entries_group \
+         ON forward_rule_retired_entries (device_group_id, tunnel_id, rule_id)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 47: tunnel entry-drain leases present");
+
+    // ── Migration 48: bounded, node-renewed entry-drain leases ──
+    // Existing v47 rows deliberately fail closed. A node that still has a live
+    // retired runtime will renew the row through its next status report.
+    add_column_if_missing(
+        pool,
+        "forward_rule_retired_entries",
+        "expires_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    tracing::info!("Migration 48: entry-drain leases are bounded and renewable");
+
     Ok(())
 }
 
@@ -1815,7 +1976,13 @@ mod tests {
             assert_column(&pool, "forward_rules", col).await;
         }
         // device_groups additions
-        for col in ["capabilities", "region", "line_type", "remark"] {
+        for col in [
+            "capabilities",
+            "region",
+            "line_type",
+            "remark",
+            "credential_revision",
+        ] {
             assert_column(&pool, "device_groups", col).await;
         }
         // tunnel_profiles table itself exists
@@ -2081,6 +2248,7 @@ mod tests {
             ("device_groups", "region"),
             ("device_groups", "line_type"),
             ("device_groups", "remark"),
+            ("device_groups", "credential_revision"),
             ("forward_rule_hops", "tunnel_port"),
         ] {
             assert_column(&pool, table, col).await;
@@ -2501,5 +2669,90 @@ mod tests {
             paused.0, 0,
             "hop-backed v1.2 chain rule must remain active after restart"
         );
+    }
+
+    /// Preset-tunnel rules deliberately have route_mode=chain but no
+    /// forward_rule_hops. The tunnel_id is their fail-closed discriminator and
+    /// must exempt them from the historical chain-removal migration.
+    #[tokio::test]
+    async fn migration_22_keeps_preset_tunnel_rule_active_on_restart() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (201, 'entry', 'in', 'preset-entry', 1, '127.0.0.1'), \
+                    (202, 'exit', 'out', 'preset-exit', 1, '127.0.0.1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO tunnels (id, name, enabled, uid) VALUES (301, 'preset', 1, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tunnel_hops (tunnel_id, position, device_group_id, listen_port) \
+             VALUES (301, 0, 201, NULL), (301, 1, 202, 33001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rule_id = sqlx::query(
+            "INSERT INTO forward_rules (name, uid, listen_port, protocol, \
+             public_transport, node_transport, entry_transport, route_mode, \
+             forward_mode, target_addr, target_port, device_group_in, \
+             device_group_out, paused, tunnel_id) \
+             VALUES ('preset-rule', 1, 31002, 'tcp', 'raw', 'raw', 'raw', \
+                     'chain', 'chain', '203.0.113.20', 443, 201, 202, 0, 301)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        run_migrations(&pool).await.unwrap();
+
+        let paused: i64 = sqlx::query_scalar("SELECT paused FROM forward_rules WHERE id = ?")
+            .bind(rule_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            paused, 0,
+            "preset tunnel rules must stay active after restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_sharing_defaults_to_admin_only_and_is_idempotent() {
+        let pool = fresh_pool().await;
+        assert_column(&pool, "tunnels", "shared").await;
+        sqlx::query(
+            "INSERT INTO device_groups (id,name,group_type,token,uid) \
+             VALUES (401,'sharing-entry','in','sharing-entry-token',1), \
+                    (402,'sharing-exit','out','sharing-exit-token',1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO tunnels (name,enabled,uid) VALUES ('legacy-preset',1,1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let shared: bool =
+            sqlx::query_scalar("SELECT shared FROM tunnels WHERE name='legacy-preset'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!shared, "omitting shared must fail closed to admin-only");
+
+        run_migrations(&pool)
+            .await
+            .expect("sharing migration must be idempotent");
+        let shared_after_restart: bool =
+            sqlx::query_scalar("SELECT shared FROM tunnels WHERE name='legacy-preset'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!shared_after_restart);
     }
 }

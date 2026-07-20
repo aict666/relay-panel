@@ -60,6 +60,14 @@ impl GroupRepository for SqliteRepository {
         Ok(group)
     }
 
+    async fn list_group_credential_revisions(&self) -> Result<Vec<(i64, i64)>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT id, credential_revision FROM device_groups ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
     async fn find_by_id(
         &self,
         id: i64,
@@ -171,6 +179,68 @@ impl GroupRepository for SqliteRepository {
             return Ok(0);
         }
 
+        // BEGIN IMMEDIATE serializes this invariant check with tunnel path
+        // writers. Checking before the transaction left a window where a new
+        // tunnel could bind the group immediately before the UPDATE.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! rollback_on_err {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(error.into());
+                    }
+                }
+            };
+        }
+
+        let current: Option<(String, String)> = match scope.owner_id() {
+            None => rollback_on_err!(
+                sqlx::query_as("SELECT group_type, connect_host FROM device_groups WHERE id = ?",)
+                    .bind(id)
+                    .fetch_optional(&mut *conn)
+                    .await
+            ),
+            Some(uid) => rollback_on_err!(
+                sqlx::query_as(
+                    "SELECT group_type, connect_host FROM device_groups WHERE id = ? AND uid = ?",
+                )
+                .bind(id)
+                .bind(uid)
+                .fetch_optional(&mut *conn)
+                .await
+            ),
+        };
+        let Some((current_type, current_host)) = current else {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Ok(0);
+        };
+
+        let effective_type = group_type.unwrap_or(&current_type);
+        let effective_host = connect_host.unwrap_or(&current_host);
+        let (entry_tunnels, downstream_tunnels): (i64, i64) = rollback_on_err!(
+            sqlx::query_as(
+                "SELECT COUNT(DISTINCT CASE WHEN position = 0 THEN tunnel_id END), \
+                        COUNT(DISTINCT CASE WHEN position > 0 THEN tunnel_id END) \
+                 FROM tunnel_hops WHERE device_group_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        let invalid_entry = entry_tunnels > 0 && !matches!(effective_type, "in" | "both");
+        let invalid_downstream = downstream_tunnels > 0
+            && (effective_type == "monitor" || effective_host.trim().is_empty());
+        if invalid_entry || invalid_downstream {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Err(DbError::TunnelGroupInvariant {
+                entry_tunnels,
+                downstream_tunnels,
+            });
+        }
+
         let sql = match scope.owner_id() {
             None => format!("UPDATE device_groups SET {} WHERE id = ?", sets.join(", ")),
             Some(_) => format!(
@@ -202,7 +272,8 @@ impl GroupRepository for SqliteRepository {
             q = q.bind(uid);
         }
 
-        let result = q.execute(&self.pool).await?;
+        let result = rollback_on_err!(q.execute(&mut *conn).await);
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(result.rows_affected())
     }
 
@@ -213,10 +284,14 @@ impl GroupRepository for SqliteRepository {
         new_token: &str,
     ) -> Result<u64, DbError> {
         let result = match scope.owner_id() {
-            None => sqlx::query("UPDATE device_groups SET token = ? WHERE id = ?")
+            None => sqlx::query(
+                "UPDATE device_groups SET token = ?, credential_revision = credential_revision + 1 WHERE id = ?",
+            )
                 .bind(new_token)
                 .bind(id),
-            Some(uid) => sqlx::query("UPDATE device_groups SET token = ? WHERE id = ? AND uid = ?")
+            Some(uid) => sqlx::query(
+                "UPDATE device_groups SET token = ?, credential_revision = credential_revision + 1 WHERE id = ? AND uid = ?",
+            )
                 .bind(new_token)
                 .bind(id)
                 .bind(uid),
@@ -227,24 +302,14 @@ impl GroupRepository for SqliteRepository {
     }
 
     async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError> {
-        // Check if fallback_group column exists (defensive: test schemas may not have it).
-        let has_fallback: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM pragma_table_info('forward_rules') WHERE name = 'fallback_group'",
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM forward_rules \
+             WHERE device_group_in = ? OR device_group_out = ?",
         )
+        .bind(id)
+        .bind(id)
         .fetch_one(&self.pool)
         .await?;
-        let sql = if has_fallback.0 > 0 {
-            "SELECT COUNT(*) FROM forward_rules \
-             WHERE device_group_in = ? OR device_group_out = ? OR fallback_group = ?"
-        } else {
-            "SELECT COUNT(*) FROM forward_rules \
-             WHERE device_group_in = ? OR device_group_out = ?"
-        };
-        let mut q = sqlx::query_as(sql).bind(id).bind(id);
-        if has_fallback.0 > 0 {
-            q = q.bind(id);
-        }
-        let row: (i64,) = q.fetch_one(&self.pool).await?;
         // Also count chain hop references (intermediate/exit groups).
         let hop_count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM forward_rule_hops WHERE device_group_id = ?")
@@ -265,6 +330,77 @@ impl GroupRepository for SqliteRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    async fn delete_group_checked(&self, id: i64) -> Result<GroupDeleteOutcome, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_ {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
+        }
+        let exists: Option<i64> = try_!(
+            sqlx::query_scalar("SELECT id FROM device_groups WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await
+        );
+        if exists.is_none() {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Ok(GroupDeleteOutcome::NotFound);
+        }
+        let rule_count: i64 = try_!(
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM ( \
+               SELECT id AS rule_id FROM forward_rules \
+                WHERE device_group_in = ? OR device_group_out = ? \
+               UNION \
+               SELECT rule_id FROM forward_rule_hops WHERE device_group_id = ? \
+             ) refs",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        let tunnel_count: i64 = try_!(
+            sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT tunnel_id) FROM tunnel_hops WHERE device_group_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        let fallback_group_count: i64 = try_!(
+            sqlx::query_scalar("SELECT COUNT(*) FROM device_groups WHERE fallback_group = ?")
+                .bind(id)
+                .fetch_one(&mut *conn)
+                .await
+        );
+        if rule_count > 0 || tunnel_count > 0 || fallback_group_count > 0 {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Ok(GroupDeleteOutcome::InUse {
+                rule_count,
+                tunnel_count,
+                fallback_group_count,
+            });
+        }
+        try_!(
+            sqlx::query("DELETE FROM device_groups WHERE id = ?")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+        );
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(GroupDeleteOutcome::Deleted)
     }
 
     async fn delete_groups_by_uid(&self, uid: i64) -> Result<u64, DbError> {

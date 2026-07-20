@@ -271,6 +271,7 @@ pub async fn auto_assign_port(
 #[derive(Debug)]
 pub enum CreateRuleError {
     BadRequest(String),
+    Forbidden(String),
     PortConflict(u16),
     Database(DbError),
 }
@@ -278,10 +279,31 @@ pub enum CreateRuleError {
 #[derive(Debug)]
 pub enum UpdateRuleError {
     BadRequest(String),
+    Forbidden(String),
     NotFound,
     PortConflict,
     Internal(String),
     Database(DbError),
+}
+
+async fn user_can_bind_preset_tunnel(
+    db: &dyn Repository,
+    user_id: i64,
+    tunnel: &relay_shared::models::Tunnel,
+) -> Result<bool, DbError> {
+    if db.is_admin(user_id).await? {
+        return Ok(true);
+    }
+    if !tunnel.shared {
+        return Ok(false);
+    }
+    let Some(entry) = tunnel.hops.first() else {
+        return Ok(false);
+    };
+    Ok(db
+        .authorized_device_group_ids(user_id)
+        .await?
+        .contains(&entry.device_group_id))
 }
 
 async fn validate_admin_owned_inbound_group(
@@ -467,10 +489,54 @@ pub async fn create_rule(
     // The scope for validating referenced groups = the FINAL owner.
     let _owner_scope = ResourceScope::Owner(owner_uid);
 
-    // Resolve effective topology: chain via route_mode or forward_mode or hops.
+    if req.tunnel_id.is_some() && req.hops.is_some() {
+        return Err(CreateRuleError::BadRequest(
+            "tunnel_id and hops are mutually exclusive".into(),
+        ));
+    }
+    if req.forward_mode == "direct" && (req.tunnel_id.is_some() || req.hops.is_some()) {
+        return Err(CreateRuleError::BadRequest(
+            "direct mode cannot include tunnel_id or hops".into(),
+        ));
+    }
+
+    // Resolve effective topology: a preset tunnel is persisted as chain but
+    // deliberately has no rule-level hop rows.
+    let preset_tunnel = if let Some(tunnel_id) = req.tunnel_id {
+        let tunnel = db
+            .find_tunnel_by_id(tunnel_id)
+            .await
+            .map_err(CreateRuleError::Database)?
+            .ok_or_else(|| CreateRuleError::BadRequest("tunnel_id: no such tunnel".into()))?;
+        if !tunnel.enabled {
+            return Err(CreateRuleError::BadRequest(
+                "tunnel_id: disabled tunnels cannot accept new rules".into(),
+            ));
+        }
+        if !user_can_bind_preset_tunnel(db, owner_uid, &tunnel)
+            .await
+            .map_err(CreateRuleError::Database)?
+        {
+            return Err(CreateRuleError::Forbidden(
+                "该隧道未共享给您，或您的套餐未授权其入口线路".into(),
+            ));
+        }
+        if tunnel.hops.len() < CHAIN_HOPS_MIN {
+            return Err(CreateRuleError::BadRequest(
+                "tunnel_id: tunnel path is incomplete".into(),
+            ));
+        }
+        Some(tunnel)
+    } else {
+        None
+    };
+
+    // Resolve effective topology: chain via route_mode, forward_mode, hops or
+    // an administrator-managed preset tunnel.
     let is_chain = matches!(req.route_mode, RouteMode::Chain)
         || req.forward_mode == "chain"
-        || req.hops.as_ref().map(|h| !h.is_empty()).unwrap_or(false);
+        || req.hops.as_ref().map(|h| !h.is_empty()).unwrap_or(false)
+        || preset_tunnel.is_some();
 
     let (
         effective_device_group_in,
@@ -478,7 +544,27 @@ pub async fn create_rule(
         hop_group_ids,
         forward_mode,
         route_str,
-    ) = if is_chain {
+    ) = if let Some(tunnel) = &preset_tunnel {
+        let entry = tunnel.hops.first().unwrap().device_group_id;
+        let exit = tunnel.hops.last().unwrap().device_group_id;
+        if req.device_group_in != 0 && req.device_group_in != entry {
+            return Err(CreateRuleError::BadRequest(
+                "device_group_in must equal the preset tunnel entry group".into(),
+            ));
+        }
+        if req.device_group_out.is_some_and(|value| value != exit) {
+            return Err(CreateRuleError::BadRequest(
+                "device_group_out must equal the preset tunnel exit group".into(),
+            ));
+        }
+        (
+            entry,
+            Some(exit),
+            Vec::new(),
+            "chain".to_string(),
+            RouteMode::Chain.to_db_str(),
+        )
+    } else if is_chain {
         let hops = req.hops.clone().unwrap_or_default();
         if hops.is_empty() {
             return Err(CreateRuleError::BadRequest(
@@ -658,7 +744,7 @@ pub async fn create_rule(
         };
 
         match db
-            .create_rule_full(
+            .create_rule_full_with_tunnel(
                 &req.name,
                 owner_uid,
                 port as i32,
@@ -679,6 +765,7 @@ pub async fn create_rule(
                 up_mbps,
                 down_mbps,
                 req.tunnel_profile_id,
+                req.tunnel_id,
             )
             .await
         {
@@ -714,6 +801,12 @@ pub async fn create_rule(
         Err(DbError::PortConflict | DbError::UniqueViolation) => {
             Err(CreateRuleError::PortConflict(last_port.unwrap_or(0)))
         }
+        Err(DbError::TunnelUnavailable) => Err(CreateRuleError::BadRequest(
+            "tunnel_id: tunnel was disabled or its path changed; refresh and retry".into(),
+        )),
+        Err(DbError::TunnelAccessDenied) => Err(CreateRuleError::Forbidden(
+            "该隧道未共享给您，或您的套餐未授权其入口线路".into(),
+        )),
         Err(e) => {
             tracing::error!("create_rule: create_rule_full failed: {}", e);
             Err(CreateRuleError::Database(e))
@@ -724,6 +817,7 @@ pub async fn create_rule(
 fn map_create_rule_validation_error(err: CreateRuleError) -> UpdateRuleError {
     match err {
         CreateRuleError::BadRequest(msg) => UpdateRuleError::BadRequest(msg),
+        CreateRuleError::Forbidden(msg) => UpdateRuleError::Forbidden(msg),
         CreateRuleError::PortConflict(_) => UpdateRuleError::PortConflict,
         CreateRuleError::Database(e) => UpdateRuleError::Database(e),
     }
@@ -772,6 +866,16 @@ pub async fn update_rule(
     };
     let _owner_scope = ResourceScope::Owner(existing.uid);
 
+    if req.hops.is_some()
+        && (matches!(req.tunnel_id, Some(Some(_)))
+            || (req.tunnel_id.is_none() && existing.tunnel_id.is_some()))
+    {
+        return Err(UpdateRuleError::BadRequest(
+            "hops cannot be submitted while a preset tunnel remains bound; set tunnel_id to null to switch to a custom chain"
+                .into(),
+        ));
+    }
+
     // `route_mode` and the legacy `forward_mode` describe the same topology.
     // Reject contradictions rather than silently giving one field precedence.
     let route_requests_chain = matches!(req.route_mode, Some(RouteMode::Chain));
@@ -786,40 +890,89 @@ pub async fn update_rule(
         ));
     }
 
-    // A hop list is meaningful only for an effective chain rule. Without this
-    // guard a direct rule could accumulate hidden hop rows and even have its
-    // entry group changed through hops[0], only for those rows to become live
-    // after a later unrelated mode change.
     let explicitly_chain = route_requests_chain || forward_requests_chain;
     let explicitly_direct = route_requests_direct || forward_requests_direct;
-    if req.hops.is_some()
-        && (explicitly_direct || (!explicitly_chain && existing.route_mode != "chain"))
-    {
+    if req.hops.is_some() && explicitly_direct {
         return Err(UpdateRuleError::BadRequest(
             "hops are only valid for chain mode".into(),
         ));
     }
 
-    // Effective topology after this update.
-    let becoming_chain = matches!(req.route_mode, Some(RouteMode::Chain))
-        || req.forward_mode.as_deref() == Some("chain")
-        || (req.hops.is_some() && existing.route_mode == "chain")
-        || (req.hops.is_some()
-            && req.route_mode.is_none()
-            && req.forward_mode.is_none()
-            && existing.route_mode == "chain");
-    let becoming_direct = matches!(req.route_mode, Some(RouteMode::Direct))
-        || req.forward_mode.as_deref() == Some("direct");
+    let becoming_direct = explicitly_direct;
+    if becoming_direct && matches!(req.tunnel_id, Some(Some(_))) {
+        return Err(UpdateRuleError::BadRequest(
+            "direct mode cannot bind a preset tunnel".into(),
+        ));
+    }
+    let effective_tunnel_id = if becoming_direct {
+        None
+    } else {
+        req.tunnel_id.unwrap_or(existing.tunnel_id)
+    };
+    let preset_tunnel = if let Some(tunnel_id) = effective_tunnel_id {
+        let tunnel = db
+            .find_tunnel_by_id(tunnel_id)
+            .await
+            .map_err(UpdateRuleError::Database)?
+            .ok_or_else(|| UpdateRuleError::BadRequest("tunnel_id: no such tunnel".into()))?;
+        let newly_binding = existing.tunnel_id != Some(tunnel_id);
+        if newly_binding && !tunnel.enabled {
+            return Err(UpdateRuleError::BadRequest(
+                "tunnel_id: disabled tunnels cannot accept new rules".into(),
+            ));
+        }
+        if (newly_binding || req.paused == Some(false))
+            && !user_can_bind_preset_tunnel(db, existing.uid, &tunnel)
+                .await
+                .map_err(UpdateRuleError::Database)?
+        {
+            return Err(UpdateRuleError::Forbidden(
+                "该隧道未共享给您，或您的套餐未授权其入口线路".into(),
+            ));
+        }
+        if tunnel.hops.len() < CHAIN_HOPS_MIN {
+            return Err(UpdateRuleError::BadRequest(
+                "tunnel_id: tunnel path is incomplete".into(),
+            ));
+        }
+        Some(tunnel)
+    } else {
+        None
+    };
+    if preset_tunnel.is_some() && explicitly_direct {
+        return Err(UpdateRuleError::BadRequest(
+            "preset tunnels require chain mode".into(),
+        ));
+    }
+
+    let becoming_chain = preset_tunnel.is_some()
+        || explicitly_chain
+        || req.hops.is_some()
+        || (!becoming_direct && existing.route_mode == "chain");
+
+    if existing.tunnel_id.is_some()
+        && matches!(req.tunnel_id, Some(None))
+        && !becoming_direct
+        && req.hops.is_none()
+    {
+        return Err(UpdateRuleError::BadRequest(
+            "unbind a preset tunnel by switching to direct mode or providing custom hops".into(),
+        ));
+    }
 
     // device_group_out is derived from hops in chain mode — never set raw on
     // direct rules (would hit FK or silently change topology).
-    if req.device_group_out.is_some() && req.hops.is_none() && !becoming_chain {
+    if req.device_group_out.is_some()
+        && req.hops.is_none()
+        && preset_tunnel.is_none()
+        && !becoming_chain
+    {
         return Err(UpdateRuleError::BadRequest(
             "device_group_out: only used with chain mode (set via hops); omit for direct".into(),
         ));
     }
 
-    if becoming_chain && !becoming_direct {
+    if becoming_chain && !becoming_direct && preset_tunnel.is_none() {
         if let Some(ref hops) = req.hops {
             validate_chain_hops(db, hops, "update_rule")
                 .await
@@ -827,6 +980,21 @@ pub async fn update_rule(
         } else if existing.route_mode != "chain" {
             return Err(UpdateRuleError::BadRequest(
                 "hops: required when switching a rule to chain mode".into(),
+            ));
+        }
+    }
+
+    if let Some(tunnel) = &preset_tunnel {
+        let entry = tunnel.hops.first().unwrap().device_group_id;
+        let exit = tunnel.hops.last().unwrap().device_group_id;
+        if req.device_group_in.is_some_and(|value| value != entry) {
+            return Err(UpdateRuleError::BadRequest(
+                "device_group_in must equal the preset tunnel entry group".into(),
+            ));
+        }
+        if req.device_group_out.is_some_and(|value| value != exit) {
+            return Err(UpdateRuleError::BadRequest(
+                "device_group_out must equal the preset tunnel exit group".into(),
             ));
         }
     }
@@ -861,9 +1029,11 @@ pub async fn update_rule(
         }
     }
 
-    let switching_to_direct = becoming_direct && !becoming_chain;
+    let switching_to_direct = becoming_direct;
     let device_group_out_arg: Option<Option<i64>> = if switching_to_direct {
         Some(None)
+    } else if let Some(tunnel) = &preset_tunnel {
+        Some(Some(tunnel.hops.last().unwrap().device_group_id))
     } else if let Some(ref hops) = req.hops {
         hops.last().copied().map(Some)
     } else {
@@ -871,7 +1041,9 @@ pub async fn update_rule(
     };
 
     // When hops are provided, entry group comes from hops[0].
-    let device_group_in_arg: Option<i64> = if let Some(ref hops) = req.hops {
+    let device_group_in_arg: Option<i64> = if let Some(tunnel) = &preset_tunnel {
+        Some(tunnel.hops.first().unwrap().device_group_id)
+    } else if let Some(ref hops) = req.hops {
         hops.first().copied()
     } else {
         req.device_group_in
@@ -914,6 +1086,7 @@ pub async fn update_rule(
         || req.max_connections.is_some()
         || req.auto_restart_minutes.is_some()
         || req.tunnel_profile_id.is_some()
+        || req.tunnel_id.is_some()
         || req.paused.is_some();
     if !has_field {
         return Err(UpdateRuleError::BadRequest("No fields to update".into()));
@@ -1107,35 +1280,36 @@ pub async fn update_rule(
                 .collect()
         })
     });
-    let planned_hop_ports: Option<Vec<(i64, i32)>> = if switching_to_direct {
-        Some(Vec::new())
-    } else if let Some(ref hop_gids) = hop_gids_to_plan {
-        let entry_port = req.listen_port.unwrap_or(existing.listen_port as u16);
-        let mut planned = Vec::with_capacity(hop_gids.len());
-        for (position, gid) in hop_gids.iter().copied().enumerate() {
-            let port = if position == 0 {
-                entry_port
-            } else if protocol_unchanged {
-                if let Some(old) = existing_hops.iter().find(|h| h.device_group_id == gid) {
-                    old.listen_port as u16
+    let planned_hop_ports: Option<Vec<(i64, i32)>> =
+        if switching_to_direct || preset_tunnel.is_some() {
+            Some(Vec::new())
+        } else if let Some(ref hop_gids) = hop_gids_to_plan {
+            let entry_port = req.listen_port.unwrap_or(existing.listen_port as u16);
+            let mut planned = Vec::with_capacity(hop_gids.len());
+            for (position, gid) in hop_gids.iter().copied().enumerate() {
+                let port = if position == 0 {
+                    entry_port
+                } else if protocol_unchanged {
+                    if let Some(old) = existing_hops.iter().find(|h| h.device_group_id == gid) {
+                        old.listen_port as u16
+                    } else {
+                        allocate_chain_hop_ports(db, &[hop_gids[0], gid], entry_port, protocol_str)
+                            .await
+                            .map_err(map_create_rule_validation_error)?[1]
+                            .1 as u16
+                    }
                 } else {
                     allocate_chain_hop_ports(db, &[hop_gids[0], gid], entry_port, protocol_str)
                         .await
                         .map_err(map_create_rule_validation_error)?[1]
                         .1 as u16
-                }
-            } else {
-                allocate_chain_hop_ports(db, &[hop_gids[0], gid], entry_port, protocol_str)
-                    .await
-                    .map_err(map_create_rule_validation_error)?[1]
-                    .1 as u16
-            };
-            planned.push((gid, port as i32));
-        }
-        Some(planned)
-    } else {
-        None
-    };
+                };
+                planned.push((gid, port as i32));
+            }
+            Some(planned)
+        } else {
+            None
+        };
 
     let rate_limits = if req.upload_limit_mbps.is_some() || req.download_limit_mbps.is_some() {
         Some((
@@ -1206,12 +1380,23 @@ pub async fn update_rule(
         rate_limits,
         connection_controls,
         tunnel_profile_id: req.tunnel_profile_id,
+        tunnel_id: if switching_to_direct {
+            Some(None)
+        } else {
+            req.tunnel_id
+        },
     };
 
     match db.update_rule_full(&update).await {
         Ok(0) => Err(UpdateRuleError::NotFound),
         Ok(_) => Ok(()),
         Err(DbError::UniqueViolation | DbError::PortConflict) => Err(UpdateRuleError::PortConflict),
+        Err(DbError::TunnelUnavailable) => Err(UpdateRuleError::BadRequest(
+            "tunnel_id: tunnel was disabled or its path changed; refresh and retry".into(),
+        )),
+        Err(DbError::TunnelAccessDenied) => Err(UpdateRuleError::Forbidden(
+            "该隧道未共享给您，或您的套餐未授权其入口线路".into(),
+        )),
         Err(e) => {
             tracing::error!("update_rule {}: update_rule_fields failed: {}", id, e);
             Err(UpdateRuleError::Database(e))

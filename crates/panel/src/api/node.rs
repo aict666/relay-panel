@@ -38,6 +38,30 @@ pub(crate) fn config_protocol_compatible(headers: &HeaderMap) -> bool {
 }
 
 pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // Authentication must run before the compatibility gate. Otherwise a
+    // revoked node that also reports an old protocol receives 426 and keeps
+    // forwarding from its cache instead of treating the credential as
+    // authoritatively rejected.
+    let Some(token) = extract_node_token(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "invalid node credential").into_response();
+    };
+
+    let group: Option<DeviceGroup> = match state.db.find_by_token(&token).await {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!("get_config: find_by_token failed: {}", e);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "config unavailable: transient database error",
+            )
+                .into_response();
+        }
+    };
+
+    let Some(group) = group else {
+        return (StatusCode::UNAUTHORIZED, "invalid node credential").into_response();
+    };
+
     // v0.4.0: protocol-version gate. A node reporting a different
     // config_protocol_version (or none at all — pre-v0.4.0 node) must NOT
     // receive config it can't deserialize (e.g. the renamed node_transport
@@ -58,30 +82,6 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
         )
             .into_response();
     }
-
-    // Token comes ONLY from the Authorization header. No token → treat as
-    // "no matching group" and return an empty config (NOT an error: a node
-    // that hasn't been assigned a group yet should keep its cached config).
-    let Some(token) = extract_node_token(&headers) else {
-        return Json(NodeConfigResponse { listeners: vec![] }).into_response();
-    };
-
-    // Find device group by token.
-    let group: Option<DeviceGroup> = match state.db.find_by_token(&token).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::error!("get_config: find_by_token failed: {}", e);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config unavailable: transient database error",
-            )
-                .into_response();
-        }
-    };
-
-    let Some(group) = group else {
-        return Json(NodeConfigResponse { listeners: vec![] }).into_response();
-    };
 
     // v0.3.6: delegate to the shared `build_node_config`. This path and the WS
     // push path (ws.rs) now use the SAME function.
@@ -116,11 +116,11 @@ pub async fn report_traffic(
     // HTTP-status note: a missing/invalid token here returns HTTP 200 with a
     // business `code: 401` INSIDE the JSON body — NOT a real HTTP 401. This is
     // deliberate backward-compat: all shipped nodes read the JSON `code` field
-    // and ignore the HTTP status on these node-facing endpoints. The WebSocket
-    // upgrade path (ws.rs::node_ws_handler) is the ONE exception — it returns a
-    // real HTTP 401 because WS upgrades must fail at the HTTP layer (the client
-    // never gets to read a JSON body on a failed upgrade). Do NOT "normalize"
-    // these without a coordinated node upgrade; see the test module's
+    // and ignore the HTTP status on these reporting endpoints. The protocol-v8
+    // config endpoint and WebSocket upgrade path are exceptions: both return a
+    // real HTTP 401 so the node can immediately revoke cached tunnel
+    // credentials. Do NOT "normalize" the remaining reporting endpoints
+    // without a coordinated node upgrade; see the test module's
     // `node_http_status_compat_*` tests that pin the current behavior.
     let Some(token) = extract_node_token(&headers) else {
         return Json(ApiResponse {
@@ -219,6 +219,46 @@ pub async fn report_status(
     };
 
     if let Some(g) = group {
+        let mut draining_rule_ids: Vec<i64> = req
+            .draining_rule_ids
+            .iter()
+            .copied()
+            .filter(|rule_id| *rule_id > 0)
+            .collect();
+        draining_rule_ids.sort_unstable();
+        draining_rule_ids.dedup();
+        if !draining_rule_ids.is_empty() {
+            // Bound each generated IN query without discarding legitimate
+            // tails. A large shared tunnel can have more than 4096 rules
+            // draining at once after an entry move.
+            let mut renewed = 0u64;
+            let mut renewal_failed = false;
+            for rule_ids in draining_rule_ids.chunks(4096) {
+                match state
+                    .db
+                    .renew_draining_tunnel_rule_ids_for_group(g.id, rule_ids)
+                    .await
+                {
+                    Ok(count) => renewed = renewed.saturating_add(count),
+                    Err(error) => {
+                        renewal_failed = true;
+                        tracing::warn!(
+                            group_id = g.id,
+                            "failed to renew entry-drain leases: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
+            if !renewal_failed && renewed < draining_rule_ids.len() as u64 {
+                tracing::debug!(
+                    group_id = g.id,
+                    requested = draining_rule_ids.len(),
+                    renewed,
+                    "some reported drain leases were absent"
+                );
+            }
+        }
         // v0.3.0: key node status by (group_id, node_id) so multiple nodes
         // sharing one group token no longer overwrite each other. The node_id
         // is a stable per-node identity generated on first start (see
@@ -616,19 +656,20 @@ mod tests {
         assert_eq!(user_traffic(&pool, 2).await, 0);
     }
 
-    // ── v0.4.9: node HTTP-status compatibility pins ──
+    // ── node HTTP-status compatibility pins ──
     //
-    // The three node-facing endpoints have DELIBERATELY DIFFERENT auth-failure
-    // behaviors, preserved for backward compat with all shipped nodes:
+    // Node-facing endpoints deliberately have different auth-failure behavior:
     //   - report_traffic / report_status: missing token → HTTP 200, business
     //     code 401 INSIDE the JSON body (nodes read `code`, not the HTTP status).
-    //   - get_config: missing token → HTTP 200, empty config (NOT an error).
+    //   - get_config (config protocol v8): missing/invalid token → real HTTP
+    //     401 so relay-node clears cached forwarding and revokes tunnel streams.
     //   - WebSocket upgrade: missing/invalid token → real HTTP 401 (WS upgrades
     //     must fail at the HTTP layer — the client never reads a JSON body).
     //
     // These tests PIN that behavior so a future "let's normalize to real HTTP
-    // 401s" change can't land silently and break old nodes. Changing any of
-    // these requires a coordinated major-version node upgrade.
+    // 401s" change can't land silently and break old nodes. The get_config
+    // change is gated by CONFIG_PROTOCOL_VERSION=8, so an old node is rejected
+    // with 426 before it can observe this contract.
 
     /// report_traffic with NO Authorization header → HTTP 200, JSON code 401.
     #[tokio::test]
@@ -677,20 +718,19 @@ mod tests {
             config_protocol_version: None,
             listener_errors: None,
             install_method: None,
+            draining_rule_ids: vec![],
         };
         let Json(resp) = report_status(State(state.clone()), h, Json(req)).await;
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
     }
 
-    /// get_config with NO Authorization header (but a valid config-protocol
-    /// header) → HTTP 200 with an EMPTY config, NOT an error. A node that
-    /// hasn't been assigned a group should keep its cached config.
+    /// Config protocol v8 treats a missing credential as authoritative
+    /// revocation so relay-node cannot keep retired authenticated streams.
     #[tokio::test]
-    async fn node_http_status_compat_get_config_missing_token_returns_empty_config() {
+    async fn node_config_missing_token_is_real_http401() {
         let (state, _pool) = seeded_state().await;
         let mut h = HeaderMap::new();
-        // get_config gates on config-protocol FIRST; supply a matching one so
-        // we reach the token check (else it'd return 426, masking this path).
+        // Supply a matching protocol too; authentication remains authoritative.
         h.insert(
             "X-Config-Protocol-Version",
             relay_shared::protocol::CONFIG_PROTOCOL_VERSION
@@ -700,24 +740,34 @@ mod tests {
         );
         // No Authorization header.
         let resp = get_config(State(state.clone()), h).await;
-        // Pin: HTTP 200 (not 401/403) + an empty listeners array.
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            v["listeners"].as_array().map(|a| a.len()),
-            Some(0),
-            "missing token → empty config, not an error"
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// An explicitly supplied but unknown token has the same fail-closed
+    /// response as a missing one; the endpoint must not disclose which part of
+    /// the credential lookup failed.
+    #[tokio::test]
+    async fn node_config_unknown_token_is_real_http401() {
+        let (state, _pool) = seeded_state().await;
+        let mut headers = auth_headers("rotated-or-unknown-token");
+        headers.insert(
+            "X-Config-Protocol-Version",
+            relay_shared::protocol::CONFIG_PROTOCOL_VERSION
+                .to_string()
+                .parse()
+                .unwrap(),
         );
+        let response = get_config(State(state), headers).await;
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
     /// During a panel-first rolling upgrade an old node must receive 426, never
     /// a v6 config it cannot understand. The node interprets 426 as "keep the
     /// cached forwarding config", which is the no-outage compatibility gate.
     #[tokio::test]
-    async fn config_protocol_mismatch_returns_426_before_config_build() {
+    async fn authenticated_config_protocol_mismatch_returns_426_before_config_build() {
         let (state, _pool) = seeded_state().await;
-        let mut headers = HeaderMap::new();
+        let mut headers = auth_headers("tok-A");
         headers.insert(
             "X-Config-Protocol-Version",
             (relay_shared::protocol::CONFIG_PROTOCOL_VERSION - 1)
@@ -739,6 +789,21 @@ mod tests {
             value["received"],
             relay_shared::protocol::CONFIG_PROTOCOL_VERSION - 1
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_token_with_old_protocol_returns_401_not_426() {
+        let (state, _pool) = seeded_state().await;
+        let mut headers = auth_headers("revoked-token");
+        headers.insert(
+            "X-Config-Protocol-Version",
+            (relay_shared::protocol::CONFIG_PROTOCOL_VERSION - 1)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        let response = get_config(State(state), headers).await;
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one
@@ -800,6 +865,7 @@ mod tests {
             config_protocol_version: None,
             listener_errors: None,
             install_method: Some("systemd".into()),
+            draining_rule_ids: vec![],
         };
         let Json(resp) =
             report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;

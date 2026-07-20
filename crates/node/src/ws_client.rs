@@ -45,6 +45,7 @@ pub async fn run_ws_loop(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     node_id: &str,
+    config_synchronizer: &poller::ConfigSynchronizer,
 ) {
     let ws_url = derive_ws_url(&config.panel_url);
     let mut backoff = 1u64;
@@ -56,7 +57,15 @@ pub async fn run_ws_loop(
     loop {
         tracing::info!("websocket connecting to {} ...", ws_url);
 
-        let exit = connect_and_run(&ws_url, &config.token, config, manager, node_id).await;
+        let exit = connect_and_run(
+            &ws_url,
+            &config.token,
+            config,
+            manager,
+            node_id,
+            config_synchronizer,
+        )
+        .await;
         match exit {
             WsExit::ConfigChanged => {
                 tracing::info!("websocket: config_changed received, reconnecting immediately");
@@ -155,6 +164,7 @@ async fn connect_and_run(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     node_id: &str,
+    config_synchronizer: &poller::ConfigSynchronizer,
 ) -> WsExit {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
@@ -240,28 +250,73 @@ async fn connect_and_run(
                 };
                 match msg_result {
                     Ok(Message::Text(text)) => {
-                        if let Ok(resp) =
+                        if let Ok(snapshot) =
                             serde_json::from_str::<relay_shared::protocol::NodeConfigResponse>(&text)
                         {
                             tracing::info!(
-                                "websocket: received config ({} listeners), applying",
-                                resp.listeners.len()
+                                "websocket: received config hint ({} listeners), fetching serialized current snapshot",
+                                snapshot.listeners.len()
                             );
-                            let mut mgr = manager.lock().await;
-                            mgr.apply_config(&resp).await;
-                            tracing::info!("websocket: config applied");
+                            // Do not apply the embedded snapshot directly. It may
+                            // have been built before an in-flight HTTP poll that
+                            // already observed a newer DB state. Re-fetch through
+                            // the shared synchronizer so request, cache write and
+                            // apply have one total order.
+                            let result = config_synchronizer.sync(config, manager).await;
+                            tracing::info!(?result, "websocket: serialized config sync completed");
+                        } else if let Some(revoke) = serde_json::from_str::<
+                            relay_shared::protocol::RevokeTunnelCredentialsMessage,
+                        >(&text)
+                        .ok()
+                        .filter(|message| message.msg_type == "revoke_tunnel_credentials")
+                        {
+                            tracing::warn!(
+                                group_id = revoke.group_id,
+                                "websocket: tunnel credential revocation received; synchronizing and closing affected streams"
+                            );
+                            // Serialize with any older HTTP request first. Once
+                            // this returns, no pre-rotation response can be
+                            // applied later and restore the revoked key.
+                            match config_synchronizer
+                                .sync_after_tunnel_credential_revoke(
+                                    config,
+                                    manager,
+                                    revoke.group_id,
+                                )
+                                .await
+                            {
+                                poller::SyncResult::Ok => {
+                                    // apply_config compared credential revisions
+                                    // and revoked only pre-rotation generations.
+                                    // Cancelling by group again here would also
+                                    // kill connections already authenticated
+                                    // with the replacement credential.
+                                }
+                                poller::SyncResult::CredentialsRejected => {
+                                    // The synchronizer already applied an empty
+                                    // config and revoked every tunnel generation.
+                                }
+                                poller::SyncResult::ProtocolMismatch
+                                | poller::SyncResult::Transient => {
+                                    tracing::error!(
+                                        group_id = revoke.group_id,
+                                        "credential replacement unavailable; affected tunnel state was failed closed in memory and restart cache"
+                                    );
+                                }
+                            }
                         } else if text.contains("config_changed") {
                             tracing::info!("websocket: config_changed received, re-fetching");
-                            match poller::fetch_config(config).await {
-                                poller::FetchResult::Ok(resp) => {
-                                    let mut mgr = manager.lock().await;
-                                    mgr.apply_config(&resp).await;
+                            match config_synchronizer.sync(config, manager).await {
+                                poller::SyncResult::Ok => {
                                     tracing::info!("websocket: config applied after config_changed");
                                 }
-                                poller::FetchResult::ProtocolMismatch => {
+                                poller::SyncResult::ProtocolMismatch => {
                                     tracing::warn!("websocket: config fetch returned protocol mismatch; keeping cached config");
                                 }
-                                poller::FetchResult::Transient => {
+                                poller::SyncResult::CredentialsRejected => {
+                                    tracing::error!("websocket: node credential rejected; stopping cached forwarding");
+                                }
+                                poller::SyncResult::Transient => {
                                     tracing::warn!("websocket: config fetch failed transiently; keeping cached config");
                                 }
                             }

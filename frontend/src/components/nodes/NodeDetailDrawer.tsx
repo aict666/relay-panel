@@ -1,5 +1,5 @@
  
-import { Drawer, Descriptions, Tag, Button, Popconfirm, message } from 'antd';
+import { Alert, Drawer, Descriptions, Tag, Button, Popconfirm, message, Space } from 'antd';
 import { DeleteOutlined } from '@ant-design/icons';
 import { formatPercent, formatBytes, formatBps, formatUptime } from '../../utils/format';
 import { useI18n } from '../../i18n/context';
@@ -51,6 +51,7 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
   return (
     <Drawer title={row?.group_name || t('resourceDetails')} open={open} onClose={onClose} size={440}>
       {row && (
+        <>
         <Descriptions column={1} size="small" bordered>
           <Descriptions.Item label={t('status')}>
             {row.online ? <Tag color="green">{t('online')}</Tag> : <Tag>{t('offline')}</Tag>}
@@ -138,6 +139,26 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
           )}
         </Descriptions>
 
+        {isAdmin && row.listener_errors && row.listener_errors.length > 0 && (
+          <Space orientation="vertical" style={{ width: '100%', marginTop: 12 }}>
+            {row.listener_errors.map((listenerError, index) => (
+              <Alert
+                key={`${listenerError.port}-${listenerError.protocol}-${index}`}
+                type="error"
+                showIcon
+                title={
+                  <Space wrap>
+                    <span className="rp-mono">{listenerError.protocol}:{listenerError.port}</span>
+                    {listenerError.tunnel_id != null && <Tag color="geekblue">Tunnel #{listenerError.tunnel_id}</Tag>}
+                    {listenerError.rule_id != null && <Tag>Rule #{listenerError.rule_id}</Tag>}
+                  </Space>
+                }
+                description={listenerError.error}
+              />
+            ))}
+          </Space>
+        )}
+        </>
       )}
       {isAdmin && row && (
         <div style={{ marginTop: 16 }}>

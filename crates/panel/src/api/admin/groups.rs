@@ -78,14 +78,21 @@ pub async fn rotate_group_token(
     match crate::service::groups::rotate_group_token(state.db.as_ref(), id).await {
         Ok(None) => Json(err(404, "分组不存在")),
         Ok(Some(new_token)) => {
-            // v0.3.9: tear down every live WS connection for this group BEFORE
-            // broadcasting. The old token just became invalid, but sockets that
-            // authenticated at upgrade time stay open with the revoked credential
-            // — close_group drops them so the node reconnects and re-auths with
-            // the new token. (broadcast_all alone was insufficient: it pushed
-            // config_changed, the node re-fetched config with the OLD token, the
-            // panel returned an empty config, and the node tore down all its
-            // listeners — a complete outage on every token rotation.)
+            // A rotated token can revoke a link generation that has already
+            // been removed from the current tunnel path but is still draining
+            // established TCP streams. Tell every node to cancel active and
+            // retired authenticated generations before refreshing configs.
+            state
+                .node_connections
+                .broadcast_all(&format!(
+                    r#"{{"type":"revoke_tunnel_credentials","group_id":{id}}}"#
+                ))
+                .await;
+            // Tear down every live WS connection for this group. The old token
+            // just became invalid, but sockets authenticated at upgrade time
+            // otherwise stay open indefinitely. Nodes still configured with
+            // the revoked token now fail closed on the next HTTP poll; the
+            // operator must install `new_token` before forwarding resumes.
             let closed = state.node_connections.close_group(id).await;
             // Notify any connections in OTHER groups too (harmless no-op for this
             // group since close_group already drained it).
@@ -148,6 +155,16 @@ pub async fn update_group(
         Err(UpdateGroupError::NoFields) => Json(err(400, "无需要更新的字段")),
         // v0.3.6: 0 rows = group id didn't exist. 404 + no broadcast.
         Err(UpdateGroupError::NotFound) => Json(err(404, "Group not found")),
+        Err(UpdateGroupError::TunnelInvariant {
+            entry_tunnels,
+            downstream_tunnels,
+        }) => Json(err(
+            409,
+            format!(
+                "该设备组正被预设隧道引用，当前修改会破坏路径（入口 {} 条，后续节点 {} 条）",
+                entry_tunnels, downstream_tunnels
+            ),
+        )),
         Err(UpdateGroupError::Database(e)) => {
             tracing::error!("update_group {}: update_group_fields failed: {}", id, e);
             Json(err(500, "数据库错误"))
@@ -185,8 +202,8 @@ pub async fn delete_group(
                 return Json(err(
                     409,
                     format!(
-                        "该分组仍被 {} 条规则使用，请先迁移规则。",
-                        in_use.rule_count
+                        "该分组仍被 {} 条规则、{} 条预设隧道和 {} 个分组回退配置引用，请先迁移对应配置。",
+                        in_use.rule_count, in_use.tunnel_count, in_use.fallback_group_count
                     ),
                 ));
             }

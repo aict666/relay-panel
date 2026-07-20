@@ -250,6 +250,22 @@ pub async fn node_ws_handler(
         None => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
     };
 
+    // Authenticate before reporting a protocol mismatch. A revoked node must
+    // receive 401 even when it is old, so it cannot interpret 426 as permission
+    // to retain cached forwarding state.
+    use relay_shared::models::DeviceGroup;
+    let group: Option<DeviceGroup> = match state.db.find_by_token(&token).await {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!("node_ws_handler: find_by_token failed: {}", e);
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let group = match group {
+        Some(g) => g,
+        None => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
+    };
+
     // v0.4.0: config-protocol gate. A node whose X-Config-Protocol-Version
     // header is absent or doesn't match the panel's is refused at upgrade time
     // (426 Upgrade Required) with a structured JSON body so the node can log
@@ -268,20 +284,6 @@ pub async fn node_ws_handler(
         )
             .into_response();
     }
-
-    use relay_shared::models::DeviceGroup;
-    let group: Option<DeviceGroup> = match state.db.find_by_token(&token).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::error!("node_ws_handler: find_by_token failed: {}", e);
-            None
-        }
-    };
-
-    let group = match group {
-        Some(g) => g,
-        None => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
-    };
 
     let group_id = group.id;
     // v0.4.14: optional per-node identity. None for an older node that didn't

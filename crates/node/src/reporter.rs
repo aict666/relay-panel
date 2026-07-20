@@ -63,17 +63,25 @@ impl TrafficCounter {
     /// not clear), so no traffic is ever lost.
     pub async fn snapshot(&self) -> TrafficSnapshot<'_> {
         let map = self.data.read().await;
-        let entries: Vec<TrafficEntry> = map
+        let captured: Vec<RuleCounterSnapshot> = map
             .iter()
-            .map(|(rule_id, c)| TrafficEntry {
-                rule_id: *rule_id,
-                upload: c.0.load(Ordering::Relaxed),
-                download: c.1.load(Ordering::Relaxed),
+            .map(|(rule_id, counters)| RuleCounterSnapshot {
+                entry: TrafficEntry {
+                    rule_id: *rule_id,
+                    upload: counters.0.load(Ordering::Relaxed),
+                    download: counters.1.load(Ordering::Relaxed),
+                },
+                counters: counters.clone(),
             })
+            .collect();
+        let entries = captured
+            .iter()
+            .map(|snapshot| snapshot.entry.clone())
             .collect();
         TrafficSnapshot {
             counter: self,
             entries,
+            captured,
         }
     }
 
@@ -114,23 +122,49 @@ impl TrafficCounter {
 pub struct TrafficSnapshot<'a> {
     counter: &'a TrafficCounter,
     pub entries: Vec<TrafficEntry>,
+    // Keep the exact counter generation that supplied each entry. A rule can
+    // be pruned and recreated with the same id while an HTTP report is in
+    // flight; committing the old snapshot against the replacement counter
+    // would otherwise subtract unrelated new traffic (and can underflow).
+    captured: Vec<RuleCounterSnapshot>,
+}
+
+struct RuleCounterSnapshot {
+    entry: TrafficEntry,
+    counters: RuleCounters,
 }
 
 impl TrafficSnapshot<'_> {
     /// Subtract the snapshotted bytes from the live counters. Bytes counted
     /// after the snapshot was taken are untouched. Safe to call once.
     pub async fn commit(self) {
-        // Periodic (not the hot path): take the write lock so fetch_sub AND the
+        // Periodic (not the hot path): take the write lock so subtraction AND the
         // zero-entry cleanup happen without racing an add(). Only the exact
         // snapshotted bytes are subtracted; bytes counted after the snapshot are
-        // preserved (they show up as a larger prev value → entry not removed).
+        // preserved (they show up as a larger current value → entry not removed).
         let mut map = self.counter.data.write().await;
-        for e in &self.entries {
+        for snapshot in &self.captured {
+            let e = &snapshot.entry;
             let drained = if let Some(c) = map.get(&e.rule_id) {
-                let prev_up = c.0.fetch_sub(e.upload, Ordering::Relaxed);
-                let prev_down = c.1.fetch_sub(e.download, Ordering::Relaxed);
-                // new == 0 iff prev == snapshotted (no adds since the snapshot).
-                prev_up == e.upload && prev_down == e.download
+                if Arc::ptr_eq(c, &snapshot.counters) {
+                    // The map write lock excludes add(), which always takes the map
+                    // read/write lock before touching these atomics. Check both
+                    // dimensions before storing either one so even an accidental
+                    // overlapping commit cannot partially consume a snapshot.
+                    let current_up = c.0.load(Ordering::Relaxed);
+                    let current_down = c.1.load(Ordering::Relaxed);
+                    if current_up < e.upload || current_down < e.download {
+                        false
+                    } else {
+                        let remaining_up = current_up - e.upload;
+                        let remaining_down = current_down - e.download;
+                        c.0.store(remaining_up, Ordering::Relaxed);
+                        c.1.store(remaining_down, Ordering::Relaxed);
+                        remaining_up == 0 && remaining_down == 0
+                    }
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -327,6 +361,10 @@ pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter) {
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.token))
         .json(&report)
+        // Keep traffic retries bounded. A half-open panel connection must not
+        // stall the HTTP config loop indefinitely while counters continue to
+        // accumulate locally.
+        .timeout(Duration::from_secs(15))
         .send()
         .await
     {
@@ -802,6 +840,7 @@ pub async fn report_status(
     start_time: Instant,
     node_id: &str,
     listener_errors: Vec<ListenerError>,
+    draining_rule_ids: Vec<i64>,
 ) {
     let snap = metrics.snapshot().await;
     let active_connections = connections.current().await;
@@ -856,6 +895,7 @@ pub async fn report_status(
         // v1.0.10: how this node is run, so the panel only offers a one-click
         // self-upgrade to systemd nodes (docker → update image; manual → none).
         install_method: Some(crate::updater::install_method().to_string()),
+        draining_rule_ids,
     };
 
     // debug, not info: this runs every poll cycle (default 10s). Keeping it
@@ -885,6 +925,10 @@ pub async fn report_status(
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.token))
         .json(&report)
+        // Status also renews retired-entry billing leases. Bound every attempt
+        // well below the one-minute heartbeat so one half-open request cannot
+        // suppress all later renewals until the five-minute lease expires.
+        .timeout(Duration::from_secs(15))
         .send()
         .await
     {
@@ -1097,6 +1141,43 @@ mod tests {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p))
     }
 
+    #[tokio::test]
+    async fn old_traffic_snapshot_does_not_consume_recreated_rule_counter() {
+        let counter = TrafficCounter::new();
+        counter.add(7, 100, 200).await;
+        let old_snapshot = counter.snapshot().await;
+
+        // A config update can permanently remove the old listener while its
+        // report is in flight, then recreate the same database rule id before
+        // the panel ACK arrives. The new bytes belong to another counter
+        // generation and must survive the old snapshot's commit.
+        counter.prune_rule(7).await;
+        counter.add(7, 3, 4).await;
+        old_snapshot.commit().await;
+
+        let current = counter.snapshot().await;
+        assert_eq!(current.entries.len(), 1);
+        assert_eq!(current.entries[0].rule_id, 7);
+        assert_eq!(current.entries[0].upload, 3);
+        assert_eq!(current.entries[0].download, 4);
+    }
+
+    #[tokio::test]
+    async fn traffic_snapshot_commit_preserves_bytes_added_after_snapshot() {
+        let counter = TrafficCounter::new();
+        counter.add(9, 100, 200).await;
+        let snapshot = counter.snapshot().await;
+        counter.add(9, 3, 4).await;
+
+        snapshot.commit().await;
+
+        let current = counter.snapshot().await;
+        assert_eq!(current.entries.len(), 1);
+        assert_eq!(current.entries[0].rule_id, 9);
+        assert_eq!(current.entries[0].upload, 3);
+        assert_eq!(current.entries[0].download, 4);
+    }
+
     /// read_system_uptime_secs parses /proc/uptime's first field as whole
     /// seconds. On Linux CI this returns a real uptime (> 0); on non-Linux
     /// (dev machines without /proc) it returns 0 — so we only assert the
@@ -1303,7 +1384,13 @@ mod tests {
                 tcp_fast_open: false,
             })
             .collect();
-        let cfg = NodeConfigResponse { listeners };
+        let cfg = NodeConfigResponse {
+            listeners,
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+        };
 
         // apply_config should return promptly even for 1000 rules — the diff
         // is O(n) and binding happens in spawned tasks, not inline.

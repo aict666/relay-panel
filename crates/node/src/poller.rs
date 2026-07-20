@@ -1,7 +1,10 @@
 use crate::config::NodeConfig;
+use crate::forwarder::ForwarderManager;
 use relay_shared::protocol::{NodeConfigResponse, CONFIG_PROTOCOL_VERSION};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Path for the config cache file. Used when the panel is unreachable.
 const CACHE_FILE: &str = "config-cache.json";
@@ -23,9 +26,113 @@ pub enum FetchResult {
     /// keeps its cached config; the caller should back off (the only fix is an
     /// upgrade, so polling fast is pointless).
     ProtocolMismatch,
+    /// The panel authoritatively rejected this group credential (401/403).
+    /// Unlike a network outage this must fail closed: callers apply the empty
+    /// config returned here and the disk cache is replaced immediately.
+    CredentialsRejected(NodeConfigResponse),
     /// Transient failure (network error, 5xx, non-JSON body). The caller keeps
     /// the cached config and retries on the normal interval.
     Transient,
+}
+
+/// Outcome of one serialized fetch-and-apply operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncResult {
+    Ok,
+    ProtocolMismatch,
+    CredentialsRejected,
+    Transient,
+}
+
+/// Serializes every production config fetch through the cache write and
+/// manager apply. The HTTP fallback loop and WebSocket control loop otherwise
+/// issue independent requests; an older request that completes last could
+/// overwrite a newly-rotated credential or re-enable a stopped tunnel both in
+/// memory and in `config-cache.json`.
+#[derive(Clone, Default)]
+pub struct ConfigSynchronizer {
+    gate: Arc<Mutex<()>>,
+}
+
+impl ConfigSynchronizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn sync(
+        &self,
+        config: &NodeConfig,
+        manager: &Arc<Mutex<ForwarderManager>>,
+    ) -> SyncResult {
+        // Hold this guard before the HTTP request starts. Ordering only the
+        // final apply is insufficient because fetch_config also persists the
+        // response to disk before returning it.
+        let _guard = self.gate.lock().await;
+        match fetch_config(config).await {
+            FetchResult::Ok(response) => {
+                manager.lock().await.apply_config(&response).await;
+                SyncResult::Ok
+            }
+            FetchResult::ProtocolMismatch => SyncResult::ProtocolMismatch,
+            FetchResult::CredentialsRejected(response) => {
+                let mut manager = manager.lock().await;
+                manager.revoke_all_tunnel_credentials();
+                manager.apply_config(&response).await;
+                SyncResult::CredentialsRejected
+            }
+            FetchResult::Transient => SyncResult::Transient,
+        }
+    }
+
+    /// Synchronize after an explicit panel credential-revocation command. If
+    /// the replacement snapshot cannot be fetched, fail the affected links
+    /// closed both in memory and in the restart cache while this same ordering
+    /// gate is held. That prevents a concurrent ordinary poll or a process
+    /// restart from restoring the revoked generation.
+    pub async fn sync_after_tunnel_credential_revoke(
+        &self,
+        config: &NodeConfig,
+        manager: &Arc<Mutex<ForwarderManager>>,
+        group_id: i64,
+    ) -> SyncResult {
+        let _guard = self.gate.lock().await;
+        match fetch_config(config).await {
+            FetchResult::Ok(response) => {
+                manager.lock().await.apply_config(&response).await;
+                SyncResult::Ok
+            }
+            FetchResult::CredentialsRejected(response) => {
+                let mut manager = manager.lock().await;
+                manager.revoke_all_tunnel_credentials();
+                manager.apply_config(&response).await;
+                SyncResult::CredentialsRejected
+            }
+            FetchResult::ProtocolMismatch => {
+                persist_revocation_fallback(manager, group_id).await;
+                SyncResult::ProtocolMismatch
+            }
+            FetchResult::Transient => {
+                persist_revocation_fallback(manager, group_id).await;
+                SyncResult::Transient
+            }
+        }
+    }
+}
+
+async fn persist_revocation_fallback(manager: &Arc<Mutex<ForwarderManager>>, group_id: i64) {
+    let sanitized = manager
+        .lock()
+        .await
+        .fail_closed_tunnel_credentials(group_id)
+        .await;
+    if let Some(config) = sanitized {
+        save_cache_fail_closed(&config);
+    } else {
+        // No applied in-memory snapshot means the on-disk cache cannot be
+        // proven free of this credential. Remove it rather than allowing a
+        // restart to resurrect unknown state.
+        remove_cache_fail_closed();
+    }
 }
 
 pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
@@ -65,6 +172,18 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
         );
         return FetchResult::ProtocolMismatch;
     }
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        tracing::error!(
+            status = %status,
+            "fetch_config: node credential rejected; stopping cached forwarding"
+        );
+        let empty = empty_config();
+        save_cache_fail_closed(&empty);
+        return FetchResult::CredentialsRejected(empty);
+    }
     if !status.is_success() {
         tracing::warn!(status = %status, "fetch_config: non-2xx response; keeping cached config");
         return FetchResult::Transient;
@@ -79,6 +198,16 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
             tracing::warn!("fetch_config: response parse failed: {}", e);
             FetchResult::Transient
         }
+    }
+}
+
+fn empty_config() -> NodeConfigResponse {
+    NodeConfigResponse {
+        listeners: Vec::new(),
+        tunnels: Vec::new(),
+        credential_revisions: vec![],
+        terminate_tunnel_ids: Vec::new(),
+        drain_rule_ids: Vec::new(),
     }
 }
 
@@ -104,15 +233,46 @@ pub fn load_cache() -> Option<NodeConfigResponse> {
 /// Save config to config-cache.json (next to the binary or in working dir).
 fn save_cache(config: &NodeConfigResponse) {
     let path = cache_path();
-    match serde_json::to_string_pretty(config) {
-        Ok(json) => {
-            if let Err(e) = write_private_atomic(&path, json.as_bytes()) {
-                tracing::warn!("Failed to write config cache to {}: {}", path.display(), e);
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to serialize config cache: {}", e);
-        }
+    if let Err(error) = save_cache_at(config, &path) {
+        tracing::warn!(
+            "Failed to write config cache to {}: {}",
+            path.display(),
+            error
+        );
+    }
+}
+
+fn save_cache_fail_closed(config: &NodeConfigResponse) {
+    let path = cache_path();
+    if let Err(error) = save_cache_at(config, &path) {
+        tracing::error!(
+            "Failed to persist fail-closed config cache to {}: {}; removing stale cache",
+            path.display(),
+            error
+        );
+        remove_cache_at_fail_closed(&path);
+    }
+}
+
+fn save_cache_at(config: &NodeConfigResponse, path: &std::path::Path) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(config)
+        .map_err(|error| std::io::Error::other(format!("serialize config cache: {error}")))?;
+    write_private_atomic(path, &json)
+}
+
+fn remove_cache_fail_closed() {
+    remove_cache_at_fail_closed(&cache_path());
+}
+
+fn remove_cache_at_fail_closed(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => tracing::warn!("Removed stale config cache {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::error!(
+            "Failed to remove stale config cache {} after credential revocation: {}",
+            path.display(),
+            error
+        ),
     }
 }
 

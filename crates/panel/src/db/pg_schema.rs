@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS device_groups (
     name TEXT NOT NULL,
     group_type TEXT NOT NULL,
     token TEXT NOT NULL UNIQUE,
+    credential_revision BIGINT NOT NULL DEFAULT 0,
     uid BIGINT NOT NULL REFERENCES users(id),
     connect_host TEXT NOT NULL DEFAULT '',
     port_range TEXT NOT NULL DEFAULT '1-65535',
@@ -108,6 +109,30 @@ CREATE TABLE IF NOT EXISTS tunnel_profiles (
     created_at      TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
 );
 
+CREATE TABLE IF NOT EXISTS tunnels (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    shared BOOLEAN NOT NULL DEFAULT FALSE,
+    uid BIGINT NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
+);
+
+CREATE TABLE IF NOT EXISTS tunnel_hops (
+    id BIGSERIAL PRIMARY KEY,
+    tunnel_id BIGINT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    device_group_id BIGINT NOT NULL REFERENCES device_groups(id),
+    listen_port INTEGER CHECK (listen_port >= 1 AND listen_port <= 65535),
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    UNIQUE (tunnel_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tunnel_hops_tunnel_position
+    ON tunnel_hops (tunnel_id, position);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tunnel_hops_group_port
+    ON tunnel_hops (device_group_id, listen_port) WHERE listen_port IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS forward_rules (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL,
@@ -128,6 +153,7 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     device_group_out BIGINT REFERENCES device_groups(id),
     forward_mode TEXT NOT NULL DEFAULT 'group',
     tunnel_profile_id BIGINT REFERENCES tunnel_profiles(id),
+    tunnel_id BIGINT REFERENCES tunnels(id),
     domain TEXT,
     ws_path TEXT,
     ws_host TEXT,
@@ -146,6 +172,17 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
 );
+
+CREATE TABLE IF NOT EXISTS forward_rule_retired_entries (
+    rule_id BIGINT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+    tunnel_id BIGINT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+    device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    expires_at BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (rule_id, tunnel_id, device_group_id)
+);
+CREATE INDEX IF NOT EXISTS idx_forward_rule_retired_entries_group
+    ON forward_rule_retired_entries (device_group_id, tunnel_id, rule_id);
 
 CREATE TABLE IF NOT EXISTS forward_rule_targets (
     id BIGSERIAL PRIMARY KEY,
@@ -306,7 +343,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 26;
+pub const PG_SCHEMA_VERSION: i32 = 31;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1257,12 +1294,164 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 26: app_settings.site_name present");
     }
 
+    // ── Revision 27: reusable preset tunnels + rule binding ──
+    if current < 27 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS tunnels (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                shared BOOLEAN NOT NULL DEFAULT FALSE,
+                uid BIGINT NOT NULL REFERENCES users(id),
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
+            )"#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS tunnel_hops (
+                id BIGSERIAL PRIMARY KEY,
+                tunnel_id BIGINT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL CHECK (position >= 0),
+                device_group_id BIGINT NOT NULL REFERENCES device_groups(id),
+                listen_port INTEGER CHECK (listen_port >= 1 AND listen_port <= 65535),
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                UNIQUE (tunnel_id, position)
+            )"#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_tunnel_hops_tunnel_position \
+             ON tunnel_hops (tunnel_id, position)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tunnel_hops_group_port \
+             ON tunnel_hops (device_group_id, listen_port) WHERE listen_port IS NOT NULL",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS tunnel_id BIGINT REFERENCES tunnels(id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_forward_rules_tunnel_id ON forward_rules (tunnel_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (27) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 27: reusable tunnels + forward_rules.tunnel_id present");
+    }
+
+    // Revision 28: explicit user-sharing gate for preset tunnels. Existing
+    // rows default to admin-only so an upgrade cannot silently broaden access.
+    if current < 28 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE tunnels ADD COLUMN IF NOT EXISTS shared BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (28) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 28: tunnels.shared permission gate present");
+    }
+
+    // Revision 29: durable device-group credential generations. This is
+    // intentionally separate from the token itself; nodes may receive the
+    // revision map but never another group's credential.
+    if current < 29 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE device_groups ADD COLUMN IF NOT EXISTS credential_revision BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (29) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 29: device_groups.credential_revision present");
+    }
+
+    // Revision 30: remember old entry groups so their established TCP
+    // connections can drain and remain authorized for traffic accounting.
+    if current < 30 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS forward_rule_retired_entries (
+                rule_id BIGINT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+                tunnel_id BIGINT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+                device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+                PRIMARY KEY (rule_id, tunnel_id, device_group_id)
+            )"#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_forward_rule_retired_entries_group \
+             ON forward_rule_retired_entries (device_group_id, tunnel_id, rule_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (30) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 30: tunnel entry-drain leases present");
+    }
+
+    // Revision 31: a retired entry is authorized only while a node with a live
+    // retired runtime keeps renewing it. Old v30 rows start expired.
+    if current < 31 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE forward_rule_retired_entries ADD COLUMN IF NOT EXISTS expires_at BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (31) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 31: entry-drain leases are bounded and renewable");
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_version_reaches_bounded_entry_drain_migration() {
+        // Keep the early-return guard in run_pg_migrations aligned with the
+        // highest ordered migration below. A lower value silently skips newer
+        // migrations on existing PostgreSQL databases.
+        assert_eq!(PG_SCHEMA_VERSION, 31);
+    }
 
     // A `;` inside a -- line comment must NOT split a statement. This is the
     // exact bug that broke every PG test in v0.4.4: the schema_version comment

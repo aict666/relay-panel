@@ -148,6 +148,8 @@ impl CertReloader {
                                 port: 0, // Not port-specific.
                                 protocol: "tls".into(),
                                 error: msg.clone(),
+                                tunnel_id: None,
+                                rule_id: None,
                             });
                         }
                         // Update last_mtime anyway so we don't spin on the

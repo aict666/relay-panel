@@ -83,6 +83,46 @@ pub struct ForwardRuleHop {
     pub connect_host: Option<String>,
 }
 
+/// An administrator-managed reusable route.  Unlike `TunnelProfile` (the
+/// historical WS/TLS transport template), this owns an ordered device-group
+/// path and one shared TCP listener on every non-entry hop.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Tunnel {
+    pub id: i64,
+    pub name: String,
+    pub enabled: bool,
+    /// Whether ordinary users may bind this tunnel. This deliberately reuses
+    /// the existing entry-group authorization model: shared is necessary but
+    /// not sufficient; the rule owner must also be allowed to use hop 0.
+    pub shared: bool,
+    pub uid: i64,
+    pub created_at: String,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub hops: Vec<TunnelHop>,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub bound_rule_count: i64,
+}
+
+/// One hop of a reusable tunnel. Position 0 is the public entry and therefore
+/// has no shared listener port; positions 1..N each reserve one TCP port.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TunnelHop {
+    pub id: i64,
+    pub tunnel_id: i64,
+    pub position: i32,
+    pub device_group_id: i64,
+    pub listen_port: Option<i32>,
+    pub created_at: String,
+    /// Display-only fields populated by the repository. Public APIs clear
+    /// `connect_host`; the administrator API retains it for firewall output.
+    #[serde(default)]
+    pub group_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_host: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ForwardRule {
     pub id: i64,
@@ -107,6 +147,26 @@ pub struct ForwardRule {
     /// v0.3.0: chain-mode tunnel profile. NULL → fall back to builtin 'direct'
     /// at config-build time.
     pub tunnel_profile_id: Option<i64>,
+    /// Reusable preset route. Tunnel-bound rules are deliberately persisted as
+    /// route_mode=chain with no rule-level hop rows so an old panel fails
+    /// closed rather than silently forwarding directly.
+    #[serde(default)]
+    pub tunnel_id: Option<i64>,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub tunnel_name: Option<String>,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub tunnel_enabled: Option<bool>,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub tunnel_shared: Option<bool>,
+    /// Safe display snapshot of the bound preset route. Unlike `hops`, these
+    /// rows are not rule-owned and never affect old-panel fail-closed behavior.
+    /// Public rule APIs clear every hop's internal connect_host.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub tunnel_hops: Vec<TunnelHop>,
     /// v0.3.0: optional per-rule WS/TLS metadata. NULL = use profile default /
     /// not applicable for raw/tcp.
     pub domain: Option<String>,

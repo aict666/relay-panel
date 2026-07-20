@@ -1,6 +1,17 @@
 use crate::models::Plan;
 use serde::{Deserialize, Serialize};
 
+/// Preserve the distinction between an omitted PATCH field and an explicit
+/// JSON null. Serde's default Option<Option<T>> handling collapses both to
+/// None, which would make it impossible to unbind a tunnel over HTTP.
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// The config-protocol version this panel/node build speaks.
 ///
 /// v0.4.0 introduces a deliberate compatibility gate (see ROADMAP-v0.4.md
@@ -41,7 +52,10 @@ use serde::{Deserialize, Serialize};
 /// Fast Open. Old nodes do not understand `tcp_fast_open`, and tcp_udp requires
 /// the dedicated port to keep raw TCP and UOT unambiguous, so panel and nodes
 /// must again upgrade in lockstep before either entry switch is enabled.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 7;
+/// v8 = reusable preset tunnels: NodeConfigResponse carries shared authenticated
+/// tunnel listeners and rule entry listeners can dial them with a routing
+/// handshake. Old nodes cannot safely interpret this topology.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 8;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +162,40 @@ pub struct NodeConfigRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfigResponse {
     pub listeners: Vec<ListenerConfig>,
+    #[serde(default)]
+    pub tunnels: Vec<TunnelListenerConfig>,
+    /// Monotonic credential generations for device groups. The panel sends the
+    /// complete non-secret map so a polling node can revoke an old tunnel
+    /// generation even when the same snapshot also removes that group from the
+    /// path or changes the shared port.
+    #[serde(default)]
+    pub credential_revisions: Vec<GroupCredentialRevision>,
+    /// Tunnel ids whose existing authenticated streams must be terminated on
+    /// this node (currently disabled tunnels). Ordinary path removal omits the
+    /// listener without adding the id so established TCP streams can drain.
+    #[serde(default)]
+    pub terminate_tunnel_ids: Vec<i64>,
+    /// Rules whose public listener moved away from this entry group while
+    /// authenticated TCP connections may still be alive. The node stops
+    /// accepting immediately but keeps their runtime/counters until idle.
+    #[serde(default)]
+    pub drain_rule_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupCredentialRevision {
+    pub group_id: i64,
+    pub revision: i64,
+}
+
+/// Panel → node credential-revocation command. The group id scopes the
+/// cancellation to tunnel generations whose incoming or outgoing link used
+/// that group, including generations no longer present in the latest path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeTunnelCredentialsMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub group_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +287,74 @@ pub struct ListenerConfig {
     // on users/plans are kept (deprecated) to avoid a pointless migration, but
     // the ListenerConfig wire struct no longer carries them. CONFIG_PROTOCOL_VERSION
     // bumps 3→4 so a v0.4.6 node (which still expects these fields) is gated.
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelClientConfig {
+    pub tunnel_id: i64,
+    pub rule_id: i64,
+    /// Link leaving this hop (entry is 0).
+    pub hop_position: u8,
+    pub address: String,
+    /// Per-link derived HMAC key; never a device-group control-plane token.
+    pub auth_token: String,
+    /// Stable adjacent-group identity that excludes rotatable credentials.
+    /// A key change with the same scope is credential revocation; a scope
+    /// change is a path edit whose existing streams may drain.
+    pub link_scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelNextConfig {
+    pub hop_position: u8,
+    pub address: String,
+    pub auth_token: String,
+    pub link_scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelRouteConfig {
+    pub rule_id: i64,
+    /// Stored rule protocol (tcp/udp/tcp_udp). The listener rejects a handshake
+    /// mode not allowed by this value.
+    pub protocol: String,
+    /// Populated only on the final hop; relays use `next` instead.
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub target_weights: Vec<u16>,
+    #[serde(default)]
+    pub load_balance_strategy: LoadBalanceStrategy,
+}
+
+/// One shared TCP listener for one non-entry hop of a preset tunnel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelListenerConfig {
+    pub tunnel_id: i64,
+    pub port: u16,
+    /// Position of this receiving hop (1..N).
+    pub hop_position: u8,
+    pub auth_token: String,
+    pub link_scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<TunnelNextConfig>,
+    pub routes: Vec<TunnelRouteConfig>,
+    #[serde(default = "default_tunnel_handshake_timeout_ms")]
+    pub handshake_timeout_ms: u64,
+    #[serde(default = "default_tunnel_unauthenticated_limit")]
+    pub max_unauthenticated: u32,
+    /// Entry-side clients carried in the same v8 collection. Entries with
+    /// port=0 are metadata only and are never bound as shared listeners.
+    #[serde(default)]
+    pub clients: Vec<TunnelClientConfig>,
+}
+
+fn default_tunnel_handshake_timeout_ms() -> u64 {
+    3_000
+}
+
+fn default_tunnel_unauthenticated_limit() -> u32 {
+    128
 }
 
 fn default_true() -> bool {
@@ -673,6 +789,11 @@ pub struct StatusReport {
     /// send this; the panel treats a missing value as "unknown" (no self-upgrade).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_method: Option<String>,
+    /// Preset-tunnel rules for which this node still has established TCP
+    /// streams from a retired entry generation. The panel renews only these
+    /// bounded accounting leases; omission/empty means no renewal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub draining_rule_ids: Vec<i64>,
 }
 
 /// One listener bind failure reported by a node. Carries enough context for the
@@ -684,6 +805,10 @@ pub struct ListenerError {
     pub protocol: String,
     /// Short human-readable reason (e.g. "Address already in use (os error 98)").
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<i64>,
 }
 
 // === v0.4.8: Rule diagnosis ===  === v0.4.9: secure-diagnose challenge + TCP-only ===
@@ -983,6 +1108,10 @@ pub struct CreateRuleRequest {
     /// Required when `route_mode=chain` (length 2..=8). Ignored for direct.
     #[serde(default)]
     pub hops: Option<Vec<i64>>,
+    /// Bind the rule to an administrator-managed reusable tunnel. Mutually
+    /// exclusive with `hops`; the server derives entry/exit groups from it.
+    #[serde(default)]
+    pub tunnel_id: Option<i64>,
     /// v0.4.0: user-facing ingress transport. Defaults to Raw. The panel
     /// derives `node_transport` from this (identity for raw/ws) and
     /// stores both. Replaces the v0.3.x `entry_transport` field.
@@ -1036,6 +1165,11 @@ pub struct UpdateRuleRequest {
     /// when the effective route_mode is Chain. Omitted keeps current hops.
     #[serde(default)]
     pub hops: Option<Vec<i64>>,
+    /// Some(Some(id)) binds a preset tunnel; Some(None) unbinds it; omitted
+    /// keeps the current binding. A bound tunnel is mutually exclusive with
+    /// rule-level `hops`.
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub tunnel_id: Option<Option<i64>>,
     /// v0.4.0: user-facing ingress transport. Some(value) updates (and
     /// re-derives node_transport); omitted keeps current. Replaces the v0.3.x
     /// `entry_transport` field.
@@ -1062,7 +1196,7 @@ pub struct UpdateRuleRequest {
     pub download_limit_mbps: Option<i32>,
     /// v0.4.7: bind (Some) or unbind (None) the rule's tunnel profile. Omitted
     /// = leave current binding.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_option")]
     pub tunnel_profile_id: Option<Option<i64>>,
     /// v0.3.0: pause/resume a rule without deleting it. true = paused (the node
     /// stops forwarding — get_config filters `WHERE paused = 0`), false = active.
@@ -1240,6 +1374,44 @@ fn default_tls_mode() -> String {
     "none".to_string()
 }
 
+// === Admin API — Reusable Tunnels (config protocol v8) ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelHopRequest {
+    pub device_group_id: i64,
+    /// None means allocate from the device group's port pool. Position 0 must
+    /// always omit this value because it uses the rule's public entry port.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateTunnelRequest {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Admin-only visibility control. False keeps the tunnel usable only by
+    /// administrator-owned rules. Ordinary users additionally need hop-0
+    /// device-group authorization through the existing plan mechanism.
+    #[serde(default)]
+    pub shared: bool,
+    pub hops: Vec<TunnelHopRequest>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateTunnelRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    pub shared: Option<bool>,
+    /// Full replacement when present. Omitted keeps the stored path.
+    pub hops: Option<Vec<TunnelHopRequest>>,
+    /// Client-side path snapshot captured when the edit form was opened.
+    /// Required whenever `hops` is present so a stale browser cannot overwrite
+    /// a route that another administrator has already changed.
+    #[serde(default)]
+    pub expected_hops: Option<Vec<TunnelHopRequest>>,
+}
+
 /// Device group types. Values map to stable machine strings in the DB:
 /// - In → "in" (listener node, receives forwarding rules)
 /// - Out → "out" (egress node, target for forwarding)
@@ -1385,6 +1557,11 @@ mod tests {
             device_group_out: None,
             forward_mode: "direct".into(),
             tunnel_profile_id: None,
+            tunnel_id: None,
+            tunnel_name: None,
+            tunnel_enabled: None,
+            tunnel_shared: None,
+            tunnel_hops: Vec::new(),
             domain: None,
             ws_path: None,
             ws_host: None,
@@ -1604,5 +1781,15 @@ mod tests {
         assert!(node_supports_directed_diagnose(Some("0.4.14-rc1")));
         assert!(node_supports_directed_diagnose(Some("0.5.0")));
         assert!(node_supports_directed_diagnose(Some("1.0.0")));
+    }
+
+    #[test]
+    fn update_rule_tunnel_id_distinguishes_omitted_null_and_value() {
+        let omitted: UpdateRuleRequest = serde_json::from_str("{}").unwrap();
+        let unbind: UpdateRuleRequest = serde_json::from_str(r#"{"tunnel_id":null}"#).unwrap();
+        let bind: UpdateRuleRequest = serde_json::from_str(r#"{"tunnel_id":42}"#).unwrap();
+        assert_eq!(omitted.tunnel_id, None);
+        assert_eq!(unbind.tunnel_id, Some(None));
+        assert_eq!(bind.tunnel_id, Some(Some(42)));
     }
 }

@@ -167,6 +167,21 @@ pub fn routes() -> Router<AppState> {
             "/admin/tunnel-profiles/{id}",
             axum::routing::put(admin::update_tunnel_profile).delete(admin::delete_tunnel_profile),
         )
+        // Reusable route tunnels (separate from legacy transport profiles).
+        .route(
+            "/tunnels",
+            axum::routing::get(admin::list_available_tunnels),
+        )
+        .route(
+            "/admin/tunnels",
+            axum::routing::get(admin::list_admin_tunnels).post(admin::create_tunnel),
+        )
+        .route(
+            "/admin/tunnels/{id}",
+            axum::routing::get(admin::get_admin_tunnel)
+                .put(admin::update_tunnel)
+                .delete(admin::delete_tunnel),
+        )
         .route(
             "/admin/plans",
             axum::routing::get(admin::list_plans).post(admin::create_plan),

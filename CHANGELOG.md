@@ -10,6 +10,56 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-07-20
+
+### Added
+
+- **Reusable preset tunnels share one internal TCP port per downstream hop.**
+  Administrators can define a 2–8 group entry → relay → exit path once and bind
+  multiple TCP, UDP, or `tcp_udp` rules to it. Public entry ports and per-rule
+  targets, limits, load balancing, connection controls, and billing remain
+  independent while the internal relay listener and route table are reused.
+- **Tunnel sharing follows the existing device-group authorization model.** New
+  tunnels default to administrator-only; enabling sharing only exposes them to
+  users whose plan already authorizes the tunnel's entry group. The API
+  revalidates the final rule owner transactionally, so guessed tunnel ids and
+  stale administrator forms cannot bypass authorization.
+- **Tunnel management and diagnostics.** The administrator UI manages paths,
+  automatic/fixed internal ports, enablement, sharing, binding counts, and a
+  firewall checklist. TCP diagnosis sends an authenticated probe through every
+  shared hop to a panel-configured final target.
+
+### Changed
+
+- **Configuration protocol is now 8.** Shared listeners use a fixed client-first
+  HMAC header with timestamp and replay protection. Device-group token rotation
+  revokes active and retired authenticated generations; payload bytes remain
+  unencrypted and still require end-to-end TLS or WireGuard when confidential.
+- **Dashboard long-range charts retain real one-minute bandwidth peaks.** The
+  7-day and 30-day views no longer average short spikes away, and tooltip titles
+  display localized clock times instead of raw millisecond timestamps.
+
+### Fixed
+
+- **Path changes drain safely without cross-rule disruption.** New connections
+  switch immediately, existing TCP streams drain on the old generation, UDP
+  warm channels reconnect, and pause/disable/unshare/restart cancel only the
+  affected rule or tunnel instead of every route sharing the port.
+- **Tail traffic remains attributable across entry moves.** SQLite and
+  PostgreSQL create bounded old-entry billing leases from the transaction's
+  pre-update tunnel state, including an entry move combined with disable or
+  unshare, and preserve every lease beyond query chunk boundaries.
+- **Traffic snapshot commits cannot consume a recreated rule counter.** An
+  in-flight report is now tied to the exact counter generation it observed, so
+  rapid listener removal/recreation cannot underflow or erase newer bytes.
+
+### Tests
+
+- Added SQLite/PostgreSQL migration, authorization, port-allocation, and atomic
+  rollback parity; real shared-port TCP/UDP/`tcp_udp` isolation and three-hop
+  authenticated probe coverage; credential-revocation, replay, drain, and
+  dashboard peak regressions.
+
 ## [1.3.2] - 2026-07-19
 
 ### Added

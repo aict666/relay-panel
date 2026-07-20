@@ -72,7 +72,8 @@ pub struct RestartResponse {
     pub nodes: Vec<NodeRestartStatus>,
 }
 
-/// Send `restart_rule` for `rule_id` to every eligible node of `group_id`.
+/// Send `restart_rule` for `rule_id` to every eligible node of its current and
+/// historical entry groups.
 ///
 /// Shared by the HTTP handler and the auto-restart scheduler so both apply the
 /// same version gate and the same online check — a scheduled restart must not
@@ -84,6 +85,26 @@ pub struct RestartResponse {
 /// for confirmation from every node would hold a request open on the slowest
 /// node for no decision the caller can act on.
 pub(crate) async fn dispatch_restart(
+    state: &AppState,
+    rule_id: i64,
+    group_id: i64,
+    request_id: &str,
+) -> Result<Vec<NodeRestartStatus>, crate::db::error::DbError> {
+    let mut group_ids = state.db.list_rule_restart_entry_group_ids(rule_id).await?;
+    if !group_ids.contains(&group_id) {
+        group_ids.push(group_id);
+    }
+    group_ids.sort_unstable();
+    group_ids.dedup();
+
+    let mut out = Vec::new();
+    for entry_group_id in group_ids {
+        out.extend(dispatch_restart_group(state, rule_id, entry_group_id, request_id).await?);
+    }
+    Ok(out)
+}
+
+async fn dispatch_restart_group(
     state: &AppState,
     rule_id: i64,
     group_id: i64,

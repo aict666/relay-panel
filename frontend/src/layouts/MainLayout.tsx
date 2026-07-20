@@ -68,6 +68,7 @@ export default function MainLayout() {
   ];
   const adminOnlyItems = [
     { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
+    { key: '/tunnels', icon: <ApiOutlined />, label: t('tunnelManagement') },
     { key: '/plans', icon: <ShoppingOutlined />, label: t('planManagement') },
     { key: '/users', icon: <UserOutlined />, label: t('users') },
     { key: '/settings', icon: <SettingOutlined />, label: t('systemSettings') },

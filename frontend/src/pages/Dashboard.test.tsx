@@ -144,6 +144,10 @@ describe('Dashboard group aggregation', () => {
       timestamp: '2026-07-19T09:00:00Z',
       upload_bps_avg: 100,
       download_bps_avg: 200,
+      upload_bps_max: 500,
+      download_bps_max: 600,
+      upload_bps_max_at: '2026-07-19T12:04:00Z',
+      download_bps_max_at: '2026-07-19T12:04:00Z',
       connections_max: 3,
       online_nodes_min: 2,
       recent_nodes_max: 2,
@@ -152,12 +156,21 @@ describe('Dashboard group aggregation', () => {
     renderDashboard();
     await flush();
 
-    const areaProps = mockArea.mock.calls.at(-1)?.[0] as { axis?: { x?: Record<string, unknown> } };
+    const areaProps = mockArea.mock.calls.at(-1)?.[0] as {
+      axis?: { x?: Record<string, unknown> };
+      data?: Array<{ time: number; value: number }>;
+      tooltip?: { title?: (datum: { time: number }) => string };
+    };
     const lineProps = mockLine.mock.calls.at(-1)?.[0] as { axis?: { x?: Record<string, unknown> } };
     expect(areaProps.axis?.x?.labelAutoRotate).toBe(false);
     expect(areaProps.axis?.x?.labelAutoHide).toBe(true);
     expect(lineProps.axis?.x?.labelAutoRotate).toBe(false);
     expect(lineProps.axis?.x?.labelAutoHide).toBe(true);
+    expect(areaProps.data).toEqual(expect.arrayContaining([
+      expect.objectContaining({ time: Date.parse('2026-07-19T12:04:00Z'), value: 500 }),
+      expect.objectContaining({ time: Date.parse('2026-07-19T12:04:00Z'), value: 600 }),
+    ]));
+    expect(areaProps.tooltip?.title?.({ time: Date.parse('2026-07-19T09:00:00Z') })).not.toMatch(/^\d+$/);
   });
 
   it('stops the history refresh timer after unmount', async () => {

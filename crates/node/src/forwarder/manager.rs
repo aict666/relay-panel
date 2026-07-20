@@ -9,11 +9,12 @@ use super::ws;
 use crate::reporter::{ConnectionTracker, TrafficCounter};
 use relay_shared::protocol::{
     ListenerConfig, ListenerError, LoadBalanceStrategy, NodeConfigResponse, NodeTransport,
-    Protocol, UotRole,
+    Protocol, TunnelClientConfig, TunnelListenerConfig, UotRole,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -118,6 +119,123 @@ struct ManagedListener {
     fingerprint: ListenerFingerprint,
 }
 
+type TunnelListenerKey = (i64, u16);
+
+struct ManagedTunnelListener {
+    handle: JoinHandle<()>,
+    config: TunnelListenerConfig,
+    state: super::tunnel::TunnelListenerState,
+    runtime: super::tunnel::TunnelRuntime,
+}
+
+struct RetiredTunnelRuntime {
+    tunnel_id: i64,
+    runtime: super::tunnel::TunnelRuntime,
+}
+
+struct RetiredRuleRuntime {
+    rule_id: i64,
+    runtime: RuleRuntime,
+}
+
+type TunnelReplayKey = (i64, u8, String, String);
+
+// A signed header is accepted for at most 60 seconds, while ReplayCache keeps
+// two 120-second nonce buckets. Retain an inactive link a little longer than
+// both windows so a quick pause, disable/re-enable or transient empty route
+// cannot reset replay protection; old credential revisions then release memory.
+const TUNNEL_REPLAY_RETENTION: Duration = Duration::from_secs(5 * 60);
+
+struct TunnelReplayCacheEntry {
+    cache: Arc<super::tunnel::ReplayCache>,
+    last_used: Instant,
+}
+
+fn tunnel_replay_key(tunnel: &TunnelListenerConfig) -> TunnelReplayKey {
+    (
+        tunnel.tunnel_id,
+        tunnel.hop_position,
+        tunnel.link_scope.clone(),
+        tunnel.auth_token.clone(),
+    )
+}
+
+fn tunnel_credentials_revoked(
+    previous: &TunnelListenerConfig,
+    next: &TunnelListenerConfig,
+) -> bool {
+    (previous.link_scope == next.link_scope && previous.auth_token != next.auth_token)
+        || previous
+            .next
+            .as_ref()
+            .zip(next.next.as_ref())
+            .is_some_and(|(previous, next)| {
+                previous.link_scope == next.link_scope && previous.auth_token != next.auth_token
+            })
+}
+
+fn link_scope_group_ids(scope: &str) -> impl Iterator<Item = i64> + '_ {
+    // Scope format is tunnel_id:position:from_group:to_group. Ignore malformed
+    // values rather than letting a control-plane typo broaden revocation.
+    scope
+        .split(':')
+        .skip(2)
+        .take(2)
+        .filter_map(|part| part.parse().ok())
+}
+
+fn link_scope_credentials(scope: &str, revisions: &HashMap<i64, i64>) -> Vec<(i64, Option<i64>)> {
+    link_scope_group_ids(scope)
+        .map(|group_id| {
+            let revision = revisions.get(&group_id).copied();
+            (group_id, revision)
+        })
+        .collect()
+}
+
+fn link_scope_uses_group(scope: &str, group_id: i64) -> bool {
+    link_scope_group_ids(scope).any(|candidate| candidate == group_id)
+}
+
+fn tunnel_listener_uses_group(config: &TunnelListenerConfig, group_id: i64) -> bool {
+    link_scope_uses_group(&config.link_scope, group_id)
+        || config
+            .next
+            .as_ref()
+            .is_some_and(|next| link_scope_uses_group(&next.link_scope, group_id))
+}
+
+/// Remove every data-plane credential and public entry that depends on one
+/// revoked device-group token while preserving unrelated offline forwarding.
+/// The returned snapshot is safe to persist and load after a process restart.
+fn fail_closed_config_for_group(config: &NodeConfigResponse, group_id: i64) -> NodeConfigResponse {
+    let mut sanitized = config.clone();
+    let affected_rule_ids: HashSet<i64> = sanitized
+        .tunnels
+        .iter()
+        .flat_map(|tunnel| tunnel.clients.iter())
+        .filter(|client| link_scope_uses_group(&client.link_scope, group_id))
+        .map(|client| client.rule_id)
+        .collect();
+
+    sanitized
+        .listeners
+        .retain(|listener| !affected_rule_ids.contains(&listener.rule_id));
+    sanitized
+        .drain_rule_ids
+        .retain(|rule_id| !affected_rule_ids.contains(rule_id));
+    sanitized.tunnels.retain_mut(|tunnel| {
+        if tunnel_listener_uses_group(tunnel, group_id) {
+            return false;
+        }
+        tunnel
+            .clients
+            .retain(|client| !link_scope_uses_group(&client.link_scope, group_id));
+        tunnel.port != 0 || !tunnel.clients.is_empty()
+    });
+    sanitized
+}
+
 /// v0.4.8: snapshot of one rule's listener state, for diagnosis. `running`
 /// reflects whether the listener task is alive right now (a task can exit
 /// without the manager knowing until the next apply).
@@ -128,6 +246,10 @@ pub struct ListenerInfo {
     pub transport: String,
     pub targets: Vec<String>,
     pub running: bool,
+    /// Present for a reusable preset tunnel. Diagnosis sends an authenticated
+    /// probe through the complete route instead of merely opening the next
+    /// shared listener's TCP socket.
+    pub tunnel: Option<TunnelClientConfig>,
 }
 
 struct ManagedRateLimit {
@@ -148,6 +270,18 @@ impl ManagedRateLimit {
 
 pub struct ForwarderManager {
     listeners: HashMap<ListenerKey, ManagedListener>,
+    shared_tunnel_listeners: HashMap<TunnelListenerKey, ManagedTunnelListener>,
+    /// Listener generations removed by an ordinary path edit. Their accept
+    /// sockets are gone, but authenticated TCP streams may still be draining.
+    /// Keeping the runtime makes a later credential revocation authoritative.
+    retired_tunnel_runtimes: Vec<RetiredTunnelRuntime>,
+    /// Public-entry rule runtimes moved to another device group. Their accept
+    /// loops are gone, but keeping the sender alive lets established TCP
+    /// connections drain while traffic remains attributed to the old entry.
+    retired_rule_runtimes: Vec<RetiredRuleRuntime>,
+    /// Replay state survives route/target rebuilds and short listener absences
+    /// while the incoming link identity and credential stay unchanged.
+    tunnel_replay_caches: HashMap<TunnelReplayKey, TunnelReplayCacheEntry>,
     /// Persistent per-rule traffic buckets. Keeping these outside a single
     /// apply_config call ensures a recovered TCP or UDP half of a tcp_udp rule
     /// rejoins the sibling's existing aggregate budget instead of receiving a
@@ -187,6 +321,10 @@ impl ForwarderManager {
     pub fn new(counter: Arc<TrafficCounter>, connections: Arc<ConnectionTracker>) -> Self {
         Self {
             listeners: HashMap::new(),
+            shared_tunnel_listeners: HashMap::new(),
+            retired_tunnel_runtimes: Vec::new(),
+            retired_rule_runtimes: Vec::new(),
+            tunnel_replay_caches: HashMap::new(),
             rule_limiters: HashMap::new(),
             rule_runtime: HashMap::new(),
             last_config: None,
@@ -226,6 +364,27 @@ impl ForwarderManager {
         self.listener_errors.lock().await.drain(..).collect()
     }
 
+    /// Rules for which this node still owns at least one established TCP stream
+    /// from a retired preset-tunnel entry generation. The panel renews only
+    /// these accounting leases; once the last stream closes the lease expires.
+    pub fn active_draining_rule_ids(&self) -> Vec<i64> {
+        let configured: HashSet<i64> = self
+            .last_config
+            .as_ref()
+            .into_iter()
+            .flat_map(|config| config.drain_rule_ids.iter().copied())
+            .collect();
+        let mut ids: Vec<i64> = self
+            .retired_rule_runtimes
+            .iter()
+            .filter(|retired| !retired.runtime.is_idle() && configured.contains(&retired.rule_id))
+            .map(|retired| retired.rule_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// v0.4.9: return the rule's TCP listener, for diagnosis. Diagnosis is
     /// TCP-only, and a tcp_udp rule runs TWO listeners (Tcp + Udp) keyed in a
     /// HashMap — iterating that map and taking the first match would be
@@ -244,6 +403,14 @@ impl ForwarderManager {
     /// TCP-only and the nondeterministic selection was a latent bug for
     /// tcp_udp rules.)
     pub fn listener_info_for_rule_tcp(&self, rule_id: i64) -> Option<ListenerInfo> {
+        let tunnel = self.last_config.as_ref().and_then(|config| {
+            config
+                .tunnels
+                .iter()
+                .flat_map(|listener| listener.clients.iter())
+                .find(|client| client.rule_id == rule_id)
+                .cloned()
+        });
         for ((port, proto, transport), ml) in &self.listeners {
             if ml.fingerprint.rule_id == rule_id && *proto == Protocol::Tcp {
                 return Some(ListenerInfo {
@@ -252,10 +419,18 @@ impl ForwarderManager {
                     transport: format!("{:?}", transport).to_lowercase(),
                     targets: ml.fingerprint.targets.clone(),
                     running: !ml.handle.is_finished(),
+                    tunnel,
                 });
             }
         }
         None
+    }
+
+    /// Resolved outbound source address used by the real forwarding path.
+    /// Diagnostics must reuse it or a multi-homed node can report a false
+    /// failure while production traffic succeeds through the configured NIC.
+    pub(crate) fn outbound_source_ipv4(&self) -> Option<std::net::Ipv4Addr> {
+        self.source_ipv4
     }
 
     /// v0.4.1: set the shared TLS acceptor for tls_simple listeners. Called at
@@ -272,6 +447,34 @@ impl ForwarderManager {
     }
 
     pub async fn apply_config(&mut self, config: &NodeConfigResponse) {
+        // Credential generations are independent from topology. Compare them
+        // before reconciling listeners so a token rotation still cancels the
+        // old generation when the same snapshot also changes/removes a hop or
+        // moves the shared port. An empty previous map is an upgrade/bootstrap
+        // case, not evidence that every credential changed.
+        let current_credential_revisions: HashMap<i64, i64> = config
+            .credential_revisions
+            .iter()
+            .map(|revision| (revision.group_id, revision.revision))
+            .collect();
+        let revoked_groups: Vec<(i64, Option<i64>)> = self
+            .last_config
+            .as_ref()
+            .filter(|previous| !previous.credential_revisions.is_empty())
+            .into_iter()
+            .flat_map(|previous| previous.credential_revisions.iter())
+            .filter(|previous| {
+                current_credential_revisions
+                    .get(&previous.group_id)
+                    .is_none_or(|current| *current != previous.revision)
+            })
+            .map(|previous| {
+                let current_revision = current_credential_revisions
+                    .get(&previous.group_id)
+                    .copied();
+                (previous.group_id, current_revision)
+            })
+            .collect();
         // ── Step 1: recover dead listeners ──
         // v0.3.6: a listener task that exited (bind failure, unrecoverable
         // error, or the v0.3.5 "instant accept error killed the task" bug) left
@@ -314,11 +517,59 @@ impl ForwarderManager {
         // therefore need their traffic counters pruned) vs. listeners that
         // are merely being restarted with a different fingerprint.
         let desired_rule_ids: HashSet<i64> = config.listeners.iter().map(|l| l.rule_id).collect();
+        let draining_rule_ids: HashSet<i64> = config.drain_rule_ids.iter().copied().collect();
+
+        // Retired entry runtimes are reaped only after their last TCP stream
+        // closes. A pause/delete/unshare/disable removes the rule from the
+        // drain list and is an explicit cancellation, not a topology drain.
+        let mut finished_retired = Vec::new();
+        self.retired_rule_runtimes.retain(|retired| {
+            if retired.runtime.is_idle() {
+                finished_retired.push(retired.rule_id);
+                false
+            } else {
+                if !draining_rule_ids.contains(&retired.rule_id)
+                    && !desired_rule_ids.contains(&retired.rule_id)
+                {
+                    retired.runtime.cancel_all();
+                }
+                true
+            }
+        });
+        for rule_id in finished_retired {
+            if !desired_rule_ids.contains(&rule_id) {
+                self.rule_limiters.remove(&rule_id);
+                if !draining_rule_ids.contains(&rule_id) {
+                    self.counter.prune_rule(rule_id).await;
+                }
+            }
+        }
+
+        // If a tunnel moves back to this group before the old streams finish,
+        // reuse the same runtime so the connection cap and restart signal stay
+        // shared across the draining and newly accepted generations.
+        let mut index = 0;
+        while index < self.retired_rule_runtimes.len() {
+            if desired_rule_ids.contains(&self.retired_rule_runtimes[index].rule_id) {
+                let RetiredRuleRuntime { rule_id, runtime } =
+                    self.retired_rule_runtimes.swap_remove(index);
+                self.rule_runtime.insert(rule_id, runtime);
+            } else {
+                index += 1;
+            }
+        }
+        let mut preserved_rule_ids = draining_rule_ids.clone();
+        preserved_rule_ids.extend(
+            self.retired_rule_runtimes
+                .iter()
+                .map(|retired| retired.rule_id),
+        );
 
         // v0.5.1: prune counters for dead listeners whose rule is no longer in
         // the new config AND has no other live listener referencing it.
         for rule_id in &dead_rule_ids {
             if !desired_rule_ids.contains(rule_id)
+                && !preserved_rule_ids.contains(rule_id)
                 && !self
                     .listeners
                     .values()
@@ -340,13 +591,46 @@ impl ForwarderManager {
             .collect();
         // Fingerprint-changed listeners that ARE still desired: stop them now so
         // step 4 starts them fresh with the new config.
+        let previous_tunnel_clients: HashMap<i64, TunnelClientConfig> = self
+            .last_config
+            .as_ref()
+            .into_iter()
+            .flat_map(|config| config.tunnels.iter())
+            .flat_map(|tunnel| tunnel.clients.iter().cloned())
+            .map(|client| (client.rule_id, client))
+            .collect();
+        let tunnel_clients: HashMap<i64, TunnelClientConfig> = config
+            .tunnels
+            .iter()
+            .flat_map(|tunnel| tunnel.clients.iter().cloned())
+            .map(|client| (client.rule_id, client))
+            .collect();
+        let mut revoked_rule_ids = HashSet::new();
         for listener in &config.listeners {
             let key = (listener.port, listener.protocol, listener.node_transport);
             if let Some(m) = self.listeners.get(&key) {
                 let new_fp = ListenerFingerprint::from_listener(listener);
                 if m.fingerprint != new_fp {
+                    // A derived link key changing while the next address stays
+                    // the same identifies a device-group token rotation. It is
+                    // a credential revocation, so unlike ordinary target/path
+                    // edits the old authenticated TCP streams must not drain.
+                    if previous_tunnel_clients
+                        .get(&listener.rule_id)
+                        .zip(tunnel_clients.get(&listener.rule_id))
+                        .is_some_and(|(old, new)| {
+                            old.link_scope == new.link_scope && old.auth_token != new.auth_token
+                        })
+                    {
+                        revoked_rule_ids.insert(listener.rule_id);
+                    }
                     to_stop.push(key);
                 }
+            }
+        }
+        for rule_id in revoked_rule_ids {
+            if let Some(runtime) = self.rule_runtime.get(&rule_id) {
+                runtime.cancel_all();
             }
         }
         for key in to_stop {
@@ -367,6 +651,7 @@ impl ForwarderManager {
                 // prevents orphaned bytes from poisoning future traffic batches.
                 let rule_id = m.fingerprint.rule_id;
                 if !desired_rule_ids.contains(&rule_id)
+                    && !preserved_rule_ids.contains(&rule_id)
                     && !self
                         .listeners
                         .values()
@@ -383,12 +668,34 @@ impl ForwarderManager {
             }
         }
 
+        // Shared preset-tunnel sockets participate in the same port lifecycle.
+        // Reconcile them after old public listeners stop and before new public
+        // listeners bind, so a port can safely move between roles in one push.
+        self.apply_shared_tunnel_listeners(config, &current_credential_revisions)
+            .await;
+
+        // Revoke only after shared accept loops have been updated or stopped.
+        // Cancelling first left a narrow security window: an old listener could
+        // accept after the generation bump, subscribe to the new generation and
+        // then authenticate with its still-old context. At this point a retained
+        // listener already exposes the new key, while a removed listener's accept
+        // task has been aborted and awaited; the final cancel is therefore
+        // authoritative for every old generation.
+        for (group_id, current_revision) in revoked_groups {
+            tracing::warn!(
+                group_id,
+                "device-group credential generation changed; revoking authenticated tunnel streams"
+            );
+            self.revoke_tunnel_credential_generations(group_id, current_revision);
+        }
+
         // ── Step 4: start new / changed listeners ──
         // Per-rule rate limiters are shared across ALL listeners of the same
         // rule and persist across apply calls. A tcp_udp rule's TCP + UDP halves
         // therefore keep drawing from one bucket even if only one dead listener
         // is recovered during this pass.
         for listener in &config.listeners {
+            let listener_tunnel = tunnel_clients.get(&listener.rule_id).cloned();
             let key = (listener.port, listener.protocol, listener.node_transport);
             // Skip if already running with the SAME fingerprint (no change).
             if let Some(m) = self.listeners.get(&key) {
@@ -482,6 +789,8 @@ impl ForwarderManager {
                     port,
                     protocol: proto_str.clone(),
                     error: format!("{:?} entry transport is disabled", listener.node_transport),
+                    tunnel_id: None,
+                    rule_id: Some(rule_id),
                 });
                 continue;
             }
@@ -514,6 +823,8 @@ impl ForwarderManager {
                     port,
                     protocol: proto_str.clone(),
                     error: "invalid UOT role/token configuration".into(),
+                    tunnel_id: None,
+                    rule_id: Some(rule_id),
                 });
                 continue;
             }
@@ -557,6 +868,8 @@ impl ForwarderManager {
                                     port,
                                     protocol: proto_str.clone(),
                                     error: format!("IPv4: {}", e),
+                                    tunnel_id: None,
+                                    rule_id: Some(rule_id),
                                 });
                             }
                         }
@@ -582,6 +895,8 @@ impl ForwarderManager {
                                     port,
                                     protocol: proto_str.clone(),
                                     error: format!("IPv6: {}", e),
+                                    tunnel_id: None,
+                                    rule_id: Some(rule_id),
                                 });
                             }
                         }
@@ -604,6 +919,8 @@ impl ForwarderManager {
                     let ipv4_src = src_ipv4;
                     let count_traffic = listener.count_traffic;
                     let tcp_fast_open = listener.tcp_fast_open;
+                    let tunnel4 = listener_tunnel.clone();
+                    let tunnel6 = listener_tunnel.clone();
                     // v1.2.0: both families get a gate cloned from the SAME
                     // RuleRuntime, so `max_connections` is a per-rule total
                     // rather than a per-family allowance.
@@ -611,7 +928,15 @@ impl ForwarderManager {
                         .rule_runtime
                         .entry(rule_id)
                         .or_default()
-                        .gate(listener.max_connections);
+                        .gate_with_credentials(
+                            listener.max_connections,
+                            listener_tunnel.as_ref().into_iter().flat_map(|client| {
+                                link_scope_credentials(
+                                    &client.link_scope,
+                                    &current_credential_revisions,
+                                )
+                            }),
+                        );
                     let gate6 = gate4.clone();
                     tokio::spawn(async move {
                         type SrvResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -636,6 +961,7 @@ impl ForwarderManager {
                                     gate4,
                                     count_traffic,
                                     tcp_fast_open,
+                                    tunnel4,
                                 )
                                 .await
                             } else {
@@ -656,6 +982,7 @@ impl ForwarderManager {
                                     gate6,
                                     count_traffic,
                                     tcp_fast_open,
+                                    tunnel6,
                                 )
                                 .await
                             } else {
@@ -690,6 +1017,8 @@ impl ForwarderManager {
                                     port,
                                     protocol: proto_str.clone(),
                                     error: format!("IPv4: {}", e),
+                                    tunnel_id: None,
+                                    rule_id: Some(rule_id),
                                 });
                             }
                         }
@@ -715,6 +1044,8 @@ impl ForwarderManager {
                                     port,
                                     protocol: proto_str.clone(),
                                     error: format!("IPv6: {}", e),
+                                    tunnel_id: None,
+                                    rule_id: Some(rule_id),
                                 });
                             }
                         }
@@ -739,6 +1070,19 @@ impl ForwarderManager {
                     let uot_token4 = listener.uot_token.clone();
                     let uot_token6 = listener.uot_token.clone();
                     let zero_rtt = listener.zero_rtt;
+                    let tunnel4 = listener_tunnel.clone();
+                    let tunnel6 = listener_tunnel.clone();
+                    let credential_cancellation = listener_tunnel.as_ref().map(|client| {
+                        self.rule_runtime
+                            .entry(rule_id)
+                            .or_default()
+                            .cancellation_with_credentials(link_scope_credentials(
+                                &client.link_scope,
+                                &current_credential_revisions,
+                            ))
+                    });
+                    let credential_cancellation4 = credential_cancellation.clone();
+                    let credential_cancellation6 = credential_cancellation;
                     tokio::spawn(async move {
                         type SrvResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
                         let (tgt4, sel4, rl4, ctr4, cn4) = (
@@ -750,7 +1094,7 @@ impl ForwarderManager {
                         );
                         let v4_fut = async move {
                             if let Some(s) = v4_sock {
-                                if uot_role == UotRole::Ingress {
+                                if uot_role == UotRole::Ingress || tunnel4.is_some() {
                                     uot::serve_ingress(
                                         s,
                                         tgt4,
@@ -763,6 +1107,8 @@ impl ForwarderManager {
                                         rid,
                                         ipv4_src,
                                         count_traffic,
+                                        tunnel4,
+                                        credential_cancellation4,
                                     )
                                     .await
                                 } else {
@@ -785,7 +1131,7 @@ impl ForwarderManager {
                         };
                         let v6_fut = async move {
                             if let Some(s) = v6_sock {
-                                if uot_role == UotRole::Ingress {
+                                if uot_role == UotRole::Ingress || tunnel6.is_some() {
                                     uot::serve_ingress(
                                         s,
                                         tgt,
@@ -798,6 +1144,8 @@ impl ForwarderManager {
                                         rid,
                                         ipv4_src,
                                         count_traffic,
+                                        tunnel6,
+                                        credential_cancellation6,
                                     )
                                     .await
                                 } else {
@@ -838,6 +1186,8 @@ impl ForwarderManager {
                                 port,
                                 protocol: proto_str.clone(),
                                 error: format!("IPv4: {}", error),
+                                tunnel_id: None,
+                                rule_id: Some(rule_id),
                             }),
                         }
                     }
@@ -848,6 +1198,8 @@ impl ForwarderManager {
                                 port,
                                 protocol: proto_str.clone(),
                                 error: format!("IPv6: {}", error),
+                                tunnel_id: None,
+                                rule_id: Some(rule_id),
                             }),
                         }
                     }
@@ -926,6 +1278,8 @@ impl ForwarderManager {
                                 port,
                                 protocol: proto_str.clone(),
                                 error: e.to_string(),
+                                tunnel_id: None,
+                                rule_id: Some(rule_id),
                             });
                         }
                     })
@@ -960,6 +1314,8 @@ impl ForwarderManager {
                                 port,
                                 protocol: proto_str.clone(),
                                 error: e.to_string(),
+                                tunnel_id: None,
+                                rule_id: Some(rule_id),
                             });
                         }
                     })
@@ -997,14 +1353,374 @@ impl ForwarderManager {
         // rule removed from the config can no longer have its traffic attributed
         // or billed (step 2/3 already pruned its counters), so letting its
         // connections outlive it would forward bytes nobody accounts for.
-        self.rule_runtime
-            .retain(|rule_id, _| desired_rule_ids.contains(rule_id));
-        self.rule_limiters
-            .retain(|rule_id, _| desired_rule_ids.contains(rule_id));
-
+        let leaving_rule_ids: Vec<i64> = self
+            .rule_runtime
+            .keys()
+            .filter(|rule_id| !desired_rule_ids.contains(rule_id))
+            .copied()
+            .collect();
+        for rule_id in leaving_rule_ids {
+            let Some(runtime) = self.rule_runtime.remove(&rule_id) else {
+                continue;
+            };
+            if draining_rule_ids.contains(&rule_id) && !runtime.is_idle() {
+                self.retired_rule_runtimes
+                    .push(RetiredRuleRuntime { rule_id, runtime });
+            }
+            // Otherwise dropping the runtime cancels its receivers, preserving
+            // the existing pause/delete/security-revocation behavior.
+        }
+        let retired_rule_ids: HashSet<i64> = self
+            .retired_rule_runtimes
+            .iter()
+            .map(|retired| retired.rule_id)
+            .collect();
+        self.rule_limiters.retain(|rule_id, _| {
+            desired_rule_ids.contains(rule_id) || retired_rule_ids.contains(rule_id)
+        });
         // v1.2.0: remember the applied config so restart_rule can rebuild a
         // rule's listeners from it without a round-trip to the panel.
         self.last_config = Some(config.clone());
+    }
+
+    async fn apply_shared_tunnel_listeners(
+        &mut self,
+        config: &NodeConfigResponse,
+        credential_revisions: &HashMap<i64, i64>,
+    ) {
+        self.retired_tunnel_runtimes
+            .retain(|retired| !retired.runtime.is_idle());
+        for retired in &self.retired_tunnel_runtimes {
+            if config.terminate_tunnel_ids.contains(&retired.tunnel_id) {
+                retired.runtime.cancel_all();
+            }
+        }
+        let desired: HashMap<TunnelListenerKey, &TunnelListenerConfig> = config
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.port != 0)
+            .map(|tunnel| ((tunnel.tunnel_id, tunnel.port), tunnel))
+            .collect();
+        // Never evict a live link. Inactive histories outlive the complete
+        // signed-header and nonce-cache acceptance window, then old unused
+        // credential revisions release their memory.
+        let desired_replay_keys: HashSet<TunnelReplayKey> = desired
+            .values()
+            .map(|tunnel| tunnel_replay_key(tunnel))
+            .collect();
+        let now = Instant::now();
+        self.tunnel_replay_caches.retain(|key, entry| {
+            if desired_replay_keys.contains(key) {
+                entry.last_used = now;
+                true
+            } else {
+                now.saturating_duration_since(entry.last_used) < TUNNEL_REPLAY_RETENTION
+            }
+        });
+        let mut stop = Vec::new();
+        let mut hot_updates = Vec::new();
+        for (key, managed) in &self.shared_tunnel_listeners {
+            let wanted = desired.get(key).copied();
+            let changed = wanted.is_none_or(|wanted| managed.config != *wanted);
+            if managed.handle.is_finished() {
+                if wanted.is_none()
+                    && config
+                        .terminate_tunnel_ids
+                        .contains(&managed.config.tunnel_id)
+                {
+                    managed.runtime.cancel_all();
+                }
+                stop.push(*key);
+            } else if let Some(wanted) = wanted {
+                if changed {
+                    hot_updates.push((*key, wanted.clone()));
+                }
+            } else {
+                if config
+                    .terminate_tunnel_ids
+                    .contains(&managed.config.tunnel_id)
+                {
+                    managed.runtime.cancel_all();
+                }
+                stop.push(*key);
+            }
+        }
+        for key in stop {
+            if let Some(managed) = self.shared_tunnel_listeners.remove(&key) {
+                let ManagedTunnelListener {
+                    mut handle,
+                    config: previous,
+                    runtime,
+                    ..
+                } = managed;
+                handle.abort();
+                let _ = (&mut handle).await;
+                if !runtime.is_idle() {
+                    self.retired_tunnel_runtimes.push(RetiredTunnelRuntime {
+                        tunnel_id: previous.tunnel_id,
+                        runtime,
+                    });
+                }
+            }
+        }
+
+        // Keep the bound socket stable when only the route table, next hop or
+        // credentials change. This preserves unrelated rules on the same shared
+        // port. A credential rotation swaps the accepting context first, then
+        // cancels streams authenticated with the previous generation.
+        for (key, wanted) in hot_updates {
+            let replay = self.replay_cache_for_tunnel(&wanted);
+            if let Some(managed) = self.shared_tunnel_listeners.get_mut(&key) {
+                let credentials_revoked = tunnel_credentials_revoked(&managed.config, &wanted);
+                managed.state.update(
+                    wanted.clone(),
+                    credential_revisions,
+                    replay,
+                    credentials_revoked,
+                );
+                managed.config = wanted;
+            }
+        }
+
+        for tunnel in &config.tunnels {
+            if tunnel.port == 0 {
+                continue;
+            }
+            let key = (tunnel.tunnel_id, tunnel.port);
+            if self.shared_tunnel_listeners.contains_key(&key) {
+                continue;
+            }
+            let ip_v4 = crate::forwarder::outbound::parse_listen_ip(&self.listen_ipv4);
+            let ip_v6 = crate::forwarder::outbound::parse_listen_ip(&self.listen_ipv6);
+            let mut v4 = None;
+            let mut v6 = None;
+            if let Some(ip) = ip_v4 {
+                match crate::forwarder::outbound::bind_tcp_listener(ip, tunnel.port) {
+                    Ok(listener) => v4 = Some(listener),
+                    Err(error) => self.listener_errors.lock().await.push(ListenerError {
+                        port: tunnel.port,
+                        protocol: "tunnel/tcp".into(),
+                        error: format!("IPv4: {error}"),
+                        tunnel_id: Some(tunnel.tunnel_id),
+                        rule_id: None,
+                    }),
+                }
+            }
+            if let Some(ip) = ip_v6 {
+                match crate::forwarder::outbound::bind_tcp_listener(ip, tunnel.port) {
+                    Ok(listener) => v6 = Some(listener),
+                    Err(error) => self.listener_errors.lock().await.push(ListenerError {
+                        port: tunnel.port,
+                        protocol: "tunnel/tcp".into(),
+                        error: format!("IPv6: {error}"),
+                        tunnel_id: Some(tunnel.tunnel_id),
+                        rule_id: None,
+                    }),
+                }
+            }
+            if v4.is_none() && v6.is_none() {
+                continue;
+            }
+            let replay = self.replay_cache_for_tunnel(tunnel);
+            let udp_sessions = Arc::new(tokio::sync::Semaphore::new(4096));
+            let runtime = super::tunnel::TunnelRuntime::new();
+            let source = self.source_ipv4;
+            let state = super::tunnel::TunnelListenerState::new(
+                tunnel.clone(),
+                credential_revisions,
+                source,
+                replay,
+                udp_sessions,
+                runtime.clone(),
+            );
+            let state4 = state.clone();
+            let state6 = state.clone();
+            let handle = tokio::spawn(async move {
+                type SrvResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+                let v4_fut = async move {
+                    if let Some(listener) = v4 {
+                        super::tunnel::serve_listener(listener, state4).await
+                    } else {
+                        std::future::pending::<SrvResult>().await
+                    }
+                };
+                let v6_fut = async move {
+                    if let Some(listener) = v6 {
+                        super::tunnel::serve_listener(listener, state6).await
+                    } else {
+                        std::future::pending::<SrvResult>().await
+                    }
+                };
+                tokio::select! {
+                    result = v4_fut => if let Err(error) = result { tracing::error!("shared tunnel v4 listener ended: {error}"); },
+                    result = v6_fut => if let Err(error) = result { tracing::error!("shared tunnel v6 listener ended: {error}"); },
+                }
+            });
+            self.shared_tunnel_listeners.insert(
+                key,
+                ManagedTunnelListener {
+                    handle,
+                    config: tunnel.clone(),
+                    state,
+                    runtime,
+                },
+            );
+        }
+    }
+
+    /// Revoke every authenticated preset-tunnel generation held by this node.
+    /// A rotated device group may belong to a listener generation that has
+    /// already left the current path, so the latest config cannot enumerate
+    /// every affected connection precisely.
+    pub fn revoke_tunnel_credentials(&mut self, group_id: i64) {
+        self.revoke_tunnel_credential_generations(group_id, None);
+    }
+
+    /// Fail closed when the panel announced a credential rotation but the node
+    /// could not fetch the replacement config. Existing generations using the
+    /// group are revoked and accept loops whose *current* route still uses the
+    /// old credential are stopped. An unrelated current route is left running
+    /// even if it still has a historical connection draining through the group.
+    pub async fn fail_closed_tunnel_credentials(
+        &mut self,
+        group_id: i64,
+    ) -> Option<NodeConfigResponse> {
+        self.revoke_tunnel_credentials(group_id);
+
+        let sanitized = self
+            .last_config
+            .as_ref()
+            .map(|config| fail_closed_config_for_group(config, group_id));
+        let affected_rule_ids: HashSet<i64> = self
+            .last_config
+            .as_ref()
+            .into_iter()
+            .flat_map(|config| config.listeners.iter())
+            .filter(|listener| {
+                sanitized.as_ref().is_none_or(|safe| {
+                    !safe
+                        .listeners
+                        .iter()
+                        .any(|candidate| candidate.rule_id == listener.rule_id)
+                })
+            })
+            .map(|listener| listener.rule_id)
+            .collect();
+
+        let listener_keys: Vec<ListenerKey> = self
+            .listeners
+            .iter()
+            .filter(|(_, listener)| affected_rule_ids.contains(&listener.fingerprint.rule_id))
+            .map(|(key, _)| *key)
+            .collect();
+        let tunnel_keys: Vec<TunnelListenerKey> = self
+            .shared_tunnel_listeners
+            .iter()
+            .filter(|(_, listener)| tunnel_listener_uses_group(&listener.config, group_id))
+            .map(|(key, _)| *key)
+            .collect();
+
+        let mut handles = Vec::with_capacity(listener_keys.len() + tunnel_keys.len());
+        for key in listener_keys {
+            if let Some(listener) = self.listeners.remove(&key) {
+                listener.handle.abort();
+                handles.push(listener.handle);
+            }
+        }
+        for key in tunnel_keys {
+            if let Some(listener) = self.shared_tunnel_listeners.remove(&key) {
+                listener.handle.abort();
+                handles.push(listener.handle);
+            }
+        }
+        for mut handle in handles {
+            let _ = (&mut handle).await;
+        }
+        if let Some(config) = sanitized.as_ref() {
+            self.last_config = Some(config.clone());
+        }
+        sanitized
+    }
+
+    fn revoke_tunnel_credential_generations(
+        &mut self,
+        group_id: i64,
+        current_revision: Option<i64>,
+    ) {
+        for managed in self.shared_tunnel_listeners.values() {
+            if managed.runtime.uses_credential_group(group_id) {
+                managed
+                    .runtime
+                    .revoke_credential_group(group_id, current_revision);
+            }
+        }
+        for retired in &self.retired_tunnel_runtimes {
+            if retired.runtime.uses_credential_group(group_id) {
+                retired
+                    .runtime
+                    .revoke_credential_group(group_id, current_revision);
+            }
+        }
+        for retired in &self.retired_rule_runtimes {
+            if retired.runtime.uses_credential_group(group_id) {
+                retired
+                    .runtime
+                    .revoke_credential_group(group_id, current_revision);
+            }
+        }
+
+        // Entry-side public TCP connections are owned by per-rule runtimes.
+        // Restrict cancellation to rules carrying preset-tunnel client metadata
+        // so direct and rule-local chain connections remain untouched.
+        let preset_rule_ids: Vec<i64> = self
+            .rule_runtime
+            .iter()
+            .filter(|(_, runtime)| runtime.uses_credential_group(group_id))
+            .map(|(rule_id, _)| *rule_id)
+            .collect();
+        for rule_id in preset_rule_ids {
+            if let Some(runtime) = self.rule_runtime.get(&rule_id) {
+                runtime.revoke_credential_group(group_id, current_revision);
+            }
+        }
+    }
+
+    /// Fail closed after the panel explicitly rejects this node's credential.
+    /// An ordinary empty config intentionally lets old tunnel streams drain
+    /// during topology edits; credential rejection is different and must tear
+    /// down every authenticated generation immediately.
+    pub fn revoke_all_tunnel_credentials(&mut self) {
+        for managed in self.shared_tunnel_listeners.values() {
+            managed.runtime.cancel_all();
+        }
+        for retired in &self.retired_tunnel_runtimes {
+            retired.runtime.cancel_all();
+        }
+        for retired in &self.retired_rule_runtimes {
+            retired.runtime.cancel_all();
+        }
+        for runtime in self.rule_runtime.values() {
+            if runtime.uses_tunnel_credentials() {
+                runtime.cancel_all();
+            }
+        }
+    }
+
+    fn replay_cache_for_tunnel(
+        &mut self,
+        tunnel: &TunnelListenerConfig,
+    ) -> Arc<super::tunnel::ReplayCache> {
+        let replay_key = tunnel_replay_key(tunnel);
+        let now = Instant::now();
+        self.tunnel_replay_caches
+            .entry(replay_key)
+            .and_modify(|entry| entry.last_used = now)
+            .or_insert_with(|| TunnelReplayCacheEntry {
+                cache: Arc::new(super::tunnel::ReplayCache::default()),
+                last_used: now,
+            })
+            .cache
+            .clone()
     }
 
     /// v1.2.0: restart ONE rule — drop every connection it is currently
@@ -1027,19 +1743,27 @@ impl ForwarderManager {
     pub async fn restart_rule(&mut self, rule_id: i64) -> (u64, usize) {
         // Cancel first — see the ordering note above.
         //
-        // No runtime is NOT the same as nothing to do: only the TCP arm of
-        // apply_config creates one (UDP has no accept() and no cancellable
-        // per-connection tasks), so a UDP-only rule legitimately has no runtime
-        // while very much having a listener. Treating that as "return early"
-        // made a UDP rule's restart a silent no-op — and silent is the operative
-        // word, because the panel reports success as soon as the command reaches
-        // the node. Whether there are connections to cancel is decided here;
-        // whether there are listeners to rebuild is decided below.
+        // No runtime is NOT the same as nothing to do: direct UDP listeners have
+        // no accept() and therefore no per-rule cancellation runtime. Preset
+        // tunnel UDP listeners do have one so credential rotation can close warm
+        // UOT channels, but restart must continue to handle both kinds. Treating
+        // a missing runtime as "return early" made direct UDP restart a silent
+        // no-op — and silent is the operative word, because the panel reports
+        // success as soon as the command reaches the node. Whether there are
+        // connections to cancel is decided here; whether there are listeners to
+        // rebuild is decided below.
         let dropped = self
             .rule_runtime
             .get(&rule_id)
             .map(|rt| rt.cancel_all())
             .unwrap_or(0);
+        let retired_dropped = self
+            .retired_rule_runtimes
+            .iter()
+            .filter(|retired| retired.rule_id == rule_id)
+            .map(|retired| retired.runtime.cancel_all())
+            .sum::<u64>();
+        let dropped = dropped.saturating_add(retired_dropped);
 
         let keys: Vec<ListenerKey> = self
             .listeners
@@ -1103,6 +1827,7 @@ mod tests {
     use relay_shared::protocol::{ListenerConfig, NodeConfigResponse, NodeTransport, Protocol};
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     impl ForwarderManager {
         /// Test-only accessor: the set of listener keys currently registered.
@@ -1139,6 +1864,10 @@ mod tests {
                 tcp_fast_open: false,
                 count_traffic: true,
             }],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         }
     }
 
@@ -1169,6 +1898,10 @@ mod tests {
                 tcp_fast_open: false,
                 count_traffic: true,
             }],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         }
     }
 
@@ -1177,6 +1910,60 @@ mod tests {
             Arc::new(TrafficCounter::new()),
             Arc::new(ConnectionTracker::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn shared_route_update_keeps_same_accept_loop() {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+        let mut config = NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![TunnelListenerConfig {
+                tunnel_id: 901,
+                port,
+                hop_position: 1,
+                auth_token: "manager-hot-key".repeat(5),
+                link_scope: "901:0".into(),
+                next: None,
+                routes: vec![relay_shared::protocol::TunnelRouteConfig {
+                    rule_id: 1,
+                    protocol: "tcp".into(),
+                    targets: vec!["127.0.0.1:9".into()],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                }],
+                handshake_timeout_ms: 1_000,
+                max_unauthenticated: 16,
+                clients: vec![],
+            }],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+        };
+        manager.apply_config(&config).await;
+        let key = (901, port);
+        let original_task = manager.shared_tunnel_listeners[&key].handle.id();
+
+        config.tunnels[0]
+            .routes
+            .push(relay_shared::protocol::TunnelRouteConfig {
+                rule_id: 2,
+                protocol: "tcp".into(),
+                targets: vec!["127.0.0.1:10".into()],
+                target_weights: vec![1],
+                load_balance_strategy: LoadBalanceStrategy::First,
+            });
+        manager.apply_config(&config).await;
+
+        assert_eq!(
+            manager.shared_tunnel_listeners[&key].handle.id(),
+            original_task,
+            "route-table changes must not abort and rebind the shared socket"
+        );
     }
 
     /// v1.0.9: a rate-limit change (set OR cleared) must change the listener
@@ -1370,6 +2157,25 @@ mod tests {
         assert_eq!(&buf[..n], b"after", "the rebuilt listener must forward");
     }
 
+    #[tokio::test]
+    async fn restart_rule_also_cancels_retired_entry_runtime() {
+        let mut manager = fresh_mgr();
+        let runtime = RuleRuntime::new();
+        let mut old_gate = runtime.gate_with_credential_groups(None, [10, 20]);
+        let guard = old_gate.admit().unwrap();
+        manager.retired_rule_runtimes.push(RetiredRuleRuntime {
+            rule_id: 77,
+            runtime,
+        });
+
+        let (dropped, restarted) = manager.restart_rule(77).await;
+        assert_eq!((dropped, restarted), (1, 0));
+        tokio::time::timeout(Duration::from_secs(1), old_gate.cancelled())
+            .await
+            .expect("restart must cancel a rule generation draining on its old entry");
+        drop(guard);
+    }
+
     /// Restarting a rule this node doesn't serve is a no-op, not a panic or a
     /// fabricated runtime entry — a rule legitimately spans only some nodes.
     #[tokio::test]
@@ -1386,13 +2192,13 @@ mod tests {
     /// rebuilt, which is what drops its sessions (they live in the listener
     /// task's session map).
     ///
-    /// Only the TCP arm of apply_config creates a RuleRuntime — UDP has no
-    /// accept() and no cancellable per-connection tasks. So restart_rule must
-    /// NOT treat "no runtime" as "nothing to do": a UDP-only rule has no
-    /// runtime but very much has a listener. Getting this wrong is invisible
-    /// from the panel, which reports success as soon as the command reaches the
-    /// node — the operator would be told the rule restarted while the node did
-    /// nothing at all.
+    /// Direct UDP has no accept() and no cancellable per-connection tasks, so it
+    /// does not create a RuleRuntime (preset-tunnel UDP does create one for
+    /// credential revocation). Therefore restart_rule must NOT treat "no
+    /// runtime" as "nothing to do": a direct UDP-only rule has no runtime but
+    /// very much has a listener. Getting this wrong is invisible from the panel,
+    /// which reports success as soon as the command reaches the node — the
+    /// operator would be told the rule restarted while the node did nothing.
     #[tokio::test]
     async fn restart_udp_only_rule_rebuilds_its_listener() {
         let mut mgr = fresh_mgr();
@@ -1456,12 +2262,322 @@ mod tests {
         );
 
         // Removing the rule drops its runtime (which cancels its connections).
-        mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
-            .await;
+        mgr.apply_config(&NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+        })
+        .await;
         assert!(
             !mgr.rule_runtime.contains_key(&1),
             "a removed rule must not leak its runtime"
         );
+    }
+
+    #[tokio::test]
+    async fn moved_tunnel_entry_drains_runtime_but_pause_still_cancels() {
+        let mut mgr = fresh_mgr();
+        mgr.listen_ipv4 = "127.0.0.1".into();
+        mgr.listen_ipv6 = String::new();
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+
+        let mut active = one_rule(port, Protocol::Tcp, NodeTransport::Raw);
+        active.tunnels.push(TunnelListenerConfig {
+            tunnel_id: 77,
+            port: 0,
+            hop_position: 0,
+            auth_token: String::new(),
+            link_scope: String::new(),
+            next: None,
+            routes: vec![],
+            handshake_timeout_ms: 3_000,
+            max_unauthenticated: 0,
+            clients: vec![TunnelClientConfig {
+                tunnel_id: 77,
+                rule_id: 1,
+                hop_position: 0,
+                address: "127.0.0.1:9".into(),
+                auth_token: "a".repeat(64),
+                link_scope: "77:0:10:20".into(),
+            }],
+        });
+        mgr.apply_config(&active).await;
+
+        let mut gate = mgr.rule_runtime.get(&1).unwrap().gate(None);
+        let guard = gate.admit().expect("one simulated established connection");
+        mgr.counter.add(1, 100, 200).await;
+
+        let mut moved = NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![1],
+        };
+        mgr.apply_config(&moved).await;
+        assert!(!mgr.rule_runtime.contains_key(&1));
+        assert_eq!(mgr.retired_rule_runtimes.len(), 1);
+        assert_eq!(mgr.active_draining_rule_ids(), vec![1]);
+        assert!(
+            mgr.counter.has_rule(1).await,
+            "unreported bytes stay billable"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), gate.cancelled())
+                .await
+                .is_err(),
+            "an entry move must not cancel the established connection"
+        );
+
+        // Removing the durable drain lease represents pause/delete/unshare or
+        // disable. Those state changes must retain the old fail-closed behavior.
+        moved.drain_rule_ids.clear();
+        mgr.apply_config(&moved).await;
+        assert!(mgr.active_draining_rule_ids().is_empty());
+        tokio::time::timeout(Duration::from_secs(1), gate.cancelled())
+            .await
+            .expect("pause must cancel a draining connection");
+        drop(guard);
+        mgr.apply_config(&moved).await;
+        assert!(mgr.retired_rule_runtimes.is_empty());
+        assert!(!mgr.counter.has_rule(1).await);
+    }
+
+    #[tokio::test]
+    async fn reactivated_rule_keeps_retired_credential_scope_revocable() {
+        let mut mgr = fresh_mgr();
+        mgr.listen_ipv4 = "127.0.0.1".into();
+        mgr.listen_ipv6 = String::new();
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+
+        let mut active = one_rule(port, Protocol::Tcp, NodeTransport::Raw);
+        active.tunnels.push(TunnelListenerConfig {
+            tunnel_id: 78,
+            port: 0,
+            hop_position: 0,
+            auth_token: String::new(),
+            link_scope: String::new(),
+            next: None,
+            routes: vec![],
+            handshake_timeout_ms: 3_000,
+            max_unauthenticated: 0,
+            clients: vec![TunnelClientConfig {
+                tunnel_id: 78,
+                rule_id: 1,
+                hop_position: 0,
+                address: "127.0.0.1:9".into(),
+                auth_token: "b".repeat(64),
+                link_scope: "78:0:10:20".into(),
+            }],
+        });
+        mgr.apply_config(&active).await;
+        let mut old_gate = mgr
+            .rule_runtime
+            .get(&1)
+            .unwrap()
+            .gate_with_credential_groups(None, [10, 20]);
+        let guard = old_gate.admit().unwrap();
+
+        mgr.apply_config(&NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![1],
+        })
+        .await;
+        assert_eq!(mgr.retired_rule_runtimes.len(), 1);
+
+        // The rule comes back to this group as direct while its old preset
+        // stream is still alive. Reactivation must not discard the old path's
+        // credential groups.
+        let direct = one_rule(port, Protocol::Tcp, NodeTransport::Raw);
+        mgr.apply_config(&direct).await;
+        assert!(mgr
+            .rule_runtime
+            .get(&1)
+            .is_some_and(|runtime| runtime.uses_credential_group(20)));
+
+        mgr.revoke_tunnel_credentials(20);
+        tokio::time::timeout(Duration::from_secs(1), old_gate.cancelled())
+            .await
+            .expect("old preset generation must remain reachable by token revocation");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn drained_historical_credential_group_does_not_cancel_current_path() {
+        let mut manager = fresh_mgr();
+        let runtime = RuleRuntime::new();
+        let mut old_gate = runtime.gate_with_credential_groups(None, [10, 20]);
+        let old_connection = old_gate.admit().unwrap();
+        manager.rule_runtime.insert(1, runtime);
+
+        let mut current_gate = manager
+            .rule_runtime
+            .get(&1)
+            .unwrap()
+            .gate_with_credential_groups(None, [10, 30]);
+        let current_connection = current_gate.admit().unwrap();
+
+        manager.revoke_tunnel_credentials(20);
+        tokio::time::timeout(Duration::from_secs(1), old_gate.cancelled())
+            .await
+            .expect("the historical generation must be revoked");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), current_gate.cancelled())
+                .await
+                .is_err()
+        );
+        drop(old_connection);
+        drop(current_connection);
+    }
+
+    #[tokio::test]
+    async fn credential_rotation_cancels_old_revision_not_new_revision() {
+        let mut manager = fresh_mgr();
+        let runtime = RuleRuntime::new();
+        let mut old_gate = runtime.gate_with_credentials(None, [(10, Some(1)), (20, Some(1))]);
+        let old_connection = old_gate.admit().unwrap();
+        let mut current_gate = runtime.gate_with_credentials(None, [(10, Some(1)), (20, Some(2))]);
+        let current_connection = current_gate.admit().unwrap();
+        manager.rule_runtime.insert(1, runtime);
+
+        manager.revoke_tunnel_credential_generations(20, Some(2));
+        tokio::time::timeout(Duration::from_secs(1), old_gate.cancelled())
+            .await
+            .expect("the pre-rotation generation must be revoked");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), current_gate.cancelled())
+                .await
+                .is_err(),
+            "connections authenticated with the current revision must survive"
+        );
+        drop(old_connection);
+        drop(current_connection);
+    }
+
+    #[tokio::test]
+    async fn failed_rotation_fetch_stops_old_credential_accept_loop_until_resync() {
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+
+        let mut config = one_rule(port, Protocol::Tcp, NodeTransport::Raw);
+        config.credential_revisions = vec![
+            relay_shared::protocol::GroupCredentialRevision {
+                group_id: 10,
+                revision: 1,
+            },
+            relay_shared::protocol::GroupCredentialRevision {
+                group_id: 20,
+                revision: 1,
+            },
+        ];
+        config.tunnels.push(TunnelListenerConfig {
+            tunnel_id: 90,
+            port: 0,
+            hop_position: 0,
+            auth_token: String::new(),
+            link_scope: String::new(),
+            next: None,
+            routes: vec![],
+            handshake_timeout_ms: 3_000,
+            max_unauthenticated: 0,
+            clients: vec![TunnelClientConfig {
+                tunnel_id: 90,
+                rule_id: 1,
+                hop_position: 0,
+                address: "127.0.0.1:9".into(),
+                auth_token: "a".repeat(64),
+                link_scope: "90:0:10:20".into(),
+            }],
+        });
+        manager.apply_config(&config).await;
+        assert!(manager
+            .listeners
+            .values()
+            .any(|listener| listener.fingerprint.rule_id == 1));
+
+        let persisted = manager
+            .fail_closed_tunnel_credentials(20)
+            .await
+            .expect("an applied snapshot must produce a fail-closed cache");
+        assert!(!manager
+            .listeners
+            .values()
+            .any(|listener| listener.fingerprint.rule_id == 1));
+        assert!(persisted.listeners.is_empty());
+        assert!(persisted.tunnels.is_empty());
+        assert!(manager.last_config.as_ref().unwrap().listeners.is_empty());
+
+        manager.apply_config(&config).await;
+        assert!(manager
+            .listeners
+            .values()
+            .any(|listener| listener.fingerprint.rule_id == 1));
+    }
+
+    #[tokio::test]
+    async fn preset_udp_warm_channel_subscribes_to_credential_revocation() {
+        let mut mgr = fresh_mgr();
+        mgr.listen_ipv4 = "127.0.0.1".into();
+        mgr.listen_ipv6 = String::new();
+        let reserved = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+
+        let mut active = one_rule(port, Protocol::Udp, NodeTransport::Raw);
+        active.tunnels.push(TunnelListenerConfig {
+            tunnel_id: 79,
+            port: 0,
+            hop_position: 0,
+            auth_token: String::new(),
+            link_scope: String::new(),
+            next: None,
+            routes: vec![],
+            handshake_timeout_ms: 3_000,
+            max_unauthenticated: 0,
+            clients: vec![TunnelClientConfig {
+                tunnel_id: 79,
+                rule_id: 1,
+                hop_position: 0,
+                address: "127.0.0.1:9".into(),
+                auth_token: "c".repeat(64),
+                link_scope: "79:0:10:20".into(),
+            }],
+        });
+        mgr.apply_config(&active).await;
+        assert!(mgr.rule_runtime.contains_key(&1));
+        assert!(mgr
+            .listeners
+            .values()
+            .all(|listener| !listener.handle.is_finished()));
+
+        mgr.revoke_tunnel_credentials(20);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if mgr
+                    .listeners
+                    .values()
+                    .all(|listener| listener.handle.is_finished())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("revocation must stop the preset UDP listener and warm channel");
     }
 
     #[tokio::test]
@@ -1491,8 +2607,14 @@ mod tests {
             "partial listener recovery must rejoin the existing aggregate bucket"
         );
 
-        mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
-            .await;
+        mgr.apply_config(&NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+        })
+        .await;
         assert!(
             mgr.rule_limiters.is_empty(),
             "deleted rule leaked its limiter"
@@ -1543,6 +2665,10 @@ mod tests {
                     count_traffic: true,
                 },
             ],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
         mgr.apply_config(&c).await;
         let keys = mgr.listener_keys();
@@ -1637,6 +2763,10 @@ mod tests {
                     count_traffic: true,
                 },
             ],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
         mgr.apply_config(&c).await;
         assert_eq!(mgr.listener_keys().len(), 2);
@@ -1758,6 +2888,10 @@ mod tests {
                     tcp_fast_open: false,
                 },
             ],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
 
         let mut exit = fresh_mgr();
@@ -1806,6 +2940,10 @@ mod tests {
                     tcp_fast_open: false,
                 },
             ],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
         let mut entry = fresh_mgr();
         entry.listen_ipv6 = String::new();
@@ -1838,10 +2976,22 @@ mod tests {
         assert_eq!(&reply[..n], b"udp-over-dedicated-uot");
 
         entry
-            .apply_config(&NodeConfigResponse { listeners: vec![] })
+            .apply_config(&NodeConfigResponse {
+                listeners: vec![],
+                tunnels: vec![],
+                credential_revisions: vec![],
+                terminate_tunnel_ids: vec![],
+                drain_rule_ids: vec![],
+            })
             .await;
-        exit.apply_config(&NodeConfigResponse { listeners: vec![] })
-            .await;
+        exit.apply_config(&NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+        })
+        .await;
         tcp_echo.abort();
         udp_echo.abort();
     }
@@ -2023,6 +3173,10 @@ mod tests {
                 tcp_fast_open: false,
                 count_traffic: true,
             }],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
         mgr.apply_config(&mk(LoadBalanceStrategy::First)).await;
         let fp1 = mgr
@@ -2063,6 +3217,10 @@ mod tests {
                 tcp_fast_open: false,
                 count_traffic: true,
             }],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
         mgr.apply_config(&mk(NodeTransport::Raw)).await;
         assert!(mgr
@@ -2101,8 +3259,14 @@ mod tests {
         mgr.apply_config(&c1).await;
         assert_eq!(mgr.listener_keys().len(), 1);
         // Empty config = rule removed.
-        mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
-            .await;
+        mgr.apply_config(&NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+        })
+        .await;
         assert!(mgr.listener_keys().is_empty(), "removed rule must stop");
     }
 
@@ -2153,6 +3317,10 @@ mod tests {
                     count_traffic: true,
                 },
             ],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
         mgr.apply_config(&c1).await;
         let fp70 = mgr
@@ -2200,6 +3368,10 @@ mod tests {
                     count_traffic: true,
                 },
             ],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
         mgr.apply_config(&c2).await;
         assert_eq!(
@@ -2451,6 +3623,10 @@ mod tests {
         }
         mgr.apply_config(&NodeConfigResponse {
             listeners: Vec::new(),
+            tunnels: Vec::new(),
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         })
         .await;
 
@@ -2516,6 +3692,10 @@ mod tests {
                     count_traffic: true,
                 },
             ],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
         mgr.apply_config(&tcp_udp_cfg).await;
         counter.add(1, 200, 100).await;
@@ -2542,6 +3722,10 @@ mod tests {
                 tcp_fast_open: false,
                 count_traffic: true,
             }],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         };
         mgr.apply_config(&tcp_cfg).await;
 
@@ -2579,6 +3763,10 @@ mod tests {
         // Apply empty config — step 1 finds the dead listener and removes it.
         mgr.apply_config(&NodeConfigResponse {
             listeners: Vec::new(),
+            tunnels: Vec::new(),
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
         })
         .await;
 
@@ -2586,5 +3774,579 @@ mod tests {
             !counter.has_rule(1).await,
             "dead listener for a removed rule must prune its counter entry"
         );
+    }
+
+    #[tokio::test]
+    async fn udp_and_tcp_udp_rules_share_preset_port_without_crosstalk() {
+        use relay_shared::protocol::{TunnelClientConfig, TunnelRouteConfig};
+
+        async fn udp_target(tag: u8) -> (String, tokio::task::JoinHandle<()>) {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap().to_string();
+            let task = tokio::spawn(async move {
+                let mut payload = [0u8; 128];
+                let (n, peer) = socket.recv_from(&mut payload).await.unwrap();
+                let mut response = vec![tag];
+                response.extend_from_slice(&payload[..n]);
+                socket.send_to(&response, peer).await.unwrap();
+            });
+            (address, task)
+        }
+
+        async fn tcp_udp_target(
+            tag: u8,
+        ) -> (
+            String,
+            tokio::task::JoinHandle<()>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = tcp.local_addr().unwrap();
+            let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+            let tcp_task = tokio::spawn(async move {
+                let (mut stream, _) = tcp.accept().await.unwrap();
+                let mut payload = [0u8; 128];
+                let n = stream.read(&mut payload).await.unwrap();
+                stream.write_all(&[tag]).await.unwrap();
+                stream.write_all(&payload[..n]).await.unwrap();
+            });
+            let udp_task = tokio::spawn(async move {
+                let mut payload = [0u8; 128];
+                let (n, peer) = udp.recv_from(&mut payload).await.unwrap();
+                let mut response = vec![tag];
+                response.extend_from_slice(&payload[..n]);
+                udp.send_to(&response, peer).await.unwrap();
+            });
+            (address.to_string(), tcp_task, udp_task)
+        }
+
+        fn reserve_udp_port() -> u16 {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.local_addr().unwrap().port()
+        }
+
+        let (target_a, target_task_a) = udp_target(b'A').await;
+        let (target_b, target_task_b) = udp_target(b'B').await;
+        let (target_c, target_tcp_task_c, target_udp_task_c) = tcp_udp_target(b'C').await;
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let shared_port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let entry_a = reserve_udp_port();
+        let entry_b = reserve_udp_port();
+        let entry_c_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let entry_c = entry_c_reservation.local_addr().unwrap().port();
+        let entry_c_udp_reservation = std::net::UdpSocket::bind(("127.0.0.1", entry_c)).unwrap();
+        drop(entry_c_reservation);
+        drop(entry_c_udp_reservation);
+        let shared_address = format!("127.0.0.1:{shared_port}");
+        let token = "udp-shared-key".repeat(6);
+
+        let mut exit = fresh_mgr();
+        exit.listen_ipv6 = String::new();
+        exit.apply_config(&NodeConfigResponse {
+            listeners: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+            tunnels: vec![TunnelListenerConfig {
+                tunnel_id: 901,
+                port: shared_port,
+                hop_position: 1,
+                auth_token: token.clone(),
+                link_scope: "901:0".into(),
+                next: None,
+                routes: vec![
+                    TunnelRouteConfig {
+                        rule_id: 1001,
+                        protocol: "udp".into(),
+                        targets: vec![target_a],
+                        target_weights: vec![1],
+                        load_balance_strategy: LoadBalanceStrategy::First,
+                    },
+                    TunnelRouteConfig {
+                        rule_id: 1002,
+                        protocol: "udp".into(),
+                        targets: vec![target_b],
+                        target_weights: vec![1],
+                        load_balance_strategy: LoadBalanceStrategy::First,
+                    },
+                    TunnelRouteConfig {
+                        rule_id: 1003,
+                        protocol: "tcp_udp".into(),
+                        targets: vec![target_c],
+                        target_weights: vec![1],
+                        load_balance_strategy: LoadBalanceStrategy::First,
+                    },
+                ],
+                handshake_timeout_ms: 1_000,
+                max_unauthenticated: 16,
+                clients: vec![],
+            }],
+        })
+        .await;
+        assert!(exit.take_listener_errors().await.is_empty());
+
+        let make_listener = |rule_id, port, protocol| ListenerConfig {
+            rule_id,
+            port,
+            protocol,
+            node_transport: NodeTransport::Raw,
+            ws_path: None,
+            targets: vec![shared_address.clone()],
+            target_weights: vec![1],
+            load_balance_strategy: LoadBalanceStrategy::First,
+            upload_limit_bps: None,
+            download_limit_bps: None,
+            max_connections: None,
+            count_traffic: true,
+            uot_role: UotRole::Disabled,
+            uot_token: Some(token.clone()),
+            uot_next_token: None,
+            zero_rtt: true,
+            tcp_fast_open: false,
+        };
+        let make_client = |rule_id| TunnelClientConfig {
+            tunnel_id: 901,
+            rule_id,
+            hop_position: 0,
+            address: shared_address.clone(),
+            auth_token: token.clone(),
+            link_scope: "901:0".into(),
+        };
+        let mut entry = fresh_mgr();
+        entry.listen_ipv6 = String::new();
+        entry
+            .apply_config(&NodeConfigResponse {
+                listeners: vec![
+                    make_listener(1001, entry_a, Protocol::Udp),
+                    make_listener(1002, entry_b, Protocol::Udp),
+                    make_listener(1003, entry_c, Protocol::Tcp),
+                    make_listener(1003, entry_c, Protocol::Udp),
+                ],
+                credential_revisions: vec![],
+                terminate_tunnel_ids: vec![],
+                drain_rule_ids: vec![],
+                tunnels: vec![TunnelListenerConfig {
+                    tunnel_id: 901,
+                    port: 0,
+                    hop_position: 0,
+                    auth_token: String::new(),
+                    link_scope: String::new(),
+                    next: None,
+                    routes: vec![],
+                    handshake_timeout_ms: 1_000,
+                    max_unauthenticated: 0,
+                    clients: vec![make_client(1001), make_client(1002), make_client(1003)],
+                }],
+            })
+            .await;
+        assert!(entry.take_listener_errors().await.is_empty());
+
+        for (entry_port, payload, tag) in [
+            (entry_a, b"one".as_slice(), b'A'),
+            (entry_b, b"two".as_slice(), b'B'),
+            (entry_c, b"three-udp".as_slice(), b'C'),
+        ] {
+            let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client
+                .send_to(payload, ("127.0.0.1", entry_port))
+                .await
+                .unwrap();
+            let mut response = [0u8; 16];
+            let (n, _) =
+                tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut response))
+                    .await
+                    .expect("preset UDP roundtrip timed out")
+                    .unwrap();
+            assert_eq!(response[0], tag);
+            assert_eq!(&response[1..n], payload);
+        }
+
+        let mut tcp_client = tokio::net::TcpStream::connect(("127.0.0.1", entry_c))
+            .await
+            .unwrap();
+        let tcp_payload = b"three-tcp";
+        tcp_client.write_all(tcp_payload).await.unwrap();
+        let mut tcp_response = vec![0u8; tcp_payload.len() + 1];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tcp_client.read_exact(&mut tcp_response),
+        )
+        .await
+        .expect("preset TCP half of tcp_udp roundtrip timed out")
+        .unwrap();
+        assert_eq!(tcp_response[0], b'C');
+        assert_eq!(&tcp_response[1..], tcp_payload);
+
+        target_task_a.await.unwrap();
+        target_task_b.await.unwrap();
+        target_tcp_task_c.await.unwrap();
+        target_udp_task_c.await.unwrap();
+        entry
+            .apply_config(&NodeConfigResponse {
+                listeners: vec![],
+                tunnels: vec![],
+                credential_revisions: vec![],
+                terminate_tunnel_ids: vec![],
+                drain_rule_ids: vec![],
+            })
+            .await;
+        exit.apply_config(&NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shared_tunnel_reuses_replay_cache_across_route_updates() {
+        use relay_shared::protocol::TunnelRouteConfig;
+
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let make_config = |target: &str| NodeConfigResponse {
+            listeners: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+            tunnels: vec![TunnelListenerConfig {
+                tunnel_id: 902,
+                port,
+                hop_position: 1,
+                auth_token: "stable-token".into(),
+                link_scope: "902:0:1:2".into(),
+                next: None,
+                routes: vec![TunnelRouteConfig {
+                    rule_id: 1101,
+                    protocol: "tcp".into(),
+                    targets: vec![target.into()],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                }],
+                handshake_timeout_ms: 1_000,
+                max_unauthenticated: 16,
+                clients: vec![],
+            }],
+        };
+        let mut manager = fresh_mgr();
+        manager.listen_ipv6 = String::new();
+        manager.apply_config(&make_config("127.0.0.1:9")).await;
+        let before = Arc::as_ptr(&manager.tunnel_replay_caches.values().next().unwrap().cache);
+        manager.apply_config(&make_config("127.0.0.1:10")).await;
+        let after = Arc::as_ptr(&manager.tunnel_replay_caches.values().next().unwrap().cache);
+        assert_eq!(before, after, "route-only edits must retain replay history");
+    }
+
+    #[tokio::test]
+    async fn live_replay_cache_is_not_evicted_by_tunnel_count() {
+        let mut manager = fresh_mgr();
+        let make_tunnel = |id| TunnelListenerConfig {
+            tunnel_id: id,
+            port: 1,
+            hop_position: 1,
+            auth_token: format!("token-{id}"),
+            link_scope: format!("{id}:0:1:2"),
+            next: None,
+            routes: vec![],
+            handshake_timeout_ms: 1_000,
+            max_unauthenticated: 16,
+            clients: vec![],
+        };
+        let first_config = make_tunnel(1);
+        let first = manager.replay_cache_for_tunnel(&first_config);
+        for id in 2..=1026 {
+            manager.replay_cache_for_tunnel(&make_tunnel(id));
+        }
+        let again = manager.replay_cache_for_tunnel(&first_config);
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a live link must retain nonce history regardless of tunnel count"
+        );
+
+        manager
+            .apply_shared_tunnel_listeners(
+                &NodeConfigResponse {
+                    listeners: vec![],
+                    tunnels: vec![],
+                    credential_revisions: vec![],
+                    terminate_tunnel_ids: vec![],
+                    drain_rule_ids: vec![],
+                },
+                &HashMap::new(),
+            )
+            .await;
+        let retained = manager
+            .tunnel_replay_caches
+            .get(&tunnel_replay_key(&first_config))
+            .expect("a temporary listener absence must retain replay history");
+        assert!(Arc::ptr_eq(&first, &retained.cache));
+    }
+
+    #[tokio::test]
+    async fn shared_tunnel_token_rotation_cancels_detached_active_streams() {
+        use relay_shared::protocol::{TunnelClientConfig, TunnelRouteConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap().to_string();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte).await;
+        });
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let make_config = |token: &str| NodeConfigResponse {
+            listeners: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+            tunnels: vec![TunnelListenerConfig {
+                tunnel_id: 903,
+                port,
+                hop_position: 1,
+                auth_token: token.into(),
+                link_scope: "903:0:1:2".into(),
+                next: None,
+                routes: vec![TunnelRouteConfig {
+                    rule_id: 1201,
+                    protocol: "tcp".into(),
+                    targets: vec![target_address.clone()],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                }],
+                handshake_timeout_ms: 1_000,
+                max_unauthenticated: 16,
+                clients: vec![],
+            }],
+        };
+        let mut manager = fresh_mgr();
+        manager.listen_ipv6 = String::new();
+        manager.apply_config(&make_config("old-token")).await;
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        crate::forwarder::tunnel::write_header(
+            &mut client,
+            &TunnelClientConfig {
+                tunnel_id: 903,
+                rule_id: 1201,
+                hop_position: 0,
+                address: format!("127.0.0.1:{port}"),
+                auth_token: "old-token".into(),
+                link_scope: "903:0:1:2".into(),
+            },
+            crate::forwarder::tunnel::TunnelMode::Tcp,
+        )
+        .await
+        .unwrap();
+        accepted_rx.await.unwrap();
+
+        manager.apply_config(&make_config("new-token")).await;
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .expect("rotated credential did not revoke active tunnel stream");
+        assert!(closed.is_err() || closed.unwrap() == 0);
+        let _ = client.shutdown().await;
+        target_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retired_shared_tunnel_runtime_remains_revocable() {
+        use relay_shared::protocol::{TunnelClientConfig, TunnelRouteConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap().to_string();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let target_task = tokio::spawn(async move {
+            let (_stream, _) = target.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+        });
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let config = NodeConfigResponse {
+            listeners: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+            tunnels: vec![TunnelListenerConfig {
+                tunnel_id: 904,
+                port,
+                hop_position: 1,
+                auth_token: "retired-token".into(),
+                link_scope: "904:0:1:2".into(),
+                next: None,
+                routes: vec![TunnelRouteConfig {
+                    rule_id: 1301,
+                    protocol: "tcp".into(),
+                    targets: vec![target_address],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                }],
+                handshake_timeout_ms: 1_000,
+                max_unauthenticated: 16,
+                clients: vec![],
+            }],
+        };
+        let mut manager = fresh_mgr();
+        manager.listen_ipv6 = String::new();
+        manager.apply_config(&config).await;
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        crate::forwarder::tunnel::write_header(
+            &mut client,
+            &TunnelClientConfig {
+                tunnel_id: 904,
+                rule_id: 1301,
+                hop_position: 0,
+                address: format!("127.0.0.1:{port}"),
+                auth_token: "retired-token".into(),
+                link_scope: "904:0:1:2".into(),
+            },
+            crate::forwarder::tunnel::TunnelMode::Tcp,
+        )
+        .await
+        .unwrap();
+        accepted_rx.await.unwrap();
+
+        manager
+            .apply_config(&NodeConfigResponse {
+                listeners: vec![],
+                tunnels: vec![],
+                credential_revisions: vec![],
+                terminate_tunnel_ids: vec![],
+                drain_rule_ids: vec![],
+            })
+            .await;
+        assert_eq!(manager.retired_tunnel_runtimes.len(), 1);
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.read(&mut byte))
+                .await
+                .is_err(),
+            "ordinary path removal must let established TCP drain"
+        );
+
+        manager.revoke_tunnel_credentials(999);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.read(&mut byte))
+                .await
+                .is_err(),
+            "an unrelated group rotation must not interrupt this tunnel"
+        );
+        manager.revoke_tunnel_credentials(2);
+        let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .expect("credential revocation did not reach retired tunnel runtime");
+        assert!(closed.is_err() || closed.unwrap() == 0);
+        let _ = client.shutdown().await;
+        let _ = release_tx.send(());
+        target_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_revision_revokes_stream_during_simultaneous_path_removal() {
+        use relay_shared::protocol::{
+            GroupCredentialRevision, TunnelClientConfig, TunnelRouteConfig,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap().to_string();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let target_task = tokio::spawn(async move {
+            let (_stream, _) = target.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+        });
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let config = NodeConfigResponse {
+            listeners: vec![],
+            credential_revisions: vec![GroupCredentialRevision {
+                group_id: 3,
+                revision: 7,
+            }],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+            tunnels: vec![TunnelListenerConfig {
+                tunnel_id: 905,
+                port,
+                hop_position: 1,
+                auth_token: "credential-rejected-token".into(),
+                link_scope: "905:0:3:4".into(),
+                next: None,
+                routes: vec![TunnelRouteConfig {
+                    rule_id: 1401,
+                    protocol: "tcp".into(),
+                    targets: vec![target_address],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                }],
+                handshake_timeout_ms: 1_000,
+                max_unauthenticated: 16,
+                clients: vec![],
+            }],
+        };
+        let mut manager = fresh_mgr();
+        manager.listen_ipv6 = String::new();
+        manager.apply_config(&config).await;
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        crate::forwarder::tunnel::write_header(
+            &mut client,
+            &TunnelClientConfig {
+                tunnel_id: 905,
+                rule_id: 1401,
+                hop_position: 0,
+                address: format!("127.0.0.1:{port}"),
+                auth_token: "credential-rejected-token".into(),
+                link_scope: "905:0:3:4".into(),
+            },
+            crate::forwarder::tunnel::TunnelMode::Tcp,
+        )
+        .await
+        .unwrap();
+        accepted_rx.await.unwrap();
+
+        manager
+            .apply_config(&NodeConfigResponse {
+                listeners: vec![],
+                tunnels: vec![],
+                credential_revisions: vec![GroupCredentialRevision {
+                    group_id: 3,
+                    revision: 8,
+                }],
+                terminate_tunnel_ids: vec![],
+                drain_rule_ids: vec![],
+            })
+            .await;
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .expect("credential generation change did not revoke the removed path");
+        assert!(closed.is_err() || closed.unwrap() == 0);
+        let _ = client.shutdown().await;
+        let _ = release_tx.send(());
+        target_task.await.unwrap();
     }
 }

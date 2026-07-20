@@ -29,7 +29,8 @@ impl NodeConfig {
         let poll_interval = std::env::var("POLL_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(10);
+            .unwrap_or(10)
+            .max(1);
 
         let cfg = Self {
             panel_url,

@@ -307,29 +307,80 @@ impl UserRepository for SqliteRepository {
         // device_groups both reference users, so the user row goes last. The user
         // delete carries the `admin = 0` guard, and if it affects 0 rows (admin or
         // already gone) we roll the whole thing back by returning before commit.
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM forward_rules WHERE uid = ?")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM tunnel_profiles WHERE uid = ?")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM device_groups WHERE uid = ?")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
-        let result = sqlx::query("DELETE FROM users WHERE id = ? AND admin = 0")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
-        if result.rows_affected() == 0 {
-            // Admin or non-existent: roll back so the cascade above is undone.
-            tx.rollback().await?;
+        // Acquire the writer lock before checking tunnel_hops. Otherwise a
+        // concurrent tunnel creator can pass its own validation after our read
+        // and commit before the group DELETE, degrading this explicit conflict
+        // into a generic foreign-key error.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_sql {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
+        }
+        let target_admin: Option<bool> = try_sql!(
+            sqlx::query_scalar("SELECT admin FROM users WHERE id = ?")
+                .bind(uid)
+                .fetch_optional(&mut *conn)
+                .await
+        );
+        if target_admin != Some(false) {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
             return Ok(0);
         }
-        tx.commit().await?;
+        let conflict: (i64, i64) = try_sql!(
+            sqlx::query_as(
+                "SELECT COUNT(DISTINCT g.id),COUNT(DISTINCT h.tunnel_id) \
+             FROM device_groups g JOIN tunnel_hops h ON h.device_group_id=g.id \
+             WHERE g.uid=?",
+            )
+            .bind(uid)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        if conflict.0 > 0 {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Err(DbError::UserTunnelGroupConflict {
+                groups: conflict.0,
+                tunnels: conflict.1,
+            });
+        }
+        try_sql!(
+            sqlx::query("DELETE FROM forward_rules WHERE uid = ?")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await
+        );
+        try_sql!(
+            sqlx::query("DELETE FROM tunnel_profiles WHERE uid = ?")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await
+        );
+        try_sql!(
+            sqlx::query("DELETE FROM device_groups WHERE uid = ?")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await
+        );
+        let result = try_sql!(
+            sqlx::query("DELETE FROM users WHERE id = ? AND admin = 0")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await
+        );
+        if result.rows_affected() == 0 {
+            // Admin or non-existent: roll back so the cascade above is undone.
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Ok(0);
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(result.rows_affected())
     }
 

@@ -25,7 +25,7 @@
 use async_trait::async_trait;
 use relay_shared::models::{
     DeviceGroup, ForwardRule, ForwardRuleTarget, Order, Plan, SharedGroupSummary, Statistic,
-    TunnelProfile, User,
+    Tunnel, TunnelHop, TunnelProfile, User,
 };
 use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
 use serde::Serialize;
@@ -50,6 +50,17 @@ use super::error::DbError;
 pub enum ResourceScope {
     All,
     Owner(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupDeleteOutcome {
+    Deleted,
+    NotFound,
+    InUse {
+        rule_count: i64,
+        tunnel_count: i64,
+        fallback_group_count: i64,
+    },
 }
 
 /// Complete, already-validated rule update passed from the service layer to a
@@ -80,6 +91,7 @@ pub struct RuleUpdateData {
     pub rate_limits: Option<(i32, i32)>,
     pub connection_controls: Option<(i32, i32)>,
     pub tunnel_profile_id: Option<Option<i64>>,
+    pub tunnel_id: Option<Option<i64>>,
 }
 
 impl ResourceScope {
@@ -408,6 +420,57 @@ pub trait RuleRepository: Send + Sync {
         upload_limit_mbps: i32,
         download_limit_mbps: i32,
         tunnel_profile_id: Option<i64>,
+    ) -> Result<Option<i64>, DbError> {
+        self.create_rule_full_with_tunnel(
+            name,
+            uid,
+            listen_port,
+            protocol,
+            public_transport,
+            node_transport,
+            route_mode,
+            entry_transport,
+            ws_path,
+            device_group_in,
+            device_group_out,
+            forward_mode,
+            target_addr,
+            target_port,
+            targets,
+            hops,
+            load_balance_strategy,
+            upload_limit_mbps,
+            download_limit_mbps,
+            tunnel_profile_id,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_rule_full_with_tunnel(
+        &self,
+        name: &str,
+        uid: i64,
+        listen_port: i32,
+        protocol: &str,
+        public_transport: &str,
+        node_transport: &str,
+        route_mode: &str,
+        entry_transport: &str,
+        ws_path: Option<&str>,
+        device_group_in: i64,
+        device_group_out: Option<i64>,
+        forward_mode: &str,
+        target_addr: &str,
+        target_port: i32,
+        targets: &[RuleTargetRequest],
+        hops: &[(i64, i32)],
+        load_balance_strategy: &str,
+        upload_limit_mbps: i32,
+        download_limit_mbps: i32,
+        tunnel_profile_id: Option<i64>,
+        tunnel_id: Option<i64>,
     ) -> Result<Option<i64>, DbError>;
     /// Find (protocol, public_transport) for effective-combo validation, scoped.
     async fn find_transport_by_id(
@@ -496,6 +559,14 @@ pub trait RuleRepository: Send + Sync {
         group_id: i64,
     ) -> Result<Vec<relay_shared::models::ForwardRuleHop>, DbError>;
 
+    /// Active custom-chain rules that place any hop on this device group.
+    /// Implementations batch-populate `ForwardRule.targets` so config assembly
+    /// does not perform one target lookup per exit listener.
+    async fn list_active_chain_rules_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<ForwardRule>, DbError>;
+
     /// Look up a single hop's next sibling (position + 1) for a rule, if any.
     async fn find_rule_hop_at(
         &self,
@@ -525,6 +596,8 @@ pub trait GroupRepository: Send + Sync {
         is_admin: bool,
     ) -> Result<Vec<SharedGroupSummary>, DbError>;
     async fn find_by_token(&self, token: &str) -> Result<Option<DeviceGroup>, DbError>;
+    /// Non-secret monotonic token generations for control-plane revocation.
+    async fn list_group_credential_revisions(&self) -> Result<Vec<(i64, i64)>, DbError>;
     /// Look up a group by id within the scope. None = no such group OR a group
     /// outside the caller's scope (indistinguishable → 404).
     async fn find_by_id(
@@ -570,11 +643,14 @@ pub trait GroupRepository: Send + Sync {
         new_token: &str,
     ) -> Result<u64, DbError>;
     /// v1.0.4: count how many forward_rules reference this group via
-    /// device_group_in, device_group_out, or fallback_group. Used as a
+    /// device_group_in, device_group_out, or a chain hop. Used as a
     /// pre-delete safety check so the admin sees a clear 409 instead of
     /// a cryptic FK violation or orphaned references.
     async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError>;
     async fn delete_group(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
+    /// Administrator deletion with the existence check, rule/tunnel reference
+    /// counts and DELETE serialized in one repository transaction.
+    async fn delete_group_checked(&self, id: i64) -> Result<GroupDeleteOutcome, DbError>;
     async fn delete_groups_by_uid(&self, uid: i64) -> Result<u64, DbError>;
     /// v1.0.8: list all inbound-capable device groups (`in` or `both`). Used by the
     /// purchase flow to compute the authorized set when grant_all_groups=true
@@ -699,6 +775,103 @@ pub trait TunnelProfileRepository: Send + Sync {
         sni: Option<&str>,
     ) -> Result<u64, DbError>;
     async fn delete_profile(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
+}
+
+// ── Reusable preset tunnels ──
+
+/// A retired entry keeps accounting authority only while a node with an
+/// established TCP stream renews it through status reports. Five minutes is
+/// long enough for several default poll cycles and bounds authority after the
+/// final stream closes or the old node disappears.
+pub const ENTRY_DRAIN_LEASE_TTL_SECS: i64 = 5 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelDeleteOutcome {
+    Deleted,
+    NotFound,
+    InUse(i64),
+}
+
+#[async_trait]
+pub trait TunnelRepository: Send + Sync {
+    async fn list_tunnels(&self) -> Result<Vec<Tunnel>, DbError>;
+    async fn find_tunnel_by_id(&self, id: i64) -> Result<Option<Tunnel>, DbError>;
+    async fn list_tunnel_hops(&self, tunnel_id: i64) -> Result<Vec<TunnelHop>, DbError>;
+    /// Count distinct preset tunnels whose path references a device group.
+    /// Kept separate from rule references so group-deletion errors can tell
+    /// operators exactly which kind of resource must be migrated first.
+    async fn count_tunnels_by_group(&self, group_id: i64) -> Result<i64, DbError>;
+    async fn count_rules_by_tunnel(&self, tunnel_id: i64) -> Result<i64, DbError>;
+    async fn list_tunnel_rule_owners(&self, tunnel_id: i64) -> Result<Vec<(i64, i64)>, DbError>;
+    /// Insert the route and all hop rows atomically. `hops` is the complete
+    /// ordered path; entry port is None, all later ports are Some. The method
+    /// serializes allocation against rule/tunnel writers and performs the final
+    /// TCP socket-conflict check inside the transaction.
+    async fn create_tunnel_full(
+        &self,
+        name: &str,
+        enabled: bool,
+        shared: bool,
+        uid: i64,
+        hops: &[(i64, Option<i32>)],
+    ) -> Result<i64, DbError>;
+    /// Update only the supplied scalar fields and, when present, replace the
+    /// complete path atomically. `expected_hops` is the caller's snapshot used
+    /// to reject a stale path replacement instead of overwriting a concurrent
+    /// administrator edit. Scalar-only updates never rewrite hop rows.
+    async fn update_tunnel_full(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        enabled: Option<bool>,
+        shared: Option<bool>,
+        hops: Option<&[(i64, Option<i32>)]>,
+        expected_hops: Option<&[(i64, Option<i32>)]>,
+    ) -> Result<u64, DbError>;
+    /// Atomically distinguish a missing tunnel from one that is still bound.
+    async fn delete_tunnel(&self, id: i64) -> Result<TunnelDeleteOutcome, DbError>;
+    /// Active, user-gated rules bound to one enabled tunnel.
+    async fn list_active_rules_for_tunnel(
+        &self,
+        tunnel_id: i64,
+    ) -> Result<Vec<ForwardRule>, DbError>;
+    /// Active, user-gated rules for every enabled tunnel touching one group.
+    /// Used by node config generation to avoid querying rules once per tunnel.
+    async fn list_active_tunnel_rules_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<ForwardRule>, DbError>;
+    /// Enabled tunnels that have any hop on a node's group.
+    async fn list_enabled_tunnels_for_group(&self, group_id: i64) -> Result<Vec<Tunnel>, DbError>;
+    /// Group id/token pairs for an exact path snapshot. Internal node config
+    /// material only; callers must never expose the tokens through APIs.
+    async fn list_group_tokens(&self, group_ids: &[i64]) -> Result<Vec<(i64, String)>, DbError>;
+    /// Every disabled, still-bound tunnel. The id-only termination set is sent
+    /// to all nodes: an offline node may still hold a connection from a hop that
+    /// was removed after the tunnel was disabled, so current-path membership is
+    /// not sufficient to identify every runtime that must be killed.
+    async fn list_disabled_bound_tunnel_ids(&self) -> Result<Vec<i64>, DbError>;
+    /// Active rules whose preset-tunnel entry previously used this group.
+    /// Their old public listeners are gone, but established TCP connections
+    /// remain billable until the node reports no more bytes.
+    async fn list_draining_tunnel_rule_ids_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<i64>, DbError>;
+    /// Current entry plus every historical preset-tunnel entry recorded for a
+    /// rule. Explicit restart is a termination command, so it deliberately
+    /// includes expired tombstones: a stale node that still has an old runtime
+    /// should be told to close it even though it no longer has accounting
+    /// authority.
+    async fn list_rule_restart_entry_group_ids(&self, rule_id: i64) -> Result<Vec<i64>, DbError>;
+    /// Extend only still-valid drain leases for rules this node confirms have
+    /// live retired streams. An expired row is a tombstone and must never be
+    /// revivable by a later status report carrying an old group credential.
+    async fn renew_draining_tunnel_rule_ids_for_group(
+        &self,
+        group_id: i64,
+        rule_ids: &[i64],
+    ) -> Result<u64, DbError>;
 }
 
 // ── Traffic (atomic batch) ──
@@ -1013,6 +1186,7 @@ pub trait Repository:
     + GroupRepository
     + DeviceGroupAuthRepository
     + TunnelProfileRepository
+    + TunnelRepository
     + TrafficRepository
     + KvsRepository
     + StatisticsRepository

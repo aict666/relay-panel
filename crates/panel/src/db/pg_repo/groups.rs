@@ -58,6 +58,14 @@ impl GroupRepository for PgRepository {
         Ok(group)
     }
 
+    async fn list_group_credential_revisions(&self) -> Result<Vec<(i64, i64)>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT id, credential_revision FROM device_groups ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
     async fn find_by_id(
         &self,
         id: i64,
@@ -167,6 +175,54 @@ impl GroupRepository for PgRepository {
             return Ok(0);
         }
 
+        let mut tx = self.pool.begin().await?;
+        // Tunnel path writers take the same per-group advisory locks in sorted
+        // order. A single group update therefore cannot race a create/replace
+        // that introduces this group after validation.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let current: Option<(String, String)> = match scope.owner_id() {
+            None => sqlx::query_as(
+                "SELECT group_type, connect_host FROM device_groups WHERE id = $1 FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?,
+            Some(uid) => sqlx::query_as(
+                "SELECT group_type, connect_host FROM device_groups WHERE id = $1 AND uid = $2 FOR UPDATE",
+            )
+            .bind(id)
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await?,
+        };
+        let Some((current_type, current_host)) = current else {
+            tx.rollback().await?;
+            return Ok(0);
+        };
+        let effective_type = group_type.unwrap_or(&current_type);
+        let effective_host = connect_host.unwrap_or(&current_host);
+        let (entry_tunnels, downstream_tunnels): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT CASE WHEN position = 0 THEN tunnel_id END), \
+                    COUNT(DISTINCT CASE WHEN position > 0 THEN tunnel_id END) \
+             FROM tunnel_hops WHERE device_group_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let invalid_entry = entry_tunnels > 0 && !matches!(effective_type, "in" | "both");
+        let invalid_downstream = downstream_tunnels > 0
+            && (effective_type == "monitor" || effective_host.trim().is_empty());
+        if invalid_entry || invalid_downstream {
+            tx.rollback().await?;
+            return Err(DbError::TunnelGroupInvariant {
+                entry_tunnels,
+                downstream_tunnels,
+            });
+        }
+
         let mut ph = 1;
         let sets_with_ph: Vec<String> = sets
             .iter()
@@ -216,7 +272,8 @@ impl GroupRepository for PgRepository {
             q = q.bind(uid);
         }
 
-        let result = q.execute(&self.pool).await?;
+        let result = q.execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -227,11 +284,15 @@ impl GroupRepository for PgRepository {
         new_token: &str,
     ) -> Result<u64, DbError> {
         let result = match scope.owner_id() {
-            None => sqlx::query("UPDATE device_groups SET token = $1 WHERE id = $2")
+            None => sqlx::query(
+                "UPDATE device_groups SET token = $1, credential_revision = credential_revision + 1 WHERE id = $2",
+            )
                 .bind(new_token)
                 .bind(id),
             Some(uid) => {
-                sqlx::query("UPDATE device_groups SET token = $1 WHERE id = $2 AND uid = $3")
+                sqlx::query(
+                    "UPDATE device_groups SET token = $1, credential_revision = credential_revision + 1 WHERE id = $2 AND uid = $3",
+                )
                     .bind(new_token)
                     .bind(id)
                     .bind(uid)
@@ -245,7 +306,7 @@ impl GroupRepository for PgRepository {
     async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError> {
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM forward_rules \
-             WHERE device_group_in = $1 OR device_group_out = $1 OR fallback_group = $1",
+             WHERE device_group_in = $1 OR device_group_out = $1",
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -269,6 +330,62 @@ impl GroupRepository for PgRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    async fn delete_group_checked(&self, id: i64) -> Result<GroupDeleteOutcome, DbError> {
+        let mut tx = self.pool.begin().await?;
+        // Rule and preset-tunnel writers take this same lock before claiming a
+        // group. Counts made after it therefore stay authoritative through the
+        // DELETE instead of degrading a concurrent reference into an FK 500.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM device_groups WHERE id=$1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_none() {
+            tx.rollback().await?;
+            return Ok(GroupDeleteOutcome::NotFound);
+        }
+        let rule_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ( \
+               SELECT id AS rule_id FROM forward_rules \
+                WHERE device_group_in=$1 OR device_group_out=$1 \
+               UNION \
+               SELECT rule_id FROM forward_rule_hops WHERE device_group_id=$1 \
+             ) refs",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let tunnel_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT tunnel_id) FROM tunnel_hops WHERE device_group_id=$1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let fallback_group_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM device_groups WHERE fallback_group=$1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if rule_count > 0 || tunnel_count > 0 || fallback_group_count > 0 {
+            tx.rollback().await?;
+            return Ok(GroupDeleteOutcome::InUse {
+                rule_count,
+                tunnel_count,
+                fallback_group_count,
+            });
+        }
+        sqlx::query("DELETE FROM device_groups WHERE id=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(GroupDeleteOutcome::Deleted)
     }
 
     async fn delete_groups_by_uid(&self, uid: i64) -> Result<u64, DbError> {

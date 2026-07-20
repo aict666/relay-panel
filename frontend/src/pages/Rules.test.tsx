@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { canUsePresetForRuleUpdate } from '../utils/tunnels';
+import type { Tunnel } from '../api/types';
 
 // ============================================================
 // Pure-function tests for Rules.tsx helpers
@@ -155,5 +157,38 @@ describe('strategyOptions', () => {
       expect(opt.label).not.toContain(':');
       expect(opt.label.length).toBeLessThan(20);
     }
+  });
+});
+
+describe('preset tunnel update permissions', () => {
+  const preset = (id: number, enabled = true, hopCount = 2): Tunnel => ({
+    id,
+    name: `tunnel-${id}`,
+    enabled,
+    shared: true,
+    uid: 1,
+    created_at: '',
+    bound_rule_count: 0,
+    hops: Array.from({ length: hopCount }, (_, position) => ({
+      id: position + 1,
+      tunnel_id: id,
+      position,
+      device_group_id: position + 10,
+      listen_port: position === 0 ? null : 30000 + position,
+      created_at: '',
+    })),
+  });
+
+  it('preserves the current binding after it disappears from the selectable catalog', () => {
+    expect(canUsePresetForRuleUpdate(7, 7, undefined)).toBe(true);
+  });
+
+  it('never treats a missing catalog entry as permission for a new binding', () => {
+    expect(canUsePresetForRuleUpdate(7, 8, undefined)).toBe(false);
+  });
+
+  it('allows an existing disabled binding but rejects selecting it for another rule', () => {
+    expect(canUsePresetForRuleUpdate(7, 7, preset(7, false))).toBe(true);
+    expect(canUsePresetForRuleUpdate(7, 8, preset(7, false))).toBe(false);
   });
 });

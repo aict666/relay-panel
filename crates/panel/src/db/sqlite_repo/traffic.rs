@@ -89,7 +89,11 @@ impl TrafficRepository for SqliteRepository {
         }
 
         // ── Pass 2: ownership + existing-value resolution.
-        // SINGLE query per distinct rule_id: id+uid gated by device_group_in.
+        // SINGLE query per distinct rule_id: id+uid gated by the current entry
+        // or by a durable retired-entry lease created during a tunnel move.
+        // A lease remains valid until its explicit expiry even if pause, ban,
+        // unshare or disable has just stopped renewal: bytes accepted before the
+        // control-plane change still need one final, attributable upload.
         // A miss means "not available to this node" (missing OR foreign) — we
         // do NOT run a second "does this id exist elsewhere?" query; that was
         // the rule-id existence oracle. The reason is logged, not returned.
@@ -119,9 +123,13 @@ impl TrafficRepository for SqliteRepository {
                 "SELECT fr.id, fr.uid, fr.traffic_used, u.traffic_used \
                  FROM forward_rules fr \
                  JOIN users u ON u.id = fr.uid \
-                 WHERE fr.id = ? AND fr.device_group_in = ?",
+                 WHERE fr.id = ? AND (fr.device_group_in = ? OR EXISTS( \
+                   SELECT 1 FROM forward_rule_retired_entries re \
+                   WHERE re.rule_id=fr.id AND re.device_group_id=? \
+                     AND re.expires_at>=unixepoch()))",
             )
             .bind(rule_id)
+            .bind(group_id)
             .bind(group_id)
             .fetch_optional(&mut *tx)
             .await?;

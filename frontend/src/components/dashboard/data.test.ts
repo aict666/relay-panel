@@ -68,6 +68,10 @@ describe('dashboard chart data', () => {
     const base = {
       upload_bps_avg: 1,
       download_bps_avg: 2,
+      upload_bps_max: 1,
+      download_bps_max: 2,
+      upload_bps_max_at: '2026-07-19T12:00:00Z',
+      download_bps_max_at: '2026-07-19T12:00:00Z',
       connections_max: 3,
       online_nodes_min: 1,
       recent_nodes_max: 1,
@@ -80,6 +84,7 @@ describe('dashboard chart data', () => {
     expect(points).toHaveLength(3);
     expect(points[1].timestamp).toBe('2026-07-19T12:01:00.000Z');
     expect(points[1].upload_bps_avg).toBeNull();
+    expect(points[1].upload_bps_max).toBeNull();
     expect(points[1].connections_max).toBeNull();
   });
 
