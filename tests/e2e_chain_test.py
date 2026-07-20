@@ -112,11 +112,21 @@ class UDPHandler(socketserver.BaseRequestHandler):
         sock.sendto(data, self.client_address)
 
 
+class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+
+class ReusableThreadingUDPServer(socketserver.ThreadingUDPServer):
+    allow_reuse_address = True
+
+
 def start_echo():
-    tcp = socketserver.ThreadingTCPServer(("127.0.0.1", ECHO_PORT), TCPHandler)
-    udp = socketserver.ThreadingUDPServer(("127.0.0.1", ECHO_PORT), UDPHandler)
-    tcp.allow_reuse_address = True
-    udp.allow_reuse_address = True
+    tcp = ReusableThreadingTCPServer(("127.0.0.1", ECHO_PORT), TCPHandler)
+    try:
+        udp = ReusableThreadingUDPServer(("127.0.0.1", ECHO_PORT), UDPHandler)
+    except Exception:
+        tcp.server_close()
+        raise
     threading.Thread(target=tcp.serve_forever, daemon=True).start()
     threading.Thread(target=udp.serve_forever, daemon=True).start()
     print(f"[echo] TCP+UDP :{ECHO_PORT}")
@@ -176,7 +186,15 @@ def main():
     work = tempfile.mkdtemp(prefix="relay-chain-e2e-")
     db = os.path.join(work, "data.db")
     procs = []
+    process_logs = []
     echo = None
+
+    def open_process_log(name):
+        path = os.path.join(work, f"{name}.log")
+        handle = open(path, "wb")
+        process_logs.append((name, path, handle))
+        return handle
+
     try:
         echo = start_echo()
         assert wait_for_port("127.0.0.1", ECHO_PORT, 5)
@@ -192,7 +210,7 @@ def main():
             [PANEL_BIN],
             env=panel_env,
             cwd=work,
-            stdout=subprocess.PIPE,
+            stdout=open_process_log("panel"),
             stderr=subprocess.STDOUT,
         )
         procs.append(panel)
@@ -342,7 +360,7 @@ def main():
                 [NODE_BIN],
                 env=env,
                 cwd=work,
-                stdout=subprocess.PIPE,
+                stdout=open_process_log(f"node-{name}"),
                 stderr=subprocess.STDOUT,
             )
             procs.append(p)
@@ -444,14 +462,21 @@ def main():
         return 0
     except Exception as e:
         print(f"\n=== CHAIN E2E FAILED: {e} ===", file=sys.stderr)
-        # Dump panel/node logs if still running
-        for p in procs:
-            if p.poll() is None:
-                continue
-            if p.stdout:
-                out = p.stdout.read()
+        # Each child writes to a file instead of an unread PIPE, which avoids
+        # deadlocking when verbose logs exceed the operating system pipe buffer.
+        for name, path, handle in process_logs:
+            try:
+                handle.flush()
+                with open(path, "rb") as log:
+                    out = log.read()
                 if out:
-                    print(out.decode("utf-8", errors="replace")[-4000:], file=sys.stderr)
+                    print(
+                        f"--- {name} log tail ---\n"
+                        + out.decode("utf-8", errors="replace")[-4000:],
+                        file=sys.stderr,
+                    )
+            except OSError:
+                pass
         return 1
     finally:
         for p in procs:
@@ -465,8 +490,14 @@ def main():
             except Exception:
                 try:
                     p.kill()
+                    p.wait(timeout=3)
                 except Exception:
                     pass
+        for _, _, handle in process_logs:
+            try:
+                handle.close()
+            except Exception:
+                pass
         if echo is not None:
             for server in echo:
                 try:

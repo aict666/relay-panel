@@ -3,7 +3,7 @@ import {
   CloudServerOutlined, ApiOutlined, UserOutlined, DashboardOutlined, ReloadOutlined,
   ArrowUpOutlined, ArrowDownOutlined,
 } from '@ant-design/icons';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import type {
@@ -60,44 +60,64 @@ export default function Dashboard() {
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [showChangelog, setShowChangelog] = useState(false);
   const [versionRefreshing, setVersionRefreshing] = useState(false);
+  const loadInFlightRef = useRef(false);
+  const versionRequestRef = useRef(0);
+  const backgroundVersionInFlightRef = useRef(false);
+  const manualVersionInFlightRef = useRef(false);
 
   const load = async () => {
+    if (loadInFlightRef.current) return;
+    loadInFlightRef.current = true;
     try {
-      const [users, rules, groups] = await Promise.all([
-        api.get<unknown, ApiEnvelope<User[]>>('/admin/users'),
-        api.get<unknown, ApiEnvelope<ForwardRule[]>>('/rules'),
-        api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
-      ]);
-      setStats({
-        users: users.data?.length || 0,
-        rules: rules.data?.length || 0,
-        groups: groups.data?.length || 0,
-      });
-      setRules(rules.data || []);
-      setDeviceGroups(groups.data || []);
-      setCatalogError(false);
-    } catch {
-      setCatalogError(true);
-    }
+      try {
+        const [users, rules, groups] = await Promise.all([
+          api.get<unknown, ApiEnvelope<User[]>>('/admin/users'),
+          api.get<unknown, ApiEnvelope<ForwardRule[]>>('/rules'),
+          api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
+        ]);
+        setStats({
+          users: users.data?.length || 0,
+          rules: rules.data?.length || 0,
+          groups: groups.data?.length || 0,
+        });
+        setRules(rules.data || []);
+        setDeviceGroups(groups.data || []);
+        setCatalogError(false);
+      } catch {
+        setCatalogError(true);
+      }
 
-    try {
-      const nodeStatus = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
-      setNodes(nodeStatus.data || []);
-      setNodesError(false);
-    } catch {
-      setNodesError(true);
+      try {
+        const nodeStatus = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
+        setNodes(nodeStatus.data || []);
+        setNodesError(false);
+      } catch {
+        setNodesError(true);
+      }
+    } finally {
+      loadInFlightRef.current = false;
     }
   };
 
   const checkVersion = async (forceRefresh = false) => {
-    if (forceRefresh) setVersionRefreshing(true);
+    if (forceRefresh) {
+      if (manualVersionInFlightRef.current) return;
+      manualVersionInFlightRef.current = true;
+      setVersionRefreshing(true);
+    } else {
+      // Do not let a scheduled cached check start after (and supersede) a
+      // manual force-refresh. Background checks also never need to overlap.
+      if (manualVersionInFlightRef.current || backgroundVersionInFlightRef.current) return;
+      backgroundVersionInFlightRef.current = true;
+    }
+    const requestId = ++versionRequestRef.current;
     try {
       // ?refresh=true bypasses the 30-minute server-side cache so the manual
       // "check update" button always queries GitHub live. Backend accepts
       // true/false/1/0; frontend standardizes on "true".
       const url = forceRefresh ? '/system/version?refresh=true' : '/system/version';
       const res = await api.get<unknown, VersionInfo>(url);
-      setVersionInfo(res);
+      if (requestId === versionRequestRef.current) setVersionInfo(res);
     } catch (err: unknown) {
       // axios errors expose the response on err.response (AxiosError); other
       // throws just have a message. Read whatever is available and surface it
@@ -112,19 +132,26 @@ export default function Dashboard() {
         e?.response?.data?.error_message ||
         e?.response?.data?.message ||
         e?.message;
-      setVersionInfo({
-        current_version: versionInfo?.current_version || '',
-        latest_version: versionInfo?.latest_version || '',
-        has_update: false,
-        is_outdated: false,
-        release_url: '',
-        release_notes: '',
-        published_at: '',
-        check_failed: true,
-        error_message: serverMsg || 'Unknown error',
-      });
+      if (requestId === versionRequestRef.current) {
+        setVersionInfo((previous) => ({
+          current_version: previous?.current_version || '',
+          latest_version: previous?.latest_version || '',
+          has_update: false,
+          is_outdated: false,
+          release_url: '',
+          release_notes: '',
+          published_at: '',
+          check_failed: true,
+          error_message: serverMsg || 'Unknown error',
+        }));
+      }
     } finally {
-      if (forceRefresh) setVersionRefreshing(false);
+      if (forceRefresh) {
+        manualVersionInFlightRef.current = false;
+        setVersionRefreshing(false);
+      } else {
+        backgroundVersionInFlightRef.current = false;
+      }
     }
   };
 
@@ -134,7 +161,6 @@ export default function Dashboard() {
     const ti = setInterval(load, 10000);
     const tv = setInterval(checkVersion, 1800000); // 30 min
     return () => { clearInterval(ti); clearInterval(tv); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {

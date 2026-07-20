@@ -12,6 +12,7 @@ use relay_shared::protocol::{
     CreateRuleRequest, GroupType, Protocol, PublicTransport, RouteMode, RuleTargetRequest,
     UpdateRuleRequest, CHAIN_HOPS_MAX, CHAIN_HOPS_MIN,
 };
+use std::net::{IpAddr, Ipv6Addr};
 
 /// Accepted forward_mode values for create/update.
 pub fn validate_forward_mode(mode: &str) -> bool {
@@ -81,8 +82,35 @@ pub fn is_plausible_target_host(host: &str) -> bool {
     if h.contains("://") || h.contains('/') || h.chars().any(char::is_whitespace) {
         return false;
     }
-    h.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+
+    // Accept both raw and bracketed IP literals. Brackets are useful in forms
+    // copied from host:port notation; node_config::format_host_port preserves
+    // them without producing a double-bracketed address.
+    if h.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    if let Some(inner) = h.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return inner.parse::<Ipv6Addr>().is_ok();
+    }
+
+    // A remaining colon is neither a valid DNS hostname nor an IP literal.
+    // Validate labels so punctuation-only inputs such as ":", "..." and "-"
+    // do not survive until the relay node fails DNS resolution at runtime.
+    if h.contains(':') {
+        return false;
+    }
+    let dns_name = h.strip_suffix('.').unwrap_or(h);
+    !dns_name.is_empty()
+        && dns_name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().any(|c| c.is_ascii_alphanumeric())
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        })
 }
 
 pub fn normalize_rule_targets(
@@ -1530,6 +1558,40 @@ mod tests {
             weight: 1,
         }];
         assert!(normalize_rule_targets(Some(bad), "x", 1).is_err());
+    }
+
+    #[test]
+    fn target_host_validation_accepts_addresses_and_rejects_punctuation() {
+        for valid in [
+            "example.com",
+            "example.com.",
+            "localhost",
+            "service_name",
+            "192.0.2.1",
+            "2001:db8::1",
+            "[2001:db8::1]",
+        ] {
+            assert!(is_plausible_target_host(valid), "{valid} should be valid");
+        }
+
+        for invalid in [
+            "",
+            ":",
+            "...",
+            "-",
+            "_",
+            "a..example",
+            "-example.com",
+            "example-.com",
+            "example.com:443",
+            "[192.0.2.1]",
+            "[not-an-ip]",
+        ] {
+            assert!(
+                !is_plausible_target_host(invalid),
+                "{invalid} should be invalid"
+            );
+        }
     }
 
     /// v1.2.x: the unset / "全可转发" sentinel and any garbage fall back to the

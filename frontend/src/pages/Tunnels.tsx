@@ -41,6 +41,8 @@ export default function Tunnels() {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setTunnels([]);
+    setGroups([]);
     try {
       const [tr, gr] = await Promise.all([
         api.get<unknown, ApiEnvelope<Tunnel[]>>('/admin/tunnels'),

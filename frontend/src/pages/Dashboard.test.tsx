@@ -72,6 +72,82 @@ function renderDashboard() {
 }
 
 describe('Dashboard group aggregation', () => {
+  it('does not overlap catalog polling while the previous load is still pending', async () => {
+    let resolveNodes!: (value: ReturnType<typeof ok<NodeStatus[]>>) => void;
+    const pendingNodes = new Promise<ReturnType<typeof ok<NodeStatus[]>>>((resolve) => {
+      resolveNodes = resolve;
+    });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/admin/users' || url === '/rules' || url === '/groups') return Promise.resolve(ok([]));
+      if (url === '/nodes') return pendingNodes;
+      if (url.startsWith('/dashboard/history?range=')) {
+        return Promise.resolve(ok({ range: '24h', bucket_seconds: 300, points: [] }));
+      }
+      if (url === '/system/version') {
+        return Promise.resolve({ current_version: '1.0.0', latest_version: '', has_update: false, is_outdated: false, release_url: '', release_notes: '', published_at: '', check_failed: false, error_message: '' });
+      }
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    renderDashboard();
+    await flush();
+    expect(mockGet.mock.calls.filter(([url]) => url === '/admin/users')).toHaveLength(1);
+
+    await flush(10000);
+    expect(mockGet.mock.calls.filter(([url]) => url === '/admin/users')).toHaveLength(1);
+
+    resolveNodes(ok([]));
+    await flush();
+  });
+
+  it('keeps the newest version response when an older request finishes later', async () => {
+    type VersionResponse = {
+      current_version: string;
+      latest_version: string;
+      has_update: boolean;
+      is_outdated: boolean;
+      release_url: string;
+      release_notes: string;
+      published_at: string;
+      check_failed: boolean;
+      error_message: string;
+    };
+    let resolveInitial!: (value: VersionResponse) => void;
+    let resolveForced!: (value: VersionResponse) => void;
+    const initial = new Promise<VersionResponse>((resolve) => { resolveInitial = resolve; });
+    const forced = new Promise<VersionResponse>((resolve) => { resolveForced = resolve; });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/admin/users' || url === '/rules' || url === '/groups' || url === '/nodes') {
+        return Promise.resolve(ok([]));
+      }
+      if (url.startsWith('/dashboard/history?range=')) {
+        return Promise.resolve(ok({ range: '24h', bucket_seconds: 300, points: [] }));
+      }
+      if (url === '/system/version') return initial;
+      if (url === '/system/version?refresh=true') return forced;
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    renderDashboard();
+    await flush();
+    screen.getByRole('button', { name: /checkUpdate/ }).click();
+    await flush();
+
+    // A scheduled cached check must not supersede a pending manual refresh.
+    await flush(1800000);
+    expect(mockGet.mock.calls.filter(([url]) => url === '/system/version')).toHaveLength(1);
+    expect(mockGet.mock.calls.filter(([url]) => url === '/system/version?refresh=true')).toHaveLength(1);
+
+    resolveForced({ current_version: '2.0.0', latest_version: '', has_update: false, is_outdated: false, release_url: '', release_notes: '', published_at: '', check_failed: false, error_message: '' });
+    await flush();
+    expect(screen.getByText('v2.0.0')).toBeInTheDocument();
+
+    resolveInitial({ current_version: '1.0.0', latest_version: '', has_update: false, is_outdated: false, release_url: '', release_notes: '', published_at: '', check_failed: false, error_message: '' });
+    await flush();
+    expect(screen.getByText('v2.0.0')).toBeInTheDocument();
+    expect(screen.queryByText('v1.0.0')).not.toBeInTheDocument();
+  });
+
   it('renders one row per group with online/total and aggregates the rate', async () => {
     mockAll([
       ns(1, { node_id: 'a', online: true, upload_bps: 100, download_bps: 200, connections: 3 }),

@@ -668,8 +668,8 @@ mod tests {
     //
     // These tests PIN that behavior so a future "let's normalize to real HTTP
     // 401s" change can't land silently and break old nodes. The get_config
-    // change is gated by CONFIG_PROTOCOL_VERSION=8, so an old node is rejected
-    // with 426 before it can observe this contract.
+    // contract was introduced with protocol v8; any node that does not match
+    // the current protocol is rejected with 426 before it can observe it.
 
     /// report_traffic with NO Authorization header → HTTP 200, JSON code 401.
     #[tokio::test]

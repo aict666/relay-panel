@@ -115,6 +115,7 @@ describe('NodeGroupSection v1.2 node-version comparison', () => {
     render(
       <NodeGroupSection rows={rows} panelProtocol={0} latestNodeVersion="" nodeVersionCheckFailed={true} isMobile={false} t={t} openDetail={vi.fn()} onUpgrade={onUpgrade} />,
     );
+    expect(screen.getByLabelText('nodeUpgrade')).toHaveTextContent('-');
     const buttons = screen.queryAllByRole('button');
     for (const b of buttons) b.click();
     expect(onUpgrade).not.toHaveBeenCalled();

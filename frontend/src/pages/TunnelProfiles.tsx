@@ -1,6 +1,6 @@
 import { Table, Button, Modal, Form, Input, Select, Space, message, Popconfirm, Tag, Tooltip } from 'antd';
 import { PlusOutlined, ReloadOutlined, EditOutlined, ApartmentOutlined } from '@ant-design/icons';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, TunnelProfile } from '../api/types';
 import { useI18n } from '../i18n/context';
@@ -25,17 +25,20 @@ export default function TunnelProfiles() {
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
+    setProfiles([]);
     try {
       // v0.4.11 PR1: use /admin/tunnel-profiles for management page (returns only
       // custom ws/tls_simple templates, not builtin).
       const res = await api.get<unknown, ApiEnvelope<TunnelProfile[]>>('/admin/tunnel-profiles');
       setProfiles(res.data || []);
+    } catch {
+      message.error(t('loadFailed'));
     } finally { setLoading(false); }
-  };
+  }, [t]);
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [load]);
 
   const handleCreate = async (values: ProfileValues) => {
     try {
