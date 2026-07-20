@@ -263,25 +263,24 @@ export default function Tunnels() {
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]} className="rp-tunnel-name-field">
             <Input maxLength={100} />
           </Form.Item>
-          <div className="rp-tunnel-toggle-grid">
-            <Form.Item name="enabled" label={t('status')} valuePropName="checked" className="rp-tunnel-toggle-field">
-              <Switch checkedChildren={t('enabled')} unCheckedChildren={t('disabled')} />
-            </Form.Item>
-            <Form.Item
-              name="shared"
-              label={(
-                <Space size={5}>
-                  {t('tunnelUserSharing')}
-                  <Tooltip title={t('tunnelUserSharingHint')}>
-                    <QuestionCircleOutlined className="rp-tunnel-help-icon" />
-                  </Tooltip>
-                </Space>
-              )}
-              valuePropName="checked"
-              className="rp-tunnel-toggle-field"
-            >
-              <Switch />
-            </Form.Item>
+          <div className="rp-tunnel-setting-bar">
+            <div className="rp-tunnel-setting-item">
+              <Text>{t('status')}</Text>
+              <Form.Item name="enabled" valuePropName="checked" noStyle>
+                <Switch checkedChildren={t('enabled')} unCheckedChildren={t('disabled')} />
+              </Form.Item>
+            </div>
+            <div className="rp-tunnel-setting-item">
+              <Space size={5}>
+                <Text>{t('tunnelUserSharing')}</Text>
+                <Tooltip title={t('tunnelUserSharingHint')}>
+                  <QuestionCircleOutlined className="rp-tunnel-help-icon" />
+                </Tooltip>
+              </Space>
+              <Form.Item name="shared" valuePropName="checked" noStyle>
+                <Switch />
+              </Form.Item>
+            </div>
           </div>
           {editing?.shared && !watchedShared && editing.bound_rule_count > 0 && (
             <Alert
@@ -310,11 +309,16 @@ export default function Tunnels() {
             {(fields, { add, remove }, { errors }) => (
               <div className="rp-tunnel-path-editor">
                 <div className="rp-tunnel-path-heading">
-                  <Text strong><span className="rp-required-mark">*</span>{t('tunnelPath')}</Text>
-                  <Text type="secondary" className="rp-tunnel-path-hint">{t('tunnelHopCountHint')}</Text>
+                  <Space size={5}>
+                    <Text strong><span className="rp-required-mark">*</span>{t('tunnelPath')}</Text>
+                    <Tooltip title={t('tunnelHopCountHint')}>
+                      <QuestionCircleOutlined className="rp-tunnel-help-icon" />
+                    </Tooltip>
+                  </Space>
                 </div>
-                <Space orientation="vertical" style={{ width: '100%' }} size={10}>
+                <div className="rp-tunnel-hop-list">
                   {fields.map((field, index) => {
+                    const { key: fieldKey, ...fieldProps } = field;
                     const portMode = watchedHops[index]?.port_mode ?? 'auto';
                     const options = (index === 0 ? entryGroups : relayGroups).map(group => ({
                       value: group.id,
@@ -322,12 +326,12 @@ export default function Tunnels() {
                       disabled: selectedGroupIds.includes(group.id) && watchedHops[index]?.device_group_id !== group.id,
                     }));
                     return (
-                      <div key={field.key} className="rp-tunnel-hop-row">
+                      <div key={fieldKey} className="rp-tunnel-hop-row">
                         <Tag className="rp-tunnel-hop-role">
                           {index === 0 ? t('hopEntry') : index === fields.length - 1 ? t('hopExit') : `${t('hopMid')} ${index}`}
                         </Tag>
                         <Form.Item
-                          {...field}
+                          {...fieldProps}
                           name={[field.name, 'device_group_id']}
                           rules={[{ required: true, message: t('select') }]}
                           className="rp-tunnel-hop-group"
@@ -371,7 +375,7 @@ export default function Tunnels() {
                     </Button>
                   )}
                   <Form.ErrorList errors={errors} />
-                </Space>
+                </div>
               </div>
             )}
           </Form.List>
