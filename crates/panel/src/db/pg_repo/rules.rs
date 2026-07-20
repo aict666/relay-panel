@@ -1229,45 +1229,46 @@ impl RuleRepository for PgRepository {
             {
                 let mut set = query.separated(", ");
                 if let Some(value) = update.name.as_deref() {
-                    set.push("name = ").push_bind(value);
+                    set.push("name = ").push_bind_unseparated(value);
                 }
                 if let Some(value) = update.listen_port {
-                    set.push("listen_port = ").push_bind(value);
+                    set.push("listen_port = ").push_bind_unseparated(value);
                 }
                 if let Some(value) = update.protocol.as_deref() {
-                    set.push("protocol = ").push_bind(value);
+                    set.push("protocol = ").push_bind_unseparated(value);
                 }
                 if let Some(value) = update.public_transport.as_deref() {
-                    set.push("public_transport = ").push_bind(value);
+                    set.push("public_transport = ").push_bind_unseparated(value);
                     set.push("node_transport = ")
-                        .push_bind(update.node_transport.as_deref().unwrap_or(value));
+                        .push_bind_unseparated(update.node_transport.as_deref().unwrap_or(value));
                     set.push("entry_transport = ")
-                        .push_bind(update.entry_transport.as_deref().unwrap_or(value));
+                        .push_bind_unseparated(update.entry_transport.as_deref().unwrap_or(value));
                 }
                 if let Some(value) = update.route_mode.as_deref() {
-                    set.push("route_mode = ").push_bind(value);
+                    set.push("route_mode = ").push_bind_unseparated(value);
                 }
                 if let Some(value) = &update.ws_path {
-                    set.push("ws_path = ").push_bind(value.as_deref());
+                    set.push("ws_path = ")
+                        .push_bind_unseparated(value.as_deref());
                 }
                 if let Some(value) = update.device_group_in {
-                    set.push("device_group_in = ").push_bind(value);
+                    set.push("device_group_in = ").push_bind_unseparated(value);
                 }
                 if let Some(value) = update.device_group_out {
-                    set.push("device_group_out = ").push_bind(value);
+                    set.push("device_group_out = ").push_bind_unseparated(value);
                 }
                 if let Some(value) = update.forward_mode.as_deref() {
-                    set.push("forward_mode = ").push_bind(value);
+                    set.push("forward_mode = ").push_bind_unseparated(value);
                 }
                 if let Some(value) = update.target_addr.as_deref() {
-                    set.push("target_addr = ").push_bind(value);
+                    set.push("target_addr = ").push_bind_unseparated(value);
                 }
                 if let Some(value) = update.target_port {
-                    set.push("target_port = ").push_bind(value);
+                    set.push("target_port = ").push_bind_unseparated(value);
                 }
                 if let Some(value) = update.paused {
-                    set.push("paused = ").push_bind(value);
-                    set.push("auto_paused = ").push_bind(false);
+                    set.push("paused = ").push_bind_unseparated(value);
+                    set.push("auto_paused = ").push_bind_unseparated(false);
                 }
             }
             query.push(" WHERE id = ").push_bind(update.id);
