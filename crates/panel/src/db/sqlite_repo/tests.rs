@@ -4851,6 +4851,161 @@ async fn reusable_tunnel_repository_contract() {
 }
 
 #[tokio::test]
+async fn active_route_change_leases_old_downstream_ports_and_pause_revokes_them() {
+    let db = repo().await;
+    for (id, name, group_type, host) in [
+        (901, "entry", "in", "192.0.2.1"),
+        (902, "old-exit", "out", "192.0.2.2"),
+        (903, "new-exit", "out", "192.0.2.3"),
+    ] {
+        sqlx::query(
+            "INSERT INTO device_groups(id,name,group_type,token,uid,connect_host) \
+             VALUES(?,?,?,?,1,?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(group_type)
+        .bind(format!("route-transition-{id}"))
+        .bind(host)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let tunnel_id = db
+        .create_tunnel_full(
+            "new-preset",
+            true,
+            false,
+            1,
+            &[(901, None), (903, Some(42_003))],
+        )
+        .await
+        .unwrap();
+    let rule_id = sqlx::query(
+        "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+         device_group_in,device_group_out,target_addr,target_port) \
+         VALUES('moving',1,41001,'tcp_udp','chain','chain',901,902,'203.0.113.9',443)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO forward_rule_hops(rule_id,position,device_group_id,listen_port,tunnel_port) \
+         VALUES(?,0,901,41001,NULL),(?,1,902,41002,41003)",
+    )
+    .bind(rule_id)
+    .bind(rule_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.update_rule_full(&RuleUpdateData {
+        id: rule_id,
+        effective_device_group_in: 901,
+        route_mode: Some("chain".into()),
+        device_group_in: Some(901),
+        device_group_out: Some(Some(903)),
+        hops: Some(vec![]),
+        tunnel_id: Some(Some(tunnel_id)),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.list_route_transition_rule_ids_for_group(902)
+            .await
+            .unwrap(),
+        vec![rule_id]
+    );
+    let ports = db.list_group_port_protocols(902).await.unwrap();
+    assert!(ports.contains(&(41_002, "tcp_udp".into())));
+    assert!(ports.contains(&(41_003, "tcp".into())));
+    assert_eq!(
+        db.list_route_staging_rule_ids_for_group(901).await.unwrap(),
+        vec![rule_id]
+    );
+    assert!(matches!(
+        db.insert_quota_guarded(
+            "must-not-steal-draining-port",
+            1,
+            41_002,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            902,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+        )
+        .await,
+        Err(DbError::PortConflict)
+    ));
+    sqlx::query(
+        "UPDATE forward_rule_route_transitions SET activate_at=0,expires_at=0 WHERE rule_id=?",
+    )
+    .bind(rule_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        db.list_route_drain_rule_ids_for_group(902).await.unwrap(),
+        vec![rule_id]
+    );
+
+    db.update_rule_full(&RuleUpdateData {
+        id: rule_id,
+        effective_device_group_in: 901,
+        paused: Some(true),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert!(db
+        .list_route_transition_rule_ids_for_group(902)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .list_route_drain_rule_ids_for_group(902)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let direct_rule_id = sqlx::query(
+        "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+         device_group_in,target_addr,target_port) \
+         VALUES('direct-to-preset',1,41011,'tcp','direct','direct',901,'127.0.0.1',80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    db.update_rule_full(&RuleUpdateData {
+        id: direct_rule_id,
+        effective_device_group_in: 901,
+        route_mode: Some("chain".into()),
+        device_group_in: Some(901),
+        device_group_out: Some(Some(903)),
+        hops: Some(vec![]),
+        tunnel_id: Some(Some(tunnel_id)),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        db.list_route_staging_rule_ids_for_group(901).await.unwrap(),
+        vec![direct_rule_id],
+        "a newly added downstream path must pre-warm before entry activation"
+    );
+}
+
+#[tokio::test]
 async fn tunnel_entry_move_keeps_a_scoped_drain_and_billing_lease() {
     let db = repo().await;
     for (id, name, group_type, host) in [
@@ -4933,6 +5088,21 @@ async fn tunnel_entry_move_keeps_a_scoped_drain_and_billing_lease() {
         db.list_draining_tunnel_rule_ids_for_group(721)
             .await
             .unwrap(),
+        vec![rule_id]
+    );
+    assert_eq!(
+        db.list_route_transition_rule_ids_for_group(723)
+            .await
+            .unwrap(),
+        vec![rule_id],
+        "the old shared exit route must overlap while the path converges"
+    );
+    assert_eq!(
+        db.list_route_staging_rule_ids_for_group(721).await.unwrap(),
+        vec![rule_id]
+    );
+    assert_eq!(
+        db.list_route_staging_rule_ids_for_group(722).await.unwrap(),
         vec![rule_id]
     );
     assert_eq!(

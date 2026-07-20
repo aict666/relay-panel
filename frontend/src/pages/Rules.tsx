@@ -724,15 +724,12 @@ const IMPORT_DEFAULTS = {
         }
         if (r.tunnel_id) {
           const tunnel = tunnelMap.get(r.tunnel_id);
-          const path = tunnel ? tunnelPathText(tunnel) : hopPathText(r.tunnel_hops);
           return (
             <Space size={4} orientation="vertical">
               <Tag color={r.tunnel_enabled === false ? 'red' : 'geekblue'}>
                 {r.tunnel_name || tunnel?.name || `#${r.tunnel_id}`}
               </Tag>
-              <Text ellipsis={{ tooltip: path }} style={{ display: 'block', maxWidth: 170, fontSize: 12 }}>{path}</Text>
               {r.tunnel_enabled === false && <Text type="danger" style={{ fontSize: 12 }}>{t('tunnelDisabled')}</Text>}
-              {r.tunnel_shared === false && <Text type="warning" style={{ fontSize: 12 }}>{t('tunnelAdminOnly')}</Text>}
             </Space>
           );
         }
@@ -796,9 +793,6 @@ const IMPORT_DEFAULTS = {
                 least_latency: t('lbLeastLatency'),
                 least_connections: t('lbLeastConnections'),
               }[r.load_balance_strategy] ?? r.load_balance_strategy}</Tag>
-            )}
-            {(r.protocol === 'udp' || r.protocol === 'tcp_udp') && (r.route_mode === 'chain' || r.forward_mode === 'chain') && (
-              <Tooltip title={t('uotAutoHint')}><Tag color="purple">UOT Ready</Tag></Tooltip>
             )}
           </Space>
         );
@@ -986,13 +980,12 @@ const IMPORT_DEFAULTS = {
         <Space orientation="vertical" style={{ width: '100%' }} className="rp-target-editor">
           <Text strong>{t('targets')}</Text>
           {fields.map((field, index) => (
-            <Space key={field.key} align="baseline" wrap className="rp-target-row">
+            <div key={field.key} className="rp-target-row">
               <Form.Item
                 {...field}
                 name={[field.name, 'host']}
                 label={t('address')}
                 rules={[{ required: true }]}
-                style={{ marginBottom: 8 }}
                 className="rp-target-host"
               >
                 <Input placeholder={t('targetAddress')} />
@@ -1003,7 +996,7 @@ const IMPORT_DEFAULTS = {
                 label={t('targetWeight')}
                 initialValue={1}
                 rules={[{ required: true }]}
-                style={{ marginBottom: 8, width: 92 }}
+                className="rp-target-weight"
               >
                 <InputNumber min={1} max={100} style={{ width: '100%' }} />
               </Form.Item>
@@ -1022,29 +1015,54 @@ const IMPORT_DEFAULTS = {
                     },
                   },
                 ]}
-                style={{ marginBottom: 8 }}
                 className="rp-target-port"
               >
                 <InputNumber min={1} max={65535} placeholder={t('targetPort')} style={{ width: '100%' }} />
               </Form.Item>
-              <Form.Item
-                {...field}
-                name={[field.name, 'enabled']}
-                valuePropName="checked"
-                initialValue={true}
-                style={{ marginBottom: 8 }}
-              >
-                <Switch size="small" />
-              </Form.Item>
-              <Button size="small" icon={<ArrowUpOutlined />} aria-label={t('moveTargetUp')} disabled={index === 0} onClick={() => move(index, index - 1)} />
-              <Button size="small" icon={<ArrowDownOutlined />} aria-label={t('moveTargetDown')} disabled={index === fields.length - 1} onClick={() => move(index, index + 1)} />
-              <Button size="small" danger icon={<DeleteOutlined />} aria-label={t('deleteTarget')} disabled={fields.length <= 1} onClick={() => remove(field.name)} />
-            </Space>
+              <div className="rp-target-actions">
+                <Form.Item
+                  {...field}
+                  name={[field.name, 'enabled']}
+                  valuePropName="checked"
+                  initialValue={true}
+                  noStyle
+                >
+                  <Switch size="small" aria-label={t('enabled')} />
+                </Form.Item>
+                <Button type="text" size="small" icon={<ArrowUpOutlined />} title={t('moveTargetUp')} aria-label={t('moveTargetUp')} disabled={index === 0} onClick={() => move(index, index - 1)} />
+                <Button type="text" size="small" icon={<ArrowDownOutlined />} title={t('moveTargetDown')} aria-label={t('moveTargetDown')} disabled={index === fields.length - 1} onClick={() => move(index, index + 1)} />
+                <Button type="text" size="small" danger icon={<DeleteOutlined />} title={t('deleteTarget')} aria-label={t('deleteTarget')} disabled={fields.length <= 1} onClick={() => remove(field.name)} />
+              </div>
+            </div>
           ))}
-          <Button size="small" icon={<PlusOutlined />} onClick={() => add({ host: '', port: undefined as unknown as number, enabled: true, weight: 1 })}>{t('addTarget')}</Button>
+          <Button type="dashed" icon={<PlusOutlined />} block onClick={() => add({ host: '', port: undefined as unknown as number, enabled: true, weight: 1 })}>{t('addTarget')}</Button>
         </Space>
       )}
     </Form.List>
+  );
+
+  const loadBalanceLabel = (
+    <span>
+      {t('loadBalanceStrategy')}{' '}
+      <Tooltip
+        placement="top"
+        overlayStyle={{ maxWidth: 440 }}
+        title={(
+          <div className="rp-load-balance-help">
+            <strong>{t('lbStrategyBlockTitle')}</strong>
+            <div>• {t('lbFirstDesc')}</div>
+            <div>• {t('lbRoundRobinDesc')}</div>
+            <div>• {t('lbFailoverDesc')}</div>
+            <div>• {t('lbWeightedDesc')}</div>
+            <div>• {t('lbLeastLatencyDesc')}</div>
+            <div>• {t('lbLeastConnectionsDesc')}</div>
+            <div className="rp-load-balance-help-footer">{t('lbStrategyBlockFooter')}</div>
+          </div>
+        )}
+      >
+        <QuestionCircleOutlined className="rp-inline-help-icon" />
+      </Tooltip>
+    </span>
   );
 
   const exportMenuItems: MenuProps['items'] = [
@@ -1097,8 +1115,7 @@ const IMPORT_DEFAULTS = {
     if (r.tunnel_id) {
       const tunnel = tunnelMap.get(r.tunnel_id);
       const prefix = r.tunnel_name || tunnel?.name || `#${r.tunnel_id}`;
-      const path = tunnel ? tunnelPathText(tunnel) : hopPathText(r.tunnel_hops);
-      return `${prefix}: ${path}${r.tunnel_enabled === false ? ` · ${t('tunnelDisabled')}` : ''}${r.tunnel_shared === false ? ` · ${t('tunnelAdminOnly')}` : ''}`;
+      return `${prefix}${r.tunnel_enabled === false ? ` · ${t('tunnelDisabled')}` : ''}`;
     }
     const labels = (r.hops ?? []).map(h =>
       h.group_name || groupInfo.get(h.device_group_id)?.name || `#${h.device_group_id}`
@@ -1273,7 +1290,7 @@ const IMPORT_DEFAULTS = {
         />
       )}
 
-      <Modal title={t('addRule')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={620}>
+      <Modal title={t('addRule')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={680}>
         <Form
           form={createForm}
           onFinish={handleCreate}
@@ -1359,26 +1376,9 @@ const IMPORT_DEFAULTS = {
               label: t('tabForward'),
               children: (<>
                 {renderTargetsEditor()}
-                <Form.Item name="load_balance_strategy" label={t('loadBalanceStrategy')} initialValue="first">
+                <Form.Item name="load_balance_strategy" label={loadBalanceLabel} initialValue="first">
                   <Select options={strategyOptions} />
                 </Form.Item>
-                <Alert
-                  type="info"
-                  showIcon
-                  style={{ fontSize: 12, marginBottom: 16 }}
-                  title={t('lbStrategyBlockTitle')}
-                  description={
-                    <div>
-                      <div>• {t('lbFirstDesc')}</div>
-                      <div>• {t('lbRoundRobinDesc')}</div>
-                      <div>• {t('lbFailoverDesc')}</div>
-                      <div>• {t('lbWeightedDesc')}</div>
-                      <div>• {t('lbLeastLatencyDesc')}</div>
-                      <div>• {t('lbLeastConnectionsDesc')}</div>
-                      <div style={{ marginTop: 8, color: '#888' }}>{t('lbStrategyBlockFooter')}</div>
-                    </div>
-                  }
-                />
                 <Form.Item
                   label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
                   extra={t('rateLimitsHint')}
@@ -1394,7 +1394,7 @@ const IMPORT_DEFAULTS = {
         </Form>
       </Modal>
 
-      <Modal title={t('editRule')} open={editOpen} onCancel={() => setEditOpen(false)} onOk={() => editForm.submit()} okText={t('save')} cancelText={t('cancel')} width={620}>
+      <Modal title={t('editRule')} open={editOpen} onCancel={() => setEditOpen(false)} onOk={() => editForm.submit()} okText={t('save')} cancelText={t('cancel')} width={680}>
         <Form
           form={editForm}
           onFinish={handleUpdate}
@@ -1475,26 +1475,9 @@ const IMPORT_DEFAULTS = {
               label: t('tabForward'),
               children: (<>
                 {renderTargetsEditor()}
-                <Form.Item name="load_balance_strategy" label={t('loadBalanceStrategy')} initialValue="first">
+                <Form.Item name="load_balance_strategy" label={loadBalanceLabel} initialValue="first">
                   <Select options={strategyOptions} />
                 </Form.Item>
-                <Alert
-                  type="info"
-                  showIcon
-                  style={{ fontSize: 12, marginBottom: 16 }}
-                  title={t('lbStrategyBlockTitle')}
-                  description={
-                    <div>
-                      <div>• {t('lbFirstDesc')}</div>
-                      <div>• {t('lbRoundRobinDesc')}</div>
-                      <div>• {t('lbFailoverDesc')}</div>
-                      <div>• {t('lbWeightedDesc')}</div>
-                      <div>• {t('lbLeastLatencyDesc')}</div>
-                      <div>• {t('lbLeastConnectionsDesc')}</div>
-                      <div style={{ marginTop: 8, color: '#888' }}>{t('lbStrategyBlockFooter')}</div>
-                    </div>
-                  }
-                />
                 <Form.Item
                   label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
                   extra={t('rateLimitsHint')}
@@ -1537,8 +1520,7 @@ const IMPORT_DEFAULTS = {
         )}
       </Modal>
 
-      {/* v0.4.8: rule diagnosis modal — three sections: ingress node, target
-          egress, and panel dispatch summary. */}
+      {/* Relay-node listener and downstream TCP probe results. */}
       <Modal
         title={diagnosing ? `${t('diagnoseTitle')} · ${diagnosing.name} (#${diagnosing.id})` : t('diagnoseTitle')}
         open={!!diagnosing}
@@ -1550,8 +1532,6 @@ const IMPORT_DEFAULTS = {
           <div style={{ textAlign: 'center', padding: 32 }} aria-live="polite" aria-busy="true"><Spin tip={t('diagnoseRunning')} /></div>
         ) : diagnoseResult ? (
           <>
-            <Alert type="info" showIcon style={{ marginBottom: 16 }}
-              title={t('diagnoseScopeHint')} />
             {/* v0.4.14: only the relay-node's OWN TCP diagnosis is shown — the
                 node's listener status + its node→target TCP connectivity/latency.
                 The latency is the node→target TCP handshake time, NOT a client

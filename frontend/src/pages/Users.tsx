@@ -1,5 +1,6 @@
-import { Table, Button, Tag, Popconfirm, message, Progress, Tooltip, Modal, Form, Input, InputNumber, Switch, Space, Select, DatePicker, Divider } from 'antd';
-import { EditOutlined, ReloadOutlined, UndoOutlined, UserOutlined, PlusOutlined, KeyOutlined, ApiOutlined, ShoppingOutlined } from '@ant-design/icons';
+import { Table, Button, Tag, Popconfirm, message, Progress, Tooltip, Modal, Form, Input, InputNumber, Switch, Space, Select, DatePicker, Divider, Dropdown } from 'antd';
+import type { MenuProps } from 'antd';
+import { DeleteOutlined, EditOutlined, ReloadOutlined, UndoOutlined, UserOutlined, PlusOutlined, KeyOutlined, ApiOutlined, ShoppingOutlined, MoreOutlined } from '@ant-design/icons';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import dayjs, { type Dayjs } from 'dayjs';
@@ -273,6 +274,52 @@ export default function Users() {
     } finally { setSaving(false); }
   };
 
+  const userActionMenu = (u: User): MenuProps => ({
+    items: [
+      { key: 'rules', icon: <ApiOutlined />, label: t('manageRules') },
+      { key: 'reset-traffic', icon: <UndoOutlined />, label: t('resetTraffic') },
+      ...(isAdmin && !u.admin ? [
+        { type: 'divider' as const },
+        { key: 'password', icon: <KeyOutlined />, label: t('resetPassword') },
+        { key: 'suspend', label: u.suspended ? t('unsuspend') : t('suspend') },
+        { type: 'divider' as const },
+        { key: 'delete', icon: <DeleteOutlined />, label: t('delete'), danger: true },
+      ] : []),
+    ],
+    onClick: ({ key }) => {
+      if (key === 'rules') {
+        navigate(`/rules?owner_uid=${u.id}`);
+        return;
+      }
+      if (key === 'password') {
+        openReset(u);
+        return;
+      }
+      if (key === 'reset-traffic') {
+        Modal.confirm({
+          title: t('resetTrafficConfirm'),
+          onOk: () => handleResetTraffic(u.id),
+        });
+        return;
+      }
+      if (key === 'suspend') {
+        Modal.confirm({
+          title: u.suspended ? t('unsuspendConfirm') : t('suspendConfirm'),
+          onOk: () => handleToggleSuspend(u),
+        });
+        return;
+      }
+      if (key === 'delete') {
+        Modal.confirm({
+          title: t('deleteUserConfirm'),
+          okText: t('delete'),
+          okButtonProps: { danger: true },
+          onOk: () => handleDelete(u.id),
+        });
+      }
+    },
+  });
+
   const columns = [
     { title: t('id'), dataIndex: 'id', key: 'id', width: 60 },
     { title: t('username'), dataIndex: 'username', key: 'username' },
@@ -339,35 +386,13 @@ export default function Users() {
     },
     { title: t('joined'), dataIndex: 'created_at', key: 'created_at' },
     {
-      // v0.4.20: standalone "Rule Management" column for admin user-rule management.
-      title: t('manageRulesColumn'), key: 'manageRules', width: 70,
+      title: t('action'), key: 'action', width: 115,
       render: (_: unknown, u: User) => (
-        <Button icon={<ApiOutlined />} size="small" type="text" onClick={() => navigate(`/rules?owner_uid=${u.id}`)}>{t('manageRules')}</Button>
-      ),
-    },
-    {
-      title: t('action'), key: 'action', width: 210,
-      render: (_: unknown, u: User) => (
-        <Space size="small">
+        <Space size={0}>
           <Button icon={<EditOutlined />} size="small" type="text" onClick={() => openEdit(u)}>{t('edit')}</Button>
-          <Popconfirm title={t('resetTrafficConfirm')} onConfirm={() => handleResetTraffic(u.id)}>
-            <Button icon={<UndoOutlined />} size="small" type="text">{t('resetTraffic')}</Button>
-          </Popconfirm>
-          {/* v0.4.10 PR4: reset password — only for non-admin users (an admin
-              changes their own password via /account, never another admin's). */}
-          {isAdmin && !u.admin && (
-            <Popconfirm title={u.suspended ? t('unsuspendConfirm') : t('suspendConfirm')} onConfirm={() => handleToggleSuspend(u)}>
-              <Button size="small" type="text">{u.suspended ? t('unsuspend') : t('suspend')}</Button>
-            </Popconfirm>
-          )}
-          {isAdmin && !u.admin && (
-            <Button icon={<KeyOutlined />} size="small" type="text" onClick={() => openReset(u)}>{t('resetPassword')}</Button>
-          )}
-          {isAdmin && !u.admin && (
-            <Popconfirm title={t('deleteUserConfirm')} onConfirm={() => handleDelete(u.id)}>
-              <Button danger size="small" type="text">{t('delete')}</Button>
-            </Popconfirm>
-          )}
+          <Dropdown menu={userActionMenu(u)} trigger={['click']} placement="bottomRight">
+            <Button icon={<MoreOutlined />} size="small" type="text" aria-label={t('action')} title={t('action')} />
+          </Dropdown>
         </Space>
       ),
     },

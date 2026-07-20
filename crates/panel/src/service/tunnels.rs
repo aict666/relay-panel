@@ -43,6 +43,37 @@ fn map_db_error(error: DbError) -> TunnelError {
     }
 }
 
+/// Reusing a shared listener port is safe only when both its incoming identity
+/// and its complete downstream route are unchanged. Otherwise phase-one
+/// pre-warming would mutate the old path in place instead of building a
+/// parallel new path, recreating the very switch-order outage it prevents.
+fn can_reuse_hop_port(
+    old_hops: &[TunnelHop],
+    requested: &[TunnelHopRequest],
+    position: usize,
+) -> bool {
+    let Some(old_position) = old_hops
+        .iter()
+        .position(|old| old.device_group_id == requested[position].device_group_id)
+    else {
+        return false;
+    };
+    let suffix_unchanged = old_hops.len() == requested.len()
+        && old_hops[position..]
+            .iter()
+            .zip(&requested[position..])
+            .all(|(old, new)| {
+                old.device_group_id == new.device_group_id
+                    && new
+                        .listen_port
+                        .is_none_or(|port| old.listen_port == Some(i32::from(port)))
+            });
+    old_position == position
+        && position > 0
+        && old_hops[old_position - 1].device_group_id == requested[position - 1].device_group_id
+        && suffix_unchanged
+}
+
 async fn resolve_hops(
     db: &dyn Repository,
     requested: &[TunnelHopRequest],
@@ -88,28 +119,42 @@ async fn resolve_hops(
             return Err(TunnelError::MissingConnectHost);
         }
 
+        let safe_old_port = can_reuse_hop_port(old_hops, requested, position)
+            .then(|| old_ports.get(&group.id).copied().flatten())
+            .flatten();
         let port = if let Some(port) = hop.listen_port {
             if port == 0 {
                 return Err(TunnelError::InvalidPort);
             }
-            let conflicts = db
-                .list_group_port_protocols(group.id)
-                .await
-                .map_err(TunnelError::Database)?
-                .into_iter()
-                .any(|(used, protocol)| {
-                    used == i32::from(port)
-                        && matches!(protocol.as_str(), "tcp" | "tcp_udp")
-                        && old_ports.get(&group.id).copied().flatten() != Some(used)
-                });
-            if conflicts {
-                return Err(TunnelError::PortConflict {
-                    group_id: group.id,
-                    port,
-                });
+            // The edit form sends the persisted port back even when the user
+            // did not explicitly pin it. If the incoming link changed, choose
+            // a fresh port automatically so old/new HMAC contexts can coexist.
+            if old_ports.get(&group.id).copied().flatten() == Some(i32::from(port))
+                && safe_old_port.is_none()
+            {
+                auto_assign_port(db, group.id, "tcp")
+                    .await
+                    .map_err(TunnelError::PortPool)?
+            } else {
+                let conflicts = db
+                    .list_group_port_protocols(group.id)
+                    .await
+                    .map_err(TunnelError::Database)?
+                    .into_iter()
+                    .any(|(used, protocol)| {
+                        used == i32::from(port)
+                            && matches!(protocol.as_str(), "tcp" | "tcp_udp")
+                            && safe_old_port != Some(used)
+                    });
+                if conflicts {
+                    return Err(TunnelError::PortConflict {
+                        group_id: group.id,
+                        port,
+                    });
+                }
+                port
             }
-            port
-        } else if let Some(old) = old_ports.get(&group.id).copied().flatten() {
+        } else if let Some(old) = safe_old_port {
             old as u16
         } else {
             auto_assign_port(db, group.id, "tcp")
@@ -187,12 +232,14 @@ pub async fn update_tunnel(
     };
 
     let has_new_auto_port = req.hops.as_ref().is_some_and(|requested| {
-        requested.iter().skip(1).any(|hop| {
-            hop.listen_port.is_none()
-                && !current
-                    .hops
-                    .iter()
-                    .any(|old| old.device_group_id == hop.device_group_id)
+        requested.iter().enumerate().skip(1).any(|(position, hop)| {
+            hop.listen_port.is_none() && !can_reuse_hop_port(&current.hops, requested, position)
+                || hop.listen_port.is_some()
+                    && !can_reuse_hop_port(&current.hops, requested, position)
+                    && current.hops.iter().any(|old| {
+                        old.device_group_id == hop.device_group_id
+                            && old.listen_port.map(|port| port as u16) == hop.listen_port
+                    })
         })
     });
     let mut attempts = 0;

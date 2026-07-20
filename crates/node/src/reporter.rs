@@ -1390,6 +1390,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
 
         // apply_config should return promptly even for 1000 rules — the diff

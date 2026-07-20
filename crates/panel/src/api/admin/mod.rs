@@ -13,6 +13,19 @@ mod shop;
 mod tunnels;
 mod users;
 
+fn schedule_route_transition_activation(state: &crate::api::AppState) {
+    let connections = state.node_connections.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(
+            crate::db::repo::ROUTE_TRANSITION_STAGE_SECS as u64,
+        ))
+        .await;
+        connections
+            .broadcast_all(r#"{"type":"config_changed"}"#)
+            .await;
+    });
+}
+
 pub use groups::*;
 pub use password::*;
 pub use plans::*;
@@ -3864,6 +3877,12 @@ mod tests {
         )
         .await;
         assert_eq!(updated.code, 0, "{}", updated.message);
+        let updated_tunnel = updated.data.expect("updated tunnel");
+        assert_ne!(
+            updated_tunnel.hops[1].listen_port,
+            tunnel.hops[1].listen_port,
+            "changing the upstream group must allocate a second shared port so old/new HMAC links overlap"
+        );
         let endpoints: (i64, Option<i64>) = sqlx::query_as(
             "SELECT device_group_in,device_group_out FROM forward_rules WHERE name='move-with-route'",
         )

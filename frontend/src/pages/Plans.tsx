@@ -2,7 +2,7 @@ import { Table, Button, Modal, Form, Input, InputNumber, Select, Switch, Space, 
 import { PlusOutlined, ReloadOutlined, EditOutlined, ShoppingOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useState } from 'react';
 import api from '../api/client';
-import type { ApiEnvelope, Plan, DeviceGroup } from '../api/types';
+import type { ApiEnvelope, Plan, DeviceGroup, Tunnel } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 
@@ -25,6 +25,7 @@ export default function Plans() {
   const { t } = useI18n();
   const [plans, setPlans] = useState<Plan[]>([]);
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
+  const [tunnels, setTunnels] = useState<Tunnel[]>([]);
   const [loading, setLoading] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -40,18 +41,22 @@ export default function Plans() {
   // duration field for data plans instead of offering a no-op input.
   const createPlanType = Form.useWatch('plan_type', createForm);
   const editPlanType = Form.useWatch('plan_type', editForm);
+  const createGroupIds = Form.useWatch('device_group_ids', createForm) as number[] | undefined;
+  const editGroupIds = Form.useWatch('device_group_ids', editForm) as number[] | undefined;
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [plansRes, groupsRes] = await Promise.all([
+      const [plansRes, groupsRes, tunnelsRes] = await Promise.all([
         api.get<unknown, ApiEnvelope<Plan[]>>('/admin/plans'),
         api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
+        api.get<unknown, ApiEnvelope<Tunnel[]>>('/admin/tunnels'),
       ]);
       setPlans(plansRes.data || []);
       // Only inbound-capable groups are meaningful as plan grants. A `both`
       // group can be a rule entry and therefore belongs in this list too.
       setGroups((groupsRes.data || []).filter((g) => g.group_type === 'in' || g.group_type === 'both'));
+      setTunnels(tunnelsRes.data || []);
     } finally { setLoading(false); }
   }, []);
 
@@ -62,6 +67,31 @@ export default function Plans() {
     (id: number) => groups.find((g) => g.id === id)?.name ?? `#${id}`,
     [groups],
   );
+
+  // Tunnel access deliberately follows the existing line authorization model:
+  // a user can select a shared tunnel only when their plan grants its entry
+  // group. Surface that derived set here so the effective permission is no
+  // longer hidden from administrators.
+  const grantedTunnels = useCallback((grantAll: boolean, groupIds: number[]) => {
+    const allowed = new Set(groupIds);
+    return tunnels.filter((tunnel) => {
+      const entryGroupId = tunnel.hops[0]?.device_group_id;
+      return tunnel.shared && entryGroupId != null && (grantAll || allowed.has(entryGroupId));
+    });
+  }, [tunnels]);
+
+  const tunnelGrantPreview = (grantAll: boolean, groupIds: number[]) => {
+    const granted = grantedTunnels(grantAll, groupIds);
+    return (
+      <div className="rp-plan-tunnel-grants">
+        {granted.length > 0 ? granted.map((tunnel) => (
+          <Tag key={tunnel.id} color={tunnel.enabled ? 'geekblue' : 'default'}>
+            {tunnel.name}{tunnel.enabled ? '' : ` · ${t('disabled')}`}
+          </Tag>
+        )) : <Text type="secondary">-</Text>}
+      </div>
+    );
+  };
 
   const handleCreate = async (values: {
     name: string; max_rules: number; traffic_gb: number; price: string;
@@ -146,6 +176,12 @@ export default function Plans() {
     }
   };
 
+  const openCreate = () => {
+    createForm.resetFields();
+    setCreateGrantAll(false);
+    setCreateOpen(true);
+  };
+
   const columns = [
     { title: t('id'), dataIndex: 'id', key: 'id', width: 60 },
     { title: t('name'), dataIndex: 'name', key: 'name' },
@@ -167,6 +203,15 @@ export default function Plans() {
         const ids = p.device_group_ids || [];
         if (ids.length === 0) return <Text type="secondary">-</Text>;
         return <span>{ids.map(groupName).join(', ')}</span>;
+      },
+    },
+    {
+      title: t('planGrantTunnels'), key: 'grant_tunnels', width: 180,
+      render: (_: unknown, p: Plan) => {
+        const granted = grantedTunnels(!!p.grant_all_groups, p.device_group_ids || []);
+        if (granted.length === 0) return <Text type="secondary">-</Text>;
+        const names = granted.map((tunnel) => tunnel.name).join(', ');
+        return <Text ellipsis={{ tooltip: names }}>{names}</Text>;
       },
     },
     { title: t('planPrice'), dataIndex: 'price', key: 'price', render: (v: string) => <span className="rp-mono">{v}</span> },
@@ -193,7 +238,7 @@ export default function Plans() {
         <h2 className="rp-page-title"><ShoppingOutlined /> {t('planManagement')}</h2>
         <Space className="rp-page-actions" wrap>
           <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>{t('addPlan')}</Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>{t('addPlan')}</Button>
         </Space>
       </div>
       <Table className="rp-responsive-table" dataSource={plans} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} scroll={{ x: 'max-content' }} />
@@ -237,6 +282,9 @@ export default function Plans() {
               placeholder={t('planGrantGroupsPlaceholder')}
               options={groups.map((g) => ({ value: g.id, label: g.name }))}
             />
+          </Form.Item>
+          <Form.Item label={t('planGrantTunnels')}>
+            {tunnelGrantPreview(createGrantAll, createGroupIds || [])}
           </Form.Item>
           <Space align="start" style={{ display: 'flex' }}>
             <Form.Item name="hidden" label={t('planHidden')} valuePropName="checked" style={{ flex: 1 }}>
@@ -287,6 +335,9 @@ export default function Plans() {
               placeholder={t('planGrantGroupsPlaceholder')}
               options={groups.map((g) => ({ value: g.id, label: g.name }))}
             />
+          </Form.Item>
+          <Form.Item label={t('planGrantTunnels')}>
+            {tunnelGrantPreview(editGrantAll, editGroupIds || [])}
           </Form.Item>
           <Space align="start" style={{ display: 'flex' }}>
             <Form.Item name="hidden" label={t('planHidden')} valuePropName="checked" style={{ flex: 1 }}><Switch /></Form.Item>

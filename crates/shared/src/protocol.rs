@@ -55,7 +55,10 @@ where
 /// v8 = reusable preset tunnels: NodeConfigResponse carries shared authenticated
 /// tunnel listeners and rule entry listeners can dial them with a routing
 /// handshake. Old nodes cannot safely interpret this topology.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 8;
+/// v9 = make live route changes overlap safely. The panel marks old downstream
+/// rule generations with a short route-transition lease; nodes keep those
+/// listeners/routes accepting until the new path has reached every hop.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 9;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -180,6 +183,22 @@ pub struct NodeConfigResponse {
     /// accepting immediately but keeps their runtime/counters until idle.
     #[serde(default)]
     pub drain_rule_ids: Vec<i64>,
+    /// Rules whose previous *downstream* path is temporarily valid during an
+    /// active-to-active route change. A node keeps matching old listeners and
+    /// shared-tunnel routes accepting while the id is present, so independently
+    /// polling hops cannot create a connection-refused window. Pause, delete,
+    /// authorization loss and credential revocation never grant this lease.
+    #[serde(default)]
+    pub route_transition_rule_ids: Vec<i64>,
+    /// Rules whose new downstream path is being pre-warmed. Entry nodes keep
+    /// the previous public listener generation until this short staging marker
+    /// disappears; downstream nodes still apply the new snapshot immediately.
+    #[serde(default)]
+    pub route_staging_rule_ids: Vec<i64>,
+    /// Expired overlap leases whose accept socket must stay closed while any
+    /// already-established ordinary TCP streams finish naturally.
+    #[serde(default)]
+    pub route_drain_rule_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

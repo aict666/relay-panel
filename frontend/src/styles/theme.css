@@ -445,14 +445,124 @@ html, body, #root {
   min-width: 0;
 }
 
-/* Target rows mix fields with icon buttons, so an even split is wrong: the
- * address takes the slack, port and the move/delete buttons keep their size. */
-.rp-target-row {
-  width: 100%;
+/* Preset tunnel editor: keep the important choices visible without turning
+ * two switches and a short route into a tall, sparse form. */
+.rp-tunnel-name-field {
+  margin-bottom: 14px;
 }
-.rp-target-row > .ant-space-item:first-child {
-  flex: 1 1 200px;
-  min-width: 0;
+.rp-tunnel-toggle-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.rp-tunnel-toggle-field {
+  margin-bottom: 0 !important;
+  padding: 10px 12px;
+  border: 1px solid var(--rp-hairline);
+  border-radius: var(--rp-radius-sm);
+  background: var(--rp-subtle-bg);
+}
+.rp-tunnel-toggle-field .ant-form-item-row {
+  display: flex;
+  flex-flow: row nowrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.rp-tunnel-toggle-field .ant-form-item-label {
+  flex: 1 1 auto;
+  padding: 0 !important;
+  text-align: start;
+}
+.rp-tunnel-toggle-field .ant-form-item-control {
+  flex: 0 0 auto;
+}
+.rp-tunnel-help-icon {
+  color: var(--rp-text-tertiary);
+  cursor: help;
+}
+.rp-tunnel-path-editor {
+  margin-top: 2px;
+}
+.rp-tunnel-path-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.rp-required-mark {
+  margin-inline-end: 4px;
+  color: var(--ant-color-error, #ff4d4f);
+}
+.rp-tunnel-path-hint {
+  font-size: 12px;
+  text-align: end;
+}
+.rp-tunnel-hop-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  min-height: 54px;
+  padding: 10px;
+  border: 1px solid var(--rp-hairline);
+  border-radius: var(--rp-radius-sm);
+  background: var(--rp-subtle-bg);
+}
+.rp-tunnel-hop-role {
+  flex: 0 0 54px;
+  margin: 5px 0 0;
+  text-align: center;
+}
+.rp-tunnel-hop-group {
+  flex: 1 1 260px;
+  min-width: 180px;
+  margin-bottom: 0 !important;
+}
+.rp-tunnel-port-controls {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+.rp-tunnel-port-mode,
+.rp-tunnel-fixed-port {
+  width: 112px;
+  margin-bottom: 0 !important;
+}
+.rp-tunnel-remove-hop {
+  flex: 0 0 auto;
+}
+.rp-tunnel-add-hop {
+  height: 40px;
+}
+
+@media (max-width: 767px) {
+  .rp-tunnel-toggle-grid {
+    grid-template-columns: 1fr;
+  }
+  .rp-tunnel-path-heading {
+    display: block;
+  }
+  .rp-tunnel-path-hint {
+    display: block;
+    margin-top: 2px;
+    text-align: start;
+  }
+  .rp-tunnel-hop-row {
+    flex-wrap: wrap;
+  }
+  .rp-tunnel-hop-role {
+    flex-basis: 48px;
+  }
+  .rp-tunnel-hop-group {
+    flex: 1 1 calc(100% - 58px);
+  }
+  .rp-tunnel-port-controls {
+    flex: 1 1 100%;
+    padding-inline-start: 58px;
+  }
 }
 
 /* Segmented (language switch) */
@@ -712,16 +822,73 @@ html, body, #root {
 }
 
 .rp-target-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 76px 106px auto;
+  align-items: end;
+  gap: 10px;
   width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--rp-hairline);
+  border-radius: var(--rp-radius-sm);
+  background: var(--rp-subtle-bg);
 }
 
-.rp-target-host {
-  width: 100%;
-  min-width: 180px;
+.rp-target-row .ant-form-item {
+  min-width: 0;
+  margin-bottom: 0;
 }
 
+.rp-target-host,
+.rp-target-weight,
 .rp-target-port {
-  width: 110px;
+  width: 100%;
+}
+
+.rp-target-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  min-height: 32px;
+}
+
+.rp-target-actions .ant-switch {
+  margin-inline-end: 3px;
+}
+
+.rp-target-actions .ant-btn {
+  padding-inline: 6px;
+}
+
+.rp-inline-help-icon {
+  color: var(--rp-text-tertiary);
+  cursor: help;
+}
+
+.rp-load-balance-help {
+  line-height: 1.55;
+}
+
+.rp-load-balance-help > strong {
+  display: block;
+  margin-bottom: 5px;
+}
+
+.rp-load-balance-help-footer {
+  margin-top: 7px;
+  opacity: 0.72;
+}
+
+.rp-plan-tunnel-grants {
+  min-height: 34px;
+  padding: 5px 8px;
+  border: 1px solid var(--rp-hairline);
+  border-radius: var(--rp-radius-sm);
+  background: var(--rp-subtle-bg);
+}
+
+.rp-plan-tunnel-grants .ant-tag {
+  margin-block: 2px;
 }
 
 .rp-chain-select {
@@ -1101,32 +1268,23 @@ html, body, #root {
     flex: 1 1 100%;
   }
 
-  .rp-target-row,
   .rp-chain-row {
     display: flex;
     flex-wrap: wrap;
   }
 
-  /* Address gets its own line; port shares the second line with the enable
-     switch and the move/delete buttons. Sizing has to happen on the Space's
-     item wrappers — the Form.Item inside them is not the flex child. */
-  .rp-target-row > .ant-space-item:first-child {
-    flex: 1 1 100%;
+  .rp-target-row {
+    grid-template-columns: minmax(0, 1fr) minmax(86px, 0.36fr);
+    gap: 8px;
   }
 
-  .rp-target-row > .ant-space-item:nth-child(2) {
-    flex: 1 1 80px;
-    min-width: 0;
+  .rp-target-host {
+    grid-column: 1 / -1;
   }
 
-  .rp-target-host,
-  .rp-target-port {
-    width: 100%;
-    min-width: 0;
-  }
-
-  .rp-target-row .ant-btn {
-    padding-inline: 8px;
+  .rp-target-actions {
+    grid-column: 1 / -1;
+    align-self: end;
   }
 
   .rp-net-ip {

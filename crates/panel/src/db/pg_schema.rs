@@ -184,6 +184,18 @@ CREATE TABLE IF NOT EXISTS forward_rule_retired_entries (
 CREATE INDEX IF NOT EXISTS idx_forward_rule_retired_entries_group
     ON forward_rule_retired_entries (device_group_id, tunnel_id, rule_id);
 
+CREATE TABLE IF NOT EXISTS forward_rule_route_transitions (
+    rule_id BIGINT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+    device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+    protocol TEXT NOT NULL CHECK (protocol IN ('tcp', 'udp', 'tcp_udp')),
+    activate_at BIGINT NOT NULL DEFAULT 0,
+    expires_at BIGINT NOT NULL,
+    PRIMARY KEY (rule_id, device_group_id, listen_port, protocol)
+);
+CREATE INDEX IF NOT EXISTS idx_forward_rule_route_transitions_group
+    ON forward_rule_route_transitions (device_group_id, listen_port, expires_at, rule_id);
+
 CREATE TABLE IF NOT EXISTS forward_rule_targets (
     id BIGSERIAL PRIMARY KEY,
     rule_id BIGINT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
@@ -343,7 +355,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 31;
+pub const PG_SCHEMA_VERSION: i32 = 33;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1438,6 +1450,57 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 31: entry-drain leases are bounded and renewable");
     }
 
+    // Revision 32: keep the old downstream path accepting briefly while an
+    // active rule/tunnel route converges independently across nodes.
+    if current < 32 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS forward_rule_route_transitions (
+                rule_id BIGINT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+                device_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+                listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+                protocol TEXT NOT NULL CHECK (protocol IN ('tcp', 'udp', 'tcp_udp')),
+                activate_at BIGINT NOT NULL DEFAULT 0,
+                expires_at BIGINT NOT NULL,
+                PRIMARY KEY (rule_id, device_group_id, listen_port, protocol)
+            )"#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_forward_rule_route_transitions_group \
+             ON forward_rule_route_transitions (device_group_id, listen_port, expires_at, rule_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (32) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 32: downstream route-transition leases present");
+    }
+
+    // Revision 33: split route changes into downstream staging and entry
+    // activation phases. Existing transition rows skip staging safely.
+    if current < 33 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE forward_rule_route_transitions \
+             ADD COLUMN IF NOT EXISTS activate_at BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (33) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 33: route-transition staging timestamp present");
+    }
+
     Ok(())
 }
 
@@ -1450,7 +1513,7 @@ mod tests {
         // Keep the early-return guard in run_pg_migrations aligned with the
         // highest ordered migration below. A lower value silently skips newer
         // migrations on existing PostgreSQL databases.
-        assert_eq!(PG_SCHEMA_VERSION, 31);
+        assert_eq!(PG_SCHEMA_VERSION, 33);
     }
 
     // A `;` inside a -- line comment must NOT split a statement. This is the

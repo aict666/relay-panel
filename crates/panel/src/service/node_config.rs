@@ -138,6 +138,9 @@ async fn build_node_config_inner(
                 credential_revisions,
                 terminate_tunnel_ids: vec![],
                 drain_rule_ids: vec![],
+                route_transition_rule_ids: vec![],
+                route_staging_rule_ids: vec![],
+                route_drain_rule_ids: vec![],
             })
         }
     };
@@ -390,12 +393,20 @@ async fn build_node_config_inner(
     tunnels.extend(entry_tunnel_configs);
     let terminate_tunnel_ids = db.list_disabled_bound_tunnel_ids().await?;
     let drain_rule_ids = db.list_draining_tunnel_rule_ids_for_group(group.id).await?;
+    let route_transition_rule_ids = db
+        .list_route_transition_rule_ids_for_group(group.id)
+        .await?;
+    let route_staging_rule_ids = db.list_route_staging_rule_ids_for_group(group.id).await?;
+    let route_drain_rule_ids = db.list_route_drain_rule_ids_for_group(group.id).await?;
     Ok(NodeConfigResponse {
         listeners,
         tunnels,
         credential_revisions,
         terminate_tunnel_ids,
         drain_rule_ids,
+        route_transition_rule_ids,
+        route_staging_rule_ids,
+        route_drain_rule_ids,
     })
 }
 

@@ -10,6 +10,40 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-07-20
+
+### Changed
+
+- **Configuration protocol is now 9.** Live preset-tunnel route and port
+  changes use a two-phase handoff: nodes pre-stage the replacement path, begin
+  accepting it after a short activation window, and retain the previous
+  generation only long enough for established streams to drain.
+- **Administrative forms are denser and less repetitive.** Tunnel and target
+  editors use compact responsive rows, user actions are grouped into a menu,
+  verbose guidance is moved to contextual help or removed, and rule tables show
+  preset names without duplicating their full path.
+- **Plan tunnel access is visible.** Plan tables and editors now show the shared
+  tunnels implied by the plan's authorized entry lines, keeping the existing
+  authorization model while making the effective permission explicit.
+
+### Fixed
+
+- **Changing a live tunnel no longer creates a remove-before-add outage.** The
+  panel persists bounded staging/overlap leases transactionally, broadcasts the
+  prepared snapshot, and sends a second activation snapshot after five seconds;
+  old TCP streams can drain for up to sixty seconds without accepting new work.
+- **Safety revocations still take effect immediately.** Pausing a rule,
+  disabling or unsharing a tunnel, deleting a route, or rotating a device-group
+  credential overrides every transition lease and closes the affected old
+  generation instead of preserving it for availability.
+
+### Tests
+
+- Added SQLite/PostgreSQL parity coverage for transition creation, expiry,
+  rollback, fresh-port allocation, and authorization revocation, plus node
+  manager tests for staged entries, shared-listener overlap, natural drain, and
+  termination precedence.
+
 ## [1.3.3] - 2026-07-20
 
 ### Added

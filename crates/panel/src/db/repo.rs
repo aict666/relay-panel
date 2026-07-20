@@ -784,6 +784,14 @@ pub trait TunnelProfileRepository: Send + Sync {
 /// long enough for several default poll cycles and bounds authority after the
 /// final stream closes or the old node disappears.
 pub const ENTRY_DRAIN_LEASE_TTL_SECS: i64 = 5 * 60;
+/// Active route changes keep the previous downstream listeners/routes valid
+/// long enough for independently polling nodes to converge. This is not an
+/// accounting or authorization lease and is deliberately much shorter than an
+/// established-connection drain lease.
+pub const ROUTE_TRANSITION_LEASE_TTL_SECS: i64 = 60;
+/// Online nodes receive an immediate staging push and a second activation push
+/// after this delay. Periodic polling is the fallback if the panel restarts.
+pub const ROUTE_TRANSITION_STAGE_SECS: i64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelDeleteOutcome {
@@ -858,6 +866,22 @@ pub trait TunnelRepository: Send + Sync {
         &self,
         group_id: i64,
     ) -> Result<Vec<i64>, DbError>;
+    /// Active, authorized rules whose cached old downstream path may keep
+    /// accepting during a bounded active-to-active topology transition.
+    async fn list_route_transition_rule_ids_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<i64>, DbError>;
+    /// Active route changes that are still in phase one. Current and retired
+    /// entry groups keep their old public listener generation during this time.
+    async fn list_route_staging_rule_ids_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<i64>, DbError>;
+    /// Still-authorized rules whose old overlap window ended. Nodes close the
+    /// old accept socket but keep established TCP streams until idle.
+    async fn list_route_drain_rule_ids_for_group(&self, group_id: i64)
+        -> Result<Vec<i64>, DbError>;
     /// Current entry plus every historical preset-tunnel entry recorded for a
     /// rule. Explicit restart is a termination command, so it deliberately
     /// includes expired tombstones: a stale node that still has an old runtime

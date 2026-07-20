@@ -322,6 +322,14 @@ impl RuleRepository for SqliteRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.extend(preset_tunnel_rows);
+        let transition_rows: Vec<(i32, String)> = sqlx::query_as(
+            "SELECT listen_port,protocol FROM forward_rule_route_transitions \
+             WHERE device_group_id=? AND expires_at>=unixepoch()",
+        )
+        .bind(device_group_in)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.extend(transition_rows);
         Ok(rows)
     }
 
@@ -388,12 +396,19 @@ impl RuleRepository for SqliteRepository {
         // overlapping socket type (TCP-bearing vs TCP-bearing, UDP-bearing vs
         // UDP-bearing). A pure-TCP and a pure-UDP rule do NOT conflict.
         let conflict: Result<Option<(i64,)>, sqlx::Error> = sqlx::query_as(
-            "SELECT 1 FROM forward_rules \
-             WHERE device_group_in = ? AND listen_port = ? \
-               AND ( (? = 1 AND protocol IN ('tcp', 'tcp_udp')) \
-                  OR (? = 1 AND protocol IN ('udp', 'tcp_udp')) ) \
-             LIMIT 1",
+            "SELECT 1 WHERE EXISTS(SELECT 1 FROM forward_rules \
+               WHERE device_group_in=? AND listen_port=? \
+                 AND ((?=1 AND protocol IN ('tcp','tcp_udp')) \
+                   OR (?=1 AND protocol IN ('udp','tcp_udp')))) \
+             OR EXISTS(SELECT 1 FROM forward_rule_route_transitions \
+               WHERE device_group_id=? AND listen_port=? AND expires_at>=unixepoch() \
+                 AND ((?=1 AND protocol IN ('tcp','tcp_udp')) \
+                   OR (?=1 AND protocol IN ('udp','tcp_udp')))) LIMIT 1",
         )
+        .bind(device_group_in)
+        .bind(listen_port)
+        .bind(needs_tcp as i32)
+        .bind(needs_udp as i32)
         .bind(device_group_in)
         .bind(listen_port)
         .bind(needs_tcp as i32)
@@ -567,7 +582,11 @@ impl RuleRepository for SqliteRepository {
                  OR (?=1 AND EXISTS (SELECT 1 FROM forward_rule_hops \
                    WHERE device_group_id=? AND tunnel_port=?)) \
                  OR (?=1 AND EXISTS (SELECT 1 FROM tunnel_hops \
-                   WHERE device_group_id=? AND listen_port=?)) LIMIT 1",
+                   WHERE device_group_id=? AND listen_port=?)) \
+                 OR EXISTS (SELECT 1 FROM forward_rule_route_transitions \
+                   WHERE device_group_id=? AND listen_port=? AND expires_at>=unixepoch() \
+                     AND ((?=1 AND protocol IN ('tcp','tcp_udp')) \
+                       OR (?=1 AND protocol IN ('udp','tcp_udp')))) LIMIT 1",
             )
             .bind(device_group_in)
             .bind(listen_port)
@@ -583,6 +602,10 @@ impl RuleRepository for SqliteRepository {
             .bind(needs_tcp as i32)
             .bind(device_group_in)
             .bind(listen_port)
+            .bind(device_group_in)
+            .bind(listen_port)
+            .bind(needs_tcp as i32)
+            .bind(needs_udp as i32)
             .fetch_optional(&mut *conn)
             .await
         );
@@ -601,12 +624,17 @@ impl RuleRepository for SqliteRepository {
                        WHERE h.device_group_id=? AND h.listen_port=? \
                        AND ((?=1 AND r.protocol IN ('tcp','tcp_udp')) OR (?=1 AND r.protocol IN ('udp','tcp_udp')))) \
                      OR (?=1 AND EXISTS (SELECT 1 FROM forward_rule_hops WHERE device_group_id=? AND tunnel_port=?)) \
-                     OR (?=1 AND EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=? AND listen_port=?)) LIMIT 1",
+                     OR (?=1 AND EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=? AND listen_port=?)) \
+                     OR EXISTS (SELECT 1 FROM forward_rule_route_transitions \
+                       WHERE device_group_id=? AND listen_port=? AND expires_at>=unixepoch() \
+                         AND ((?=1 AND protocol IN ('tcp','tcp_udp')) \
+                           OR (?=1 AND protocol IN ('udp','tcp_udp')))) LIMIT 1",
                 )
                 .bind(group_id).bind(hop_port).bind(needs_tcp as i32).bind(needs_udp as i32)
                 .bind(group_id).bind(hop_port).bind(needs_tcp as i32).bind(needs_udp as i32)
                 .bind(needs_tcp as i32).bind(group_id).bind(hop_port)
                 .bind(needs_tcp as i32).bind(group_id).bind(hop_port)
+                .bind(group_id).bind(hop_port).bind(needs_tcp as i32).bind(needs_udp as i32)
                 .fetch_optional(&mut *conn)
                 .await
             );
@@ -937,14 +965,11 @@ impl RuleRepository for SqliteRepository {
             };
         }
 
-        let existing: Option<(String, i32, i64, Option<i64>, Option<i64>, bool)> = if let Some(
-            uid,
-        ) =
-            update.owner_uid
-        {
-            try_!(
+        let existing: Option<(String, i32, i64, Option<i64>, Option<i64>, bool, String)> =
+            if let Some(uid) = update.owner_uid {
+                try_!(
                     sqlx::query_as(
-                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused \
+                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode \
                      FROM forward_rules WHERE id=? AND uid=?",
                     )
                     .bind(update.id)
@@ -952,19 +977,26 @@ impl RuleRepository for SqliteRepository {
                     .fetch_optional(&mut *conn)
                     .await
                 )
-        } else {
-            try_!(
+            } else {
+                try_!(
                     sqlx::query_as(
-                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused \
+                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode \
                      FROM forward_rules WHERE id=?",
                     )
                     .bind(update.id)
                     .fetch_optional(&mut *conn)
                     .await
                 )
-        };
-        let Some((old_protocol, old_port, old_group, old_out, old_tunnel_id, old_paused)) =
-            existing
+            };
+        let Some((
+            old_protocol,
+            old_port,
+            old_group,
+            old_out,
+            old_tunnel_id,
+            old_paused,
+            old_route_mode,
+        )) = existing
         else {
             try_!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
             return Ok(0);
@@ -975,6 +1007,47 @@ impl RuleRepository for SqliteRepository {
         let effective_out = update.device_group_out.unwrap_or(old_out);
         let effective_tunnel_id = update.tunnel_id.unwrap_or(old_tunnel_id);
         let effective_paused = update.paused.unwrap_or(old_paused);
+        let effective_route_mode = update.route_mode.as_deref().unwrap_or(&old_route_mode);
+        let route_update_requested = update.protocol.is_some()
+            || update.tunnel_id.is_some()
+            || update.hops.is_some()
+            || update.route_mode.is_some()
+            || update.device_group_in.is_some()
+            || update.device_group_out.is_some();
+        let mut old_downstream_ports: Vec<(i64, i32, String)> =
+            if route_update_requested && !old_paused {
+                if let Some(tunnel_id) = old_tunnel_id {
+                    try_!(
+                        sqlx::query_as(
+                            "SELECT device_group_id,listen_port,'tcp' FROM tunnel_hops \
+                         WHERE tunnel_id=? AND position>0 AND listen_port IS NOT NULL \
+                         ORDER BY position",
+                        )
+                        .bind(tunnel_id)
+                        .fetch_all(&mut *conn)
+                        .await
+                    )
+                } else if old_route_mode == "chain" {
+                    try_!(
+                        sqlx::query_as(
+                            "SELECT device_group_id,listen_port,? FROM forward_rule_hops \
+                         WHERE rule_id=? AND position>0 \
+                         UNION ALL SELECT device_group_id,tunnel_port,'tcp' \
+                         FROM forward_rule_hops WHERE rule_id=? AND position>0 \
+                           AND tunnel_port IS NOT NULL",
+                        )
+                        .bind(&old_protocol)
+                        .bind(update.id)
+                        .bind(update.id)
+                        .fetch_all(&mut *conn)
+                        .await
+                    )
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
         let needs_tcp = matches!(effective_protocol, "tcp" | "tcp_udp");
         let needs_udp = matches!(effective_protocol, "udp" | "tcp_udp");
 
@@ -1026,7 +1099,11 @@ impl RuleRepository for SqliteRepository {
                    WHERE h.rule_id<>? AND h.device_group_id=? AND h.listen_port=? \
                    AND ((?=1 AND r.protocol IN ('tcp','tcp_udp')) OR (?=1 AND r.protocol IN ('udp','tcp_udp')))) \
                  OR (?=1 AND EXISTS (SELECT 1 FROM forward_rule_hops WHERE rule_id<>? AND device_group_id=? AND tunnel_port=?)) \
-                 OR (?=1 AND EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=? AND listen_port=?)) LIMIT 1",
+                 OR (?=1 AND EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=? AND listen_port=?)) \
+                 OR EXISTS (SELECT 1 FROM forward_rule_route_transitions \
+                   WHERE rule_id<>? AND device_group_id=? AND listen_port=? AND expires_at>=unixepoch() \
+                     AND ((?=1 AND protocol IN ('tcp','tcp_udp')) \
+                       OR (?=1 AND protocol IN ('udp','tcp_udp')))) LIMIT 1",
             )
             .bind(update.id).bind(effective_group).bind(effective_port)
             .bind(needs_tcp as i32).bind(needs_udp as i32)
@@ -1034,6 +1111,8 @@ impl RuleRepository for SqliteRepository {
             .bind(needs_tcp as i32).bind(needs_udp as i32)
             .bind(needs_tcp as i32).bind(update.id).bind(effective_group).bind(effective_port)
             .bind(needs_tcp as i32).bind(effective_group).bind(effective_port)
+            .bind(update.id).bind(effective_group).bind(effective_port)
+            .bind(needs_tcp as i32).bind(needs_udp as i32)
             .fetch_optional(&mut *conn)
             .await
         );
@@ -1064,12 +1143,18 @@ impl RuleRepository for SqliteRepository {
                        WHERE h.rule_id<>? AND h.device_group_id=? AND h.listen_port=? \
                        AND ((?=1 AND r.protocol IN ('tcp','tcp_udp')) OR (?=1 AND r.protocol IN ('udp','tcp_udp')))) \
                      OR (?=1 AND EXISTS (SELECT 1 FROM forward_rule_hops WHERE rule_id<>? AND device_group_id=? AND tunnel_port=?)) \
-                     OR (?=1 AND EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=? AND listen_port=?)) LIMIT 1",
+                     OR (?=1 AND EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=? AND listen_port=?)) \
+                     OR EXISTS (SELECT 1 FROM forward_rule_route_transitions \
+                       WHERE rule_id<>? AND device_group_id=? AND listen_port=? AND expires_at>=unixepoch() \
+                         AND ((?=1 AND protocol IN ('tcp','tcp_udp')) \
+                           OR (?=1 AND protocol IN ('udp','tcp_udp')))) LIMIT 1",
                 )
                 .bind(update.id).bind(group_id).bind(port).bind(needs_tcp as i32).bind(needs_udp as i32)
                 .bind(update.id).bind(group_id).bind(port).bind(needs_tcp as i32).bind(needs_udp as i32)
                 .bind(needs_tcp as i32).bind(update.id).bind(group_id).bind(port)
                 .bind(needs_tcp as i32).bind(group_id).bind(port)
+                .bind(update.id).bind(group_id).bind(port)
+                .bind(needs_tcp as i32).bind(needs_udp as i32)
                 .fetch_optional(&mut *conn)
                 .await
             );
@@ -1199,6 +1284,62 @@ impl RuleRepository for SqliteRepository {
             return Ok(0);
         }
 
+        if route_update_requested || effective_paused {
+            try_!(
+                sqlx::query("DELETE FROM forward_rule_route_transitions WHERE rule_id=?")
+                    .bind(update.id)
+                    .execute(&mut *conn)
+                    .await
+            );
+        }
+        if route_update_requested && !old_paused && !effective_paused {
+            // A direct→chain/preset change has no old downstream listener to
+            // retain, but it still needs an entry staging marker so the newly
+            // added path can bind before the public listener switches.
+            if old_downstream_ports.is_empty() {
+                if let Some(tunnel_id) = effective_tunnel_id {
+                    if let Some(marker) = try_!(
+                        sqlx::query_as::<_, (i64, i32, String)>(
+                            "SELECT device_group_id,listen_port,'tcp' FROM tunnel_hops \
+                             WHERE tunnel_id=? AND position=1 AND listen_port IS NOT NULL",
+                        )
+                        .bind(tunnel_id)
+                        .fetch_optional(&mut *conn)
+                        .await
+                    ) {
+                        old_downstream_ports.push(marker);
+                    }
+                } else if effective_route_mode == "chain" {
+                    if let Some((group_id, listen_port)) = effective_hops.get(1) {
+                        old_downstream_ports.push((
+                            *group_id,
+                            *listen_port,
+                            effective_protocol.to_string(),
+                        ));
+                    }
+                }
+            }
+            for (group_id, listen_port, protocol) in old_downstream_ports {
+                try_!(
+                    sqlx::query(
+                        "INSERT INTO forward_rule_route_transitions \
+                         (rule_id,device_group_id,listen_port,protocol,activate_at,expires_at) \
+                         VALUES (?,?,?,?,unixepoch()+?,unixepoch()+?) \
+                         ON CONFLICT(rule_id,device_group_id,listen_port,protocol) DO UPDATE \
+                           SET activate_at=excluded.activate_at,expires_at=excluded.expires_at",
+                    )
+                    .bind(update.id)
+                    .bind(group_id)
+                    .bind(listen_port)
+                    .bind(protocol)
+                    .bind(ROUTE_TRANSITION_STAGE_SECS)
+                    .bind(ROUTE_TRANSITION_LEASE_TTL_SECS)
+                    .execute(&mut *conn)
+                    .await
+                );
+            }
+        }
+
         if old_group != effective_group && !effective_paused {
             if let Some(source_tunnel_id) = old_tunnel_id {
                 try_!(
@@ -1241,15 +1382,18 @@ impl RuleRepository for SqliteRepository {
         }
 
         if let Some(hops) = &update.hops {
-            let old_tunnel_ports: std::collections::HashMap<i64, Option<i32>> = try_!(
-                sqlx::query_as::<_, (i64, Option<i32>)>(
-                    "SELECT device_group_id, tunnel_port FROM forward_rule_hops WHERE rule_id = ?",
+            let old_tunnel_ports: std::collections::HashMap<(i64, i32), Option<i32>> = try_!(
+                sqlx::query_as::<_, (i64, i32, Option<i32>)>(
+                    "SELECT device_group_id, listen_port, tunnel_port FROM forward_rule_hops WHERE rule_id = ?",
                 )
                 .bind(update.id)
                 .fetch_all(&mut *conn)
                 .await
             )
             .into_iter()
+            .map(|(group_id, listen_port, tunnel_port)| {
+                ((group_id, listen_port), tunnel_port)
+            })
             .collect();
             try_!(
                 sqlx::query("DELETE FROM forward_rule_hops WHERE rule_id = ?")
@@ -1268,7 +1412,12 @@ impl RuleRepository for SqliteRepository {
                     .bind(position as i32)
                     .bind(group_id)
                     .bind(listen_port)
-                    .bind(old_tunnel_ports.get(group_id).copied().flatten())
+                    .bind(
+                        old_tunnel_ports
+                            .get(&(*group_id, *listen_port))
+                            .copied()
+                            .flatten(),
+                    )
                     .execute(&mut *conn)
                     .await
                 );
@@ -1519,11 +1668,15 @@ impl RuleRepository for SqliteRepository {
              OR EXISTS (SELECT 1 FROM forward_rule_hops h JOIN forward_rules r ON r.id=h.rule_id \
                WHERE h.device_group_id=? AND h.listen_port=? AND r.protocol IN ('tcp','tcp_udp')) \
              OR EXISTS (SELECT 1 FROM forward_rule_hops WHERE id<>? AND device_group_id=? AND tunnel_port=?) \
-             OR EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=? AND listen_port=?) LIMIT 1",
+             OR EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=? AND listen_port=?) \
+             OR EXISTS (SELECT 1 FROM forward_rule_route_transitions \
+               WHERE device_group_id=? AND listen_port=? AND expires_at>=unixepoch() \
+                 AND protocol IN ('tcp','tcp_udp')) LIMIT 1",
         )
         .bind(group_id).bind(port)
         .bind(group_id).bind(port)
         .bind(hop_id).bind(group_id).bind(port)
+        .bind(group_id).bind(port)
         .bind(group_id).bind(port)
         .fetch_optional(&mut *conn)
         .await?;

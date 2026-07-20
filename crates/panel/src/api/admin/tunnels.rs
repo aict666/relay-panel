@@ -138,12 +138,16 @@ pub async fn update_tunnel(
     Path(id): Path<i64>,
     Json(req): Json<UpdateTunnelRequest>,
 ) -> Json<ApiResponse<Tunnel>> {
+    let stages_route = req.hops.is_some();
     match crate::service::tunnels::update_tunnel(state.db.as_ref(), id, &req).await {
         Ok(tunnel) => {
             state
                 .node_connections
                 .broadcast_all(r#"{"type":"config_changed"}"#)
                 .await;
+            if stages_route {
+                super::schedule_route_transition_activation(&state);
+            }
             Json(ApiResponse::success(tunnel))
         }
         Err(error) => Json(map_error(error)),

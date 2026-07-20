@@ -1,9 +1,9 @@
 import {
   Alert, Button, Card, Form, Input, InputNumber, List, Modal, Popconfirm,
-  Select, Space, Switch, Table, Tag, Typography, message, Grid,
+  Select, Space, Switch, Table, Tag, Tooltip, Typography, message, Grid,
 } from 'antd';
 import {
-  ApiOutlined, DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined,
+  ApiOutlined, DeleteOutlined, EditOutlined, PlusOutlined, QuestionCircleOutlined, ReloadOutlined,
 } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import api from '../api/client';
@@ -35,7 +35,6 @@ export default function Tunnels() {
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Tunnel | null>(null);
-  const [firewall, setFirewall] = useState<Tunnel | null>(null);
   const [form] = Form.useForm<TunnelFormValue>();
   const watchedHops = Form.useWatch('hops', form) ?? [];
   const watchedShared = Form.useWatch('shared', form) ?? false;
@@ -129,7 +128,6 @@ export default function Tunnels() {
       }
       message.success(editing ? t('tunnelUpdated') : t('tunnelCreated'));
       setOpen(false);
-      if (!editing || pathChanged) setFirewall(response.data);
       await load();
     } catch {
       message.error(editing ? t('tunnelUpdateFailed') : t('tunnelCreateFailed'));
@@ -225,8 +223,6 @@ export default function Tunnels() {
         </Space>
       </div>
 
-      <Alert type="info" showIcon style={{ marginBottom: 16 }} title={t('tunnelManagementHint')} />
-
       {mobile ? (
         <List
           loading={loading}
@@ -258,25 +254,35 @@ export default function Tunnels() {
         open={open}
         onCancel={() => setOpen(false)}
         onOk={() => form.submit()}
-        width={760}
+        width={780}
         okText={t('save')}
         cancelText={t('cancel')}
+        className="rp-tunnel-modal"
       >
-        <Form form={form} layout="vertical" onFinish={submit}>
-          <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}>
+        <Form form={form} layout="vertical" onFinish={submit} className="rp-tunnel-form">
+          <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]} className="rp-tunnel-name-field">
             <Input maxLength={100} />
           </Form.Item>
-          <Form.Item name="enabled" label={t('status')} valuePropName="checked">
-            <Switch checkedChildren={t('enabled')} unCheckedChildren={t('disabled')} />
-          </Form.Item>
-          <Form.Item
-            name="shared"
-            label={t('tunnelUserSharing')}
-            valuePropName="checked"
-            extra={t('tunnelUserSharingHint')}
-          >
-            <Switch />
-          </Form.Item>
+          <div className="rp-tunnel-toggle-grid">
+            <Form.Item name="enabled" label={t('status')} valuePropName="checked" className="rp-tunnel-toggle-field">
+              <Switch checkedChildren={t('enabled')} unCheckedChildren={t('disabled')} />
+            </Form.Item>
+            <Form.Item
+              name="shared"
+              label={(
+                <Space size={5}>
+                  {t('tunnelUserSharing')}
+                  <Tooltip title={t('tunnelUserSharingHint')}>
+                    <QuestionCircleOutlined className="rp-tunnel-help-icon" />
+                  </Tooltip>
+                </Space>
+              )}
+              valuePropName="checked"
+              className="rp-tunnel-toggle-field"
+            >
+              <Switch />
+            </Form.Item>
+          </div>
           {editing?.shared && !watchedShared && editing.bound_rule_count > 0 && (
             <Alert
               type="warning"
@@ -302,8 +308,12 @@ export default function Tunnels() {
             },
           }]}>
             {(fields, { add, remove }, { errors }) => (
-              <Form.Item label={t('tunnelPath')} required extra={t('tunnelHopCountHint')}>
-                <Space orientation="vertical" style={{ width: '100%' }}>
+              <div className="rp-tunnel-path-editor">
+                <div className="rp-tunnel-path-heading">
+                  <Text strong><span className="rp-required-mark">*</span>{t('tunnelPath')}</Text>
+                  <Text type="secondary" className="rp-tunnel-path-hint">{t('tunnelHopCountHint')}</Text>
+                </div>
+                <Space orientation="vertical" style={{ width: '100%' }} size={10}>
                   {fields.map((field, index) => {
                     const portMode = watchedHops[index]?.port_mode ?? 'auto';
                     const options = (index === 0 ? entryGroups : relayGroups).map(group => ({
@@ -312,69 +322,62 @@ export default function Tunnels() {
                       disabled: selectedGroupIds.includes(group.id) && watchedHops[index]?.device_group_id !== group.id,
                     }));
                     return (
-                      <Space key={field.key} align="start" style={{ display: 'flex', width: '100%' }}>
-                        <Tag style={{ marginTop: 5 }}>
+                      <div key={field.key} className="rp-tunnel-hop-row">
+                        <Tag className="rp-tunnel-hop-role">
                           {index === 0 ? t('hopEntry') : index === fields.length - 1 ? t('hopExit') : `${t('hopMid')} ${index}`}
                         </Tag>
                         <Form.Item
                           {...field}
                           name={[field.name, 'device_group_id']}
                           rules={[{ required: true, message: t('select') }]}
-                          style={{ flex: 1, marginBottom: 8 }}
+                          className="rp-tunnel-hop-group"
                         >
                           <Select options={options} showSearch optionFilterProp="label" placeholder={t('select')} />
                         </Form.Item>
                         {index > 0 && (
-                          <>
-                            <Form.Item name={[field.name, 'port_mode']} style={{ width: 105, marginBottom: 8 }}>
+                          <div className="rp-tunnel-port-controls">
+                            <Form.Item name={[field.name, 'port_mode']} className="rp-tunnel-port-mode">
                               <Select options={[
                                 { value: 'auto', label: t('autoPort') },
                                 { value: 'fixed', label: t('fixedPort') },
                               ]} />
                             </Form.Item>
-                            <Form.Item
-                              name={[field.name, 'listen_port']}
-                              rules={portMode === 'fixed' ? [{ required: true, message: t('listenPortHint') }] : []}
-                              style={{ width: 115, marginBottom: 8 }}
-                            >
-                              <InputNumber min={1} max={65535} disabled={portMode !== 'fixed'} placeholder={t('autoPort')} style={{ width: '100%' }} />
-                            </Form.Item>
-                          </>
+                            {portMode === 'fixed' && (
+                              <Form.Item
+                                name={[field.name, 'listen_port']}
+                                rules={[{ required: true, message: t('listenPortHint') }]}
+                                className="rp-tunnel-fixed-port"
+                              >
+                                <InputNumber min={1} max={65535} placeholder={t('port')} style={{ width: '100%' }} />
+                              </Form.Item>
+                            )}
+                          </div>
                         )}
-                        {fields.length > 2 && <Button type="text" danger icon={<DeleteOutlined />} onClick={() => remove(field.name)} />}
-                      </Space>
+                        {fields.length > 2 && (
+                          <Button
+                            type="text"
+                            danger
+                            icon={<DeleteOutlined />}
+                            onClick={() => remove(field.name)}
+                            className="rp-tunnel-remove-hop"
+                          />
+                        )}
+                      </div>
                     );
                   })}
-                  {fields.length < 8 && <Button type="dashed" block icon={<PlusOutlined />} onClick={() => add({ port_mode: 'auto' })}>{t('addHop')}</Button>}
+                  {fields.length < 8 && (
+                    <Button type="dashed" block icon={<PlusOutlined />} onClick={() => add({ port_mode: 'auto' })} className="rp-tunnel-add-hop">
+                      {t('addHop')}
+                    </Button>
+                  )}
                   <Form.ErrorList errors={errors} />
                 </Space>
-              </Form.Item>
+              </div>
             )}
           </Form.List>
         </Form>
       </Modal>
 
-      <Modal
-        title={t('firewallAllowlist')}
-        open={!!firewall}
-        onCancel={() => setFirewall(null)}
-        footer={<Button type="primary" onClick={() => setFirewall(null)}>{t('close')}</Button>}
-        width={680}
-      >
-        <Alert type="success" showIcon style={{ marginBottom: 12 }} title={t('firewallAllowlistHint')} />
-        <Table
-          size="small"
-          pagination={false}
-          rowKey="id"
-          dataSource={firewall?.hops.slice(1) ?? []}
-          columns={[
-            { title: t('deviceGroups'), dataIndex: 'group_name', key: 'group' },
-            { title: t('address'), dataIndex: 'connect_host', key: 'host', render: (value: string | null) => <span className="rp-mono">{value || '-'}</span> },
-            { title: t('protocol'), key: 'protocol', render: () => <Tag>TCP</Tag> },
-            { title: t('listenPort'), dataIndex: 'listen_port', key: 'port', render: (value: number) => <span className="rp-mono">{value}</span> },
-          ]}
-        />
-      </Modal>
     </>
   );
 }
