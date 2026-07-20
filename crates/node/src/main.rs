@@ -154,6 +154,12 @@ fn print_help() {
     println!("  RUST_LOG          Log level, e.g. info (default: warn)");
 }
 
+const MAX_STATUS_HEARTBEAT_SECS: u64 = 60;
+
+fn status_heartbeat_seconds(poll_interval: u64) -> u64 {
+    poll_interval.clamp(1, MAX_STATUS_HEARTBEAT_SECS)
+}
+
 /// The real service entry point. Only reached when no --version/--help flag
 /// was passed on the command line.
 async fn run() {
@@ -230,14 +236,59 @@ async fn run() {
     // node-id file, so the panel can tell multiple nodes sharing one group
     // token apart (otherwise their status entries overwrite each other).
     let node_id = poller::get_or_create_node_id();
+    let config_synchronizer = poller::ConfigSynchronizer::new();
 
     // --- Fork 1: WebSocket control channel (real-time config push) ---
     {
         let config_ws = config.clone();
         let manager_ws = manager.clone();
         let node_id_ws = node_id.clone();
+        let config_synchronizer_ws = config_synchronizer.clone();
         tokio::spawn(async move {
-            ws_client::run_ws_loop(&config_ws, &manager_ws, &node_id_ws).await;
+            ws_client::run_ws_loop(
+                &config_ws,
+                &manager_ws,
+                &node_id_ws,
+                &config_synchronizer_ws,
+            )
+            .await;
+        });
+    }
+
+    // Status is a lease heartbeat as well as observability. Keep it independent
+    // from the configurable config-poll interval: retired-entry accounting
+    // leases live for five minutes, while protocol-mismatch backoff is also five
+    // minutes and operators may choose an even longer POLL_INTERVAL.
+    {
+        let status_config = config.clone();
+        let status_metrics = metrics.clone();
+        let status_connections = connections.clone();
+        let status_manager = manager.clone();
+        let status_node_id = node_id.clone();
+        tokio::spawn(async move {
+            let heartbeat_seconds = status_heartbeat_seconds(status_config.poll_interval);
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_seconds));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                heartbeat.tick().await;
+                let (listener_errors, draining_rule_ids) = {
+                    let manager = status_manager.lock().await;
+                    (
+                        manager.take_listener_errors().await,
+                        manager.active_draining_rule_ids(),
+                    )
+                };
+                reporter::report_status(
+                    &status_config,
+                    &status_metrics,
+                    &status_connections,
+                    start_time,
+                    &status_node_id,
+                    listener_errors,
+                    draining_rule_ids,
+                )
+                .await;
+            }
         });
     }
 
@@ -256,10 +307,8 @@ async fn run() {
     loop {
         interval.tick().await;
 
-        match poller::fetch_config(&config).await {
-            poller::FetchResult::Ok(resp) => {
-                let mut mgr = manager.lock().await;
-                mgr.apply_config(&resp).await;
+        match config_synchronizer.sync(&config, &manager).await {
+            poller::SyncResult::Ok => {
                 // Recovered from a mismatch: restore the normal poll interval.
                 if in_mismatch_backoff {
                     tracing::info!("config protocol OK again; restoring normal poll interval");
@@ -267,7 +316,7 @@ async fn run() {
                     in_mismatch_backoff = false;
                 }
             }
-            poller::FetchResult::ProtocolMismatch => {
+            poller::SyncResult::ProtocolMismatch => {
                 // Permanent: upgrade required. Switch to a long interval if we
                 // haven't already (avoids re-logging every tick).
                 if !in_mismatch_backoff {
@@ -279,7 +328,13 @@ async fn run() {
                     in_mismatch_backoff = true;
                 }
             }
-            poller::FetchResult::Transient => {
+            poller::SyncResult::CredentialsRejected => {
+                if in_mismatch_backoff {
+                    interval = tokio::time::interval(Duration::from_secs(config.poll_interval));
+                    in_mismatch_backoff = false;
+                }
+            }
+            poller::SyncResult::Transient => {
                 if in_mismatch_backoff {
                     // Was in mismatch backoff but now it's a different error —
                     // could mean the panel was upgraded. Restore normal interval.
@@ -289,34 +344,28 @@ async fn run() {
             }
         }
 
-        // Report traffic + status (failures are logged but don't crash).
+        // Report traffic (failures are logged but don't crash). Status runs on
+        // its own bounded heartbeat above so drain-lease renewal cannot be
+        // delayed by config polling/backoff.
         // Note: connection counting does NOT depend on the WebSocket control
         // channel — these values reflect real active TCP/UDP forwarding state
         // and are reported over plain HTTP, so they keep working even if WS
         // is down.
         reporter::report_traffic(&config, &counter).await;
-        // Drain any listener bind/runtime errors captured since the last cycle
-        // and forward them to the panel so an operator can see WHY a rule isn't
-        // forwarding (port in use, permission denied, etc.).
-        let listener_errors = {
-            let mgr = manager.lock().await;
-            mgr.take_listener_errors().await
-        };
-        reporter::report_status(
-            &config,
-            &metrics,
-            &connections,
-            start_time,
-            &node_id,
-            listener_errors,
-        )
-        .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::install_crypto_provider;
+    use super::{install_crypto_provider, status_heartbeat_seconds};
+
+    #[test]
+    fn status_heartbeat_is_bounded_below_drain_lease() {
+        assert_eq!(status_heartbeat_seconds(0), 1);
+        assert_eq!(status_heartbeat_seconds(10), 10);
+        assert_eq!(status_heartbeat_seconds(300), 60);
+        assert_eq!(status_heartbeat_seconds(u64::MAX), 60);
+    }
 
     /// v0.4.16: `install_crypto_provider()` must succeed and install the ring
     /// provider process-wide. Before this fix, rustls 0.23 panicked with

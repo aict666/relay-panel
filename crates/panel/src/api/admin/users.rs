@@ -123,6 +123,12 @@ pub async fn delete_user(
             );
             Json(ApiResponse::success(()))
         }
+        Err(crate::db::error::DbError::UserTunnelGroupConflict { groups, tunnels }) => Json(err(
+            409,
+            format!(
+                "该用户仍拥有 {groups} 个被 {tunnels} 条预设隧道引用的设备组，请先修改或删除相关隧道"
+            ),
+        )),
         Err(e) => {
             tracing::error!("delete_user {}: cascade delete failed: {}", id, e);
             Json(err(500, "数据库错误"))

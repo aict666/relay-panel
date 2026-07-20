@@ -10,6 +10,7 @@ mod profiles;
 mod rules;
 mod settings;
 mod shop;
+mod tunnels;
 mod users;
 
 pub use groups::*;
@@ -19,6 +20,7 @@ pub use profiles::*;
 pub use rules::*;
 pub use settings::*;
 pub use shop::*;
+pub use tunnels::*;
 pub use users::*;
 
 /// A user WITHOUT the password hash — for API responses. Never expose the
@@ -127,9 +129,9 @@ mod tests {
     use axum::extract::{Path, Query, State};
     use axum::Json;
     use relay_shared::protocol::{
-        CreateGroupRequest, CreateRuleRequest, GroupType, Protocol, PublicTransport,
-        RegisterRequest, RegistrationSettingsRequest, UpdateGroupRequest, UpdateRuleRequest,
-        UpdateUserRequest,
+        CreateGroupRequest, CreateRuleRequest, CreateTunnelRequest, GroupType, Protocol,
+        PublicTransport, RegisterRequest, RegistrationSettingsRequest, TunnelHopRequest,
+        UpdateGroupRequest, UpdateRuleRequest, UpdateTunnelRequest, UpdateUserRequest,
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
@@ -415,6 +417,41 @@ mod tests {
         assert_eq!(user_exists.0, 1);
         assert_eq!(group_exists.0, 1, "admin group must remain");
         assert_eq!(rule_exists.0, 1, "admin rule must remain");
+    }
+
+    #[tokio::test]
+    async fn delete_user_reports_tunnel_group_conflict_without_partial_deletion() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "legacy-owner", false).await;
+        add_group(&pool, 20, 2, "legacy-entry").await;
+        add_group_typed(&pool, 30, 1, "admin-exit", "out").await;
+        sqlx::query("INSERT INTO tunnels (id,name,uid) VALUES (40,'legacy-path',1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tunnel_hops (tunnel_id,position,device_group_id,listen_port) \
+             VALUES (40,0,20,NULL),(40,1,30,23000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(resp) = delete_user(AdminOnly { user_id: 1 }, State(state), Path(2)).await;
+        assert_eq!(resp.code, 409, "{}", resp.message);
+        assert!(resp.message.contains("1 个被 1 条预设隧道引用"));
+
+        let user_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id=2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let group_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM device_groups WHERE id=20")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(user_exists, 1);
+        assert_eq!(group_exists, 1);
     }
 
     #[tokio::test]
@@ -1107,6 +1144,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delete_group_used_as_fallback_returns_409() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 21, 1, "fallback-target").await;
+        add_group(&pool, 22, 1, "fallback-owner").await;
+        sqlx::query("UPDATE device_groups SET fallback_group=21 WHERE id=22")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let Json(resp) =
+            super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(21)).await;
+        assert_eq!(resp.code, 409);
+        assert!(resp.message.contains("分组回退配置"));
+    }
+
     /// v1.0.4: count_rules_by_group detects rule references correctly.
     #[tokio::test]
     async fn count_rules_by_group_detects_rule_references() {
@@ -1362,6 +1415,7 @@ mod tests {
             forward_mode: "direct".into(),
             route_mode: Default::default(),
             hops: None,
+            tunnel_id: None,
             public_transport: Default::default(),
             ws_path: None,
             target_addr: "127.0.0.1".into(),
@@ -2390,6 +2444,7 @@ mod tests {
             forward_mode: "direct".into(),
             route_mode: Default::default(),
             hops: None,
+            tunnel_id: None,
             public_transport,
             ws_path: None,
             target_addr: "127.0.0.1".into(),
@@ -3063,5 +3118,860 @@ mod tests {
         )
         .await;
         assert_eq!(resp.code, 400, "{}", resp.message);
+    }
+
+    async fn seed_tunnel_groups(pool: &SqlitePool) {
+        add_group_typed(pool, 501, 1, "preset-entry", "in").await;
+        add_group_typed(pool, 502, 1, "preset-exit", "out").await;
+        sqlx::query(
+            "UPDATE device_groups SET connect_host='127.0.0.1', port_range='35000-35010' \
+             WHERE id IN (501, 502)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn tunnel_request(name: &str) -> CreateTunnelRequest {
+        CreateTunnelRequest {
+            name: name.into(),
+            enabled: true,
+            shared: true,
+            hops: vec![
+                TunnelHopRequest {
+                    device_group_id: 501,
+                    listen_port: None,
+                },
+                TunnelHopRequest {
+                    device_group_id: 502,
+                    listen_port: Some(35005),
+                },
+            ],
+        }
+    }
+
+    fn tunnel_path_snapshot(tunnel: &relay_shared::models::Tunnel) -> Vec<TunnelHopRequest> {
+        tunnel
+            .hops
+            .iter()
+            .map(|hop| TunnelHopRequest {
+                device_group_id: hop.device_group_id,
+                listen_port: hop.listen_port.map(|port| port as u16),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_rejects_zero_internal_port_on_create_and_update() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+
+        let mut invalid_create = tunnel_request("zero-port-create");
+        invalid_create.hops[1].listen_port = Some(0);
+        let Json(rejected) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(invalid_create),
+        )
+        .await;
+        assert_eq!(rejected.code, 400, "{}", rejected.message);
+        assert_eq!(state.db.list_tunnels().await.unwrap().len(), 0);
+
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("zero-port-update")),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+        let Json(rejected) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                hops: Some(vec![
+                    TunnelHopRequest {
+                        device_group_id: 501,
+                        listen_port: None,
+                    },
+                    TunnelHopRequest {
+                        device_group_id: 502,
+                        listen_port: Some(0),
+                    },
+                ]),
+                expected_hops: Some(tunnel_path_snapshot(&tunnel)),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(rejected.code, 400, "{}", rejected.message);
+        let stored = state
+            .db
+            .find_tunnel_by_id(tunnel.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.hops[1].listen_port, Some(35005));
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_admin_crud_and_delete_protection() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("  shared-route  ")),
+        )
+        .await;
+        assert_eq!(created.code, 0, "{}", created.message);
+        let tunnel = created.data.unwrap();
+        assert_eq!(tunnel.name, "shared-route");
+        assert_eq!(tunnel.hops.len(), 2);
+        assert_eq!(tunnel.hops[0].listen_port, None);
+        assert_eq!(tunnel.hops[1].listen_port, Some(35005));
+        assert_eq!(tunnel.hops[1].group_name.as_deref(), Some("preset-exit"));
+        assert_eq!(tunnel.hops[1].connect_host.as_deref(), Some("127.0.0.1"));
+
+        let Json(updated) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                name: Some("renamed-route".into()),
+                enabled: Some(false),
+                shared: None,
+                hops: None,
+                expected_hops: None,
+            }),
+        )
+        .await;
+        assert_eq!(updated.code, 0, "{}", updated.message);
+        assert_eq!(updated.data.as_ref().unwrap().name, "renamed-route");
+        assert!(!updated.data.as_ref().unwrap().enabled);
+
+        sqlx::query(
+            "INSERT INTO forward_rules (name, uid, listen_port, protocol, route_mode, \
+             forward_mode, device_group_in, device_group_out, target_addr, target_port, tunnel_id) \
+             VALUES ('bound', 1, 34001, 'tcp', 'chain', 'chain', 501, 502, '127.0.0.1', 80, ?)",
+        )
+        .bind(tunnel.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let Json(blocked) = super::tunnels::delete_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+        )
+        .await;
+        assert_eq!(blocked.code, 409);
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_partial_updates_do_not_rewrite_other_fields_or_hops() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("partial-update")),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+        let hop_ids: Vec<i64> = tunnel.hops.iter().map(|hop| hop.id).collect();
+
+        state
+            .db
+            .update_tunnel_full(tunnel.id, None, None, Some(false), None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_tunnel_full(tunnel.id, None, Some(false), None, None, None)
+            .await
+            .unwrap();
+
+        let updated = state
+            .db
+            .find_tunnel_by_id(tunnel.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !updated.shared,
+            "enabled-only update must not restore sharing"
+        );
+        assert!(
+            !updated.enabled,
+            "sharing-only update must not restore enabled"
+        );
+        assert_eq!(
+            updated.hops.iter().map(|hop| hop.id).collect::<Vec<_>>(),
+            hop_ids,
+            "scalar-only updates must not delete and recreate tunnel hops"
+        );
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_stale_path_replacement_is_rejected() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("stale-path")),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+        let expected: Vec<(i64, Option<i32>)> = tunnel
+            .hops
+            .iter()
+            .map(|hop| (hop.device_group_id, hop.listen_port))
+            .collect();
+        let first = vec![(501, None), (502, Some(35006))];
+        state
+            .db
+            .update_tunnel_full(tunnel.id, None, None, None, Some(&first), Some(&expected))
+            .await
+            .unwrap();
+        let stale_snapshot = tunnel_path_snapshot(&tunnel);
+        let Json(stale) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                shared: Some(false),
+                hops: Some(stale_snapshot.clone()),
+                expected_hops: Some(stale_snapshot),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(stale.code, 409, "{}", stale.message);
+        let stored = state
+            .db
+            .find_tunnel_by_id(tunnel.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.shared,
+            "stale scalar fields must roll back with the path"
+        );
+        assert_eq!(
+            stored.hops[1].listen_port,
+            Some(35006),
+            "stale form must not overwrite the committed path"
+        );
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_catalog_filters_by_entry_authorization() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        add_user(&pool, 52, "limited", false).await;
+        assign_user_groups(&pool, 52, &[]).await;
+        let mut request = tunnel_request("hidden-from-user");
+        request.shared = false;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(request),
+        )
+        .await;
+        assert_eq!(created.code, 0);
+        let tunnel = created.data.unwrap();
+
+        let Json(empty) =
+            super::tunnels::list_available_tunnels(auth(52, false), State(state.clone())).await;
+        assert!(empty.data.unwrap().is_empty());
+
+        assign_user_groups(&pool, 52, &[501]).await;
+        let Json(still_hidden) =
+            super::tunnels::list_available_tunnels(auth(52, false), State(state.clone())).await;
+        assert!(
+            still_hidden.data.unwrap().is_empty(),
+            "入口已授权也不能看到管理员未共享的隧道"
+        );
+
+        let Json(shared) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                shared: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(shared.code, 0, "{}", shared.message);
+
+        sqlx::query(
+            "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+             device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+             VALUES('catalog-bound',1,34999,'tcp','chain','chain',501,502,'127.0.0.1',80,?)",
+        )
+        .bind(tunnel.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(visible) =
+            super::tunnels::list_available_tunnels(auth(52, false), State(state.clone())).await;
+        let tunnels = visible.data.unwrap();
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(
+            tunnels[0].bound_rule_count, 0,
+            "普通用户目录不能泄露全局规则绑定数量"
+        );
+        assert!(tunnels[0].hops.iter().all(|hop| hop.connect_host.is_none()));
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_sharing_reuses_entry_authorization_and_gates_runtime() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        add_user(&pool, 54, "shared-user", false).await;
+        assign_user_groups(&pool, 54, &[501]).await;
+
+        let mut tunnel_req = tunnel_request("permission-gated-route");
+        tunnel_req.shared = false;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_req),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+
+        let preset_rule = |name: &str, port: u16| {
+            let mut request = rule_req(name, port, 501, None);
+            request.route_mode = relay_shared::protocol::RouteMode::Chain;
+            request.forward_mode = "chain".into();
+            request.device_group_out = Some(502);
+            request.tunnel_id = Some(tunnel.id);
+            request
+        };
+
+        let Json(denied) = create_rule(
+            auth(54, false),
+            State(state.clone()),
+            Json(preset_rule("ordinary-denied", 34010)),
+        )
+        .await;
+        assert_eq!(denied.code, 403, "未共享隧道不能被普通用户猜 ID 绑定");
+
+        let Json(admin_bound) = create_rule(
+            auth(1, true),
+            State(state.clone()),
+            Json(preset_rule("admin-bound", 34011)),
+        )
+        .await;
+        assert_eq!(admin_bound.code, 0, "{}", admin_bound.message);
+        assert_eq!(state.db.list_active_for_config(501).await.unwrap().len(), 1);
+
+        let Json(shared) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                shared: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(shared.code, 0, "{}", shared.message);
+        let Json(user_bound) = create_rule(
+            auth(54, false),
+            State(state.clone()),
+            Json(preset_rule("ordinary-bound", 34012)),
+        )
+        .await;
+        assert_eq!(user_bound.code, 0, "{}", user_bound.message);
+        assert_eq!(state.db.list_active_for_config(501).await.unwrap().len(), 2);
+
+        let Json(unshared) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                shared: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(unshared.code, 0, "{}", unshared.message);
+        let active = state.db.list_active_for_config(501).await.unwrap();
+        assert_eq!(active.len(), 1, "取消共享后仅管理员规则继续下发");
+        assert_eq!(active[0].uid, 1);
+        let ordinary_rule_id: i64 =
+            sqlx::query_scalar("SELECT id FROM forward_rules WHERE name='ordinary-bound'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let ordinary_rule = state
+            .db
+            .list_rules(&crate::db::repo::ResourceScope::Owner(54))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|rule| rule.id == ordinary_rule_id)
+            .unwrap();
+        assert_eq!(
+            ordinary_rule.tunnel_hops.len(),
+            2,
+            "撤销共享后，规则仍需携带只读路径供原有列表和编辑表单展示"
+        );
+        assert!(
+            ordinary_rule
+                .tunnel_hops
+                .iter()
+                .all(|hop| hop.connect_host.is_none()),
+            "规则路径快照不能向普通用户泄露内部连接地址"
+        );
+        let Json(resume_denied) = update_rule(
+            auth(54, false),
+            State(state.clone()),
+            Path(ordinary_rule_id),
+            Json(UpdateRuleRequest {
+                paused: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(
+            resume_denied.code, 403,
+            "取消共享后普通用户不能通过恢复规则绕过权限"
+        );
+        let manual_paused: bool =
+            sqlx::query_scalar("SELECT paused FROM forward_rules WHERE name='ordinary-bound'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!manual_paused, "取消共享不能篡改规则的人工暂停状态");
+
+        let Json(reshared) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                shared: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(reshared.code, 0, "{}", reshared.message);
+        assert_eq!(state.db.list_active_for_config(501).await.unwrap().len(), 2);
+
+        assign_user_groups(&pool, 54, &[]).await;
+        let active = state.db.list_active_for_config(501).await.unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "套餐撤销入口授权后普通用户规则必须停止下发"
+        );
+        assert_eq!(active[0].uid, 1);
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_rule_binding_is_chain_without_rule_hops_and_can_unbind() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("rule-route")),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+
+        let mut conflicting_create = rule_req("preset-direct-conflict", 34001, 501, None);
+        conflicting_create.tunnel_id = Some(tunnel.id);
+        let Json(conflicting_create_response) = create_rule(
+            auth(1, true),
+            State(state.clone()),
+            Json(conflicting_create),
+        )
+        .await;
+        assert_eq!(
+            conflicting_create_response.code, 400,
+            "direct mode must not silently turn into a preset chain"
+        );
+
+        let mut request = rule_req("preset-bound", 34002, 501, None);
+        request.route_mode = relay_shared::protocol::RouteMode::Chain;
+        request.forward_mode = "chain".into();
+        request.device_group_out = Some(502);
+        request.tunnel_id = Some(tunnel.id);
+        let Json(bound) = create_rule(auth(1, true), State(state.clone()), Json(request)).await;
+        assert_eq!(bound.code, 0, "{}", bound.message);
+        let (rule_id, route_mode, stored_tunnel): (i64, String, Option<i64>) = sqlx::query_as(
+            "SELECT id, route_mode, tunnel_id FROM forward_rules WHERE name='preset-bound'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(route_mode, "chain");
+        assert_eq!(stored_tunnel, Some(tunnel.id));
+        let hop_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id=?")
+                .bind(rule_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            hop_count, 0,
+            "preset binding must not allocate rule-level hops"
+        );
+
+        let Json(implicit_custom) = update_rule(
+            auth(1, true),
+            State(state.clone()),
+            Path(rule_id),
+            Json(UpdateRuleRequest {
+                hops: Some(vec![501, 502]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(
+            implicit_custom.code, 400,
+            "custom hops must not be silently ignored while the preset remains bound"
+        );
+        let unchanged: (Option<i64>, i64) = sqlx::query_as(
+            "SELECT tunnel_id, (SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id=?) \
+             FROM forward_rules WHERE id=?",
+        )
+        .bind(rule_id)
+        .bind(rule_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, (Some(tunnel.id), 0));
+
+        // Explicit null means "unbind". It must be accepted together with a
+        // replacement custom path; rejecting every present tunnel_id used to
+        // make this transition impossible in one atomic update.
+        let Json(custom) = update_rule(
+            auth(1, true),
+            State(state.clone()),
+            Path(rule_id),
+            Json(UpdateRuleRequest {
+                route_mode: Some(relay_shared::protocol::RouteMode::Chain),
+                forward_mode: Some("chain".into()),
+                tunnel_id: Some(None),
+                hops: Some(vec![501, 502]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(custom.code, 0, "{}", custom.message);
+        let stored_tunnel: Option<i64> =
+            sqlx::query_scalar("SELECT tunnel_id FROM forward_rules WHERE id=?")
+                .bind(rule_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_tunnel, None);
+        let hop_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id=?")
+                .bind(rule_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hop_count, 2);
+
+        let Json(unbound) = update_rule(
+            auth(1, true),
+            State(state.clone()),
+            Path(rule_id),
+            Json(UpdateRuleRequest {
+                route_mode: Some(relay_shared::protocol::RouteMode::Direct),
+                forward_mode: Some("direct".into()),
+                tunnel_id: Some(None),
+                device_group_in: Some(501),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(unbound.code, 0, "{}", unbound.message);
+        let stored: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT route_mode, tunnel_id, device_group_out FROM forward_rules WHERE id=?",
+        )
+        .bind(rule_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ("direct".into(), None, None));
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_port_is_tcp_scoped_and_group_delete_is_protected() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        sqlx::query(
+            "INSERT INTO forward_rules (name, uid, listen_port, protocol, device_group_in, target_addr, target_port) \
+             VALUES ('udp-only', 1, 35006, 'udp', 502, '127.0.0.1', 53)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut udp_same_number = tunnel_request("udp-number-can-be-reused");
+        udp_same_number.hops[1].listen_port = Some(35006);
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(udp_same_number),
+        )
+        .await;
+        assert_eq!(
+            created.code, 0,
+            "pure UDP must not conflict: {}",
+            created.message
+        );
+
+        let Json(group_delete) =
+            delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(502)).await;
+        assert_eq!(
+            group_delete.code, 409,
+            "tunnel-referenced group must be protected"
+        );
+        assert!(group_delete.message.contains("1 条规则"));
+        assert!(group_delete.message.contains("1 条预设隧道"));
+
+        sqlx::query(
+            "INSERT INTO forward_rules (name, uid, listen_port, protocol, device_group_in, target_addr, target_port) \
+             VALUES ('tcp-owner', 1, 35007, 'tcp', 502, '127.0.0.1', 80)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut tcp_conflict = tunnel_request("tcp-number-conflicts");
+        tcp_conflict.hops[1].listen_port = Some(35007);
+        let Json(rejected) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tcp_conflict),
+        )
+        .await;
+        assert_eq!(rejected.code, 409);
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_entry_change_rolls_back_when_owner_lacks_authorization() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        add_group_typed(&pool, 503, 1, "new-entry", "in").await;
+        add_user(&pool, 53, "restricted-owner", false).await;
+        assign_user_groups(&pool, 53, &[501]).await;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("auth-checked-route")),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules (name, uid, listen_port, protocol, route_mode, forward_mode, \
+             device_group_in, device_group_out, target_addr, target_port, tunnel_id) \
+             VALUES ('restricted-bound', 53, 34100, 'tcp', 'chain', 'chain', 501, 502, '127.0.0.1', 80, ?)",
+        )
+        .bind(tunnel.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(rejected) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                name: None,
+                enabled: None,
+                shared: None,
+                expected_hops: Some(tunnel_path_snapshot(&tunnel)),
+                hops: Some(vec![
+                    TunnelHopRequest {
+                        device_group_id: 503,
+                        listen_port: None,
+                    },
+                    TunnelHopRequest {
+                        device_group_id: 502,
+                        listen_port: None,
+                    },
+                ]),
+            }),
+        )
+        .await;
+        assert_eq!(rejected.code, 409);
+        assert!(rejected.message.contains("1 个用户"));
+        let entry: i64 = sqlx::query_scalar(
+            "SELECT device_group_id FROM tunnel_hops WHERE tunnel_id=? AND position=0",
+        )
+        .bind(tunnel.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            entry, 501,
+            "failed route replacement must roll back atomically"
+        );
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_entry_change_updates_bound_rule_endpoints_atomically() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        add_group_typed(&pool, 503, 1, "replacement-entry", "in").await;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("movable-route")),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules (name,uid,listen_port,protocol,route_mode,forward_mode, \
+             device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+             VALUES ('move-with-route',1,34101,'tcp','chain','chain',501,502,'127.0.0.1',80,?)",
+        )
+        .bind(tunnel.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(updated) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                name: None,
+                enabled: None,
+                shared: None,
+                expected_hops: Some(tunnel_path_snapshot(&tunnel)),
+                hops: Some(vec![
+                    TunnelHopRequest {
+                        device_group_id: 503,
+                        listen_port: None,
+                    },
+                    TunnelHopRequest {
+                        device_group_id: 502,
+                        listen_port: None,
+                    },
+                ]),
+            }),
+        )
+        .await;
+        assert_eq!(updated.code, 0, "{}", updated.message);
+        let endpoints: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT device_group_in,device_group_out FROM forward_rules WHERE name='move-with-route'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(endpoints, (503, Some(502)));
+    }
+
+    #[tokio::test]
+    async fn preset_tunnel_entry_change_rolls_back_on_bound_public_port_conflict() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        add_group_typed(&pool, 503, 1, "occupied-entry", "in").await;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("conflicting-move")),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules (name,uid,listen_port,protocol,route_mode,forward_mode,device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+             VALUES ('bound-port',1,34102,'tcp','chain','chain',501,502,'127.0.0.1',80,?)",
+        )
+        .bind(tunnel.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules (name,uid,listen_port,protocol,device_group_in,target_addr,target_port) \
+             VALUES ('occupied-port',1,34102,'tcp',503,'127.0.0.1',80)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(rejected) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                name: None,
+                enabled: None,
+                shared: None,
+                expected_hops: Some(tunnel_path_snapshot(&tunnel)),
+                hops: Some(vec![
+                    TunnelHopRequest {
+                        device_group_id: 503,
+                        listen_port: None,
+                    },
+                    TunnelHopRequest {
+                        device_group_id: 502,
+                        listen_port: None,
+                    },
+                ]),
+            }),
+        )
+        .await;
+        assert_eq!(rejected.code, 409, "{}", rejected.message);
+        let entry: i64 =
+            sqlx::query_scalar("SELECT device_group_in FROM forward_rules WHERE name='bound-port'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(entry, 501);
+    }
+
+    #[tokio::test]
+    async fn rule_protocol_update_cannot_take_shared_tunnel_tcp_port() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("reserved-shared-port")),
+        )
+        .await;
+        assert_eq!(created.code, 0, "{}", created.message);
+        sqlx::query(
+            "INSERT INTO forward_rules (name,uid,listen_port,protocol,device_group_in,target_addr,target_port) \
+             VALUES ('udp-same-number',1,35005,'udp',502,'127.0.0.1',53)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rule_id: i64 =
+            sqlx::query_scalar("SELECT id FROM forward_rules WHERE name='udp-same-number'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let Json(rejected) = update_rule(
+            auth(1, true),
+            State(state),
+            Path(rule_id),
+            Json(UpdateRuleRequest {
+                protocol: Some(relay_shared::protocol::Protocol::Tcp),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(rejected.code, 409, "{}", rejected.message);
+        let protocol: String = sqlx::query_scalar("SELECT protocol FROM forward_rules WHERE id=?")
+            .bind(rule_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(protocol, "udp");
     }
 }

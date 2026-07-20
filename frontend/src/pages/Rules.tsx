@@ -4,7 +4,8 @@ import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse } from '../api/types';
+import { canUsePresetForRuleUpdate } from '../utils/tunnels';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, Tunnel } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
@@ -69,6 +70,7 @@ export default function Rules() {
     : null;
   const [rules, setRules] = useState<ForwardRule[]>([]);
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
+  const [tunnels, setTunnels] = useState<Tunnel[]>([]);
   // v0.4.11 PR3: shared inbound groups (admin-owned) for regular users.
   const [sharedGroups, setSharedGroups] = useState<SharedGroupSummary[]>([]);
   // v0.4.12 PR1: true when /groups/shared failed to load (DB error). A regular
@@ -112,12 +114,14 @@ export default function Rules() {
       // user → use filterOwnerUid; regular user → backend filters automatically.
       const ownerUid = filterOwnerUid ?? (isAdmin ? (user?.id ?? null) : null);
       const rulesUrl = ownerUid ? `/rules?owner_uid=${ownerUid}` : '/rules';
-      const [r, g] = await Promise.all([
+      const [r, g, tr] = await Promise.all([
         api.get<unknown, ApiEnvelope<ForwardRule[]>>(rulesUrl),
         api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
+        api.get<unknown, ApiEnvelope<Tunnel[]>>('/tunnels'),
       ]);
       setRules(r.data || []);
       setGroups(g.data || []);
+      setTunnels(tr.data || []);
       if (isAdmin) {
         try {
           const u = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
@@ -182,6 +186,7 @@ export default function Rules() {
   // v0.4.9: group lookup map for the "group name" column + filter. Memoized so
   // the column render + filter options share one derivation.
   const groupMap = useMemo(() => new Map(groups.map(g => [g.id, g])), [groups]);
+  const tunnelMap = useMemo(() => new Map(tunnels.map(tunnel => [tunnel.id, tunnel])), [tunnels]);
   // v1.0.8: group-name + listen-IP lookup for the rule columns. A regular user
   // does NOT own the (admin-owned) device groups, so GET /groups returns none
   // for them and the columns rendered "未知分组 / 未配置". Their AUTHORIZED
@@ -209,6 +214,7 @@ export default function Rules() {
     device_group_in: number; device_group_out: number | null;
     forward_mode: string;
     route_mode?: string;
+    tunnel_id?: number | null;
     hops?: number[];
     target_addr?: string; target_port?: number; targets?: RuleTargetInput[];
     load_balance_strategy?: string;
@@ -224,7 +230,13 @@ export default function Rules() {
       message.error(t('targetRequired'));
       return;
     }
-    const isChain = values.route_mode === 'chain' || values.forward_mode === 'chain';
+    const isPresetTunnel = values.route_mode === 'tunnel';
+    const isChain = values.route_mode === 'chain';
+    const preset = isPresetTunnel && values.tunnel_id ? tunnelMap.get(values.tunnel_id) : undefined;
+    if (isPresetTunnel && (!preset || !preset.enabled || preset.hops.length < 2)) {
+      message.error(t('tunnelSelectHint'));
+      return;
+    }
     const hops = (values.hops ?? []).filter((id): id is number => typeof id === 'number' && id > 0);
     if (isChain && hops.length < 2) {
       message.error(t('chainHopsHint'));
@@ -235,10 +247,11 @@ export default function Rules() {
       listen_port: values.listen_port || null,
       public_transport: 'raw',
       tunnel_profile_id: null,
-      forward_mode: isChain ? 'chain' : 'direct',
-      route_mode: isChain ? 'chain' : 'direct',
-      device_group_in: isChain ? hops[0] : values.device_group_in,
-      device_group_out: isChain ? hops[hops.length - 1] : null,
+      forward_mode: isChain || isPresetTunnel ? 'chain' : 'direct',
+      route_mode: isChain || isPresetTunnel ? 'chain' : 'direct',
+      tunnel_id: isPresetTunnel ? preset!.id : null,
+      device_group_in: isPresetTunnel ? preset!.hops[0].device_group_id : isChain ? hops[0] : values.device_group_in,
+      device_group_out: isPresetTunnel ? preset!.hops[preset!.hops.length - 1].device_group_id : isChain ? hops[hops.length - 1] : null,
       hops: isChain ? hops : undefined,
       owner_uid,
     });
@@ -255,11 +268,13 @@ export default function Rules() {
   const handleEdit = (r: ForwardRule) => {
     setEditing(r);
     const isChain = r.route_mode === 'chain' || r.forward_mode === 'chain';
+    const lineMode = r.tunnel_id ? 'tunnel' : isChain ? 'chain' : 'direct';
     editForm.setFieldsValue({
       name: r.name, listen_port: r.listen_port, protocol: r.protocol,
       device_group_in: r.device_group_in,
-      route_mode: isChain ? 'chain' : 'direct',
+      route_mode: lineMode,
       forward_mode: isChain ? 'chain' : 'direct',
+      tunnel_id: r.tunnel_id ?? undefined,
       hops: isChain && r.hops?.length
         ? r.hops.map(h => h.device_group_id)
         : isChain ? [r.device_group_in, r.device_group_out].filter((x): x is number => !!x) : [],
@@ -277,11 +292,16 @@ export default function Rules() {
   /** Copy: open the create modal pre-filled with the rule's values, but with
    *  a "-copy" name suffix and no listen_port (auto-assign). */
   const handleCopy = (r: ForwardRule) => {
+    setEditing(null);
     createForm.setFieldsValue({
       name: `${r.name}-copy`,
       listen_port: null,
       protocol: r.protocol,
       device_group_in: r.device_group_in,
+      route_mode: r.tunnel_id ? 'tunnel' : (r.route_mode === 'chain' || r.forward_mode === 'chain') ? 'chain' : 'direct',
+      forward_mode: r.route_mode === 'chain' || r.forward_mode === 'chain' ? 'chain' : 'direct',
+      tunnel_id: r.tunnel_id ?? undefined,
+      hops: r.tunnel_id ? undefined : (r.hops ?? []).map(h => h.device_group_id),
       target_addr: r.target_addr,
       target_port: r.target_port,
       targets: ruleTargets(r),
@@ -372,6 +392,7 @@ const IMPORT_DEFAULTS = {
     device_group_in?: number;
     route_mode?: string;
     forward_mode?: string;
+    tunnel_id?: number | null;
     hops?: number[];
     target_addr?: string; target_port?: number; targets?: RuleTargetInput[];
     load_balance_strategy?: string;
@@ -385,19 +406,35 @@ const IMPORT_DEFAULTS = {
     if (values.name !== undefined && values.name !== editing.name) payload.name = values.name;
     if (values.listen_port !== undefined && values.listen_port !== editing.listen_port) payload.listen_port = values.listen_port;
     if (values.protocol !== undefined && values.protocol !== editing.protocol) payload.protocol = values.protocol;
-    if (values.device_group_in !== undefined && values.device_group_in !== editing.device_group_in) payload.device_group_in = values.device_group_in;
-    const isChain = values.route_mode === 'chain' || values.forward_mode === 'chain';
+    const isPresetTunnel = values.route_mode === 'tunnel';
+    const isChain = values.route_mode === 'chain';
     const wasChain = editing.route_mode === 'chain' || editing.forward_mode === 'chain';
+    const wasPresetTunnel = !!editing.tunnel_id;
     const hops = (values.hops ?? []).filter((id): id is number => typeof id === 'number' && id > 0);
-    if (isChain) {
+    if (isPresetTunnel) {
+      const preset = values.tunnel_id ? tunnelMap.get(values.tunnel_id) : undefined;
+      const keepingCurrentBinding = !!values.tunnel_id && values.tunnel_id === editing.tunnel_id;
+      if (!canUsePresetForRuleUpdate(values.tunnel_id, editing.tunnel_id, preset)) {
+        message.error(t('tunnelSelectHint'));
+        return;
+      }
+      if (!keepingCurrentBinding) {
+        payload.route_mode = 'chain';
+        payload.forward_mode = 'chain';
+        payload.tunnel_id = preset!.id;
+        payload.device_group_in = preset!.hops[0].device_group_id;
+        payload.device_group_out = preset!.hops[preset!.hops.length - 1].device_group_id;
+      }
+    } else if (isChain) {
       if (hops.length < 2) {
         message.error(t('chainHopsHint'));
         return;
       }
       const oldHops = (editing.hops ?? []).map(h => h.device_group_id);
-      if (!wasChain || JSON.stringify(hops) !== JSON.stringify(oldHops)) {
+      if (!wasChain || wasPresetTunnel || JSON.stringify(hops) !== JSON.stringify(oldHops)) {
         payload.route_mode = 'chain';
         payload.forward_mode = 'chain';
+        payload.tunnel_id = null;
         payload.hops = hops;
         payload.device_group_in = hops[0];
         payload.device_group_out = hops[hops.length - 1];
@@ -405,7 +442,11 @@ const IMPORT_DEFAULTS = {
     } else if (wasChain) {
       payload.route_mode = 'direct';
       payload.forward_mode = 'direct';
+      payload.tunnel_id = null;
+      if (values.device_group_in !== undefined) payload.device_group_in = values.device_group_in;
       payload.device_group_out = null;
+    } else if (values.device_group_in !== undefined && values.device_group_in !== editing.device_group_in) {
+      payload.device_group_in = values.device_group_in;
     }
     const newTargets = formTargets(values);
     const oldTargets = ruleTargets(editing);
@@ -681,6 +722,20 @@ const IMPORT_DEFAULTS = {
         if (r.route_mode !== 'chain' && r.forward_mode !== 'chain') {
           return <Text type="secondary">{t('modeDirect')}</Text>;
         }
+        if (r.tunnel_id) {
+          const tunnel = tunnelMap.get(r.tunnel_id);
+          const path = tunnel ? tunnelPathText(tunnel) : hopPathText(r.tunnel_hops);
+          return (
+            <Space size={4} orientation="vertical">
+              <Tag color={r.tunnel_enabled === false ? 'red' : 'geekblue'}>
+                {r.tunnel_name || tunnel?.name || `#${r.tunnel_id}`}
+              </Tag>
+              <Text ellipsis={{ tooltip: path }} style={{ display: 'block', maxWidth: 170, fontSize: 12 }}>{path}</Text>
+              {r.tunnel_enabled === false && <Text type="danger" style={{ fontSize: 12 }}>{t('tunnelDisabled')}</Text>}
+              {r.tunnel_shared === false && <Text type="warning" style={{ fontSize: 12 }}>{t('tunnelAdminOnly')}</Text>}
+            </Space>
+          );
+        }
         const labels = (r.hops ?? []).map(h =>
           h.group_name || groupInfo.get(h.device_group_id)?.name || `#${h.device_group_id}`
         );
@@ -805,10 +860,60 @@ const IMPORT_DEFAULTS = {
 
   const createGroupId = Form.useWatch('device_group_in', createForm);
   const createRouteMode = Form.useWatch('route_mode', createForm);
+  const createTunnelId = Form.useWatch('tunnel_id', createForm);
   const editRouteMode = Form.useWatch('route_mode', editForm);
+  const editTunnelId = Form.useWatch('tunnel_id', editForm);
   const editGroupId = Form.useWatch('device_group_in', editForm);
   const createProto = Form.useWatch('protocol', createForm);
   const editProto = Form.useWatch('protocol', editForm);
+  const hopPathText = (hops?: Tunnel['hops']) => hops
+    ?.map(hop => hop.group_name || groupInfo.get(hop.device_group_id)?.name || `#${hop.device_group_id}`)
+    .join(' → ') || '-';
+  const tunnelPathText = (tunnel?: Tunnel) => hopPathText(tunnel?.hops);
+  const selectedCreateTunnel = createTunnelId ? tunnelMap.get(createTunnelId) : undefined;
+  const selectedEditTunnel = editTunnelId
+    ? tunnelMap.get(editTunnelId) ?? (editing?.tunnel_id === editTunnelId ? {
+      id: editTunnelId,
+      name: editing.tunnel_name || `#${editTunnelId}`,
+      enabled: editing.tunnel_enabled ?? false,
+      shared: editing.tunnel_shared ?? false,
+      uid: 0,
+      created_at: editing.created_at,
+      hops: editing.tunnel_hops ?? [],
+      bound_rule_count: 1,
+    } : undefined)
+    : undefined;
+
+  const renderTunnelPicker = (selected?: Tunnel) => (
+    <>
+      <Form.Item
+        name="tunnel_id"
+        label={t('modePresetTunnel')}
+        rules={[{ required: true, message: t('tunnelSelectHint') }]}
+        extra={t('tunnelSelectHint')}
+      >
+        <Select
+          showSearch
+          optionFilterProp="label"
+          options={(selected && !tunnelMap.has(selected.id) ? [selected, ...tunnels] : tunnels).map(tunnel => ({
+            value: tunnel.id,
+            label: `${tunnel.name} · ${tunnelPathText(tunnel)}`,
+            disabled: !tunnelMap.has(tunnel.id) || (!tunnel.enabled && tunnel.id !== selected?.id),
+          }))}
+          placeholder={t('select')}
+        />
+      </Form.Item>
+      {selected && (
+        <Alert
+          type={selected.enabled ? 'success' : 'warning'}
+          showIcon
+          style={{ marginBottom: 16 }}
+          title={selected.enabled ? tunnelPathText(selected) : t('tunnelDisabled')}
+          description={t('tunnelPortsReused')}
+        />
+      )}
+    </>
+  );
 
   const hostForForm = (gid?: number) => {
     if (!gid) return '';
@@ -989,6 +1094,12 @@ const IMPORT_DEFAULTS = {
 
   const ruleChainPath = (r: ForwardRule) => {
     if (r.route_mode !== 'chain' && r.forward_mode !== 'chain') return t('modeDirect');
+    if (r.tunnel_id) {
+      const tunnel = tunnelMap.get(r.tunnel_id);
+      const prefix = r.tunnel_name || tunnel?.name || `#${r.tunnel_id}`;
+      const path = tunnel ? tunnelPathText(tunnel) : hopPathText(r.tunnel_hops);
+      return `${prefix}: ${path}${r.tunnel_enabled === false ? ` · ${t('tunnelDisabled')}` : ''}${r.tunnel_shared === false ? ` · ${t('tunnelAdminOnly')}` : ''}`;
+    }
     const labels = (r.hops ?? []).map(h =>
       h.group_name || groupInfo.get(h.device_group_id)?.name || `#${h.device_group_id}`
     );
@@ -1069,7 +1180,7 @@ const IMPORT_DEFAULTS = {
           <Dropdown menu={{ items: exportMenuItems }}>
             <Button icon={<DownloadOutlined />}><span className="rp-mobile-hide">{t('exportImport')}</span></Button>
           </Dropdown>
-          <Button type="primary" icon={<PlusOutlined />} disabled={!isAdmin && sharedLoadFailed} onClick={() => { createForm.resetFields(); setCreateOpen(true); }}>{t('addRule')}</Button>
+          <Button type="primary" icon={<PlusOutlined />} disabled={!isAdmin && sharedLoadFailed} onClick={() => { setEditing(null); createForm.resetFields(); setCreateOpen(true); }}>{t('addRule')}</Button>
         </Space>
       </div>
       {/* v0.4.20: admin viewing another user's rules — show who. */}
@@ -1169,7 +1280,7 @@ const IMPORT_DEFAULTS = {
           layout="vertical"
           onValuesChange={(changed) => {
             if (changed.route_mode !== undefined) {
-              createForm.setFieldValue('forward_mode', changed.route_mode);
+              createForm.setFieldValue('forward_mode', changed.route_mode === 'direct' ? 'direct' : 'chain');
               if (changed.route_mode === 'chain') {
                 const hops = createForm.getFieldValue('hops');
                 if (!hops || hops.length < 2) {
@@ -1193,7 +1304,7 @@ const IMPORT_DEFAULTS = {
                     title={t('creatingRuleFor').replace('{user}', userMap.get(filterOwnerUid) ?? `#${filterOwnerUid}`)}
                   />
                 )}
-                {renderHostHint(createGroupId)}
+                {renderHostHint(createRouteMode === 'tunnel' ? selectedCreateTunnel?.hops[0]?.device_group_id : createGroupId)}
                 <Form.Item name="listen_port" label={t('listenPort')} extra={t('listenPortHint')}><InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder="auto" /></Form.Item>
                 <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp"
                   extra={isUdp(createProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
@@ -1207,10 +1318,11 @@ const IMPORT_DEFAULTS = {
                   <Select options={[
                     { value: 'direct', label: t('modeDirect') },
                     { value: 'chain', label: t('modeChain') },
+                    { value: 'tunnel', label: t('modePresetTunnel') },
                   ]} />
                 </Form.Item>
                 <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
-                {createRouteMode !== 'chain' && (
+                {createRouteMode === 'direct' && (
                   <Form.Item name="device_group_in" label={t('inboundGroup')} rules={[{ required: true }]}>
                     <Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} placeholder={allInGroups.length ? t('select') : t('createGroupFirst')} />
                   </Form.Item>
@@ -1239,6 +1351,7 @@ const IMPORT_DEFAULTS = {
                     )}
                   </Form.List>
                 )}
+                {createRouteMode === 'tunnel' && renderTunnelPicker(selectedCreateTunnel)}
               </>),
             },
             {
@@ -1288,7 +1401,7 @@ const IMPORT_DEFAULTS = {
           layout="vertical"
           onValuesChange={(changed) => {
             if (changed.route_mode !== undefined) {
-              editForm.setFieldValue('forward_mode', changed.route_mode);
+              editForm.setFieldValue('forward_mode', changed.route_mode === 'direct' ? 'direct' : 'chain');
               if (changed.route_mode === 'chain') {
                 const hops = editForm.getFieldValue('hops');
                 if (!hops || hops.length < 2) {
@@ -1304,7 +1417,7 @@ const IMPORT_DEFAULTS = {
               label: t('tabBasic'),
               children: (<>
                 <Form.Item name="name" label={t('name')}><Input /></Form.Item>
-                {renderHostHint(editGroupId)}
+                {renderHostHint(editRouteMode === 'tunnel' ? selectedEditTunnel?.hops[0]?.device_group_id : editGroupId)}
                 <Form.Item name="listen_port" label={t('listenPort')}><InputNumber min={1} max={65535} style={{ width: '100%' }} /></Form.Item>
                 <Form.Item name="protocol" label={t('protocol')}
                   extra={isUdp(editProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
@@ -1317,10 +1430,11 @@ const IMPORT_DEFAULTS = {
                   <Select options={[
                     { value: 'direct', label: t('modeDirect') },
                     { value: 'chain', label: t('modeChain') },
+                    { value: 'tunnel', label: t('modePresetTunnel') },
                   ]} />
                 </Form.Item>
                 <Form.Item name="forward_mode" hidden><Input /></Form.Item>
-                {editRouteMode !== 'chain' && (
+                {editRouteMode === 'direct' && (
                   <Form.Item name="device_group_in" label={t('inboundGroup')}><Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} /></Form.Item>
                 )}
                 {editRouteMode === 'chain' && (
@@ -1347,6 +1461,7 @@ const IMPORT_DEFAULTS = {
                     )}
                   </Form.List>
                 )}
+                {editRouteMode === 'tunnel' && renderTunnelPicker(selectedEditTunnel)}
               </>),
             },
             {

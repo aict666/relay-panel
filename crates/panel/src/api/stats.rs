@@ -154,6 +154,16 @@ pub struct DashboardHistoryPoint {
     pub timestamp: String,
     pub upload_bps_avg: i64,
     pub download_bps_avg: i64,
+    /// Highest one-minute sample inside this display bucket. Long ranges use
+    /// wider buckets, so plotting only the average would make short spikes
+    /// disappear when switching from 24h to 7d/30d.
+    pub upload_bps_max: i64,
+    pub download_bps_max: i64,
+    /// Actual minute at which each directional peak occurred. This is kept
+    /// separately because upload and download maxima can occur at different
+    /// points inside the same display bucket.
+    pub upload_bps_max_at: String,
+    pub download_bps_max_at: String,
     pub connections_max: i64,
     pub online_nodes_min: i64,
     pub recent_nodes_max: i64,
@@ -180,6 +190,10 @@ struct RawMinute {
 struct BucketAccumulator {
     upload_sum: i128,
     download_sum: i128,
+    upload_max: i64,
+    download_max: i64,
+    upload_max_at: Option<i64>,
+    download_max_at: Option<i64>,
     connections_max: i64,
     online_nodes_min: Option<i64>,
     recent_nodes_max: i64,
@@ -241,6 +255,14 @@ fn downsample_history(stats: Vec<Statistic>, bucket_seconds: i64) -> Vec<Dashboa
         let bucket = buckets.entry(bucket_start).or_default();
         bucket.upload_sum += upload_bps as i128;
         bucket.download_sum += download_bps as i128;
+        if bucket.upload_max_at.is_none() || upload_bps > bucket.upload_max {
+            bucket.upload_max = upload_bps;
+            bucket.upload_max_at = Some(timestamp);
+        }
+        if bucket.download_max_at.is_none() || download_bps > bucket.download_max {
+            bucket.download_max = download_bps;
+            bucket.download_max_at = Some(timestamp);
+        }
         bucket.connections_max = bucket.connections_max.max(connections);
         bucket.online_nodes_min = Some(
             bucket
@@ -255,11 +277,18 @@ fn downsample_history(stats: Vec<Statistic>, bucket_seconds: i64) -> Vec<Dashboa
         .into_iter()
         .filter_map(|(timestamp, bucket)| {
             let time = chrono::DateTime::from_timestamp(timestamp, 0)?;
+            let upload_max_at = chrono::DateTime::from_timestamp(bucket.upload_max_at?, 0)?;
+            let download_max_at = chrono::DateTime::from_timestamp(bucket.download_max_at?, 0)?;
             let count = i128::from(bucket.sample_count.max(1));
             Some(DashboardHistoryPoint {
                 timestamp: time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 upload_bps_avg: (bucket.upload_sum / count).min(i128::from(i64::MAX)) as i64,
                 download_bps_avg: (bucket.download_sum / count).min(i128::from(i64::MAX)) as i64,
+                upload_bps_max: bucket.upload_max,
+                download_bps_max: bucket.download_max,
+                upload_bps_max_at: upload_max_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                download_bps_max_at: download_max_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 connections_max: bucket.connections_max,
                 online_nodes_min: bucket.online_nodes_min.unwrap_or(0),
                 recent_nodes_max: bucket.recent_nodes_max,
@@ -961,11 +990,54 @@ mod tests {
                 timestamp: "2026-07-19T12:00:00Z".into(),
                 upload_bps_avg: 150,
                 download_bps_avg: 400,
+                upload_bps_max: 200,
+                download_bps_max: 500,
+                upload_bps_max_at: "2026-07-19T12:04:00Z".into(),
+                download_bps_max_at: "2026-07-19T12:04:00Z".into(),
                 connections_max: 9,
                 online_nodes_min: 1,
                 recent_nodes_max: 3,
                 sample_count: 2,
             }]
+        );
+    }
+
+    #[test]
+    fn dashboard_history_preserves_bandwidth_peak_across_range_bucket_sizes() {
+        let rows = || {
+            let mut rows = Vec::new();
+            for (base_id, key, first, peak) in [
+                (0, KEY_UPLOAD_BPS, 100_000, 5_650_000),
+                (10, KEY_DOWNLOAD_BPS, 120_000, 5_770_000),
+                (20, KEY_CONNECTIONS, 10, 11),
+                (30, KEY_ONLINE_NODES, 2, 2),
+                (40, KEY_RECENT_NODES, 2, 2),
+            ] {
+                rows.push(metric(base_id, key, "2026-07-19T12:01:00Z", first));
+                rows.push(metric(base_id + 1, key, "2026-07-19T12:16:00Z", peak));
+            }
+            rows
+        };
+
+        let five_minutes = downsample_history(rows(), 5 * 60);
+        let thirty_minutes = downsample_history(rows(), 30 * 60);
+        assert_eq!(
+            five_minutes
+                .iter()
+                .map(|point| point.download_bps_max)
+                .max(),
+            Some(5_770_000)
+        );
+        assert_eq!(thirty_minutes[0].download_bps_max, 5_770_000);
+        assert_eq!(thirty_minutes[0].upload_bps_max, 5_650_000);
+        assert_eq!(
+            thirty_minutes[0].download_bps_max_at,
+            "2026-07-19T12:16:00Z"
+        );
+        assert_eq!(thirty_minutes[0].upload_bps_max_at, "2026-07-19T12:16:00Z");
+        assert!(
+            thirty_minutes[0].download_bps_avg < thirty_minutes[0].download_bps_max,
+            "the average may be diluted, but the plotted peak must remain exact"
         );
     }
 

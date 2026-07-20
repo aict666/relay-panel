@@ -21,6 +21,28 @@ pub enum DbError {
     /// Detected by the in-transaction conflict pre-check; the partial unique
     /// indexes on forward_rules are the DB-layer backstop.
     PortConflict,
+    /// A tunnel entry replacement would strand bound rules whose ordinary
+    /// owners are not authorized for the new inbound group. Computed inside
+    /// the same write transaction as the path replacement.
+    TunnelEntryAuthorization { rules: i64, users: i64 },
+    /// A preset tunnel disappeared, was disabled while a rule was being
+    /// attached, or its entry/exit changed after service-layer validation.
+    /// Rechecked inside the rule write transaction to close the TOCTOU gap.
+    TunnelUnavailable,
+    /// The preset tunnel still exists and its path is unchanged, but the rule
+    /// owner is not allowed to bind/resume it (not shared, or hop 0 is outside
+    /// the owner's effective device-group authorization). Checked in the same
+    /// transaction as the rule write to close the sharing-toggle race.
+    TunnelAccessDenied,
+    /// A device-group edit would invalidate one or more preset-tunnel hops.
+    /// Checked in the same write transaction as the group update.
+    TunnelGroupInvariant {
+        entry_tunnels: i64,
+        downstream_tunnels: i64,
+    },
+    /// Deleting a regular user would also delete one or more legacy
+    /// user-owned device groups that are now part of administrator tunnels.
+    UserTunnelGroupConflict { groups: i64, tunnels: i64 },
     /// FOREIGN KEY constraint violation. SQLite code "787", PostgreSQL "23503".
     ForeignKeyViolation,
     /// A required row was not found (for fetch_one-or-None patterns that are
@@ -36,6 +58,23 @@ impl std::fmt::Display for DbError {
         match self {
             DbError::UniqueViolation => write!(f, "unique constraint violation"),
             DbError::PortConflict => write!(f, "listen_port conflict on inbound group"),
+            DbError::TunnelEntryAuthorization { rules, users } => write!(
+                f,
+                "tunnel entry authorization conflict ({rules} rules, {users} users)"
+            ),
+            DbError::TunnelUnavailable => write!(f, "preset tunnel is unavailable or changed"),
+            DbError::TunnelAccessDenied => write!(f, "preset tunnel access denied"),
+            DbError::TunnelGroupInvariant {
+                entry_tunnels,
+                downstream_tunnels,
+            } => write!(
+                f,
+                "device-group edit would invalidate preset tunnels ({entry_tunnels} entry, {downstream_tunnels} downstream)"
+            ),
+            DbError::UserTunnelGroupConflict { groups, tunnels } => write!(
+                f,
+                "user owns {groups} device groups referenced by {tunnels} preset tunnels"
+            ),
             DbError::ForeignKeyViolation => write!(f, "foreign key constraint violation"),
             DbError::NotFound => write!(f, "not found"),
             DbError::Other(e) => write!(f, "database error: {}", e),
@@ -65,6 +104,11 @@ impl From<sqlx::Error> for DbError {
                 Some("787") => return DbError::ForeignKeyViolation,
                 // PostgreSQL SQLSTATE 23503 (foreign_key_violation)
                 Some("23503") => return DbError::ForeignKeyViolation,
+                // PostgreSQL SERIALIZABLE transaction lost a race. Preset
+                // tunnel path updates are the only serializable repository
+                // operation; surface this as a refresh/retry conflict instead
+                // of a generic 500.
+                Some("40001") => return DbError::TunnelUnavailable,
                 _ => {}
             }
         }

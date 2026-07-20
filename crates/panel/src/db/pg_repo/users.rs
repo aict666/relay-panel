@@ -315,6 +315,38 @@ impl UserRepository for PgRepository {
         // device_groups → users. The user delete carries the admin guard; if it
         // affects 0 rows (admin or gone) we roll back so the cascade is undone.
         let mut tx = self.pool.begin().await?;
+        let target_admin: Option<bool> =
+            sqlx::query_scalar("SELECT admin FROM users WHERE id=$1 FOR UPDATE")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if target_admin != Some(false) {
+            tx.rollback().await?;
+            return Ok(0);
+        }
+        // Lock every legacy user-owned group before checking tunnel_hops. Tunnel
+        // path writers take a SHARE lock on the same rows, so either their path
+        // commits first and is reported here, or deletion wins and their
+        // in-transaction group revalidation fails safely.
+        sqlx::query("SELECT id FROM device_groups WHERE uid=$1 ORDER BY id FOR UPDATE")
+            .bind(uid)
+            .fetch_all(&mut *tx)
+            .await?;
+        let conflict: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT g.id),COUNT(DISTINCT h.tunnel_id) \
+             FROM device_groups g JOIN tunnel_hops h ON h.device_group_id=g.id \
+             WHERE g.uid=$1",
+        )
+        .bind(uid)
+        .fetch_one(&mut *tx)
+        .await?;
+        if conflict.0 > 0 {
+            tx.rollback().await?;
+            return Err(DbError::UserTunnelGroupConflict {
+                groups: conflict.0,
+                tunnels: conflict.1,
+            });
+        }
         sqlx::query("DELETE FROM forward_rules WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)

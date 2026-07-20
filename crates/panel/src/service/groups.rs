@@ -24,6 +24,10 @@ pub enum CreateGroupError {
 pub enum UpdateGroupError {
     NotFound,
     NoFields,
+    TunnelInvariant {
+        entry_tunnels: i64,
+        downstream_tunnels: i64,
+    },
     Database(DbError),
 }
 
@@ -134,49 +138,63 @@ pub async fn update_group(
             hidden,
         )
         .await
-        .map_err(UpdateGroupError::Database)?
-    {
+        .map_err(|error| match error {
+            DbError::TunnelGroupInvariant {
+                entry_tunnels,
+                downstream_tunnels,
+            } => UpdateGroupError::TunnelInvariant {
+                entry_tunnels,
+                downstream_tunnels,
+            },
+            other => UpdateGroupError::Database(other),
+        })? {
         0 => Err(UpdateGroupError::NotFound),
         _ => Ok(()),
     }
 }
 
-/// v1.0.4: error returned when a group cannot be deleted because rules
-/// still reference it.
+/// Error returned when a group cannot be deleted because rules or reusable
+/// tunnel paths still reference it.
 #[derive(Debug)]
 pub struct GroupInUseError {
     pub group_id: i64,
     pub rule_count: i64,
+    pub tunnel_count: i64,
+    pub fallback_group_count: i64,
 }
 
 impl std::fmt::Display for GroupInUseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "group {} still referenced by {} rule(s)",
-            self.group_id, self.rule_count
+            "group {} still referenced by {} rule(s), {} tunnel(s), and {} fallback group(s)",
+            self.group_id, self.rule_count, self.tunnel_count, self.fallback_group_count
         )
     }
 }
 
 impl std::error::Error for GroupInUseError {}
 
-/// Delete an admin-owned device group. Before deleting, checks that no
-/// forward_rules reference this group via device_group_in, device_group_out,
-/// or fallback_group. Returns `GroupInUseError` with the rule count if any
-/// references exist, so the handler can return a clear 409.
+/// Delete an admin-owned device group. Rule, tunnel and group-fallback
+/// references are classified inside the same transaction as the DELETE.
 pub async fn delete_group(
     db: &dyn Repository,
     id: i64,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let count = db.count_rules_by_group(id).await?;
-    if count > 0 {
-        return Err(Box::new(GroupInUseError {
+    match db.delete_group_checked(id).await? {
+        crate::db::repo::GroupDeleteOutcome::Deleted => Ok(true),
+        crate::db::repo::GroupDeleteOutcome::NotFound => Ok(false),
+        crate::db::repo::GroupDeleteOutcome::InUse {
+            rule_count,
+            tunnel_count,
+            fallback_group_count,
+        } => Err(Box::new(GroupInUseError {
             group_id: id,
-            rule_count: count,
-        }));
+            rule_count,
+            tunnel_count,
+            fallback_group_count,
+        })),
     }
-    Ok(db.delete_group(id, &ResourceScope::All).await? > 0)
 }
 
 /// Delete a rule within `scope` (owner-scoped for regular users, All for

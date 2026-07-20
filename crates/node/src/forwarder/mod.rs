@@ -10,6 +10,7 @@ pub mod selector;
 pub mod splice;
 pub mod tcp;
 pub mod tls;
+pub mod tunnel;
 pub mod udp;
 pub mod uot;
 pub mod ws;

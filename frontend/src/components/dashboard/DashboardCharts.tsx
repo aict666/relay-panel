@@ -77,12 +77,27 @@ export default function DashboardCharts({
       hour12: false,
     }).format(date);
   };
+  const formatTooltipTime = (value: unknown) => {
+    const date = new Date(Number(value));
+    if (Number.isNaN(date.getTime())) return '-';
+    return new Intl.DateTimeFormat(lang, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).format(date);
+  };
 
   const uploadLabel = t('dashboardUpload');
   const downloadLabel = t('dashboardDownload');
   const bandwidthData = historyPoints.flatMap((point) => [
-    { time: Date.parse(point.timestamp), value: point.upload_bps_avg, direction: uploadLabel },
-    { time: Date.parse(point.timestamp), value: point.download_bps_avg, direction: downloadLabel },
+    // Plot the one-minute peak retained inside each display bucket. 7d/30d use
+    // wider buckets than 24h; plotting the average made real short-lived peaks
+    // appear to vanish merely by changing the selected range.
+    { time: Date.parse(point.upload_bps_max_at ?? point.timestamp), value: point.upload_bps_max ?? point.upload_bps_avg, direction: uploadLabel },
+    { time: Date.parse(point.download_bps_max_at ?? point.timestamp), value: point.download_bps_max ?? point.download_bps_avg, direction: downloadLabel },
   ]);
   const connectionData = historyPoints.map((point) => ({
     time: Date.parse(point.timestamp),
@@ -152,7 +167,10 @@ export default function DashboardCharts({
             y: { labelFormatter: (value: unknown) => formatBps(Number(value)), title: false },
           }}
           legend={{ color: { position: 'top' } }}
-          tooltip={{ items: [{ channel: 'y', valueFormatter: (value: unknown) => formatBps(Number(value)) }] }}
+          tooltip={{
+            title: (datum: { time?: unknown }) => formatTooltipTime(datum.time),
+            items: [{ channel: 'y', valueFormatter: (value: unknown) => formatBps(Number(value)) }],
+          }}
           style={{ fillOpacity: 0.18, lineWidth: 2 }}
         />
         <div className="rp-dashboard-connection-label">{t('dashboardConnectionsPeak')}</div>
@@ -171,7 +189,10 @@ export default function DashboardCharts({
             },
             y: { labelFormatter: (value: unknown) => String(Math.round(Number(value))), title: false },
           }}
-          tooltip={{ items: [{ channel: 'y', valueFormatter: (value: unknown) => String(Math.round(Number(value))) }] }}
+          tooltip={{
+            title: (datum: { time?: unknown }) => formatTooltipTime(datum.time),
+            items: [{ channel: 'y', valueFormatter: (value: unknown) => String(Math.round(Number(value))) }],
+          }}
           style={{ stroke: '#7c6bc4', lineWidth: 2 }}
         />
       </div>

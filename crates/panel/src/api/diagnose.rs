@@ -323,7 +323,13 @@ pub async fn diagnose_rule(
     //    - chain: every hop group in order (entry → mid → exit). Each hop node
     //      probes ITS own next target (next hop connect_host:port, or the final
     //      targets on the last hop), so the UI shows the full multi-hop path.
-    let hop_group_ids: Vec<i64> = if rule.route_mode == "chain" {
+    let hop_group_ids: Vec<i64> = if rule.tunnel_id.is_some() {
+        // A preset tunnel uses one authenticated end-to-end probe from the
+        // public entry. Dispatching the rule id to shared intermediate nodes
+        // would be wrong: they intentionally have no rule-level public
+        // listener to diagnose.
+        vec![rule.device_group_in]
+    } else if rule.route_mode == "chain" {
         match state.db.list_rule_hops(rule_id).await {
             Ok(hops) if !hops.is_empty() => hops.into_iter().map(|h| h.device_group_id).collect(),
             Ok(_) => {

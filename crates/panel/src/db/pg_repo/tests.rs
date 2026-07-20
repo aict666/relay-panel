@@ -401,6 +401,48 @@ async fn pg_delete_user_cascade_removes_rules_groups_profiles_and_user() {
 }
 
 #[tokio::test]
+async fn pg_user_delete_cascade_reports_legacy_group_used_by_tunnel() {
+    let Some(db) = repo("user_tunnel_conflict").await else {
+        return;
+    };
+    db.insert_user("legacy_tunnel_owner", "h", 1).await.unwrap();
+    let uid = db
+        .find_by_username("legacy_tunnel_owner")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,connect_host,token,uid) VALUES \
+         (810,'legacy-entry','in','entry.example','legacy-entry-token',$1), \
+         (811,'admin-exit','out','exit.example','admin-exit-token',1)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.create_tunnel_full(
+        "legacy-owner-path",
+        true,
+        false,
+        1,
+        &[(810, None), (811, Some(38_110))],
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        db.delete_user_cascade(uid).await,
+        Err(DbError::UserTunnelGroupConflict {
+            groups: 1,
+            tunnels: 1
+        })
+    ));
+    assert!(db.exists_by_id(uid).await.unwrap());
+    cleanup(&db).await;
+}
+
+#[tokio::test]
 async fn pg_apply_schema_seeds_baseline_version() {
     // v0.4.4: apply_pg_schema must create schema_version and seed revision 1,
     // and run_pg_migrations must be a no-op at the baseline.
@@ -416,6 +458,43 @@ async fn pg_apply_schema_seeds_baseline_version() {
     crate::db::pg_schema::run_pg_migrations(&db.pool)
         .await
         .expect("baseline migrations must be a no-op");
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_upgrade_from_revision_28_adds_credential_revision() {
+    let Some(db) = repo("upgrade_rev28_credential_revision").await else {
+        return;
+    };
+    sqlx::query("ALTER TABLE device_groups DROP COLUMN credential_revision")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version >= 29")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Production startup applies the idempotent baseline first. CREATE TABLE IF
+    // NOT EXISTS cannot add a column to the existing table, so revision 29 must
+    // remain reachable through PG_SCHEMA_VERSION.
+    apply_pg_schema(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    let column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='device_groups' \
+           AND column_name='credential_revision'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let revision: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(column_count, 1);
+    assert_eq!(revision, 29);
     cleanup(&db).await;
 }
 
@@ -1022,7 +1101,7 @@ async fn pg_rule_hop_tunnel_port_claim_is_stable_and_reserved() {
     let second_exit = db.list_rule_hops(second.id).await.unwrap()[1].id;
     assert!(matches!(
         db.claim_rule_hop_tunnel_port(second_exit, 31000).await,
-        Err(DbError::UniqueViolation)
+        Err(DbError::PortConflict)
     ));
     cleanup(&db).await;
 }
@@ -4815,6 +4894,768 @@ async fn pg_statistics_upsert_is_idempotent_and_cleanup_is_scoped() {
             .unwrap()
             .len(),
         1
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_reusable_tunnel_repository_contract() {
+    let Some(db) = repo("reusable_tunnel_contract").await else {
+        return;
+    };
+    for (id, name, group_type, host) in [
+        (701, "preset-entry", "in", "192.0.2.1"),
+        (702, "preset-relay", "out", "192.0.2.2"),
+        (703, "preset-exit", "out", "192.0.2.3"),
+        (704, "replacement-entry", "in", ""),
+    ] {
+        sqlx::query(
+            "INSERT INTO device_groups(id,name,group_type,token,uid,connect_host) \
+             VALUES($1,$2,$3,$4,1,$5)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(group_type)
+        .bind(format!("token-{id}"))
+        .bind(host)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let tunnel_id = db
+        .create_tunnel_full(
+            "repository-route",
+            true,
+            true,
+            1,
+            &[(701, None), (702, Some(36_001))],
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+         device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+         VALUES('preset-rule',1,35001,'tcp','chain','chain',701,702,'203.0.113.8',443,$1)",
+    )
+    .bind(tunnel_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let rule_id: i64 = sqlx::query_scalar("SELECT id FROM forward_rules WHERE name='preset-rule'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rule_targets(rule_id,position,host,port,weight,enabled) \
+         VALUES($1,1,'203.0.113.9',8443,2,TRUE)",
+    )
+    .bind(rule_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let listed = db.list_tunnels().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].bound_rule_count, 1);
+    assert_eq!(listed[0].hops[1].connect_host.as_deref(), Some("192.0.2.2"));
+    assert_eq!(db.count_tunnels_by_group(701).await.unwrap(), 1);
+    assert_eq!(db.count_tunnels_by_group(702).await.unwrap(), 1);
+    assert_eq!(db.count_tunnels_by_group(703).await.unwrap(), 0);
+    let active = db.list_active_tunnel_rules_for_group(702).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].targets.len(), 1);
+    assert_eq!(active[0].targets[0].host, "203.0.113.9");
+    assert_eq!(
+        db.list_group_tokens(&[701, 702]).await.unwrap(),
+        vec![(701, "token-701".into()), (702, "token-702".into())]
+    );
+
+    let expected = [(701, None), (702, Some(36_001))];
+    let colliding_entry_move = [(704, None), (701, Some(35_001)), (702, Some(36_001))];
+    assert!(matches!(
+        db.update_tunnel_full(
+            tunnel_id,
+            None,
+            None,
+            None,
+            Some(&colliding_entry_move),
+            Some(&expected),
+        )
+        .await,
+        Err(DbError::PortConflict)
+    ));
+    assert_eq!(
+        db.find_tunnel_by_id(tunnel_id).await.unwrap().unwrap().hops[0].device_group_id,
+        701
+    );
+
+    let replacement = [(701, None), (702, Some(36_001)), (703, Some(36_002))];
+    assert_eq!(
+        db.update_tunnel_full(
+            tunnel_id,
+            None,
+            None,
+            None,
+            Some(&replacement),
+            Some(&expected),
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let exit: i64 = sqlx::query_scalar("SELECT device_group_out FROM forward_rules WHERE id=$1")
+        .bind(rule_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(exit, 703);
+    assert_eq!(db.count_tunnels_by_group(703).await.unwrap(), 1);
+
+    let route_a = [(701, None), (702, Some(36_001)), (703, Some(36_003))];
+    let route_b = [(701, None), (702, Some(36_001)), (703, Some(36_004))];
+    let db_a = PgRepository::new(db.pool.clone());
+    let db_b = PgRepository::new(db.pool.clone());
+    let (result_a, result_b) = tokio::join!(
+        db_a.update_tunnel_full(
+            tunnel_id,
+            None,
+            None,
+            None,
+            Some(&route_a),
+            Some(&replacement),
+        ),
+        db_b.update_tunnel_full(
+            tunnel_id,
+            None,
+            None,
+            None,
+            Some(&route_b),
+            Some(&replacement),
+        ),
+    );
+    let outcomes = [result_a, result_b];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(result, Ok(1)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(result, Err(DbError::TunnelUnavailable)))
+            .count(),
+        1,
+        "a stale concurrent path update must be a deterministic conflict"
+    );
+
+    assert!(matches!(
+        db.create_tunnel_full(
+            "conflicting-route",
+            true,
+            false,
+            1,
+            &[(701, None), (702, Some(36_001))],
+        )
+        .await,
+        Err(DbError::PortConflict)
+    ));
+    assert_eq!(
+        db.delete_tunnel(tunnel_id).await.unwrap(),
+        TunnelDeleteOutcome::InUse(1)
+    );
+    sqlx::query("DELETE FROM forward_rules WHERE id=$1")
+        .bind(rule_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.delete_tunnel(tunnel_id).await.unwrap(),
+        TunnelDeleteOutcome::Deleted
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_tunnel_entry_move_keeps_a_scoped_drain_and_billing_lease() {
+    let Some(db) = repo("tunnel_entry_drain").await else {
+        return;
+    };
+    for (id, name, group_type, host) in [
+        (721, "old-entry", "in", ""),
+        (722, "new-entry", "in", ""),
+        (723, "drain-exit", "out", "192.0.2.23"),
+    ] {
+        sqlx::query(
+            "INSERT INTO device_groups(id,name,group_type,token,uid,connect_host) \
+             VALUES($1,$2,$3,$4,1,$5)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(group_type)
+        .bind(format!("token-{id}"))
+        .bind(host)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let tunnel_id = db
+        .create_tunnel_full(
+            "entry-drain",
+            true,
+            false,
+            1,
+            &[(721, None), (723, Some(36_021))],
+        )
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users(id,username,password,admin) VALUES(2,'u2','x',FALSE)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO user_device_groups(user_id,device_group_id) VALUES(2,721),(2,722)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let rule_id: i64 = sqlx::query_scalar(
+        "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+         device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+         VALUES('draining-rule',1,35021,'tcp','chain','chain',721,723,'203.0.113.21',443,$1) \
+         RETURNING id",
+    )
+    .bind(tunnel_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let paused_rule_id: i64 = sqlx::query_scalar(
+        "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+         device_group_in,device_group_out,target_addr,target_port,tunnel_id,paused) \
+         VALUES('paused-before-move',1,35023,'tcp','chain','chain',721,723, \
+                '203.0.113.23',443,$1,TRUE) RETURNING id",
+    )
+    .bind(tunnel_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let newly_shared_rule_id: i64 = sqlx::query_scalar(
+        "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+         device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+         VALUES('newly-shared-during-move',2,35024,'tcp','chain','chain',721,723, \
+                '203.0.113.24',443,$1) RETURNING id",
+    )
+    .bind(tunnel_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    db.update_tunnel_full(
+        tunnel_id,
+        None,
+        None,
+        Some(true),
+        Some(&[(722, None), (723, Some(36_021))]),
+        Some(&[(721, None), (723, Some(36_021))]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.list_draining_tunnel_rule_ids_for_group(721)
+            .await
+            .unwrap(),
+        vec![rule_id]
+    );
+    assert_eq!(
+        db.list_rule_restart_entry_group_ids(rule_id).await.unwrap(),
+        vec![721, 722],
+        "restart must target both the retired and current entry groups"
+    );
+    let paused_lease_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rule_retired_entries WHERE rule_id=$1")
+            .bind(paused_rule_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(paused_lease_count, 0);
+    let newly_shared_lease_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rule_retired_entries WHERE rule_id=$1")
+            .bind(newly_shared_rule_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(newly_shared_lease_count, 0);
+    let future_rule_id: i64 = sqlx::query_scalar(
+        "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+         device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+         VALUES('future-rule',1,35022,'tcp','chain','chain',722,723,'203.0.113.22',443,$1) \
+         RETURNING id",
+    )
+    .bind(tunnel_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        db.list_draining_tunnel_rule_ids_for_group(721)
+            .await
+            .unwrap(),
+        vec![rule_id]
+    );
+    assert!(matches!(
+        db.apply_traffic_batch(
+            721,
+            &[TrafficEntry {
+                rule_id,
+                upload: 100,
+                download: 200,
+            }]
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Ok
+    ));
+    assert!(matches!(
+        db.apply_traffic_batch(
+            723,
+            &[TrafficEntry {
+                rule_id,
+                upload: 1,
+                download: 1,
+            }]
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Unavailable
+    ));
+    assert!(matches!(
+        db.apply_traffic_batch(
+            721,
+            &[TrafficEntry {
+                rule_id: future_rule_id,
+                upload: 1,
+                download: 1,
+            }]
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Unavailable
+    ));
+    sqlx::query("UPDATE forward_rules SET paused=TRUE WHERE id=$1")
+        .bind(rule_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.renew_draining_tunnel_rule_ids_for_group(721, &[rule_id])
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        db.apply_traffic_batch(
+            721,
+            &[TrafficEntry {
+                rule_id,
+                upload: 3,
+                download: 4,
+            }]
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Ok
+    ));
+    sqlx::query("UPDATE forward_rules SET paused=FALSE WHERE id=$1")
+        .bind(rule_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE forward_rules SET tunnel_id=NULL WHERE id=$1")
+        .bind(rule_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(db
+        .list_draining_tunnel_rule_ids_for_group(721)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.renew_draining_tunnel_rule_ids_for_group(721, &[rule_id])
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        db.apply_traffic_batch(
+            721,
+            &[TrafficEntry {
+                rule_id,
+                upload: 1,
+                download: 2,
+            }]
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Ok
+    ));
+    sqlx::query("UPDATE forward_rules SET tunnel_id=$1 WHERE id=$2")
+        .bind(tunnel_id)
+        .bind(rule_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tunnels SET enabled=FALSE WHERE id=$1")
+        .bind(tunnel_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.renew_draining_tunnel_rule_ids_for_group(721, &[rule_id])
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        db.apply_traffic_batch(
+            721,
+            &[TrafficEntry {
+                rule_id,
+                upload: 5,
+                download: 6,
+            }]
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Ok
+    ));
+    sqlx::query("UPDATE tunnels SET enabled=TRUE WHERE id=$1")
+        .bind(tunnel_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE forward_rule_retired_entries SET expires_at=0 WHERE rule_id=$1")
+        .bind(rule_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.apply_traffic_batch(
+            721,
+            &[TrafficEntry {
+                rule_id,
+                upload: 1,
+                download: 1,
+            }]
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Unavailable
+    ));
+    assert_eq!(
+        db.renew_draining_tunnel_rule_ids_for_group(721, &[rule_id])
+            .await
+            .unwrap(),
+        0,
+        "an expired drain lease is a tombstone and cannot be revived"
+    );
+    assert!(matches!(
+        db.apply_traffic_batch(
+            721,
+            &[TrafficEntry {
+                rule_id,
+                upload: 1,
+                download: 1,
+            }]
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Unavailable
+    ));
+    sqlx::query("UPDATE forward_rules SET paused=TRUE WHERE id=$1")
+        .bind(rule_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(db
+        .list_draining_tunnel_rule_ids_for_group(721)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        db.apply_traffic_batch(
+            721,
+            &[TrafficEntry {
+                rule_id,
+                upload: 1,
+                download: 1,
+            }]
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Unavailable
+    ));
+    sqlx::query("UPDATE tunnels SET enabled=FALSE WHERE id=$1")
+        .bind(tunnel_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_disabled_bound_tunnel_ids().await.unwrap(),
+        vec![tunnel_id]
+    );
+
+    // Enabling and moving an already-disabled tunnel must not grant the old
+    // entry a drain lease because there was no running listener to drain.
+    sqlx::query("UPDATE forward_rules SET paused=FALSE WHERE id=$1")
+        .bind(rule_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM forward_rule_retired_entries WHERE tunnel_id=$1")
+        .bind(tunnel_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.update_tunnel_full(
+        tunnel_id,
+        None,
+        Some(true),
+        None,
+        Some(&[(721, None), (723, Some(36_021))]),
+        Some(&[(722, None), (723, Some(36_021))]),
+    )
+    .await
+    .unwrap();
+    let disabled_move_lease_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rule_retired_entries WHERE tunnel_id=$1")
+            .bind(tunnel_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(disabled_move_lease_count, 0);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_tunnel_entry_move_uses_previous_state_for_tail_billing_lease() {
+    let Some(db) = repo("tunnel_entry_tail_billing").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid,connect_host) VALUES \
+         (731,'tail-old-entry','in','tail-old-token',1,''), \
+         (732,'tail-new-entry','in','tail-new-token',1,''), \
+         (733,'tail-exit','out','tail-exit-token',1,'192.0.2.33')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO users(id,username,password,admin) VALUES(2,'tail-u2','x',FALSE)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO user_device_groups(user_id,device_group_id) VALUES(2,731),(2,732)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let tunnel_id = db
+        .create_tunnel_full(
+            "tail-billing",
+            true,
+            true,
+            1,
+            &[(731, None), (733, Some(36_131))],
+        )
+        .await
+        .unwrap();
+    let admin_rule: i64 = sqlx::query_scalar(
+        "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+         device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+         VALUES('tail-admin',1,35131,'tcp','chain','chain',731,733,'203.0.113.31',443,$1) \
+         RETURNING id",
+    )
+    .bind(tunnel_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let user_rule: i64 = sqlx::query_scalar(
+        "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+         device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+         VALUES('tail-user',2,35132,'tcp','chain','chain',731,733,'203.0.113.32',443,$1) \
+         RETURNING id",
+    )
+    .bind(tunnel_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    db.update_tunnel_full(
+        tunnel_id,
+        None,
+        Some(false),
+        Some(false),
+        Some(&[(732, None), (733, Some(36_131))]),
+        Some(&[(731, None), (733, Some(36_131))]),
+    )
+    .await
+    .unwrap();
+
+    let leased_rules: Vec<i64> = sqlx::query_scalar(
+        "SELECT rule_id FROM forward_rule_retired_entries WHERE tunnel_id=$1 AND device_group_id=$2 ORDER BY rule_id",
+    )
+    .bind(tunnel_id)
+    .bind(731_i64)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(leased_rules, vec![admin_rule, user_rule]);
+    assert!(matches!(
+        db.apply_traffic_batch(
+            731,
+            &[
+                TrafficEntry {
+                    rule_id: admin_rule,
+                    upload: 10,
+                    download: 20,
+                },
+                TrafficEntry {
+                    rule_id: user_rule,
+                    upload: 30,
+                    download: 40,
+                },
+            ],
+        )
+        .await
+        .unwrap()[0],
+        TrafficEntryResult::Ok
+    ));
+    assert!(db
+        .list_draining_tunnel_rule_ids_for_group(731)
+        .await
+        .unwrap()
+        .is_empty());
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_reusable_tunnel_repository_revalidates_group_roles_inside_write() {
+    let Some(db) = repo("tunnel_group_revalidation").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups (id,name,group_type,token,uid,connect_host) VALUES \
+         (711,'invalid-entry','out','invalid-entry-token',1,'192.0.2.11'), \
+         (712,'valid-entry','in','valid-entry-token',1,''), \
+         (713,'invalid-exit','out','invalid-exit-token',1,'')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        db.create_tunnel_full(
+            "stale-entry-validation",
+            true,
+            false,
+            1,
+            &[(711, None), (713, Some(36_011))],
+        )
+        .await,
+        Err(DbError::TunnelUnavailable)
+    ));
+    assert!(matches!(
+        db.create_tunnel_full(
+            "stale-exit-validation",
+            true,
+            false,
+            1,
+            &[(712, None), (713, Some(36_012))],
+        )
+        .await,
+        Err(DbError::TunnelUnavailable)
+    ));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_group_token_revision_and_preset_tunnel_invariants_are_atomic() {
+    let Some(db) = repo("group_tunnel_guard").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups (id,name,group_type,token,uid,connect_host) VALUES \
+         (801,'entry-guard','in','guard-entry-token',1,'2001:db8::1'), \
+         (802,'exit-guard','out','guard-exit-token',1,'2001:db8::2')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let tunnel_id = db
+        .create_tunnel_full(
+            "guarded-route",
+            true,
+            false,
+            1,
+            &[(801, None), (802, Some(36_101))],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.update_group_fields(
+            801,
+            &ResourceScope::All,
+            None,
+            Some("out"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await,
+        Err(DbError::TunnelGroupInvariant {
+            entry_tunnels: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        db.update_group_fields(
+            802,
+            &ResourceScope::All,
+            None,
+            Some("monitor"),
+            Some(""),
+            None,
+            None,
+            None,
+        )
+        .await,
+        Err(DbError::TunnelGroupInvariant {
+            downstream_tunnels: 1,
+            ..
+        })
+    ));
+    let row: (String, String) =
+        sqlx::query_as("SELECT group_type,connect_host FROM device_groups WHERE id=802")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row, ("out".into(), "2001:db8::2".into()));
+    assert!(db
+        .list_group_credential_revisions()
+        .await
+        .unwrap()
+        .contains(&(801, 0)));
+    db.update_group_token(801, &ResourceScope::All, "guard-entry-token-2")
+        .await
+        .unwrap();
+    assert!(db
+        .list_group_credential_revisions()
+        .await
+        .unwrap()
+        .contains(&(801, 1)));
+    assert_eq!(
+        db.delete_tunnel(tunnel_id).await.unwrap(),
+        TunnelDeleteOutcome::Deleted
     );
     cleanup(&db).await;
 }

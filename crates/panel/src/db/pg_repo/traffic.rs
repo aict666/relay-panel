@@ -6,10 +6,12 @@ use relay_shared::protocol::TrafficEntry;
 
 // ── TrafficRepository ──
 //
-// Same atomicity contract as SQLite (see sqlite_repo.rs). PG defaults to READ
-// COMMITTED, so the ownership check + write on the same tx handle is the
-// guarantee: a concurrent tx can't make our UPDATE see a different row than
-// our SELECT did because both run on the same snapshot within this tx.
+// Same all-or-nothing batch contract as SQLite (see sqlite_repo/traffic.rs).
+// PostgreSQL READ COMMITTED takes a fresh snapshot for each statement, so the
+// validation SELECT and later UPDATE do not share one immutable snapshot.
+// The writes therefore use `traffic_used = traffic_used + delta`: PostgreSQL's
+// row locks serialize concurrent updates and each writer adds to the latest
+// committed value instead of overwriting another node's report.
 #[async_trait]
 impl TrafficRepository for PgRepository {
     async fn apply_traffic_batch(
@@ -68,7 +70,10 @@ impl TrafficRepository for PgRepository {
         }
 
         // ── Pass 2: ownership + existing-value resolution.
-        // SINGLE query per distinct rule_id, gated by device_group_in. A miss =
+        // SINGLE query per distinct rule_id, gated by the current entry or a
+        // durable retired-entry lease created during a preset-tunnel move. Lease
+        // expiry, rather than a later pause/ban/unshare/disable, is the accounting
+        // cutoff so already-accepted bytes can still be flushed. A miss =
         // "not available" (missing OR foreign); NO second existence query (that
         // was the rule-id oracle). Reason logged server-side only.
         struct Resolved {
@@ -96,7 +101,10 @@ impl TrafficRepository for PgRepository {
                 "SELECT fr.id, fr.uid, fr.traffic_used, u.traffic_used \
                  FROM forward_rules fr \
                  JOIN users u ON u.id = fr.uid \
-                 WHERE fr.id = $1 AND fr.device_group_in = $2",
+                 WHERE fr.id = $1 AND (fr.device_group_in = $2 OR EXISTS( \
+                   SELECT 1 FROM forward_rule_retired_entries re \
+                   WHERE re.rule_id=fr.id AND re.device_group_id=$2 \
+                     AND re.expires_at>=EXTRACT(EPOCH FROM now())::BIGINT))",
             )
             .bind(rule_id)
             .bind(group_id)

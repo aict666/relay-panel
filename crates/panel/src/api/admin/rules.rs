@@ -39,6 +39,18 @@ pub async fn create_rule(
     State(state): State<AppState>,
     Json(req): Json<CreateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
+    let tunnel_entry = if let Some(tunnel_id) = req.tunnel_id {
+        match state.db.find_tunnel_by_id(tunnel_id).await {
+            Ok(Some(tunnel)) => tunnel.hops.first().map(|hop| hop.device_group_id),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("create_rule: tunnel lookup failed: {}", e);
+                return Json(err(500, "数据库错误"));
+            }
+        }
+    } else {
+        None
+    };
     // v1.0.4: non-admin users with a RESTRICTED permission group (group set +
     // allow_all_groups=false) can only create rules on authorized device
     // groups. An empty authorized list means "no groups allowed" → deny. Legacy
@@ -61,10 +73,8 @@ pub async fn create_rule(
                 }
             };
             // Chain: entry is hops[0] when provided; otherwise device_group_in.
-            let entry_gid = req
-                .hops
-                .as_ref()
-                .and_then(|h| h.first().copied())
+            let entry_gid = tunnel_entry
+                .or_else(|| req.hops.as_ref().and_then(|hops| hops.first().copied()))
                 .unwrap_or(req.device_group_in);
             if !allowed.contains(&entry_gid) {
                 return Json(err(403, "device_group_in 不在您允许的分组列表中"));
@@ -82,6 +92,7 @@ pub async fn create_rule(
             Json(ApiResponse::success(()))
         }
         Err(CreateRuleError::BadRequest(msg)) => Json(err(400, msg)),
+        Err(CreateRuleError::Forbidden(msg)) => Json(err(403, msg)),
         Err(CreateRuleError::PortConflict(port)) => Json(err(
             409,
             format!("监听端口 {} 在此入口分组上已被占用", port),
@@ -104,6 +115,18 @@ pub async fn update_rule(
     // chain update derives its entry from hops[0], so authorizing only the
     // optional device_group_in field would let a restricted user smuggle an
     // unauthorized group through `hops`.
+    let tunnel_entry = if let Some(Some(tunnel_id)) = req.tunnel_id {
+        match state.db.find_tunnel_by_id(tunnel_id).await {
+            Ok(Some(tunnel)) => tunnel.hops.first().map(|hop| hop.device_group_id),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("update_rule: tunnel lookup failed: {}", e);
+                return Json(err(500, "数据库错误"));
+            }
+        }
+    } else {
+        None
+    };
     let hops_entry = req.hops.as_ref().and_then(|hops| hops.first().copied());
     if let (Some(device_group_in), Some(hops_entry)) = (req.device_group_in, hops_entry) {
         if device_group_in != hops_entry {
@@ -113,7 +136,7 @@ pub async fn update_rule(
             ));
         }
     }
-    let requested_entry_group = hops_entry.or(req.device_group_in);
+    let requested_entry_group = tunnel_entry.or(hops_entry).or(req.device_group_in);
 
     // v1.0.4: restricted non-admin users can only switch to authorized device
     // groups. Legacy/allow-all users skip this. DB error → 500.
@@ -188,6 +211,7 @@ pub async fn update_rule(
             Json(ApiResponse::success(()))
         }
         Err(UpdateRuleError::BadRequest(msg)) => Json(err(400, msg)),
+        Err(UpdateRuleError::Forbidden(msg)) => Json(err(403, msg)),
         Err(UpdateRuleError::NotFound) => Json(err(404, "规则不存在")),
         Err(UpdateRuleError::PortConflict) => Json(err(409, "监听端口在此入口分组上已被占用")),
         Err(UpdateRuleError::Internal(msg)) => Json(err(500, msg)),

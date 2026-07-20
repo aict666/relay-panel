@@ -25,10 +25,12 @@
 
 use crate::config::NodeConfig;
 use crate::forwarder::{ForwarderManager, ListenerInfo};
-use relay_shared::protocol::{DiagnoseResult, DiagnoseTargetResult, TargetProbeOutcome};
+use relay_shared::protocol::{
+    DiagnoseResult, DiagnoseTargetResult, TargetProbeOutcome, TunnelClientConfig,
+};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -70,22 +72,36 @@ async fn diagnose(
     // self.listeners is a HashMap; the TCP selector is deterministic. The
     // panel rejects pure-UDP rules before dispatch, so rule_id here is tcp or
     // tcp_udp — both have a TCP listener.
-    let info: Option<ListenerInfo> = manager.lock().await.listener_info_for_rule_tcp(rule_id);
+    let (info, source_ipv4): (Option<ListenerInfo>, _) = {
+        let manager = manager.lock().await;
+        (
+            manager.listener_info_for_rule_tcp(rule_id),
+            manager.outbound_source_ipv4(),
+        )
+    };
 
-    let (listener_running, listen_port, protocol, transport, targets) = match &info {
+    let (listener_running, listen_port, protocol, transport, targets, tunnel) = match &info {
         Some(i) => (
             i.running,
             i.port,
             i.protocol.clone(),
             i.transport.clone(),
             i.targets.clone(),
+            i.tunnel.clone(),
         ),
-        None => (false, 0, String::new(), String::new(), Vec::new()),
+        None => (false, 0, String::new(), String::new(), Vec::new(), None),
     };
 
     // Cap targets; probe in bounded-concurrency batches. TCP-only (v0.4.9).
-    let targets_to_probe: Vec<String> = targets.into_iter().take(MAX_TARGETS).collect();
-    let results = probe_targets(&targets_to_probe).await;
+    let results = if let Some(tunnel) = tunnel {
+        vec![DiagnoseTargetResult {
+            address: format!("tunnel:{} / rule:{}", tunnel.tunnel_id, tunnel.rule_id),
+            outcome: probe_preset_tunnel(&tunnel, source_ipv4).await,
+        }]
+    } else {
+        let targets_to_probe: Vec<String> = targets.into_iter().take(MAX_TARGETS).collect();
+        probe_targets(&targets_to_probe, source_ipv4).await
+    };
 
     DiagnoseResult {
         msg_type: "diagnose_result".into(),
@@ -103,11 +119,57 @@ async fn diagnose(
     }
 }
 
+/// One authenticated probe traverses every shared listener and asks the exit
+/// hop to connect to a configured final target. The caller supplies no target,
+/// so diagnosis preserves the panel-controlled SSRF boundary.
+async fn probe_preset_tunnel(
+    config: &TunnelClientConfig,
+    source_ipv4: Option<std::net::Ipv4Addr>,
+) -> TargetProbeOutcome {
+    let start = std::time::Instant::now();
+    let run = async {
+        let mut stream = crate::forwarder::outbound::tcp_connect(
+            &config.address,
+            source_ipv4,
+            PROBE_TIMEOUT.as_secs(),
+        )
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        crate::forwarder::tunnel::write_header(
+            &mut stream,
+            config,
+            crate::forwarder::tunnel::TunnelMode::Probe,
+        )
+        .await?;
+        let mut status = [0u8; 1];
+        stream.read_exact(&mut status).await?;
+        if status[0] == 1 {
+            Ok::<(), std::io::Error>(())
+        } else {
+            Err(std::io::Error::other(
+                "tunnel route or final target rejected the probe",
+            ))
+        }
+    };
+    match tokio::time::timeout(PROBE_TIMEOUT, run).await {
+        Ok(Ok(())) => TargetProbeOutcome::Reachable {
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        },
+        Ok(Err(error)) => TargetProbeOutcome::Failed {
+            error: error.to_string(),
+        },
+        Err(_) => TargetProbeOutcome::Timeout,
+    }
+}
+
 /// Probe each target with a TCP connect (3s deadline). Concurrency capped at
 /// MAX_CONCURRENT_PROBES via a semaphore. Input is capped at MAX_TARGETS
 /// (defensive — callers should already cap, but this guarantees the contract
 /// regardless). v0.4.9: TCP-only; the old UDP route-only branch is gone.
-async fn probe_targets(targets: &[String]) -> Vec<DiagnoseTargetResult> {
+async fn probe_targets(
+    targets: &[String],
+    source_ipv4: Option<std::net::Ipv4Addr>,
+) -> Vec<DiagnoseTargetResult> {
     let targets_capped: Vec<&String> = targets.iter().take(MAX_TARGETS).collect();
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES));
     let mut handles = Vec::with_capacity(targets_capped.len());
@@ -116,7 +178,7 @@ async fn probe_targets(targets: &[String]) -> Vec<DiagnoseTargetResult> {
         let permit = sem.clone();
         handles.push(tokio::spawn(async move {
             let _p = permit.acquire_owned().await.unwrap();
-            let outcome = probe_tcp(&addr).await;
+            let outcome = probe_tcp(&addr, source_ipv4).await;
             DiagnoseTargetResult {
                 address: addr,
                 outcome,
@@ -135,9 +197,14 @@ async fn probe_targets(targets: &[String]) -> Vec<DiagnoseTargetResult> {
 
 /// TCP reachability: connect with a 3s deadline. Success → close immediately.
 /// Recorded time is the connect latency.
-async fn probe_tcp(addr: &str) -> TargetProbeOutcome {
+async fn probe_tcp(addr: &str, source_ipv4: Option<std::net::Ipv4Addr>) -> TargetProbeOutcome {
     let start = std::time::Instant::now();
-    match tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(addr)).await {
+    match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        crate::forwarder::outbound::tcp_connect(addr, source_ipv4, PROBE_TIMEOUT.as_secs()),
+    )
+    .await
+    {
         Ok(Ok(_stream)) => TargetProbeOutcome::Reachable {
             elapsed_ms: start.elapsed().as_millis() as u64,
         },
@@ -186,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn probe_tcp_unreachable_returns_failed() {
         // 127.0.0.1:1 is almost never listening → connection refused.
-        let o = probe_tcp("127.0.0.1:1").await;
+        let o = probe_tcp("127.0.0.1:1", None).await;
         match o {
             TargetProbeOutcome::Failed { .. } | TargetProbeOutcome::Timeout => {}
             TargetProbeOutcome::Reachable { .. } => {
@@ -200,11 +267,29 @@ mod tests {
         // Bind a throwaway listener, probe its address, expect Reachable.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let o = probe_tcp(&addr).await;
+        let o = probe_tcp(&addr, None).await;
         assert!(
             matches!(o, TargetProbeOutcome::Reachable { .. }),
             "local listener should be reachable: {:?}",
             o
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_tcp_uses_the_configured_source_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = tokio::spawn(async move { listener.accept().await.unwrap().1.ip() });
+
+        // Use the universally-present loopback address. Some BSD kernels do
+        // not treat every 127/8 address as bindable without an explicit alias.
+        let source: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let outcome = probe_tcp(&addr, Some(source)).await;
+        assert!(matches!(outcome, TargetProbeOutcome::Reachable { .. }));
+        assert_eq!(
+            accepted.await.unwrap(),
+            std::net::IpAddr::V4(source),
+            "diagnosis must follow the same source binding as forwarding"
         );
     }
 
@@ -215,7 +300,7 @@ mod tests {
         // only the cap and that it returns without hanging. v0.4.9: TCP-only,
         // no is_udp flag.
         let addrs: Vec<String> = (0..50).map(|i| format!("127.0.0.1:{}", 1000 + i)).collect();
-        let out = probe_targets(&addrs).await;
+        let out = probe_targets(&addrs, None).await;
         assert!(
             out.len() <= MAX_TARGETS,
             "must cap at MAX_TARGETS, got {}",

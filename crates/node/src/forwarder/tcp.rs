@@ -8,6 +8,7 @@ use super::gate::RuleGate;
 use super::limiter::RateLimit;
 use super::selector::TargetSelector;
 use crate::reporter::{ConnectionTracker, TrafficCounter};
+use relay_shared::protocol::TunnelClientConfig;
 
 /// v1.2.0: how often the "rule is at its connection cap" warning may be logged
 /// per listener. A rule sitting at its cap rejects on EVERY accept, so an
@@ -35,6 +36,7 @@ pub async fn serve_tcp_listener(
     gate: RuleGate,
     count_traffic: bool,
     tcp_fast_open: bool,
+    tunnel: Option<TunnelClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr = listener
         .local_addr()
@@ -99,6 +101,7 @@ pub async fn serve_tcp_listener(
                 let counter = counter.clone();
                 let connections = connections.clone();
                 let mut gate = gate.clone();
+                let tunnel = tunnel.clone();
 
                 tokio::spawn(async move {
                     // RAII guard: increments the active-TCP count on create,
@@ -134,6 +137,7 @@ pub async fn serve_tcp_listener(
                             source_ipv4,
                             count_traffic,
                             tcp_fast_open,
+                            tunnel,
                         ) => {
                             if let Err(e) = r {
                                 tracing::debug!("TCP connection error: {}", e);
@@ -194,6 +198,7 @@ async fn handle_tcp_connection(
     source_ipv4: Option<Ipv4Addr>,
     count_traffic: bool,
     tcp_fast_open: bool,
+    tunnel: Option<TunnelClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // TCP_FASTOPEN_CONNECT defers the SYN until the first write when a cookie
     // exists. That is ideal for client-first traffic, but blindly using it for
@@ -251,7 +256,7 @@ async fn handle_tcp_connection(
         }
     }
 
-    let outbound = match outbound {
+    let mut outbound = match outbound {
         Some(s) => s,
         None => {
             let detail = if failures.is_empty() {
@@ -270,6 +275,13 @@ async fn handle_tcp_connection(
     };
     // Keep the least-connections count until this forwarded connection ends.
     let _target_lease = target_lease;
+
+    // One client-first authenticated routing header, then the original byte
+    // stream continues unchanged. This happens before the Linux splice fast
+    // path, so tunnel setup costs no per-byte userspace copy.
+    if let Some(tunnel) = &tunnel {
+        super::tunnel::write_header(&mut outbound, tunnel, super::tunnel::TunnelMode::Tcp).await?;
+    }
 
     // getpeername may transiently report ENOTCONN on a cookie-hit TFO socket
     // before the first payload triggers SYN. Logging must never turn that
@@ -441,6 +453,7 @@ mod tests {
             runtime.gate(None),
             true,
             false,
+            None,
         ));
         // Keep the runtime alive for the duration of the test: dropping it would
         // cancel the connection we are about to make.
@@ -488,6 +501,7 @@ mod tests {
             runtime.gate(None),
             true,
             true,
+            None,
         ));
         let _runtime = runtime;
 
@@ -533,6 +547,7 @@ mod tests {
             runtime.gate(None),
             true,
             true,
+            None,
         ));
         let _runtime = runtime;
 
@@ -636,6 +651,7 @@ mod tests {
             runtime.gate(None),
             true,
             true,
+            None,
         ));
 
         let payload = *b"splice-syn-data!!";
@@ -703,6 +719,7 @@ mod tests {
             runtime.gate(Some(2)),
             true,
             false,
+            None,
         ));
         let _runtime = runtime;
 
