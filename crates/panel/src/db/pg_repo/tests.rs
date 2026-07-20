@@ -494,7 +494,7 @@ async fn pg_upgrade_from_revision_28_adds_credential_revision() {
         .await
         .unwrap();
     assert_eq!(column_count, 1);
-    assert_eq!(revision, 29);
+    assert_eq!(revision, crate::db::pg_schema::PG_SCHEMA_VERSION);
     cleanup(&db).await;
 }
 
