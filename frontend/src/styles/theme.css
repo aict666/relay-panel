@@ -410,12 +410,24 @@ html, body, #root {
 .ant-modal-footer {
   margin-top: 22px !important;
 }
-/* Long forms (new plan / new rule) used to push the whole page into a scroll
- * with the modal's own OK button somewhere below the fold. Scroll the body and
- * keep title + footer pinned. */
+/* Let Ant's modal wrapper own viewport scrolling. Constraining every modal
+ * body created a second vertical scrollbar inside long forms and, because of
+ * CSS overflow pairing, also surfaced tiny horizontal overflows. */
 .ant-modal .ant-modal-body {
-  max-height: calc(100dvh - 220px);
-  overflow-y: auto;
+  min-width: 0;
+}
+
+/* Modal content must shrink with its viewport. A vertical `overflow: auto`
+ * also turns a tiny horizontal overflow into a second scrollbar, so keep the
+ * body and the common tab/form wrappers explicitly shrinkable. */
+.ant-modal .ant-modal-body > *,
+.ant-modal .ant-tabs,
+.ant-modal .ant-tabs-content-holder,
+.ant-modal .ant-tabs-content,
+.ant-modal .ant-tabs-tabpane,
+.ant-modal .ant-form {
+  min-width: 0;
+  max-width: 100%;
 }
 
 /* Form labels */
@@ -450,33 +462,26 @@ html, body, #root {
 .rp-tunnel-name-field {
   margin-bottom: 14px;
 }
-.rp-tunnel-toggle-grid {
+.rp-tunnel-setting-bar {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  overflow: hidden;
   margin-bottom: 20px;
-}
-.rp-tunnel-toggle-field {
-  margin-bottom: 0 !important;
-  padding: 10px 12px;
   border: 1px solid var(--rp-hairline);
   border-radius: var(--rp-radius-sm);
   background: var(--rp-subtle-bg);
 }
-.rp-tunnel-toggle-field .ant-form-item-row {
+.rp-tunnel-setting-item {
   display: flex;
-  flex-flow: row nowrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
+  min-height: 48px;
+  padding: 8px 12px;
 }
-.rp-tunnel-toggle-field .ant-form-item-label {
-  flex: 1 1 auto;
-  padding: 0 !important;
-  text-align: start;
-}
-.rp-tunnel-toggle-field .ant-form-item-control {
-  flex: 0 0 auto;
+.rp-tunnel-setting-item + .rp-tunnel-setting-item {
+  border-inline-start: 1px solid var(--rp-hairline);
 }
 .rp-tunnel-help-icon {
   color: var(--rp-text-tertiary);
@@ -487,24 +492,27 @@ html, body, #root {
 }
 .rp-tunnel-path-heading {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 16px;
+  align-items: center;
   margin-bottom: 8px;
 }
 .rp-required-mark {
   margin-inline-end: 4px;
   color: var(--ant-color-error, #ff4d4f);
 }
-.rp-tunnel-path-hint {
-  font-size: 12px;
-  text-align: end;
-}
-.rp-tunnel-hop-row {
-  display: flex;
-  align-items: flex-start;
+.rp-tunnel-hop-list {
+  display: grid;
   gap: 10px;
   width: 100%;
+  min-width: 0;
+}
+.rp-tunnel-hop-row {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr) auto 32px;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
   min-height: 54px;
   padding: 10px;
   border: 1px solid var(--rp-hairline);
@@ -512,19 +520,22 @@ html, body, #root {
   background: var(--rp-subtle-bg);
 }
 .rp-tunnel-hop-role {
-  flex: 0 0 54px;
-  margin: 5px 0 0;
+  width: 54px;
+  margin: 0;
   text-align: center;
 }
 .rp-tunnel-hop-group {
-  flex: 1 1 260px;
-  min-width: 180px;
+  min-width: 0;
   margin-bottom: 0 !important;
 }
+.rp-tunnel-hop-group .ant-select {
+  width: 100%;
+}
 .rp-tunnel-port-controls {
-  display: flex;
-  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: repeat(2, 112px);
   gap: 8px;
+  min-width: 0;
 }
 .rp-tunnel-port-mode,
 .rp-tunnel-fixed-port {
@@ -532,36 +543,42 @@ html, body, #root {
   margin-bottom: 0 !important;
 }
 .rp-tunnel-remove-hop {
-  flex: 0 0 auto;
+  grid-column: 4;
 }
 .rp-tunnel-add-hop {
-  height: 40px;
+  height: 38px;
 }
 
 @media (max-width: 767px) {
-  .rp-tunnel-toggle-grid {
+  .rp-tunnel-setting-bar {
     grid-template-columns: 1fr;
   }
-  .rp-tunnel-path-heading {
-    display: block;
-  }
-  .rp-tunnel-path-hint {
-    display: block;
-    margin-top: 2px;
-    text-align: start;
+  .rp-tunnel-setting-item + .rp-tunnel-setting-item {
+    border-inline-start: 0;
+    border-top: 1px solid var(--rp-hairline);
   }
   .rp-tunnel-hop-row {
-    flex-wrap: wrap;
+    grid-template-columns: 48px minmax(0, 1fr) 32px;
+    align-items: center;
   }
   .rp-tunnel-hop-role {
-    flex-basis: 48px;
+    width: 48px;
   }
   .rp-tunnel-hop-group {
-    flex: 1 1 calc(100% - 58px);
+    grid-column: 2 / -1;
   }
   .rp-tunnel-port-controls {
-    flex: 1 1 100%;
-    padding-inline-start: 58px;
+    grid-column: 2 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+  .rp-tunnel-port-mode,
+  .rp-tunnel-fixed-port {
+    width: 100%;
+  }
+  .rp-tunnel-remove-hop {
+    grid-column: 1;
+    grid-row: 2;
   }
 }
 
@@ -826,7 +843,9 @@ html, body, #root {
   grid-template-columns: minmax(180px, 1fr) 76px 106px auto;
   align-items: end;
   gap: 10px;
+  box-sizing: border-box;
   width: 100%;
+  min-width: 0;
   padding: 10px 12px;
   border: 1px solid var(--rp-hairline);
   border-radius: var(--rp-radius-sm);
@@ -1305,11 +1324,6 @@ html, body, #root {
 
   .ant-modal .ant-modal-content {
     padding: 16px;
-  }
-
-  .ant-modal .ant-modal-body {
-    max-height: calc(100dvh - 160px);
-    overflow-y: auto;
   }
 
   .ant-card-head-wrapper {

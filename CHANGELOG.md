@@ -10,6 +10,24 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.5] - 2026-07-20
+
+### Changed
+
+- **Rule and tunnel dialogs now use compact, responsive form rows.** Modal
+  content shrinks within the viewport, tunnel status and sharing controls are
+  presented in one concise settings bar, and route guidance is available from
+  contextual help instead of occupying permanent form space.
+
+### Fixed
+
+- **Long forms no longer show nested or accidental horizontal scrollbars.**
+  Target rows, tunnel hops, automatic ports, fixed ports, and multi-hop paths
+  stay within the dialog width while viewport scrolling remains available for
+  genuinely long forms.
+- **Dynamic tunnel hops no longer spread React list keys through form props.**
+  This removes the React runtime warning while preserving stable field state.
+
 ## [1.3.4] - 2026-07-20
 
 ### Changed
