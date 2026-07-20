@@ -49,7 +49,8 @@ export default function SystemSettings() {
   }, []);
 
   const onSave = async () => {
-    const values = await form.validateFields();
+    const values = await form.validateFields().catch(() => null);
+    if (!values) return;
     const siteName = String(values.site_name).trim();
 
     // Client-side guard: allowed_plan_ids must not be empty.

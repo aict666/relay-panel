@@ -46,6 +46,9 @@ export default function Plans() {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setPlans([]);
+    setGroups([]);
+    setTunnels([]);
     try {
       const [plansRes, groupsRes, tunnelsRes] = await Promise.all([
         api.get<unknown, ApiEnvelope<Plan[]>>('/admin/plans'),
@@ -57,8 +60,10 @@ export default function Plans() {
       // group can be a rule entry and therefore belongs in this list too.
       setGroups((groupsRes.data || []).filter((g) => g.group_type === 'in' || g.group_type === 'both'));
       setTunnels(tunnelsRes.data || []);
+    } catch {
+      message.error(t('loadFailed'));
     } finally { setLoading(false); }
-  }, []);
+  }, [t]);
 
   useEffect(() => { load(); }, [load]);
 

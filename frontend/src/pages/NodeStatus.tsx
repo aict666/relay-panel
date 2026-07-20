@@ -98,7 +98,11 @@ export default function NodeStatus() {
       // shows an unknown state instead of a wrong upgrade button.
       setLatestNodeVersion(res.latest_node_version || '');
       setNodeVersionCheckFailed(!!res.node_version_check_failed);
-    } catch { /* ignore */ }
+    } catch {
+      // A transport/API failure is also a failed version check. Keep upgrade
+      // controls neutral rather than presenting an unexplained unknown state.
+      setNodeVersionCheckFailed(true);
+    }
   };
 
   const refresh = async () => {

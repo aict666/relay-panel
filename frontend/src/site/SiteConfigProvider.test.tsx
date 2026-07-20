@@ -42,11 +42,11 @@ describe('SiteConfigProvider', () => {
     expect(screen.getByText('RelayPanel')).toBeInTheDocument();
     await screen.findByText('星海中转');
     expect(mockGet).toHaveBeenCalledWith('/auth/registration-status');
-    expect(document.title).toBe('星海中转');
+    await waitFor(() => expect(document.title).toBe('星海中转'));
 
     await act(async () => screen.getByRole('button', { name: 'update' }).click());
     expect(screen.getByText('Updated Site')).toBeInTheDocument();
-    expect(document.title).toBe('Updated Site');
+    await waitFor(() => expect(document.title).toBe('Updated Site'));
   });
 
   it('falls back to RelayPanel when the public probe fails', async () => {

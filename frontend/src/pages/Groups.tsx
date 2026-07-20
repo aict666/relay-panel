@@ -37,28 +37,35 @@ export default function Groups() {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setGroups([]);
+    setUsers([]);
+    setNodes([]);
     try {
-      const g = await api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups');
-      setGroups(g.data || []);
       if (isAdmin) {
-        try {
-          const u = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
-          setUsers(u.data || []);
-        } catch { setUsers([]); }
-        // v1.0.4: fetch node status for expandable node lists.
-        try {
-          const n = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
-          setNodes(n.data || []);
-        } catch { setNodes([]); }
+        // The user and node catalogs drive owner labels and expandable node
+        // rows. Treat failures as load failures instead of presenting false
+        // empty lists that could mislead an administrator.
+        const [g, u, n] = await Promise.all([
+          api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
+          api.get<unknown, ApiEnvelope<User[]>>('/admin/users'),
+          api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes'),
+        ]);
+        setGroups(g.data || []);
+        setUsers(u.data || []);
+        setNodes(n.data || []);
       } else {
+        const [g, n] = await Promise.all([
+          api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
+          api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes/shared'),
+        ]);
+        setGroups(g.data || []);
         setUsers([]);
-        try {
-          const n = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes/shared');
-          setNodes(n.data || []);
-        } catch { setNodes([]); }
+        setNodes(n.data || []);
       }
+    } catch {
+      message.error(t('loadFailed'));
     } finally { setLoading(false); }
-  }, [isAdmin]);
+  }, [isAdmin, t]);
 
   useEffect(() => { load(); }, [load]);
 

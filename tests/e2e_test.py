@@ -20,10 +20,12 @@ Requires: the panel/node binaries already built (cargo build).
 import json
 import os
 import re
+import shutil
 import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -41,9 +43,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 E2E_PROFILE = os.environ.get("RELAY_E2E_PROFILE", "debug")
 if E2E_PROFILE not in ("debug", "release"):
     raise ValueError("RELAY_E2E_PROFILE must be 'debug' or 'release'")
-PANEL_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-panel.exe")
-NODE_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-node.exe")
-DB_PATH = os.path.join(PROJECT_ROOT, "data.db")
+BIN_SUFFIX = ".exe" if sys.platform == "win32" else ""
+PANEL_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-panel" + BIN_SUFFIX)
+NODE_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-node" + BIN_SUFFIX)
 
 
 def config_protocol_version():
@@ -88,10 +90,21 @@ class UDPHandler(socketserver.BaseRequestHandler):
         sock.sendto(data, self.client_address)
 
 
+class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+
+class ReusableThreadingUDPServer(socketserver.ThreadingUDPServer):
+    allow_reuse_address = True
+
+
 def start_echo_servers():
-    tcp = socketserver.ThreadingTCPServer(("127.0.0.1", TCP_ECHO_PORT), TCPHandler)
-    udp = socketserver.ThreadingUDPServer(("127.0.0.1", UDP_ECHO_PORT), UDPHandler)
-    tcp.allow_reuse_address = udp.allow_reuse_address = True
+    tcp = ReusableThreadingTCPServer(("127.0.0.1", TCP_ECHO_PORT), TCPHandler)
+    try:
+        udp = ReusableThreadingUDPServer(("127.0.0.1", UDP_ECHO_PORT), UDPHandler)
+    except Exception:
+        tcp.server_close()
+        raise
     threading.Thread(target=tcp.serve_forever, daemon=True).start()
     threading.Thread(target=udp.serve_forever, daemon=True).start()
     print(f"[echo] TCP :{TCP_ECHO_PORT}  UDP :{UDP_ECHO_PORT}")
@@ -141,23 +154,23 @@ def udp_roundtrip(port, payload):
 
 # ---------- main ----------
 def main():
-    global PANEL_BIN, NODE_BIN
-    if sys.platform != "win32":
-        PANEL_BIN = PANEL_BIN[:-4]
-        NODE_BIN = NODE_BIN[:-4]
+    assert os.path.isfile(PANEL_BIN), f"missing {PANEL_BIN}; run cargo build first"
+    assert os.path.isfile(NODE_BIN), f"missing {NODE_BIN}; run cargo build first"
 
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-
-    start_echo_servers()
-
+    work_dir = tempfile.mkdtemp(prefix="relay-panel-e2e-")
+    db_path = os.path.join(work_dir, "data.db")
     panel_env = dict(os.environ, LISTEN="127.0.0.1:18888", RUST_LOG="info",
-                     REGISTRATION_ENABLED="1")
-    panel = subprocess.Popen([PANEL_BIN], env=panel_env,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                     REGISTRATION_ENABLED="1",
+                     DATABASE_URL=f"sqlite:{db_path}?mode=rwc")
+    panel = None
     node = None
-    print(f"[panel] PID {panel.pid}")
+    tcp_echo = None
+    udp_echo = None
     try:
+        tcp_echo, udp_echo = start_echo_servers()
+        panel = subprocess.Popen([PANEL_BIN], env=panel_env, cwd=work_dir,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[panel] PID {panel.pid}")
         assert wait_for_port("127.0.0.1", 18888), "panel did not start"
 
         # 1. Login as admin
@@ -241,7 +254,7 @@ def main():
                         NODE_TOKEN=in_g1_token,
                         POLL_INTERVAL="2",
                         RUST_LOG="info")
-        node = subprocess.Popen([NODE_BIN], env=node_env,
+        node = subprocess.Popen([NODE_BIN], env=node_env, cwd=work_dir,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print(f"[node] PID {node.pid}")
         assert wait_for_port("127.0.0.1", TCP_LISTEN_PORT), "node TCP listener not up"
@@ -261,9 +274,9 @@ def main():
                 f"expected CONFIG_PROTOCOL_MISMATCH, got {body.get('code')}"
         print("[ok] config pull without protocol-version header rejected (426)")
 
-        # 4b. WITH the header but wrong token → empty listeners (gate passes,
-        #     token check returns empty). This confirms the gate is before the
-        #     token check but both work.
+        # 4b. WITH the current header and a valid token, the panel returns the
+        #     live listeners. This exercises the successful side of the same
+        #     protocol gate before the node begins forwarding traffic.
         # Read the exact shared constant used to compile both binaries. A
         # hard-coded value previously let this test exercise stale binaries
         # after the protocol was bumped, masking the real current data path.
@@ -421,6 +434,12 @@ def main():
                     p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     p.kill()
+                    p.wait(timeout=5)
+        for server in (tcp_echo, udp_echo):
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

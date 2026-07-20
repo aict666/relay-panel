@@ -54,6 +54,7 @@ export default defineConfig({
           { text: '快速开始', link: '/guide/quick-start' },
           { text: '核心概念', link: '/guide/concepts' },
           { text: '创建转发规则', link: '/guide/rules' },
+          { text: '预设隧道与端口复用', link: '/guide/tunnels' },
         ],
       },
       {

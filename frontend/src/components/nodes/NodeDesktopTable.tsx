@@ -68,9 +68,14 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
         const { state } = resolveNodeUpgrade(r, latestNodeVersion, panelProtocol, nodeVersionCheckFailed);
         switch (state) {
           case 'none':
-          case 'checkFailed':
           case 'unknown':
             return <Typography.Text type="secondary">-</Typography.Text>;
+          case 'checkFailed':
+            return (
+              <Tooltip title={t('nodeVersionCheckFailed')}>
+                <Typography.Text type="secondary" aria-label={t('nodeUpgrade')}>-</Typography.Text>
+              </Tooltip>
+            );
           case 'latest':
             return <Tooltip title={t('nodeUpgradeLatest')}><CheckCircleOutlined style={{ color: '#52c41a' }} /></Tooltip>;
           case 'ahead':

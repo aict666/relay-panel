@@ -49,7 +49,21 @@ api.interceptors.response.use(
   (res) => {
     // Our backend always returns { code, message, data }. Surface the whole
     // envelope so callers can inspect code/message; data is at .data.data.
-    return res.data;
+    const body = res.data;
+    // Most API handlers use a business envelope even for server failures, so
+    // the HTTP status can still be 200 when `code` is 500. Treat those exactly
+    // like transport-level 5xx responses: list pages must enter their existing
+    // load-failure path instead of rendering `data: null` as an empty catalog.
+    // Validation/authorization/conflict envelopes remain resolved so mutation
+    // callers can continue showing the backend's specific message.
+    if (body && typeof body.code === 'number' && body.code >= 500) {
+      const error = new Error(body.message || 'Server error') as Error & {
+        response?: typeof res;
+      };
+      error.response = res;
+      throw error;
+    }
+    return body;
   },
   (err) => {
     const status = err.response?.status;

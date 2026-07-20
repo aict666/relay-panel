@@ -100,9 +100,17 @@ export default function Rules() {
   // (Explicit null, not !selectedGroup, so a future id of 0 wouldn't be falsy.)
   const [selectedGroup, setSelectedGroup] = useState<number | null>(null);
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([]);
+  const userId = user?.id;
 
   const load = useCallback(async () => {
     setLoading(true);
+    setRules([]);
+    setGroups([]);
+    setTunnels([]);
+    setUsers([]);
+    setSelfQuota(null);
+    setSharedGroups([]);
+    setSharedLoadFailed(!isAdmin);
     try {
       // v0.4.10: /admin/users is admin-only and NOT in the main Promise.all —
       // a regular user would 403 and block the whole page load. The owner
@@ -112,7 +120,7 @@ export default function Rules() {
       // v0.4.20: admin can filter rules by owner_uid.
       // Admin on own page → filter to their own rules; admin viewing another
       // user → use filterOwnerUid; regular user → backend filters automatically.
-      const ownerUid = filterOwnerUid ?? (isAdmin ? (user?.id ?? null) : null);
+      const ownerUid = filterOwnerUid ?? (isAdmin ? (userId ?? null) : null);
       const rulesUrl = ownerUid ? `/rules?owner_uid=${ownerUid}` : '/rules';
       const [r, g, tr] = await Promise.all([
         api.get<unknown, ApiEnvelope<ForwardRule[]>>(rulesUrl),
@@ -165,8 +173,10 @@ export default function Rules() {
         setSharedLoadFailed(false);
         setSharedGroups([]);
       }
+    } catch {
+      message.error(t('loadFailed'));
     } finally { setLoading(false); }
-  }, [filterOwnerUid, isAdmin, user?.id]);
+  }, [filterOwnerUid, isAdmin, t, userId]);
 
   useEffect(() => { load(); }, [load]);
 

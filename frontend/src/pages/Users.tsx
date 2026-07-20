@@ -1,7 +1,7 @@
 import { Table, Button, Tag, Popconfirm, message, Progress, Tooltip, Modal, Form, Input, InputNumber, Switch, Space, Select, DatePicker, Divider, Dropdown } from 'antd';
 import type { MenuProps } from 'antd';
 import { DeleteOutlined, EditOutlined, ReloadOutlined, UndoOutlined, UserOutlined, PlusOutlined, KeyOutlined, ApiOutlined, ShoppingOutlined, MoreOutlined } from '@ant-design/icons';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import dayjs, { type Dayjs } from 'dayjs';
 import api from '../api/client';
@@ -77,18 +77,23 @@ export default function Users() {
   // but we keep the guard for clarity + future reuse.)
   const { isAdmin } = useAuth();
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
+    setUsers([]);
+    setPlans([]);
     try {
-      const usersRes = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
+      // The plan catalog is required by the embedded plan editor. Do not turn
+      // a failed catalog request into an empty selector that looks authoritative.
+      const [usersRes, pRes] = await Promise.all([
+        api.get<unknown, ApiEnvelope<User[]>>('/admin/users'),
+        api.get<unknown, ApiEnvelope<Plan[]>>('/admin/plans'),
+      ]);
       setUsers(usersRes.data || []);
-      // v1.0.7: load the plan catalog for the "edit user plan" assign dropdown.
-      try {
-        const pRes = await api.get<unknown, ApiEnvelope<Plan[]>>('/admin/plans');
-        setPlans(pRes.data || []);
-      } catch { setPlans([]); }
+      setPlans(pRes.data || []);
+    } catch {
+      message.error(t('loadFailed'));
     } finally { setLoading(false); }
-  };
+  }, [t]);
 
   // Resolve a plan id → display name (falls back to #id, or "no plan" for null).
   const planName = (id: number | null): string =>
@@ -122,6 +127,8 @@ export default function Users() {
         message.success(t('planAssigned'));
         setEditing(null);
         load();
+      } catch {
+        message.error(t('purchaseFailed'));
       } finally { setPlanBusy(false); }
     };
     const isSwitch = target.plan_id != null && planChoice !== target.plan_id;
@@ -150,19 +157,25 @@ export default function Users() {
       message.success(t('userUpdated'));
       setEditing(null);
       load();
+    } catch {
+      message.error(t('saveFailed'));
     } finally { setPlanBusy(false); }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [load]);
 
   const handleDelete = async (id: number) => {
-    const res = await api.delete<unknown, ApiEnvelope<null>>(`/admin/users/${id}`);
-    if (res.code !== 0) { message.error(res.message); return; }
-    message.success(t('userDeleted'));
-    load();
+    try {
+      const res = await api.delete<unknown, ApiEnvelope<null>>(`/admin/users/${id}`);
+      if (res.code !== 0) { message.error(res.message); return; }
+      message.success(t('userDeleted'));
+      load();
+    } catch {
+      message.error(t('deleteFailed'));
+    }
   };
 
-  const openEdit = async (u: User) => {
+  const openEdit = (u: User) => {
     setEditing(u);
     // v1.0.7: preload the embedded plan panel (assign choice + expiry picker).
     setPlanChoice(undefined);
@@ -181,7 +194,8 @@ export default function Users() {
 
   const handleSave = async () => {
     if (!editing) return;
-    const values = await form.validateFields();
+    const values = await form.validateFields().catch(() => null);
+    if (!values) return;
     // Trim the balance string and convert empty input to undefined so the
     // backend leaves the column unchanged. The strict validator below ensures
     // we only ever forward a value the backend will accept.
@@ -207,6 +221,8 @@ export default function Users() {
       message.success(t('userUpdated'));
       setEditing(null);
       load();
+    } catch {
+      message.error(t('saveFailed'));
     } finally { setSaving(false); }
   };
 
@@ -216,7 +232,8 @@ export default function Users() {
   };
 
   const handleCreate = async () => {
-    const values = await createForm.validateFields();
+    const values = await createForm.validateFields().catch(() => null);
+    if (!values) return;
     setSaving(true);
     try {
       const res = await api.post<unknown, ApiEnvelope<null>>('/admin/users', {
@@ -227,25 +244,35 @@ export default function Users() {
       message.success(t('userCreated'));
       setCreating(false);
       load();
+    } catch {
+      message.error(t('saveFailed'));
     } finally { setSaving(false); }
   };
 
   const handleResetTraffic = async (id: number) => {
-    const res = await api.post<unknown, ApiEnvelope<null>>(`/admin/users/${id}/reset-traffic`);
-    if (res.code !== 0) { message.error(res.message); return; }
-    message.success(t('trafficReset'));
-    load();
+    try {
+      const res = await api.post<unknown, ApiEnvelope<null>>(`/admin/users/${id}/reset-traffic`);
+      if (res.code !== 0) { message.error(res.message); return; }
+      message.success(t('trafficReset'));
+      load();
+    } catch {
+      message.error(t('saveFailed'));
+    }
   };
 
   // v1.0.8: suspend / unsuspend a user (non-admin only). Stops forwarding via
   // the config gate WITHOUT bumping token_version (the user stays logged in).
   const handleToggleSuspend = async (u: User) => {
-    const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/users/${u.id}`, {
-      suspended: !u.suspended,
-    });
-    if (res.code !== 0) { message.error(res.message); return; }
-    message.success(u.suspended ? t('userUnsuspended') : t('userSuspended'));
-    load();
+    try {
+      const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/users/${u.id}`, {
+        suspended: !u.suspended,
+      });
+      if (res.code !== 0) { message.error(res.message); return; }
+      message.success(u.suspended ? t('userUnsuspended') : t('userSuspended'));
+      load();
+    } catch {
+      message.error(t('saveFailed'));
+    }
   };
 
   // v0.4.10 PR4: open the admin password-reset modal for a user.
@@ -258,7 +285,8 @@ export default function Users() {
 
   const handleReset = async () => {
     if (!resetting) return;
-    const values = await resetForm.validateFields();
+    const values = await resetForm.validateFields().catch(() => null);
+    if (!values) return;
     setSaving(true);
     try {
       const res = await api.put<unknown, ApiEnvelope<null>>(
@@ -271,6 +299,8 @@ export default function Users() {
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('passwordResetSuccess'));
       setResetting(null);
+    } catch {
+      message.error(t('saveFailed'));
     } finally { setSaving(false); }
   };
 
