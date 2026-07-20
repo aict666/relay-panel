@@ -856,16 +856,17 @@ async fn connect_route_target(
 }
 
 async fn copy_raw(
-    mut inbound: TcpStream,
-    mut outbound: TcpStream,
+    inbound: TcpStream,
+    outbound: TcpStream,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(target_os = "linux")]
     {
         super::splice::zero_copy_bidirectional(inbound, outbound).await?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let (mut inbound, mut outbound) = (inbound, outbound);
         tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
         Ok(())
     }
