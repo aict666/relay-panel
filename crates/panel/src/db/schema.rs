@@ -226,6 +226,22 @@ CREATE TABLE IF NOT EXISTS forward_rule_retired_entries (
 CREATE INDEX IF NOT EXISTS idx_forward_rule_retired_entries_group
     ON forward_rule_retired_entries (device_group_id, tunnel_id, rule_id);
 
+-- Short overlap leases for active route changes. Unlike retired entry leases,
+-- these rows authorize no traffic accounting and never include the public
+-- entry hop; they only tell an old downstream node to keep its cached listener
+-- or shared route accepting until the new path has converged.
+CREATE TABLE IF NOT EXISTS forward_rule_route_transitions (
+    rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+    device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+    protocol TEXT NOT NULL CHECK (protocol IN ('tcp', 'udp', 'tcp_udp')),
+    activate_at INTEGER NOT NULL DEFAULT 0,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (rule_id, device_group_id, listen_port, protocol)
+);
+CREATE INDEX IF NOT EXISTS idx_forward_rule_route_transitions_group
+    ON forward_rule_route_transitions (device_group_id, listen_port, expires_at, rule_id);
+
 CREATE TABLE IF NOT EXISTS forward_rule_targets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
@@ -1708,6 +1724,35 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     )
     .await?;
     tracing::info!("Migration 48: entry-drain leases are bounded and renewable");
+
+    // ── Migration 49: bounded downstream route-transition overlap ──
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS forward_rule_route_transitions (
+            rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+            device_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+            listen_port INTEGER NOT NULL CHECK (listen_port >= 1 AND listen_port <= 65535),
+            protocol TEXT NOT NULL CHECK (protocol IN ('tcp', 'udp', 'tcp_udp')),
+            activate_at INTEGER NOT NULL DEFAULT 0,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (rule_id, device_group_id, listen_port, protocol)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_forward_rule_route_transitions_group \
+         ON forward_rule_route_transitions (device_group_id, listen_port, expires_at, rule_id)",
+    )
+    .execute(pool)
+    .await?;
+    add_column_if_missing(
+        pool,
+        "forward_rule_route_transitions",
+        "activate_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    tracing::info!("Migration 49: downstream route-transition leases present");
 
     Ok(())
 }

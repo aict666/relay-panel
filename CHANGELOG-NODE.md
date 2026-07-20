@@ -13,6 +13,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-07-20
+
+### Changed
+
+- **Configuration protocol v9 adds staged route activation.** Replacement entry
+  listeners and shared-tunnel routes can be distributed before traffic moves,
+  eliminating the cross-node remove-before-add window during live path or port
+  changes.
+
+### Fixed
+
+- **Old route generations drain without taking new traffic.** Ordinary entry
+  listeners, shared routes, TCP streams, and UDP warm channels follow explicit
+  staging, overlap, and drain markers, preserving unrelated rules on the same
+  shared port.
+- **Credential and administrative revocation wins over availability leases.**
+  Token rotation, pause, tunnel disable/unshare, and explicit termination close
+  stale generations immediately and never retain an invalid HMAC route.
+
+### Compatibility
+
+- Requires RelayPanel **1.3.4+**. Protocol-v9 panels and nodes must be upgraded
+  together; mixed versions fail the configuration-version gate.
+
+### Tests
+
+- Added manager regressions for pre-staged entries, shared-route overlap,
+  termination precedence, idle drain cleanup, and credential rotation during a
+  transition.
+
 ## [1.3.2] - 2026-07-20
 
 ### Added

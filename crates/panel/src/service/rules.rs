@@ -1290,8 +1290,21 @@ pub async fn update_rule(
                 let port = if position == 0 {
                     entry_port
                 } else if protocol_unchanged {
-                    if let Some(old) = existing_hops.iter().find(|h| h.device_group_id == gid) {
-                        old.listen_port as u16
+                    let suffix_unchanged = existing_hops.len() == hop_gids.len()
+                        && existing_hops[position..]
+                            .iter()
+                            .map(|hop| hop.device_group_id)
+                            .eq(hop_gids[position..].iter().copied());
+                    let incoming_unchanged = existing_hops
+                        .get(position - 1)
+                        .is_some_and(|old| old.device_group_id == hop_gids[position - 1]);
+                    if suffix_unchanged
+                        && incoming_unchanged
+                        && existing_hops
+                            .get(position)
+                            .is_some_and(|old| old.device_group_id == gid)
+                    {
+                        existing_hops[position].listen_port as u16
                     } else {
                         allocate_chain_hop_ports(db, &[hop_gids[0], gid], entry_port, protocol_str)
                             .await

@@ -208,6 +208,9 @@ fn empty_config() -> NodeConfigResponse {
         credential_revisions: vec![],
         terminate_tunnel_ids: Vec::new(),
         drain_rule_ids: Vec::new(),
+        route_transition_rule_ids: vec![],
+        route_staging_rule_ids: vec![],
+        route_drain_rule_ids: vec![],
     }
 }
 

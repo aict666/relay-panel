@@ -110,6 +110,12 @@ pub async fn update_rule(
     Path(id): Path<i64>,
     Json(req): Json<UpdateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
+    let stages_route = req.protocol.is_some()
+        || req.device_group_in.is_some()
+        || req.device_group_out.is_some()
+        || req.route_mode.is_some()
+        || req.hops.is_some()
+        || req.tunnel_id.is_some();
     let scope = user.resource_scope();
     // Resolve the actual entry group exactly as the service layer does.  A
     // chain update derives its entry from hops[0], so authorizing only the
@@ -208,6 +214,9 @@ pub async fn update_rule(
                 .node_connections
                 .broadcast_all(r#"{"type":"config_changed"}"#)
                 .await;
+            if stages_route {
+                super::schedule_route_transition_activation(&state);
+            }
             Json(ApiResponse::success(()))
         }
         Err(UpdateRuleError::BadRequest(msg)) => Json(err(400, msg)),

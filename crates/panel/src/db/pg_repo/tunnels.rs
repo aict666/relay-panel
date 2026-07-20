@@ -1,6 +1,9 @@
 use super::PgRepository;
 use crate::db::error::DbError;
-use crate::db::repo::{TunnelDeleteOutcome, TunnelRepository, ENTRY_DRAIN_LEASE_TTL_SECS};
+use crate::db::repo::{
+    TunnelDeleteOutcome, TunnelRepository, ENTRY_DRAIN_LEASE_TTL_SECS,
+    ROUTE_TRANSITION_LEASE_TTL_SECS, ROUTE_TRANSITION_STAGE_SECS,
+};
 use async_trait::async_trait;
 use relay_shared::models::{ForwardRule, ForwardRuleTarget, Tunnel, TunnelHop};
 use std::collections::HashMap;
@@ -159,7 +162,11 @@ impl TunnelRepository for PgRepository {
                  EXISTS (SELECT 1 FROM forward_rules WHERE device_group_in=$1 AND listen_port=$2 AND protocol IN ('tcp','tcp_udp')) \
                  OR EXISTS (SELECT 1 FROM forward_rule_hops h JOIN forward_rules r ON r.id=h.rule_id WHERE h.device_group_id=$1 AND h.listen_port=$2 AND r.protocol IN ('tcp','tcp_udp')) \
                  OR EXISTS (SELECT 1 FROM forward_rule_hops WHERE device_group_id=$1 AND tunnel_port=$2) \
-                 OR EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=$1 AND listen_port=$2) LIMIT 1",
+                 OR EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=$1 AND listen_port=$2) \
+                 OR EXISTS (SELECT 1 FROM forward_rule_route_transitions \
+                   WHERE device_group_id=$1 AND listen_port=$2 \
+                     AND expires_at>=EXTRACT(EPOCH FROM NOW())::BIGINT \
+                     AND protocol IN ('tcp','tcp_udp')) LIMIT 1",
             ).bind(group_id).bind(port).fetch_optional(&mut *tx).await?;
             if conflict.is_some() {
                 tx.rollback().await?;
@@ -317,6 +324,12 @@ impl TunnelRepository for PgRepository {
                (SELECT 1 FROM forward_rule_hops WHERE device_group_id=$2 AND tunnel_port=bound.listen_port)) \
              OR (bound.protocol IN ('tcp','tcp_udp') AND EXISTS \
                (SELECT 1 FROM tunnel_hops WHERE tunnel_id<>$1 AND device_group_id=$2 AND listen_port=bound.listen_port)) \
+             OR EXISTS (SELECT 1 FROM forward_rule_route_transitions rt \
+               WHERE rt.rule_id<>bound.id AND rt.device_group_id=$2 \
+                 AND rt.listen_port=bound.listen_port \
+                 AND rt.expires_at>=EXTRACT(EPOCH FROM NOW())::BIGINT \
+                 AND ((bound.protocol IN ('tcp','tcp_udp') AND rt.protocol IN ('tcp','tcp_udp')) \
+                   OR (bound.protocol IN ('udp','tcp_udp') AND rt.protocol IN ('udp','tcp_udp')))) \
              ) LIMIT 1",
         )
             .bind(id)
@@ -337,7 +350,12 @@ impl TunnelRepository for PgRepository {
                      EXISTS (SELECT 1 FROM forward_rules WHERE device_group_in=$1 AND listen_port=$2 AND protocol IN ('tcp','tcp_udp')) \
                      OR EXISTS (SELECT 1 FROM forward_rule_hops h JOIN forward_rules r ON r.id=h.rule_id WHERE h.device_group_id=$1 AND h.listen_port=$2 AND r.protocol IN ('tcp','tcp_udp')) \
                      OR EXISTS (SELECT 1 FROM forward_rule_hops WHERE device_group_id=$1 AND tunnel_port=$2) \
-                     OR EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=$1 AND listen_port=$2 AND tunnel_id<>$3) LIMIT 1",
+                     OR EXISTS (SELECT 1 FROM tunnel_hops WHERE device_group_id=$1 AND listen_port=$2 AND tunnel_id<>$3) \
+                     OR EXISTS (SELECT 1 FROM forward_rule_route_transitions \
+                       WHERE rule_id NOT IN (SELECT id FROM forward_rules WHERE tunnel_id=$3) \
+                         AND device_group_id=$1 AND listen_port=$2 \
+                         AND expires_at>=EXTRACT(EPOCH FROM NOW())::BIGINT \
+                         AND protocol IN ('tcp','tcp_udp')) LIMIT 1",
                 ).bind(group_id).bind(port).bind(id).fetch_optional(&mut *tx).await?;
                 if conflict.is_some() {
                     tx.rollback().await?;
@@ -360,6 +378,42 @@ impl TunnelRepository for PgRepository {
             return Ok(0);
         }
         if let Some(hops) = hops {
+            sqlx::query(
+                "DELETE FROM forward_rule_route_transitions WHERE rule_id IN \
+                 (SELECT id FROM forward_rules WHERE tunnel_id=$1)",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            let remains_enabled = enabled.unwrap_or(was_enabled);
+            if was_enabled && remains_enabled {
+                sqlx::query(
+                    "INSERT INTO forward_rule_route_transitions \
+                     (rule_id,device_group_id,listen_port,protocol,activate_at,expires_at) \
+                     SELECT fr.id,old_hop.device_group_id,old_hop.listen_port,'tcp', \
+                       EXTRACT(EPOCH FROM now())::BIGINT+$1, \
+                       EXTRACT(EPOCH FROM now())::BIGINT+$2 \
+                     FROM forward_rules fr JOIN users u ON u.id=fr.uid \
+                     JOIN tunnel_hops old_hop ON old_hop.tunnel_id=$3 AND old_hop.position>0 \
+                     WHERE fr.tunnel_id=$3 AND fr.paused=FALSE \
+                       AND u.banned=FALSE AND u.suspended=FALSE \
+                       AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
+                       AND (u.plan_expire_at IS NULL OR u.plan_expire_at> \
+                         to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
+                       AND (u.admin=TRUE OR ($4=TRUE AND (u.all_device_groups=TRUE OR EXISTS( \
+                         SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
+                           AND udg.device_group_id=$5)))) \
+                     ON CONFLICT(rule_id,device_group_id,listen_port,protocol) DO UPDATE \
+                       SET activate_at=excluded.activate_at,expires_at=excluded.expires_at",
+                )
+                .bind(ROUTE_TRANSITION_STAGE_SECS)
+                .bind(ROUTE_TRANSITION_LEASE_TTL_SECS)
+                .bind(id)
+                .bind(was_shared)
+                .bind(hops.first().map(|hop| hop.0))
+                .execute(&mut *tx)
+                .await?;
+            }
             let old_entry = current_hops.first().map(|hop| hop.0);
             let new_entry = hops.first().map(|hop| hop.0);
             if old_entry != new_entry {
@@ -613,6 +667,88 @@ impl TunnelRepository for PgRepository {
                AND (u.admin=TRUE OR (source_tunnel.shared=TRUE AND (u.all_device_groups=TRUE OR EXISTS( \
                  SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
                    AND udg.device_group_id=re.device_group_id)))) \
+             ORDER BY fr.id",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn list_route_transition_rule_ids_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<i64>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT fr.id FROM forward_rule_route_transitions rt \
+             JOIN forward_rules fr ON fr.id=rt.rule_id \
+             JOIN users u ON u.id=fr.uid \
+             LEFT JOIN tunnels t ON t.id=fr.tunnel_id \
+             WHERE rt.device_group_id=$1 \
+               AND rt.expires_at>=EXTRACT(EPOCH FROM now())::BIGINT \
+               AND fr.paused=FALSE AND u.banned=FALSE AND u.suspended=FALSE \
+               AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
+               AND (u.plan_expire_at IS NULL OR u.plan_expire_at> \
+                 to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
+               AND (fr.tunnel_id IS NULL OR (t.enabled=TRUE AND \
+                 (u.admin=TRUE OR (t.shared=TRUE AND (u.all_device_groups=TRUE OR EXISTS( \
+                   SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
+                     AND udg.device_group_id=fr.device_group_in)))))) \
+             ORDER BY fr.id",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn list_route_staging_rule_ids_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<i64>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT fr.id FROM forward_rule_route_transitions rt \
+             JOIN forward_rules fr ON fr.id=rt.rule_id \
+             JOIN users u ON u.id=fr.uid \
+             LEFT JOIN tunnels t ON t.id=fr.tunnel_id \
+             WHERE rt.activate_at>EXTRACT(EPOCH FROM now())::BIGINT \
+               AND rt.expires_at>=EXTRACT(EPOCH FROM now())::BIGINT \
+               AND (fr.device_group_in=$1 OR EXISTS( \
+                 SELECT 1 FROM forward_rule_retired_entries re WHERE re.rule_id=fr.id \
+                   AND re.device_group_id=$1 \
+                   AND re.expires_at>=EXTRACT(EPOCH FROM now())::BIGINT)) \
+               AND fr.paused=FALSE AND u.banned=FALSE AND u.suspended=FALSE \
+               AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
+               AND (u.plan_expire_at IS NULL OR u.plan_expire_at> \
+                 to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
+               AND (fr.tunnel_id IS NULL OR (t.enabled=TRUE AND \
+                 (u.admin=TRUE OR (t.shared=TRUE AND (u.all_device_groups=TRUE OR EXISTS( \
+                   SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
+                     AND udg.device_group_id=$1)))))) \
+             ORDER BY fr.id",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn list_route_drain_rule_ids_for_group(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<i64>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT fr.id FROM forward_rule_route_transitions rt \
+             JOIN forward_rules fr ON fr.id=rt.rule_id \
+             JOIN users u ON u.id=fr.uid \
+             LEFT JOIN tunnels t ON t.id=fr.tunnel_id \
+             WHERE rt.device_group_id=$1 \
+               AND rt.expires_at<EXTRACT(EPOCH FROM now())::BIGINT \
+               AND fr.paused=FALSE AND u.banned=FALSE AND u.suspended=FALSE \
+               AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
+               AND (u.plan_expire_at IS NULL OR u.plan_expire_at> \
+                 to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
+               AND (fr.tunnel_id IS NULL OR (t.enabled=TRUE AND \
+                 (u.admin=TRUE OR (t.shared=TRUE AND (u.all_device_groups=TRUE OR EXISTS( \
+                   SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
+                     AND udg.device_group_id=fr.device_group_in)))))) \
              ORDER BY fr.id",
         )
         .bind(group_id)

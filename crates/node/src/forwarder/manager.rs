@@ -224,6 +224,15 @@ fn fail_closed_config_for_group(config: &NodeConfigResponse, group_id: i64) -> N
     sanitized
         .drain_rule_ids
         .retain(|rule_id| !affected_rule_ids.contains(rule_id));
+    sanitized
+        .route_transition_rule_ids
+        .retain(|rule_id| !affected_rule_ids.contains(rule_id));
+    sanitized
+        .route_staging_rule_ids
+        .retain(|rule_id| !affected_rule_ids.contains(rule_id));
+    sanitized
+        .route_drain_rule_ids
+        .retain(|rule_id| !affected_rule_ids.contains(rule_id));
     sanitized.tunnels.retain_mut(|tunnel| {
         if tunnel_listener_uses_group(tunnel, group_id) {
             return false;
@@ -505,19 +514,56 @@ impl ForwarderManager {
         // ── Step 2: compute the desired set ──
         // Protocol::TcpUdp should never appear here (the panel expands it), but
         // we skip it defensively.
-        let active_keys: HashSet<ListenerKey> = config
+        // A route-transition lease is deliberately ignored when any credential
+        // generation changed in this snapshot. Revocation must win over
+        // availability even if an unrelated control-plane lease is stale.
+        let route_transition_rule_ids: HashSet<i64> = if revoked_groups.is_empty() {
+            config.route_transition_rule_ids.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let route_staging_rule_ids: HashSet<i64> = if revoked_groups.is_empty() {
+            config.route_staging_rule_ids.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let route_drain_rule_ids: HashSet<i64> = if revoked_groups.is_empty() {
+            config.route_drain_rule_ids.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let retained_route_rule_ids: HashSet<i64> = route_transition_rule_ids
+            .union(&route_staging_rule_ids)
+            .copied()
+            .collect();
+        let mut active_keys: HashSet<ListenerKey> = config
             .listeners
             .iter()
             .filter(|l| l.protocol != Protocol::TcpUdp)
             .map(|l| (l.port, l.protocol, l.node_transport))
             .collect();
+        // Old downstream accept loops are already bound and hold their full
+        // previous forwarding context. Keeping their keys desired avoids a
+        // cross-node remove-before-add window without rebuilding secrets from
+        // the new snapshot. Dead generations are not resurrected.
+        active_keys.extend(self.listeners.iter().filter_map(|(key, listener)| {
+            retained_route_rule_ids
+                .contains(&listener.fingerprint.rule_id)
+                .then_some(*key)
+        }));
 
         // v0.5.1: collect the rule_ids present in the NEW config so we can
         // decide which stopped listeners truly belong to deleted rules (and
         // therefore need their traffic counters pruned) vs. listeners that
         // are merely being restarted with a different fingerprint.
-        let desired_rule_ids: HashSet<i64> = config.listeners.iter().map(|l| l.rule_id).collect();
+        let mut desired_rule_ids: HashSet<i64> =
+            config.listeners.iter().map(|l| l.rule_id).collect();
+        desired_rule_ids.extend(retained_route_rule_ids.iter().copied());
         let draining_rule_ids: HashSet<i64> = config.drain_rule_ids.iter().copied().collect();
+        let runtime_draining_rule_ids: HashSet<i64> = draining_rule_ids
+            .union(&route_drain_rule_ids)
+            .copied()
+            .collect();
 
         // Retired entry runtimes are reaped only after their last TCP stream
         // closes. A pause/delete/unshare/disable removes the rule from the
@@ -528,7 +574,7 @@ impl ForwarderManager {
                 finished_retired.push(retired.rule_id);
                 false
             } else {
-                if !draining_rule_ids.contains(&retired.rule_id)
+                if !runtime_draining_rule_ids.contains(&retired.rule_id)
                     && !desired_rule_ids.contains(&retired.rule_id)
                 {
                     retired.runtime.cancel_all();
@@ -539,7 +585,7 @@ impl ForwarderManager {
         for rule_id in finished_retired {
             if !desired_rule_ids.contains(&rule_id) {
                 self.rule_limiters.remove(&rule_id);
-                if !draining_rule_ids.contains(&rule_id) {
+                if !runtime_draining_rule_ids.contains(&rule_id) {
                     self.counter.prune_rule(rule_id).await;
                 }
             }
@@ -558,7 +604,7 @@ impl ForwarderManager {
                 index += 1;
             }
         }
-        let mut preserved_rule_ids = draining_rule_ids.clone();
+        let mut preserved_rule_ids = runtime_draining_rule_ids.clone();
         preserved_rule_ids.extend(
             self.retired_rule_runtimes
                 .iter()
@@ -624,7 +670,9 @@ impl ForwarderManager {
                     {
                         revoked_rule_ids.insert(listener.rule_id);
                     }
-                    to_stop.push(key);
+                    if !route_staging_rule_ids.contains(&listener.rule_id) {
+                        to_stop.push(key);
+                    }
                 }
             }
         }
@@ -671,8 +719,12 @@ impl ForwarderManager {
         // Shared preset-tunnel sockets participate in the same port lifecycle.
         // Reconcile them after old public listeners stop and before new public
         // listeners bind, so a port can safely move between roles in one push.
-        self.apply_shared_tunnel_listeners(config, &current_credential_revisions)
-            .await;
+        self.apply_shared_tunnel_listeners(
+            config,
+            &current_credential_revisions,
+            &route_transition_rule_ids,
+        )
+        .await;
 
         // Revoke only after shared accept loops have been updated or stopped.
         // Cancelling first left a narrow security window: an old listener could
@@ -697,6 +749,17 @@ impl ForwarderManager {
         for listener in &config.listeners {
             let listener_tunnel = tunnel_clients.get(&listener.rule_id).cloned();
             let key = (listener.port, listener.protocol, listener.node_transport);
+            // Phase one of a route edit pre-warms downstream listeners while
+            // the entry keeps its previous generation. If that generation has
+            // already died, fail open to the new one instead of leaving the
+            // public protocol unavailable for the whole staging interval.
+            if route_staging_rule_ids.contains(&listener.rule_id)
+                && self.listeners.iter().any(|(old_key, old)| {
+                    old.fingerprint.rule_id == listener.rule_id && old_key.1 == listener.protocol
+                })
+            {
+                continue;
+            }
             // Skip if already running with the SAME fingerprint (no change).
             if let Some(m) = self.listeners.get(&key) {
                 if m.fingerprint == ListenerFingerprint::from_listener(listener) {
@@ -1363,7 +1426,7 @@ impl ForwarderManager {
             let Some(runtime) = self.rule_runtime.remove(&rule_id) else {
                 continue;
             };
-            if draining_rule_ids.contains(&rule_id) && !runtime.is_idle() {
+            if runtime_draining_rule_ids.contains(&rule_id) && !runtime.is_idle() {
                 self.retired_rule_runtimes
                     .push(RetiredRuleRuntime { rule_id, runtime });
             }
@@ -1387,6 +1450,7 @@ impl ForwarderManager {
         &mut self,
         config: &NodeConfigResponse,
         credential_revisions: &HashMap<i64, i64>,
+        route_transition_rule_ids: &HashSet<i64>,
     ) {
         self.retired_tunnel_runtimes
             .retain(|retired| !retired.runtime.is_idle());
@@ -1395,19 +1459,35 @@ impl ForwarderManager {
                 retired.runtime.cancel_all();
             }
         }
-        let desired: HashMap<TunnelListenerKey, &TunnelListenerConfig> = config
+        let mut desired: HashMap<TunnelListenerKey, TunnelListenerConfig> = config
             .tunnels
             .iter()
             .filter(|tunnel| tunnel.port != 0)
-            .map(|tunnel| ((tunnel.tunnel_id, tunnel.port), tunnel))
+            .map(|tunnel| ((tunnel.tunnel_id, tunnel.port), tunnel.clone()))
             .collect();
+        // If the shared socket remains at the same key, retain only the old
+        // routes covered by the lease. The current config still supplies the
+        // accepting credential, next hop and all unrelated routes.
+        for (key, managed) in &self.shared_tunnel_listeners {
+            let Some(wanted) = desired.get_mut(key) else {
+                continue;
+            };
+            for route in &managed.config.routes {
+                if route_transition_rule_ids.contains(&route.rule_id)
+                    && !wanted
+                        .routes
+                        .iter()
+                        .any(|candidate| candidate.rule_id == route.rule_id)
+                {
+                    wanted.routes.push(route.clone());
+                }
+            }
+        }
         // Never evict a live link. Inactive histories outlive the complete
         // signed-header and nonce-cache acceptance window, then old unused
         // credential revisions release their memory.
-        let desired_replay_keys: HashSet<TunnelReplayKey> = desired
-            .values()
-            .map(|tunnel| tunnel_replay_key(tunnel))
-            .collect();
+        let desired_replay_keys: HashSet<TunnelReplayKey> =
+            desired.values().map(tunnel_replay_key).collect();
         let now = Instant::now();
         self.tunnel_replay_caches.retain(|key, entry| {
             if desired_replay_keys.contains(key) {
@@ -1420,7 +1500,7 @@ impl ForwarderManager {
         let mut stop = Vec::new();
         let mut hot_updates = Vec::new();
         for (key, managed) in &self.shared_tunnel_listeners {
-            let wanted = desired.get(key).copied();
+            let wanted = desired.get(key);
             let changed = wanted.is_none_or(|wanted| managed.config != *wanted);
             if managed.handle.is_finished() {
                 if wanted.is_none()
@@ -1436,13 +1516,21 @@ impl ForwarderManager {
                     hot_updates.push((*key, wanted.clone()));
                 }
             } else {
-                if config
+                let terminated = config
                     .terminate_tunnel_ids
-                    .contains(&managed.config.tunnel_id)
-                {
+                    .contains(&managed.config.tunnel_id);
+                if terminated {
                     managed.runtime.cancel_all();
                 }
-                stop.push(*key);
+                let keep_for_transition = !terminated
+                    && managed
+                        .config
+                        .routes
+                        .iter()
+                        .any(|route| route_transition_rule_ids.contains(&route.rule_id));
+                if !keep_for_transition {
+                    stop.push(*key);
+                }
             }
         }
         for key in stop {
@@ -1482,7 +1570,7 @@ impl ForwarderManager {
             }
         }
 
-        for tunnel in &config.tunnels {
+        for tunnel in desired.values() {
             if tunnel.port == 0 {
                 continue;
             }
@@ -1868,6 +1956,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         }
     }
 
@@ -1902,6 +1993,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         }
     }
 
@@ -1943,6 +2037,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         manager.apply_config(&config).await;
         let key = (901, port);
@@ -1964,6 +2061,179 @@ mod tests {
             original_task,
             "route-table changes must not abort and rebind the shared socket"
         );
+    }
+
+    #[tokio::test]
+    async fn route_transition_keeps_old_ordinary_listener_until_lease_disappears() {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+        manager
+            .apply_config(&one_rule(port, Protocol::Tcp, NodeTransport::Raw))
+            .await;
+        let key = (port, Protocol::Tcp, NodeTransport::Raw);
+        let original_task = manager.listeners[&key].handle.id();
+
+        let mut switched = NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![1],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
+        };
+        manager.apply_config(&switched).await;
+        assert_eq!(manager.listeners[&key].handle.id(), original_task);
+        assert!(manager.rule_runtime.contains_key(&1));
+        let gate = manager.rule_runtime[&1].gate(None);
+        let live_connection = gate.admit().unwrap();
+
+        switched.route_transition_rule_ids.clear();
+        switched.route_drain_rule_ids = vec![1];
+        manager.apply_config(&switched).await;
+        assert!(!manager.listeners.contains_key(&key));
+        assert!(!manager.rule_runtime.contains_key(&1));
+        assert_eq!(manager.retired_rule_runtimes.len(), 1);
+
+        drop(live_connection);
+        manager.apply_config(&switched).await;
+        assert!(manager.retired_rule_runtimes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_staging_keeps_old_entry_generation_until_activation() {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+        let original = one_rule(port, Protocol::Tcp, NodeTransport::Raw);
+        manager.apply_config(&original).await;
+        let key = (port, Protocol::Tcp, NodeTransport::Raw);
+        let original_task = manager.listeners[&key].handle.id();
+        let original_fingerprint = manager.listeners[&key].fingerprint.clone();
+
+        let mut staged = original.clone();
+        staged.listeners[0].targets = vec!["127.0.0.1:10".into()];
+        staged.route_staging_rule_ids = vec![1];
+        staged.route_transition_rule_ids = vec![1];
+        manager.apply_config(&staged).await;
+        assert_eq!(manager.listeners[&key].handle.id(), original_task);
+        assert_eq!(manager.listeners[&key].fingerprint, original_fingerprint);
+
+        staged.route_staging_rule_ids.clear();
+        manager.apply_config(&staged).await;
+        assert_ne!(manager.listeners[&key].handle.id(), original_task);
+        assert_ne!(manager.listeners[&key].fingerprint, original_fingerprint);
+    }
+
+    #[tokio::test]
+    async fn route_transition_retains_removed_shared_route_and_socket() {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+        let tunnel = TunnelListenerConfig {
+            tunnel_id: 902,
+            port,
+            hop_position: 1,
+            auth_token: "transition-key".repeat(5),
+            link_scope: "902:0:10:20".into(),
+            next: None,
+            routes: vec![relay_shared::protocol::TunnelRouteConfig {
+                rule_id: 1,
+                protocol: "tcp".into(),
+                targets: vec!["127.0.0.1:9".into()],
+                target_weights: vec![1],
+                load_balance_strategy: LoadBalanceStrategy::First,
+            }],
+            handshake_timeout_ms: 1_000,
+            max_unauthenticated: 16,
+            clients: vec![],
+        };
+        let active = NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![tunnel],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
+        };
+        manager.apply_config(&active).await;
+        let key = (902, port);
+        let original_task = manager.shared_tunnel_listeners[&key].handle.id();
+
+        let mut switched = NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![1],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
+        };
+        manager.apply_config(&switched).await;
+        let retained = &manager.shared_tunnel_listeners[&key];
+        assert_eq!(retained.handle.id(), original_task);
+        assert_eq!(retained.config.routes[0].rule_id, 1);
+
+        switched.route_transition_rule_ids.clear();
+        manager.apply_config(&switched).await;
+        assert!(!manager.shared_tunnel_listeners.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn tunnel_termination_overrides_route_transition_lease() {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+        let mut active = NodeConfigResponse {
+            listeners: vec![],
+            tunnels: vec![TunnelListenerConfig {
+                tunnel_id: 903,
+                port,
+                hop_position: 1,
+                auth_token: "terminated-key".repeat(5),
+                link_scope: "903:0:10:20".into(),
+                next: None,
+                routes: vec![relay_shared::protocol::TunnelRouteConfig {
+                    rule_id: 1,
+                    protocol: "tcp".into(),
+                    targets: vec!["127.0.0.1:9".into()],
+                    target_weights: vec![1],
+                    load_balance_strategy: LoadBalanceStrategy::First,
+                }],
+                handshake_timeout_ms: 1_000,
+                max_unauthenticated: 16,
+                clients: vec![],
+            }],
+            credential_revisions: vec![],
+            terminate_tunnel_ids: vec![],
+            drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
+        };
+        manager.apply_config(&active).await;
+        active.tunnels.clear();
+        active.terminate_tunnel_ids.push(903);
+        active.route_transition_rule_ids.push(1);
+        manager.apply_config(&active).await;
+        assert!(manager.shared_tunnel_listeners.is_empty());
     }
 
     /// v1.0.9: a rate-limit change (set OR cleared) must change the listener
@@ -2268,6 +2538,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         })
         .await;
         assert!(
@@ -2317,6 +2590,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![1],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         mgr.apply_config(&moved).await;
         assert!(!mgr.rule_runtime.contains_key(&1));
@@ -2390,6 +2666,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![1],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         })
         .await;
         assert_eq!(mgr.retired_rule_runtimes.len(), 1);
@@ -2613,6 +2892,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         })
         .await;
         assert!(
@@ -2669,6 +2951,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         mgr.apply_config(&c).await;
         let keys = mgr.listener_keys();
@@ -2767,6 +3052,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         mgr.apply_config(&c).await;
         assert_eq!(mgr.listener_keys().len(), 2);
@@ -2892,6 +3180,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
 
         let mut exit = fresh_mgr();
@@ -2944,6 +3235,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         let mut entry = fresh_mgr();
         entry.listen_ipv6 = String::new();
@@ -2982,6 +3276,9 @@ mod tests {
                 credential_revisions: vec![],
                 terminate_tunnel_ids: vec![],
                 drain_rule_ids: vec![],
+                route_transition_rule_ids: vec![],
+                route_staging_rule_ids: vec![],
+                route_drain_rule_ids: vec![],
             })
             .await;
         exit.apply_config(&NodeConfigResponse {
@@ -2990,6 +3287,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         })
         .await;
         tcp_echo.abort();
@@ -3177,6 +3477,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         mgr.apply_config(&mk(LoadBalanceStrategy::First)).await;
         let fp1 = mgr
@@ -3221,6 +3524,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         mgr.apply_config(&mk(NodeTransport::Raw)).await;
         assert!(mgr
@@ -3265,6 +3571,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         })
         .await;
         assert!(mgr.listener_keys().is_empty(), "removed rule must stop");
@@ -3321,6 +3630,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         mgr.apply_config(&c1).await;
         let fp70 = mgr
@@ -3372,6 +3684,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         mgr.apply_config(&c2).await;
         assert_eq!(
@@ -3627,6 +3942,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         })
         .await;
 
@@ -3696,6 +4014,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         mgr.apply_config(&tcp_udp_cfg).await;
         counter.add(1, 200, 100).await;
@@ -3726,6 +4047,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         };
         mgr.apply_config(&tcp_cfg).await;
 
@@ -3767,6 +4091,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         })
         .await;
 
@@ -3848,6 +4175,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 901,
                 port: shared_port,
@@ -3926,6 +4256,9 @@ mod tests {
                 credential_revisions: vec![],
                 terminate_tunnel_ids: vec![],
                 drain_rule_ids: vec![],
+                route_transition_rule_ids: vec![],
+                route_staging_rule_ids: vec![],
+                route_drain_rule_ids: vec![],
                 tunnels: vec![TunnelListenerConfig {
                     tunnel_id: 901,
                     port: 0,
@@ -3989,6 +4322,9 @@ mod tests {
                 credential_revisions: vec![],
                 terminate_tunnel_ids: vec![],
                 drain_rule_ids: vec![],
+                route_transition_rule_ids: vec![],
+                route_staging_rule_ids: vec![],
+                route_drain_rule_ids: vec![],
             })
             .await;
         exit.apply_config(&NodeConfigResponse {
@@ -3997,6 +4333,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
         })
         .await;
     }
@@ -4013,6 +4352,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 902,
                 port,
@@ -4075,8 +4417,12 @@ mod tests {
                     credential_revisions: vec![],
                     terminate_tunnel_ids: vec![],
                     drain_rule_ids: vec![],
+                    route_transition_rule_ids: vec![],
+                    route_staging_rule_ids: vec![],
+                    route_drain_rule_ids: vec![],
                 },
                 &HashMap::new(),
+                &HashSet::new(),
             )
             .await;
         let retained = manager
@@ -4108,6 +4454,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 903,
                 port,
@@ -4182,6 +4531,9 @@ mod tests {
             credential_revisions: vec![],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 904,
                 port,
@@ -4231,6 +4583,9 @@ mod tests {
                 credential_revisions: vec![],
                 terminate_tunnel_ids: vec![],
                 drain_rule_ids: vec![],
+                route_transition_rule_ids: vec![],
+                route_staging_rule_ids: vec![],
+                route_drain_rule_ids: vec![],
             })
             .await;
         assert_eq!(manager.retired_tunnel_runtimes.len(), 1);
@@ -4286,6 +4641,9 @@ mod tests {
             }],
             terminate_tunnel_ids: vec![],
             drain_rule_ids: vec![],
+            route_transition_rule_ids: vec![],
+            route_staging_rule_ids: vec![],
+            route_drain_rule_ids: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 905,
                 port,
@@ -4338,6 +4696,9 @@ mod tests {
                 }],
                 terminate_tunnel_ids: vec![],
                 drain_rule_ids: vec![],
+                route_transition_rule_ids: vec![],
+                route_staging_rule_ids: vec![],
+                route_drain_rule_ids: vec![],
             })
             .await;
         let mut byte = [0u8; 1];
