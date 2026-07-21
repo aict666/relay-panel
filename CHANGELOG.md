@@ -10,6 +10,50 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.6] - 2026-07-21
+
+### Security
+
+- **Authentication and authorization now fail closed.** Login, current-user
+  resolution, group access, node identity validation, and administrative
+  mutations no longer acknowledge success when persistence or verification
+  fails.
+- **Generated node install commands are shell-safe.** Tokens and panel URLs are
+  quoted as data, preventing shell metacharacters from changing the command.
+
+### Changed
+
+- **Administrative writes use transactional compare-and-set semantics.** Plans,
+  users, rules, tunnels, profiles, groups, settings, and purchases reject stale
+  forms instead of overwriting concurrent changes or charging against a changed
+  catalog.
+- **Rule creation accepts connection and restart limits directly.** The create
+  path now validates the same bounds as updates, eliminating the follow-up edit
+  window.
+
+### Fixed
+
+- **Traffic limits retain their exact byte value.** Opening and saving a form no
+  longer rounds an unchanged quota through a two-decimal GiB display, and unsafe
+  browser-sized values are rejected.
+- **Node status is durable and key-safe.** Invalid node identifiers are rejected,
+  storage and lease-renewal failures are surfaced, and GeoIP cleanup preserves
+  addresses still reported by another node.
+- **Sessions cannot regain stale privilege.** Delayed identity requests are
+  invalidated across account changes, failed logins roll back local state, and
+  password changes immediately end the revoked session.
+- **Frontend mutations are race-safe.** Duplicate submits, stale modal state,
+  tunnel toggles, imports, and catalog purchases stay synchronized with their
+  server result.
+
+### Tests
+
+- Added SQLite/PostgreSQL parity and failure-injection coverage for authorization,
+  transaction rollback, catalog revisions, traffic accounting, node reports,
+  transitions, and dependent deletes.
+- Added browser interaction regressions for authentication, groups, users,
+  rules, tunnels, plans, purchases, traffic conversion, and install commands.
+
 ## [1.3.5] - 2026-07-20
 
 ### Changed
