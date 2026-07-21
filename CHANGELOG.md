@@ -10,6 +10,13 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.11] - 2026-07-21
+
+### Added
+
+- 导航侧栏底部新增 RelayPanel 项目地址，可直接打开 GitHub 仓库；桌面展开状态完整
+  展示地址，折叠状态保留带提示的 GitHub 入口，移动端抽屉同步可用。
+
 ## [1.3.10] - 2026-07-21
 
 ### Changed

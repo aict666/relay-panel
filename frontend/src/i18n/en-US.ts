@@ -24,6 +24,7 @@ export const enUS: Dict = {
   navGroupWorkspace: 'Workspace',
   navGroupAdmin: 'Administration',
   toggleMenu: 'Menu',
+  projectAddress: 'Project',
   dashboard: 'Dashboard',
   forwardRules: 'Forward Rules',
   deviceGroups: 'Device Groups',

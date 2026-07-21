@@ -18,6 +18,7 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   ThunderboltFilled,
+  GithubOutlined,
 } from '@ant-design/icons';
 import { useI18n } from '../i18n/context';
 import api from '../api/client';
@@ -27,6 +28,7 @@ import { makePasswordValidator } from '../utils/password';
 import { useSiteConfig } from '../site/useSiteConfig';
 
 const { Sider, Content, Header } = Layout;
+const PROJECT_URL = 'https://github.com/aict666/relay-panel';
 
 /** Sidebar masthead. Shrinks to just the mark when the rail is collapsed. */
 function Brand({ collapsed = false }: { collapsed?: boolean }) {
@@ -36,6 +38,29 @@ function Brand({ collapsed = false }: { collapsed?: boolean }) {
       <span className="rp-brand-mark"><ThunderboltFilled /></span>
       {!collapsed && <span className="rp-brand-name" title={siteName}>{siteName}</span>}
     </div>
+  );
+}
+
+/** Permanent project attribution at the bottom of the navigation rail. */
+function ProjectLink({ collapsed = false }: { collapsed?: boolean }) {
+  const { t } = useI18n();
+  return (
+    <a
+      className={`rp-project-link${collapsed ? ' rp-project-link-collapsed' : ''}`}
+      href={PROJECT_URL}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label={`${t('projectAddress')}: ${PROJECT_URL}`}
+      title={collapsed ? PROJECT_URL : undefined}
+    >
+      <GithubOutlined className="rp-project-icon" />
+      {!collapsed && (
+        <span className="rp-project-meta">
+          <span className="rp-project-label">{t('projectAddress')}</span>
+          <span className="rp-project-url">github.com/aict666/relay-panel</span>
+        </span>
+      )}
+    </a>
   );
 }
 
@@ -104,16 +129,6 @@ export default function MainLayout() {
     setNavOpen(false);
   };
 
-  const nav = (
-    <Menu
-      className="rp-nav"
-      mode="inline"
-      selectedKeys={[location.pathname]}
-      items={menuItems}
-      onClick={({ key }) => go(key)}
-    />
-  );
-
   const userMenu: MenuProps['items'] = [
     {
       key: 'password',
@@ -166,7 +181,14 @@ export default function MainLayout() {
           style={{ position: 'sticky', top: 0, height: '100dvh', overflow: 'hidden' }}
         >
           <Brand collapsed={collapsed} />
-          {nav}
+          <Menu
+            className="rp-nav"
+            mode="inline"
+            selectedKeys={[location.pathname]}
+            items={menuItems}
+            onClick={({ key }) => go(key)}
+          />
+          <ProjectLink collapsed={collapsed} />
         </Sider>
       )}
 
@@ -176,10 +198,17 @@ export default function MainLayout() {
         onClose={() => setNavOpen(false)}
         size={272}
         closable={false}
-        styles={{ body: { padding: 0 }, header: { display: 'none' } }}
+        styles={{ body: { padding: 0, display: 'flex', flexDirection: 'column' }, header: { display: 'none' } }}
       >
         <Brand />
-        {nav}
+        <Menu
+          className="rp-nav"
+          mode="inline"
+          selectedKeys={[location.pathname]}
+          items={menuItems}
+          onClick={({ key }) => go(key)}
+        />
+        <ProjectLink />
       </Drawer>
 
       <Layout style={{ minWidth: 0 }}>

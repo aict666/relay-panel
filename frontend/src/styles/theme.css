@@ -102,6 +102,11 @@ html, body, #root {
   border-inline-end: 1px solid var(--rp-hairline);
 }
 
+.rp-sidebar .ant-layout-sider-children {
+  display: flex;
+  flex-direction: column;
+}
+
 .rp-brand {
   height: var(--rp-header-height);
   display: flex;
@@ -142,9 +147,11 @@ html, body, #root {
 }
 
 .rp-nav {
+  flex: 1 1 auto;
+  min-height: 0;
   padding-block: 12px 20px;
   overflow-y: auto;
-  height: calc(100% - var(--rp-header-height));
+  height: auto;
 }
 
 .rp-nav.ant-menu-inline,
@@ -176,6 +183,56 @@ html, body, #root {
   text-align: center;
   overflow: hidden;
   text-overflow: clip;
+}
+
+.rp-project-link {
+  flex: 0 0 auto;
+  min-width: 0;
+  margin: 0 12px 14px;
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--rp-text-secondary);
+  border: 1px solid var(--rp-hairline);
+  border-radius: 10px;
+  background: var(--rp-bg);
+  transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+
+.rp-project-link:hover {
+  color: var(--rp-primary-strong);
+  border-color: var(--rp-primary-soft);
+  background: #f0fdfa;
+}
+
+.rp-project-icon {
+  flex: 0 0 auto;
+  font-size: 17px;
+}
+
+.rp-project-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.rp-project-label {
+  font-size: 11px;
+  color: var(--rp-text-tertiary);
+}
+
+.rp-project-url {
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.rp-project-link-collapsed {
+  justify-content: center;
+  margin-inline: 14px;
+  padding-inline: 0;
 }
 
 /* ---- Header ---- */
