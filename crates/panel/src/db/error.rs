@@ -88,6 +88,10 @@ pub enum DbError {
     /// A device group referenced by one or more plans cannot be changed to a
     /// non-inbound type while those plans still grant it.
     GroupPlanInvariant { plans: i64 },
+    /// A non-empty ingress protocol policy cannot be stored on a group that is
+    /// not currently ingress-capable. Checked under the same row/write lock as
+    /// the group update so concurrent type/policy edits cannot violate it.
+    GroupProtocolPolicyInvariant,
     /// A required row was not found (for fetch_one-or-None patterns that are
     /// expected to succeed).
     NotFound,
@@ -156,6 +160,9 @@ impl std::fmt::Display for DbError {
             DbError::UserDeviceGroupInvalid => write!(f, "invalid user device-group grant"),
             DbError::GroupPlanInvariant { plans } => {
                 write!(f, "device group is granted by {plans} plan(s)")
+            }
+            DbError::GroupProtocolPolicyInvariant => {
+                write!(f, "protocol blocking requires an ingress-capable device group")
             }
             DbError::NotFound => write!(f, "not found"),
             DbError::InvalidData(context) => write!(f, "invalid persisted data: {context}"),

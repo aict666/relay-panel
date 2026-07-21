@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS device_groups (
     port_range TEXT NOT NULL DEFAULT '1-65535',
     fallback_group BIGINT REFERENCES device_groups(id),
     config TEXT NOT NULL DEFAULT '{}',
+    blocked_protocols TEXT NOT NULL DEFAULT '[]',
     capabilities TEXT NOT NULL DEFAULT '["tcp","udp"]',
     region TEXT,
     line_type TEXT,
@@ -355,7 +356,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 33;
+pub const PG_SCHEMA_VERSION: i32 = 34;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1501,6 +1502,23 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 33: route-transition staging timestamp present");
     }
 
+    // Revision 34: best-effort public-ingress protocol blocking.
+    if current < 34 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE device_groups ADD COLUMN IF NOT EXISTS blocked_protocols TEXT NOT NULL DEFAULT '[]'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (34) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 34: device_groups.blocked_protocols present");
+    }
+
     Ok(())
 }
 
@@ -1513,7 +1531,7 @@ mod tests {
         // Keep the early-return guard in run_pg_migrations aligned with the
         // highest ordered migration below. A lower value silently skips newer
         // migrations on existing PostgreSQL databases.
-        assert_eq!(PG_SCHEMA_VERSION, 33);
+        assert_eq!(PG_SCHEMA_VERSION, 34);
     }
 
     // A `;` inside a -- line comment must NOT split a statement. This is the

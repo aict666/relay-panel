@@ -4,11 +4,11 @@ use dashmap::DashMap;
 use relay_shared::protocol::{
     ApiResponse, ListenerError, StatusReport, TrafficEntry, TrafficReport,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, Networks, System};
 use tokio::sync::{Mutex, RwLock};
 
@@ -204,6 +204,8 @@ pub const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct ConnectionTracker {
     tcp: Arc<AtomicU64>,
     udp: DashMap<UdpSessionKey, Instant>,
+    blocked_tls: AtomicU64,
+    last_tls_block_log_secs: AtomicU64,
 }
 
 /// Identity of a single UDP "connection". A client's source port plus the
@@ -219,6 +221,8 @@ impl ConnectionTracker {
         Self {
             tcp: Arc::new(AtomicU64::new(0)),
             udp: DashMap::new(),
+            blocked_tls: AtomicU64::new(0),
+            last_tls_block_log_secs: AtomicU64::new(0),
         }
     }
 
@@ -300,6 +304,38 @@ impl ConnectionTracker {
         prune_expired(&self.udp);
         let udp = self.udp.len() as u32;
         tcp.saturating_add(udp)
+    }
+
+    /// Record one rejected TLS ClientHello. The cumulative count is lock-free
+    /// and survives listener hot reloads for the lifetime of this node process.
+    /// Individual rejects are intentionally not logged; one representative
+    /// warning per minute is enough for diagnosis without turning scans into a
+    /// disk/CPU amplification vector.
+    pub fn record_blocked_tls(&self, rule_id: i64, client_addr: SocketAddr) -> u64 {
+        let total = self.blocked_tls.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = self.last_tls_block_log_secs.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 60
+            && self
+                .last_tls_block_log_secs
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                rule_id,
+                %client_addr,
+                total,
+                "blocked TLS ClientHello at public ingress (log rate-limited to once per 60s)"
+            );
+        }
+        total
+    }
+
+    pub fn blocked_protocol_connections(&self) -> BTreeMap<String, u64> {
+        BTreeMap::from([("tls".to_string(), self.blocked_tls.load(Ordering::Relaxed))])
     }
 }
 
@@ -896,6 +932,7 @@ pub async fn report_status(
         // self-upgrade to systemd nodes (docker → update image; manual → none).
         install_method: Some(crate::updater::install_method().to_string()),
         draining_rule_ids,
+        blocked_protocol_connections: Some(connections.blocked_protocol_connections()),
     };
 
     // debug, not info: this runs every poll cycle (default 10s). Keeping it
@@ -1382,6 +1419,7 @@ mod tests {
                 uot_next_token: None,
                 zero_rtt: false,
                 tcp_fast_open: false,
+                blocked_protocols: vec![],
             })
             .collect();
         let cfg = NodeConfigResponse {
@@ -1393,6 +1431,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
 
         // apply_config should return promptly even for 1000 rules — the diff

@@ -187,6 +187,8 @@ export interface Tunnel {
   bound_rule_count: number;
 }
 
+export type BlockedProtocol = 'tls';
+
 export interface DeviceGroup {
   id: number;
   name: string;
@@ -197,6 +199,8 @@ export interface DeviceGroup {
   port_range: string;
   fallback_group: number | null;
   config: string;
+  /** Best-effort public-ingress protocol policy. */
+  blocked_protocols?: BlockedProtocol[];
   /** v1.0.8: traffic billing multiplier (0.1..=100, default 1.0). Users are
    *  charged real bytes * rate; rule/user byte counters stay real. */
   rate: number;
@@ -321,6 +325,8 @@ export interface NodeStatus {
    *  denied, etc.). Missing/empty = all listeners healthy. Older nodes don't
    *  report it; render "ok" for them. */
   listener_errors?: ListenerError[] | null;
+  /** Cumulative policy rejects since this node process started. */
+  blocked_protocol_connections?: Record<string, number> | null;
 }
 
 export interface LoginResponse {
@@ -472,6 +478,7 @@ export interface SharedGroupSummary {
   capabilities: string;
   region?: string | null;
   line_type?: string | null;
+  blocked_protocols?: BlockedProtocol[];
 }
 
 /** v0.4.13 PR2 / v0.4.14 PR1: per-NODE availability + load metrics for a shared
@@ -488,6 +495,7 @@ export interface SharedNodeSummary {
   capabilities: string;
   region?: string | null;
   line_type?: string | null;
+  blocked_protocols?: BlockedProtocol[];
   node_id: string;
   online: boolean;
   public_ip?: string | null;
@@ -566,4 +574,5 @@ export interface NodeDisplayRow {
   /** Shared-group-only metadata (user view). */
   region?: string | null;
   line_type?: string | null;
+  blocked_protocols?: BlockedProtocol[];
 }

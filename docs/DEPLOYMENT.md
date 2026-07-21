@@ -182,7 +182,7 @@ embeds it into the one-line install command.
 `RELAY_ENABLE_UOT` and `RELAY_ENABLE_TCP_0RTT` both default to `true`. A normal
 maintenance-window upgrade therefore activates both features after the panel
 and nodes are upgraded. For a mixed-version rolling upgrade, explicitly set
-both to `false` first, upgrade every node to the current config protocol v9,
+both to `false` first, upgrade every node to the current config protocol v10,
 verify native forwarding/listener health, then canary them separately. The
 complete ordering, firewall requirements, rollback steps, and TCP 0-RTT limits are in
 [ADVANCED-ROUTING-UOT.md](ADVANCED-ROUTING-UOT.md).

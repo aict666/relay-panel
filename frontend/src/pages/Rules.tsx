@@ -6,7 +6,7 @@ import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
 import { canUsePresetForRuleUpdate } from '../utils/tunnels';
 import { ruleFormTabForErrors } from '../utils/ruleForm';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, Tunnel } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, Tunnel, BlockedProtocol } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
@@ -254,10 +254,18 @@ export default function Rules() {
   // groups come from /groups/shared (SharedGroupSummary, which carries name +
   // connect_host) — merge both so name/IP resolve for admins and users alike.
   const groupInfo = useMemo(() => {
-    const m = new Map<number, { name: string; connect_host: string }>();
-    for (const g of groups) m.set(g.id, { name: g.name, connect_host: g.connect_host });
+    const m = new Map<number, { name: string; connect_host: string; blocked_protocols?: BlockedProtocol[] }>();
+    for (const g of groups) m.set(g.id, {
+      name: g.name,
+      connect_host: g.connect_host,
+      blocked_protocols: g.blocked_protocols,
+    });
     for (const g of sharedGroups) {
-      if (!m.has(g.id)) m.set(g.id, { name: g.name, connect_host: g.connect_host });
+      if (!m.has(g.id)) m.set(g.id, {
+        name: g.name,
+        connect_host: g.connect_host,
+        blocked_protocols: g.blocked_protocols,
+      });
     }
     return m;
   }, [groups, sharedGroups]);
@@ -970,6 +978,16 @@ const IMPORT_DEFAULTS = {
   // also rejects. This keeps the UI and the API invariant in lock-step.
   const sharedInGroups = sharedGroups.filter(isInboundGroup);
   const allInGroups = isAdmin ? inGroups : sharedInGroups;
+  const inboundGroupOptions = allInGroups.map(g => ({
+    value: g.id,
+    searchLabel: g.name,
+    label: (
+      <Space size={4}>
+        <span>{g.name} (#{g.id})</span>
+        {g.blocked_protocols?.includes('tls') && <Tag color="red">{t('tlsBlocked')}</Tag>}
+      </Space>
+    ),
+  }));
   // Chain hops: entry must be inbound-capable; mid/exit can be any forwarding
   // group. `both` is intentionally available in either position.
   const hopGroupOptions = (isAdmin
@@ -977,7 +995,7 @@ const IMPORT_DEFAULTS = {
     : sharedInGroups
   ).map(g => ({
     value: g.id,
-    label: `${g.name} (${g.group_type}${g.connect_host ? ` · ${g.connect_host}` : ''})`,
+    label: `${g.name} (${g.group_type}${g.connect_host ? ` · ${g.connect_host}` : ''})${g.blocked_protocols?.includes('tls') ? ` · ${t('tlsBlocked')}` : ''}`,
   }));
   const protocolOptions = [
     { value: 'tcp_udp', label: t('tcpUdp') },
@@ -1006,6 +1024,11 @@ const IMPORT_DEFAULTS = {
     ?.map(hop => hop.group_name || groupInfo.get(hop.device_group_id)?.name || `#${hop.device_group_id}`)
     .join(' → ') || '-';
   const tunnelPathText = (tunnel?: Tunnel) => hopPathText(tunnel?.hops);
+  const tunnelBlocksTls = (tunnel?: Tunnel) => {
+    const entryGroupId = tunnel?.hops[0]?.device_group_id;
+    return entryGroupId !== undefined
+      && groupInfo.get(entryGroupId)?.blocked_protocols?.includes('tls') === true;
+  };
   const selectedCreateTunnel = createTunnelId ? tunnelMap.get(createTunnelId) : undefined;
   const selectedEditTunnel = editTunnelId
     ? tunnelMap.get(editTunnelId) ?? (editing?.tunnel_id === editTunnelId ? {
@@ -1030,10 +1053,16 @@ const IMPORT_DEFAULTS = {
       >
         <Select
           showSearch
-          optionFilterProp="label"
+          optionFilterProp="searchLabel"
           options={(selected && !tunnelMap.has(selected.id) ? [selected, ...tunnels] : tunnels).map(tunnel => ({
             value: tunnel.id,
-            label: `${tunnel.name} · ${tunnelPathText(tunnel)}`,
+            searchLabel: `${tunnel.name} · ${tunnelPathText(tunnel)}`,
+            label: (
+              <Space size={4}>
+                <span>{tunnel.name} · {tunnelPathText(tunnel)}</span>
+                {tunnelBlocksTls(tunnel) && <Tag color="red">{t('tlsBlocked')}</Tag>}
+              </Space>
+            ),
             disabled: !tunnelMap.has(tunnel.id) || (!tunnel.enabled && tunnel.id !== selected?.id),
           }))}
           placeholder={t('select')}
@@ -1044,7 +1073,12 @@ const IMPORT_DEFAULTS = {
           type={selected.enabled ? 'success' : 'warning'}
           showIcon
           style={{ marginBottom: 16 }}
-          title={selected.enabled ? tunnelPathText(selected) : t('tunnelDisabled')}
+          title={selected.enabled ? (
+            <Space size={4}>
+              <span>{tunnelPathText(selected)}</span>
+              {tunnelBlocksTls(selected) && <Tag color="red">{t('tlsBlocked')}</Tag>}
+            </Space>
+          ) : t('tunnelDisabled')}
           description={t('tunnelPortsReused')}
         />
       )}
@@ -1128,10 +1162,12 @@ const IMPORT_DEFAULTS = {
       {(fields, { add, remove, move }) => (
         <Space orientation="vertical" style={{ width: '100%' }} className="rp-target-editor">
           <Text strong>{t('targets')}</Text>
-          {fields.map((field, index) => (
-            <div key={field.key} className="rp-target-row">
+          {fields.map((field, index) => {
+            const { key, ...fieldProps } = field;
+            return (
+            <div key={key} className="rp-target-row">
               <Form.Item
-                {...field}
+                {...fieldProps}
                 name={[field.name, 'host']}
                 label={t('address')}
                 rules={[{ required: true }]}
@@ -1140,7 +1176,7 @@ const IMPORT_DEFAULTS = {
                 <Input placeholder={t('targetAddress')} />
               </Form.Item>
               <Form.Item
-                {...field}
+                {...fieldProps}
                 name={[field.name, 'weight']}
                 label={t('targetWeight')}
                 initialValue={1}
@@ -1150,7 +1186,7 @@ const IMPORT_DEFAULTS = {
                 <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item
-                {...field}
+                {...fieldProps}
                 name={[field.name, 'port']}
                 label={t('port')}
                 rules={[
@@ -1170,7 +1206,7 @@ const IMPORT_DEFAULTS = {
               </Form.Item>
               <div className="rp-target-actions">
                 <Form.Item
-                  {...field}
+                  {...fieldProps}
                   name={[field.name, 'enabled']}
                   valuePropName="checked"
                   initialValue={true}
@@ -1183,7 +1219,8 @@ const IMPORT_DEFAULTS = {
                 <Button type="text" size="small" danger icon={<DeleteOutlined />} title={t('deleteTarget')} aria-label={t('deleteTarget')} disabled={fields.length <= 1} onClick={() => remove(field.name)} />
               </div>
             </div>
-          ))}
+            );
+          })}
           <Button type="dashed" icon={<PlusOutlined />} block onClick={() => add({ host: '', port: undefined as unknown as number, enabled: true, weight: 1 })}>{t('addTarget')}</Button>
         </Space>
       )}
@@ -1517,7 +1554,7 @@ const IMPORT_DEFAULTS = {
                 <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
                 {createRouteMode === 'direct' && (
                   <Form.Item name="device_group_in" label={t('inboundGroup')} rules={[{ required: true }]}>
-                    <Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} placeholder={allInGroups.length ? t('select') : t('createGroupFirst')} />
+                    <Select options={inboundGroupOptions} optionFilterProp="searchLabel" placeholder={allInGroups.length ? t('select') : t('createGroupFirst')} />
                   </Form.Item>
                 )}
                 {createRouteMode === 'chain' && (
@@ -1525,17 +1562,20 @@ const IMPORT_DEFAULTS = {
                     {(fields, { add, remove }) => (
                       <Form.Item label={t('chainHops')} extra={t('chainHopsHint')} required>
                         <Space orientation="vertical" style={{ width: '100%' }}>
-                          {fields.map((field, idx) => (
-                            <Space key={field.key} align="baseline" style={{ display: 'flex' }} className="rp-chain-row">
+                          {fields.map((field, idx) => {
+                            const { key, ...fieldProps } = field;
+                            return (
+                            <Space key={key} align="baseline" style={{ display: 'flex' }} className="rp-chain-row">
                               <Tag>{idx === 0 ? t('hopEntry') : idx === fields.length - 1 ? t('hopExit') : `${t('hopMid')} ${idx}`}</Tag>
-                              <Form.Item {...field} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1 }} className="rp-chain-select">
+                              <Form.Item {...fieldProps} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1 }} className="rp-chain-select">
                                 <Select options={hopGroupOptions} placeholder={t('select')} showSearch optionFilterProp="label" />
                               </Form.Item>
                               {fields.length > 2 && (
                                 <Button type="text" danger onClick={() => remove(field.name)} icon={<DeleteOutlined />} />
                               )}
                             </Space>
-                          ))}
+                            );
+                          })}
                           {fields.length < 8 && (
                             <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>{t('addHop')}</Button>
                           )}
@@ -1617,24 +1657,27 @@ const IMPORT_DEFAULTS = {
                 </Form.Item>
                 <Form.Item name="forward_mode" hidden><Input /></Form.Item>
                 {editRouteMode === 'direct' && (
-                  <Form.Item name="device_group_in" label={t('inboundGroup')}><Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} /></Form.Item>
+                  <Form.Item name="device_group_in" label={t('inboundGroup')}><Select options={inboundGroupOptions} optionFilterProp="searchLabel" /></Form.Item>
                 )}
                 {editRouteMode === 'chain' && (
                   <Form.List name="hops">
                     {(fields, { add, remove }) => (
                       <Form.Item label={t('chainHops')} extra={t('chainHopsHint')} required>
                         <Space orientation="vertical" style={{ width: '100%' }}>
-                          {fields.map((field, idx) => (
-                            <Space key={field.key} align="baseline" style={{ display: 'flex' }} className="rp-chain-row">
+                          {fields.map((field, idx) => {
+                            const { key, ...fieldProps } = field;
+                            return (
+                            <Space key={key} align="baseline" style={{ display: 'flex' }} className="rp-chain-row">
                               <Tag>{idx === 0 ? t('hopEntry') : idx === fields.length - 1 ? t('hopExit') : `${t('hopMid')} ${idx}`}</Tag>
-                              <Form.Item {...field} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1 }} className="rp-chain-select">
+                              <Form.Item {...fieldProps} rules={[{ required: true, message: t('select') }]} style={{ marginBottom: 0, flex: 1 }} className="rp-chain-select">
                                 <Select options={hopGroupOptions} placeholder={t('select')} showSearch optionFilterProp="label" />
                               </Form.Item>
                               {fields.length > 2 && (
                                 <Button type="text" danger onClick={() => remove(field.name)} icon={<DeleteOutlined />} />
                               )}
                             </Space>
-                          ))}
+                            );
+                          })}
                           {fields.length < 8 && (
                             <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>{t('addHop')}</Button>
                           )}
@@ -1689,8 +1732,7 @@ const IMPORT_DEFAULTS = {
           <>
             <Form.Item label={t('selectInboundGroup')}>
               <Select value={importGroupId} onChange={setImportGroupId} disabled={saving || loading || loadFailed}
-                options={(isAdmin ? groups.filter(isInboundGroup) : sharedGroups.filter(isInboundGroup))
-                  .map(g => ({ value: g.id, label: `${g.name} (#${g.id})` }))}
+                options={inboundGroupOptions}
                 placeholder={t('selectDeviceGroups')} style={{ width: '100%' }} />
             </Form.Item>
             <Alert type="info" showIcon style={{ marginBottom: 12 }}

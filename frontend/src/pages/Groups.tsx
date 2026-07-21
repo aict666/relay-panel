@@ -12,6 +12,16 @@ const { Text } = Typography;
 
 const INSTALL_SCRIPT_URL = 'https://raw.githubusercontent.com/aict666/relay-panel/main/scripts/relay-node-install.sh';
 
+interface GroupFormValues {
+  name?: string;
+  group_type?: string;
+  connect_host?: string;
+  port_range?: string;
+  rate?: number;
+  hidden?: boolean;
+  block_tls?: boolean;
+}
+
 function isLocalhost(): boolean {
   const h = window.location.hostname;
   return h === 'localhost' || h === '127.0.0.1' || h === '::1';
@@ -33,6 +43,8 @@ export default function Groups() {
   const [editing, setEditing] = useState<DeviceGroup | null>(null);
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
+  const createGroupType = Form.useWatch('group_type', createForm);
+  const editGroupType = Form.useWatch('group_type', editForm);
   const loadGenerationRef = useRef(0);
   const loadScopeRef = useRef<string | null>(null);
   const desiredScopeRef = useRef(authScope);
@@ -104,14 +116,24 @@ export default function Groups() {
 
   const nodeCount = useCallback((groupId: number) => nodesByGroup(groupId).length, [nodesByGroup]);
   const onlineCount = useCallback((groupId: number) => nodesByGroup(groupId).filter(n => n.online).length, [nodesByGroup]);
+  const blockedTlsCount = useCallback((groupId: number) => nodesByGroup(groupId)
+    .filter(n => n.online)
+    .reduce((sum, n) => sum + (n.blocked_protocol_connections?.tls ?? 0), 0), [nodesByGroup]);
 
-  const handleCreate = async (values: { name: string; group_type: string; connect_host: string; port_range: string; rate?: number; hidden?: boolean }) => {
+  const handleCreate = async (values: GroupFormValues) => {
     if (!isAdmin || loading || loadFailed || saving) return;
     setSaving(true);
     try {
       // v1.0.8: rate defaults to 1.0 on the server when omitted; send it
       // explicitly so the value the admin picked is what gets persisted.
-      const payload = { ...values, rate: values.rate ?? 1.0, hidden: values.hidden ?? false };
+      const { block_tls, ...groupValues } = values;
+      const ingressCapable = values.group_type === 'in' || values.group_type === 'both';
+      const payload = {
+        ...groupValues,
+        rate: values.rate ?? 1.0,
+        hidden: values.hidden ?? false,
+        blocked_protocols: ingressCapable && block_tls ? ['tls'] : [],
+      };
       const res = await api.post<unknown, ApiEnvelope<DeviceGroup>>('/groups', payload);
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('groupCreated'));
@@ -125,11 +147,19 @@ export default function Groups() {
   const handleEdit = (g: DeviceGroup) => {
     if (!isAdmin || loading || loadFailed || saving) return;
     setEditing(g);
-    editForm.setFieldsValue({ name: g.name, group_type: g.group_type, connect_host: g.connect_host, port_range: g.port_range, rate: g.rate, hidden: !!g.hidden });
+    editForm.setFieldsValue({
+      name: g.name,
+      group_type: g.group_type,
+      connect_host: g.connect_host,
+      port_range: g.port_range,
+      rate: g.rate,
+      hidden: !!g.hidden,
+      block_tls: g.blocked_protocols?.includes('tls') ?? false,
+    });
     setEditOpen(true);
   };
 
-  const handleUpdate = async (values: { name?: string; group_type?: string; connect_host?: string; port_range?: string; rate?: number; hidden?: boolean }) => {
+  const handleUpdate = async (values: GroupFormValues) => {
     if (!isAdmin || !editing) return;
     if (loading || loadFailed || saving) return;
     const payload: Record<string, unknown> = {};
@@ -142,6 +172,10 @@ export default function Groups() {
     if (values.rate !== undefined && values.rate !== editing.rate) payload.rate = values.rate;
     // v1.0.7: only send hidden when it actually changed.
     if (values.hidden !== undefined && values.hidden !== !!editing.hidden) payload.hidden = values.hidden;
+    const effectiveType = values.group_type ?? editing.group_type;
+    const nextBlockTls = (effectiveType === 'in' || effectiveType === 'both') && !!values.block_tls;
+    const previousBlockTls = editing.blocked_protocols?.includes('tls') ?? false;
+    if (nextBlockTls !== previousBlockTls) payload.blocked_protocols = nextBlockTls ? ['tls'] : [];
     if (Object.keys(payload).length === 0) { setEditOpen(false); return; }
     setSaving(true);
     try {
@@ -269,6 +303,20 @@ export default function Groups() {
     { title: t('connectHost'), dataIndex: 'connect_host', key: 'connect_host', render: (v: string) => <span className="rp-mono">{v}</span> },
     { title: t('portRange'), dataIndex: 'port_range', key: 'port_range', render: (v: string) => <span className="rp-mono">{v}</span> },
     {
+      title: t('protocolBlocking'), dataIndex: 'blocked_protocols', key: 'blocked_protocols', width: 120,
+      render: (protocols?: string[]) => protocols?.includes('tls')
+        ? <Tag color="red">{t('tlsBlocked')}</Tag>
+        : <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>,
+    },
+    {
+      title: <Tooltip title={t('blockedSinceNodeStart')}>{t('blockedTlsConnections')}</Tooltip>,
+      key: 'blocked_tls_connections', width: 100,
+      render: (_: unknown, g: DeviceGroup | SharedGroupSummary) => {
+        const count = blockedTlsCount(g.id);
+        return count > 0 ? count.toLocaleString() : <span style={{ color: 'var(--rp-text-tertiary)' }}>0</span>;
+      },
+    },
+    {
       // v1.0.8: billing rate. Only show a tag when it differs from 1.0 — a 1x
       // column on every row is noise. The tag color reflects the multiplier
       // direction (gold = premium line, no tag = bill-as-used).
@@ -297,7 +345,7 @@ export default function Groups() {
       ) : null,
     },
   ];
-  const regularColumnKeys = new Set(['id', 'name', 'group_type', 'connect_host']);
+  const regularColumnKeys = new Set(['id', 'name', 'group_type', 'connect_host', 'blocked_protocols']);
   const visibleColumns = isAdmin ? columns : columns.filter(column => regularColumnKeys.has(column.key));
 
   const expandedRowRender = (g: DeviceGroup | SharedGroupSummary) => {
@@ -330,6 +378,7 @@ export default function Groups() {
             { title: 'ID', dataIndex: 'node_id', key: 'node_id', width: 120, render: (v: string | undefined) => v ? <Text code style={{ fontSize: 11 }}>{v.slice(0, 8)}...{v.slice(-4)}</Text> : '-' },
             { title: t('status'), dataIndex: 'online', key: 'online', width: 80, render: (v: boolean) => <Tag color={v ? 'green' : 'default'}>{v ? t('online') : t('offline')}</Tag> },
             { title: t('nodeVersion'), dataIndex: 'node_version', key: 'version', width: 90, render: (v: string | undefined) => v ? <span className="rp-mono" style={{ fontSize: 12 }}>{v}</span> : '-' },
+            { title: t('blockedTlsConnections'), key: 'blocked_tls_connections', width: 100, render: (_: unknown, n: NodeStatus) => (n.blocked_protocol_connections?.tls ?? 0).toLocaleString() },
             { title: t('lastSeen'), dataIndex: 'last_seen', key: 'last_seen', width: 120, render: (v: string | undefined) => v ? <span style={{ fontSize: 12 }}>{v}</span> : '-' },
           ]}
         />
@@ -368,7 +417,9 @@ export default function Groups() {
         <Form form={createForm} onFinish={handleCreate} layout="vertical" disabled={saving || loading || loadFailed}>
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input placeholder="tokyo-node-1" /></Form.Item>
           <Form.Item name="group_type" label={t('type')} rules={[{ required: true }]} initialValue="in">
-            <Select options={groupTypeOptions} />
+            <Select options={groupTypeOptions} onChange={(value) => {
+              if (value !== 'in' && value !== 'both') createForm.setFieldValue('block_tls', false);
+            }} />
           </Form.Item>
           <Form.Item name="connect_host" label={t('connectHost')} rules={[{ required: true }]}><Input placeholder="1.2.3.4 or node.example.com" /></Form.Item>
           <Form.Item name="port_range" label={t('portRange')} rules={[{ required: true }]} initialValue="10000-65535"><Input placeholder="10000-65535" /></Form.Item>
@@ -382,13 +433,18 @@ export default function Groups() {
           <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" initialValue={false} extra={t('groupHiddenHint')}>
             <Switch />
           </Form.Item>
+          <Form.Item name="block_tls" label={t('protocolBlocking')} valuePropName="checked" initialValue={false} extra={t('blockTlsHint')}>
+            <Switch checkedChildren="TLS" unCheckedChildren="TLS" disabled={createGroupType !== 'in' && createGroupType !== 'both'} />
+          </Form.Item>
         </Form>
       </Modal>
 
       <Modal title={t('editGroup')} open={editOpen} onCancel={() => { if (!saving) setEditOpen(false); }} onOk={() => editForm.submit()} confirmLoading={saving} okButtonProps={{ disabled: loading || loadFailed }} okText={t('save')} cancelText={t('cancel')}>
         <Form form={editForm} onFinish={handleUpdate} layout="vertical" disabled={saving || loading || loadFailed}>
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
-          <Form.Item name="group_type" label={t('type')}><Select options={groupTypeOptions} /></Form.Item>
+          <Form.Item name="group_type" label={t('type')}><Select options={groupTypeOptions} onChange={(value) => {
+            if (value !== 'in' && value !== 'both') editForm.setFieldValue('block_tls', false);
+          }} /></Form.Item>
           <Form.Item name="connect_host" label={t('connectHost')}><Input /></Form.Item>
           <Form.Item name="port_range" label={t('portRange')}><Input /></Form.Item>
           <Form.Item name="rate" label={t('rate')} extra={t('rateHint')}>
@@ -396,6 +452,9 @@ export default function Groups() {
           </Form.Item>
           <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" extra={t('groupHiddenHint')}>
             <Switch />
+          </Form.Item>
+          <Form.Item name="block_tls" label={t('protocolBlocking')} valuePropName="checked" extra={t('blockTlsHint')}>
+            <Switch checkedChildren="TLS" unCheckedChildren="TLS" disabled={editGroupType !== 'in' && editGroupType !== 'both'} />
           </Form.Item>
         </Form>
       </Modal>

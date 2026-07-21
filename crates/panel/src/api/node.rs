@@ -46,8 +46,8 @@ pub(crate) fn extract_config_protocol_version(headers: &HeaderMap) -> Option<u32
 
 /// v0.4.0: the config-protocol compatibility gate. Returns true if the node's
 /// reported version matches the panel's `CONFIG_PROTOCOL_VERSION`. A missing
-/// header (old node) is treated as incompatible. Used by both get_config (HTTP)
-/// and the WS upgrade path so both paths refuse consistently.
+/// header (old node) is treated as incompatible. Used by HTTP to gate snapshots
+/// and by WebSocket to select its protocol-incompatible control-only mode.
 pub(crate) fn config_protocol_compatible(headers: &HeaderMap) -> bool {
     match extract_config_protocol_version(headers) {
         Some(v) => v == CONFIG_PROTOCOL_VERSION,
@@ -55,11 +55,29 @@ pub(crate) fn config_protocol_compatible(headers: &HeaderMap) -> bool {
     }
 }
 
+/// Protocol v8 introduced authoritative 401/403 handling in relay-node's
+/// config poller. v4-v7 treated every non-426 error as transient and retained
+/// the disk cache, so a rotated/deleted token must receive a successful empty
+/// snapshot to stop those historical nodes durably.
+const CREDENTIAL_REJECTION_AWARE_PROTOCOL: u32 = 8;
+
+fn rejected_node_credential_response(headers: &HeaderMap) -> Response {
+    let received = extract_config_protocol_version(headers);
+    if received.is_none_or(|version| version < CREDENTIAL_REJECTION_AWARE_PROTOCOL) {
+        tracing::warn!(
+            received = ?received,
+            "sending legacy node with an invalid credential an empty fail-closed configuration"
+        );
+        return Json(crate::service::node_config::empty_node_config(Vec::new())).into_response();
+    }
+    (StatusCode::UNAUTHORIZED, "invalid node credential").into_response()
+}
+
 pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
     // Authentication must run before the compatibility gate. Otherwise a
     // revoked node that also reports an old protocol receives 426 and keeps
-    // forwarding from its cache instead of treating the credential as
-    // authoritatively rejected.
+    // forwarding from its cache. Rejection-aware nodes get 401 below; older
+    // pollers get a wire-compatible empty snapshot instead.
     let Some(token) = extract_node_token(&headers) else {
         return (StatusCode::UNAUTHORIZED, "invalid node credential").into_response();
     };
@@ -77,7 +95,7 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     };
 
     let Some(group) = group else {
-        return (StatusCode::UNAUTHORIZED, "invalid node credential").into_response();
+        return rejected_node_credential_response(&headers);
     };
 
     // v0.4.0: protocol-version gate. A node reporting a different
@@ -88,6 +106,24 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     // The structured JSON lets the node log "requires v1, has v0".
     if !config_protocol_compatible(&headers) {
         let received = extract_config_protocol_version(&headers);
+        // A protocol mismatch normally preserves the old cached config to
+        // avoid an outage during rolling upgrades. That is unsafe once an
+        // ingress-blocking policy is active: a pre-v10 node would keep serving
+        // its old unfiltered listener indefinitely. Return a wire-compatible
+        // successful EMPTY snapshot so every historical poller follows its
+        // normal save-and-apply path. Protocol v4-v7 treated 401/403 as a
+        // transient error and retained their disk cache, so an error response
+        // cannot provide durable fail-closed behavior across node restarts.
+        if !decode_blocked_protocols(&group.blocked_protocols).is_empty() {
+            tracing::warn!(
+                group_id = group.id,
+                received = ?received,
+                required = CONFIG_PROTOCOL_VERSION,
+                "sending protocol-incompatible node an empty fail-closed configuration"
+            );
+            return Json(crate::service::node_config::empty_node_config(Vec::new()))
+                .into_response();
+        }
         return (
             StatusCode::UPGRADE_REQUIRED,
             Json(serde_json::json!({
@@ -114,7 +150,10 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
             // snapshot derived from the replacement credential.
             match state.db.find_by_token(&token).await {
                 Ok(Some(current)) if current.id == group.id => Json(cfg).into_response(),
-                Ok(_) => (StatusCode::UNAUTHORIZED, "invalid node credential").into_response(),
+                // Keep credential-rejection behavior centralized. A token can
+                // be rotated while the snapshot queries are running, so this
+                // branch must never release the just-built snapshot.
+                Ok(_) => rejected_node_credential_response(&headers),
                 Err(e) => {
                     tracing::error!(
                         "get_config: post-build token revalidation failed for group {}: {}",
@@ -388,6 +427,9 @@ pub async fn report_status(
             // frontend saw `undefined` and wrongly showed every node as "manual",
             // hiding the upgrade button on legitimately systemd-managed nodes.
             "install_method": req.install_method,
+            // Cumulative protocol-policy rejects since node process start.
+            // Additive optional metric: older nodes simply omit it.
+            "blocked_protocol_connections": req.blocked_protocol_connections,
         });
         // Do not acknowledge a status report that was not persisted. Nodes
         // report periodically and may retry safely; returning success here
@@ -578,6 +620,7 @@ mod tests {
             listener_errors: None,
             install_method: None,
             draining_rule_ids: vec![],
+            blocked_protocol_connections: None,
         }
     }
 
@@ -860,9 +903,8 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    /// An explicitly supplied but unknown token has the same fail-closed
-    /// response as a missing one; the endpoint must not disclose which part of
-    /// the credential lookup failed.
+    /// A rejection-aware node receives an authoritative HTTP 401 for an
+    /// explicitly supplied but unknown token.
     #[tokio::test]
     async fn node_config_unknown_token_is_real_http401() {
         let (state, _pool) = seeded_state().await;
@@ -909,12 +951,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_token_with_old_protocol_returns_401_not_426() {
+    async fn protocol_blocked_group_returns_persistable_empty_config_to_incompatible_node() {
+        let (state, pool) = seeded_state().await;
+        sqlx::query("UPDATE device_groups SET blocked_protocols='[\"tls\"]' WHERE token='tok-A'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut headers = auth_headers("tok-A");
+        headers.insert(
+            "X-Config-Protocol-Version",
+            (relay_shared::protocol::CONFIG_PROTOCOL_VERSION - 1)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+
+        let response = get_config(State(state), headers).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let current: relay_shared::protocol::NodeConfigResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(current.listeners.is_empty());
+        assert!(current.tunnels.is_empty());
+
+        // Protocol v4-v7 had only the required `listeners` top-level field and
+        // persisted successful HTTP responses. Unknown additive fields are
+        // ignored, so the v10 empty snapshot is deliberately compatible with
+        // their normal save-and-apply path.
+        #[derive(serde::Deserialize)]
+        struct LegacyNodeConfigResponse {
+            listeners: Vec<serde_json::Value>,
+        }
+        let legacy: LegacyNodeConfigResponse = serde_json::from_slice(&body).unwrap();
+        assert!(legacy.listeners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_token_with_legacy_protocol_returns_persistable_empty_config() {
         let (state, _pool) = seeded_state().await;
         let mut headers = auth_headers("revoked-token");
         headers.insert(
             "X-Config-Protocol-Version",
-            (relay_shared::protocol::CONFIG_PROTOCOL_VERSION - 1)
+            (CREDENTIAL_REJECTION_AWARE_PROTOCOL - 1)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        let response = get_config(State(state), headers).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let config: relay_shared::protocol::NodeConfigResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(config.listeners.is_empty());
+        assert!(config.tunnels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_token_with_rejection_aware_protocol_returns_401() {
+        let (state, _pool) = seeded_state().await;
+        let mut headers = auth_headers("revoked-token");
+        headers.insert(
+            "X-Config-Protocol-Version",
+            CREDENTIAL_REJECTION_AWARE_PROTOCOL
                 .to_string()
                 .parse()
                 .unwrap(),
@@ -983,6 +1085,10 @@ mod tests {
             listener_errors: None,
             install_method: Some("systemd".into()),
             draining_rule_ids: vec![],
+            blocked_protocol_connections: Some(std::collections::BTreeMap::from([(
+                "tls".to_string(),
+                7,
+            )])),
         };
         let Json(resp) =
             report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;
@@ -1000,6 +1106,12 @@ mod tests {
             v.get("install_method").and_then(|x| x.as_str()),
             Some("systemd"),
             "install_method must be persisted so the upgrade UI can offer a self-upgrade"
+        );
+        assert_eq!(
+            v.pointer("/blocked_protocol_connections/tls")
+                .and_then(|x| x.as_u64()),
+            Some(7),
+            "protocol reject counters must be persisted for the group UI"
         );
     }
 
@@ -1034,6 +1146,7 @@ mod tests {
             listener_errors: None,
             install_method: None,
             draining_rule_ids: vec![],
+            blocked_protocol_connections: None,
         };
 
         let Json(resp) =
@@ -1079,6 +1192,7 @@ mod tests {
             listener_errors: None,
             install_method: None,
             draining_rule_ids: vec![],
+            blocked_protocol_connections: None,
         };
 
         let Json(resp) = report_status(State(state), auth_headers("tok-A"), Json(req)).await;

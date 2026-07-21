@@ -239,6 +239,9 @@ fn aggregate_shared_node_summaries(
                 capabilities: g.capabilities.clone(),
                 region: g.region.clone(),
                 line_type: g.line_type.clone(),
+                blocked_protocols: relay_shared::models::decode_blocked_protocols(
+                    &g.blocked_protocols,
+                ),
                 node_id,
                 online,
                 public_ip: s("public_ip"),
@@ -307,6 +310,7 @@ mod tests {
             capabilities: "[]".into(),
             region: None,
             line_type: None,
+            blocked_protocols: "[]".into(),
             hidden: false,
         }
     }
@@ -376,7 +380,9 @@ mod tests {
     #[test]
     fn group_with_no_status_returns_placeholder_row() {
         let now = chrono::Utc::now();
-        let groups = vec![group(7, "g7")];
+        let mut policy_group = group(7, "g7");
+        policy_group.blocked_protocols = "[\"tls\"]".into();
+        let groups = vec![policy_group];
         let out = aggregate_shared_node_summaries(groups, &[], now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].group_id, 7);
@@ -384,6 +390,10 @@ mod tests {
         assert!(!out[0].online);
         assert!(out[0].cpu.is_none());
         assert!(out[0].last_seen.is_none());
+        assert_eq!(
+            out[0].blocked_protocols,
+            vec![relay_shared::models::BlockedProtocol::Tls]
+        );
     }
 
     /// Rows for groups NOT in the shared set are ignored; each group present

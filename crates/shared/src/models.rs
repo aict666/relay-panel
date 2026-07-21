@@ -1,5 +1,51 @@
 use serde::{Deserialize, Serialize};
 
+/// Protocols that an inbound device group may reject before dialing the
+/// configured target. The wire/storage vocabulary is deliberately extensible;
+/// v1 exposes only TLS ClientHello detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockedProtocol {
+    Tls,
+}
+
+pub fn normalize_blocked_protocols(protocols: &[BlockedProtocol]) -> Vec<BlockedProtocol> {
+    let mut protocols = protocols.to_vec();
+    protocols.sort_unstable();
+    protocols.dedup();
+    protocols
+}
+
+pub fn encode_blocked_protocols(protocols: &[BlockedProtocol]) -> String {
+    serde_json::to_string(&normalize_blocked_protocols(protocols))
+        .expect("BlockedProtocol is always JSON serializable")
+}
+
+pub fn decode_blocked_protocols(value: &str) -> Vec<BlockedProtocol> {
+    serde_json::from_str::<Vec<BlockedProtocol>>(value)
+        .map(|protocols| normalize_blocked_protocols(&protocols))
+        .unwrap_or_default()
+}
+
+fn empty_json_array() -> String {
+    "[]".to_string()
+}
+
+fn serialize_blocked_protocols<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    decode_blocked_protocols(value).serialize(serializer)
+}
+
+fn deserialize_blocked_protocols<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let protocols = Vec::<BlockedProtocol>::deserialize(deserializer)?;
+    Ok(encode_blocked_protocols(&protocols))
+}
+
 fn default_load_balance_strategy() -> String {
     "first".to_string()
 }
@@ -229,6 +275,14 @@ pub struct DeviceGroup {
     pub port_range: String,
     pub fallback_group: Option<i64>,
     pub config: String,
+    /// Inbound protocol policy, stored as a canonical JSON array in both
+    /// database backends but exposed as a real JSON array over the API.
+    #[serde(
+        default = "empty_json_array",
+        serialize_with = "serialize_blocked_protocols",
+        deserialize_with = "deserialize_blocked_protocols"
+    )]
+    pub blocked_protocols: String,
     /// v0.3.0: declared protocol capabilities (JSON array string). Used for
     /// pre-create validation only; e.g. `["tcp","udp"]`.
     pub capabilities: String,
@@ -260,6 +314,14 @@ pub struct SharedGroupSummary {
     pub capabilities: String,
     pub region: Option<String>,
     pub line_type: Option<String>,
+    /// Safe, user-visible ingress policy metadata. Stored as JSON text in the
+    /// row model and serialized as an array in HTTP responses.
+    #[serde(
+        default = "empty_json_array",
+        serialize_with = "serialize_blocked_protocols",
+        deserialize_with = "deserialize_blocked_protocols"
+    )]
+    pub blocked_protocols: String,
     /// v1.0.7: admin "hidden" flag. Carried here so the node-status path can
     /// filter it out (regular users don't see hidden lines in node status),
     /// while the rule dropdown / shop still list it. Default false.
@@ -288,6 +350,11 @@ pub struct SharedNodeSummary {
     pub capabilities: String,
     pub region: Option<String>,
     pub line_type: Option<String>,
+    /// Safe shared-line policy metadata repeated on every node row (and the
+    /// no-node placeholder) so regular-user status views do not lose the
+    /// warning carried by `SharedGroupSummary`.
+    #[serde(default)]
+    pub blocked_protocols: Vec<BlockedProtocol>,
     /// Per-node identity (row key). Empty for a group's no-node placeholder row.
     pub node_id: String,
     /// This node's last_seen is within the online window (backend SoT).
@@ -417,4 +484,33 @@ pub struct Statistic {
     pub stat_key: String,
     pub time: String,
     pub number: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocked_protocol_storage_is_canonical_and_api_is_an_array() {
+        assert_eq!(
+            encode_blocked_protocols(&[BlockedProtocol::Tls, BlockedProtocol::Tls]),
+            "[\"tls\"]"
+        );
+        let summary = SharedGroupSummary {
+            id: 1,
+            name: "entry".into(),
+            group_type: "in".into(),
+            connect_host: "192.0.2.1".into(),
+            capabilities: "[\"tcp\"]".into(),
+            region: None,
+            line_type: None,
+            blocked_protocols: "[\"tls\",\"tls\"]".into(),
+            hidden: false,
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["blocked_protocols"], serde_json::json!(["tls"]));
+
+        let decoded: SharedGroupSummary = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.blocked_protocols, "[\"tls\"]");
+    }
 }

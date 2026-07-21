@@ -235,7 +235,9 @@ impl NodeConnections {
 /// parameters leak into access/proxy logs (Nginx/Caddy/CDN).
 ///
 /// Protocol:
-///   - On connect: server sends config_snapshot (NodeConfigResponse JSON)
+///   - On compatible connect: server sends config_snapshot (NodeConfigResponse JSON)
+///   - On incompatible connect: socket is control-only; a blocked group gets
+///     an empty compatibility hint so its cached forwarding fails closed
 ///   - ping/pong: heartbeat
 ///   - config_changed: server pushes `{"type":"config_changed"}` to all
 ///     connections whenever an admin mutates rules/groups; the node then
@@ -266,23 +268,25 @@ pub async fn node_ws_handler(
         None => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    // v0.4.0: config-protocol gate. A node whose X-Config-Protocol-Version
-    // header is absent or doesn't match the panel's is refused at upgrade time
-    // (426 Upgrade Required) with a structured JSON body so the node can log
-    // the exact mismatch. NOT a transient error — the node must back off.
-    if !crate::api::node::config_protocol_compatible(&headers) {
-        let received = crate::api::node::extract_config_protocol_version(&headers);
-        return (
-            axum::http::StatusCode::UPGRADE_REQUIRED,
-            axum::Json(serde_json::json!({
-                "code": "CONFIG_PROTOCOL_MISMATCH",
-                "required": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
-                "received": received,
-                "message": "relay-node configuration protocol is incompatible; \
-                            upgrade relay-node to match the panel"
-            })),
-        )
-            .into_response();
+    // Keep authenticated protocol-incompatible nodes on a control-only socket.
+    // Refusing the WebSocket with 426 would put an old node into the same long
+    // backoff as its HTTP poll. If an administrator enables an ingress policy
+    // during that interval there would be no live channel on which to tell the
+    // node to fail its cached listeners closed.
+    //
+    // The bridge never exposes the incompatible current snapshot. While the
+    // policy is disabled it sends no initial config at all; once a policy is
+    // active it sends a wire-compatible empty hint. Historical clients that
+    // apply WebSocket snapshots directly stop in memory; their ordinary HTTP
+    // poll receives the same empty snapshot with 200 and persists it to disk.
+    let protocol_compatible = crate::api::node::config_protocol_compatible(&headers);
+    if !protocol_compatible {
+        tracing::warn!(
+            group_id = group.id,
+            received = ?crate::api::node::extract_config_protocol_version(&headers),
+            required = relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+            "opening protocol-incompatible control-only channel"
+        );
     }
 
     let group_id = group.id;
@@ -305,8 +309,34 @@ pub async fn node_ws_handler(
     let db = state.db.clone();
 
     ws.on_upgrade(move |socket| {
-        handle_node_ws(socket, group_id, node_id, token, db, state.node_connections)
+        handle_node_ws(
+            socket,
+            group_id,
+            node_id,
+            token,
+            db,
+            state.node_connections,
+            protocol_compatible,
+        )
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WsInitialSnapshotMode {
+    Current,
+    ControlOnly,
+    FailClosed,
+}
+
+fn ws_initial_snapshot_mode(
+    protocol_compatible: bool,
+    protocol_policy_active: bool,
+) -> WsInitialSnapshotMode {
+    match (protocol_compatible, protocol_policy_active) {
+        (true, _) => WsInitialSnapshotMode::Current,
+        (false, false) => WsInitialSnapshotMode::ControlOnly,
+        (false, true) => WsInitialSnapshotMode::FailClosed,
+    }
 }
 
 async fn handle_node_ws(
@@ -316,6 +346,7 @@ async fn handle_node_ws(
     token: String,
     db: std::sync::Arc<dyn crate::db::Repository>,
     node_connections: NodeConnections,
+    protocol_compatible: bool,
 ) {
     // Capture the generation before revalidating the credential. If rotation
     // happens before the lookup, the old token fails; if it happens after the
@@ -353,6 +384,45 @@ async fn handle_node_ws(
         return;
     };
 
+    // Re-read the policy only AFTER registration. This ordering closes the
+    // update/upgrade race for incompatible nodes: a policy commit before this
+    // read is visible here, while a commit after it broadcasts into the already
+    // registered connection's queue. The pre-upgrade group snapshot cannot
+    // provide that guarantee because the broadcast could occur before the
+    // socket becomes discoverable in NodeConnections.
+    let current_group = match db.find_by_token(&token).await {
+        Ok(Some(group)) if group.id == group_id => group,
+        Ok(_) => {
+            tracing::warn!(
+                group_id,
+                "websocket credential changed while refreshing post-registration policy"
+            );
+            node_connections.unregister(group_id, conn_id).await;
+            return;
+        }
+        Err(error) => {
+            tracing::error!(
+                group_id,
+                %error,
+                "websocket failed to refresh post-registration policy"
+            );
+            node_connections.unregister(group_id, conn_id).await;
+            return;
+        }
+    };
+    let initial_snapshot_mode = ws_initial_snapshot_mode(
+        protocol_compatible,
+        !relay_shared::models::decode_blocked_protocols(&current_group.blocked_protocols)
+            .is_empty(),
+    );
+    if !protocol_compatible {
+        tracing::warn!(
+            group_id,
+            policy_active = matches!(initial_snapshot_mode, WsInitialSnapshotMode::FailClosed),
+            "protocol-incompatible control-only channel registered"
+        );
+    }
+
     tracing::info!(
         "websocket connected: group_id={} node_id={:?}",
         group_id,
@@ -363,10 +433,22 @@ async fn handle_node_ws(
     // broadcast pushes from the channel. Both halves borrow independent state.
     let (mut sender, mut receiver) = socket.split();
 
-    // Send initial config snapshot so a freshly-connected node has its config
-    // immediately, without waiting for the first HTTP poll. None (DB error) →
-    // skip the push; the node will get its config on the next HTTP poll.
-    if let Some(config) = build_config_snapshot(db.as_ref(), group_id, &token).await {
+    // Send an empty, backward-compatible snapshot to a protocol-incompatible
+    // node in a blocked group. Newer pre-v10 nodes use it as a signal to fetch
+    // the serialized HTTP snapshot; older ones apply it directly, and their
+    // regular HTTP poll then persists the same empty configuration. Never build
+    // or expose the v10 listener snapshot on this compatibility bridge.
+    let initial_config = match initial_snapshot_mode {
+        WsInitialSnapshotMode::FailClosed => Some(policy_fail_closed_snapshot()),
+        WsInitialSnapshotMode::ControlOnly => None,
+        WsInitialSnapshotMode::Current => {
+            // A normal freshly-connected node gets its current config immediately,
+            // without waiting for the first HTTP poll. None (DB error) means skip
+            // the push; the node will retry through its ordinary HTTP poll.
+            build_config_snapshot(db.as_ref(), group_id, &token).await
+        }
+    };
+    if let Some(config) = initial_config {
         if let Ok(config_json) = serde_json::to_string(&config) {
             let _ = sender.send(Message::Text(config_json.into())).await;
         }
@@ -427,6 +509,10 @@ async fn handle_node_ws(
     node_connections.unregister(group_id, conn_id).await;
 }
 
+fn policy_fail_closed_snapshot() -> NodeConfigResponse {
+    crate::service::node_config::empty_node_config(Vec::new())
+}
+
 async fn build_config_snapshot(
     db: &dyn crate::db::Repository,
     group_id: i64,
@@ -475,6 +561,33 @@ async fn build_config_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incompatible_node_stays_control_only_until_policy_needs_fail_closed() {
+        assert_eq!(
+            ws_initial_snapshot_mode(false, false),
+            WsInitialSnapshotMode::ControlOnly
+        );
+        assert_eq!(
+            ws_initial_snapshot_mode(false, true),
+            WsInitialSnapshotMode::FailClosed
+        );
+        assert_eq!(
+            ws_initial_snapshot_mode(true, true),
+            WsInitialSnapshotMode::Current
+        );
+    }
+
+    #[test]
+    fn protocol_incompatible_policy_snapshot_is_wire_compatible_and_empty() {
+        let snapshot = policy_fail_closed_snapshot();
+        assert!(snapshot.listeners.is_empty());
+        assert!(snapshot.tunnels.is_empty());
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let decoded: NodeConfigResponse = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.listeners.is_empty());
+        assert!(decoded.tunnels.is_empty());
+    }
 
     /// register() must hand back a receiver that actually receives what
     /// broadcast_all sends. This is the contract every admin mutation

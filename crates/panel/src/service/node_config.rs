@@ -22,10 +22,11 @@
 use crate::db::error::DbError;
 use crate::db::repo::{GroupRepository, ProfileScope, ResourceScope, TunnelProfileRepository};
 use crate::db::Repository;
-use relay_shared::models::{DeviceGroup, ForwardRule};
+use relay_shared::models::{decode_blocked_protocols, BlockedProtocol, DeviceGroup, ForwardRule};
 use relay_shared::protocol::{
-    GroupCredentialRevision, LoadBalanceStrategy, NodeConfigResponse, Protocol, TunnelClientConfig,
-    TunnelListenerConfig, TunnelNextConfig, TunnelRouteConfig, UotRole,
+    GroupCredentialRevision, ListenerConfig, LoadBalanceStrategy, NodeConfigResponse,
+    NodeTransport, Protocol, TunnelClientConfig, TunnelListenerConfig, TunnelNextConfig,
+    TunnelRouteConfig, UotRole,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -35,7 +36,9 @@ struct ResolvedTargets {
     weights: Vec<u16>,
 }
 
-fn empty_node_config(credential_revisions: Vec<GroupCredentialRevision>) -> NodeConfigResponse {
+pub(crate) fn empty_node_config(
+    credential_revisions: Vec<GroupCredentialRevision>,
+) -> NodeConfigResponse {
     NodeConfigResponse {
         listeners: vec![],
         tunnels: vec![],
@@ -45,6 +48,7 @@ fn empty_node_config(credential_revisions: Vec<GroupCredentialRevision>) -> Node
         route_transition_rule_ids: vec![],
         route_staging_rule_ids: vec![],
         route_drain_rule_ids: vec![],
+        public_entry_blocked_protocols: vec![],
     }
 }
 
@@ -89,6 +93,17 @@ fn format_host_port(host: &str, port: i32) -> String {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
+    }
+}
+
+fn apply_public_entry_protocol_policy(
+    listeners: &mut [ListenerConfig],
+    blocked_protocols: &[BlockedProtocol],
+) {
+    for listener in listeners {
+        if listener.protocol == Protocol::Tcp && listener.node_transport == NodeTransport::Raw {
+            listener.blocked_protocols = blocked_protocols.to_vec();
+        }
     }
 }
 
@@ -185,6 +200,7 @@ async fn build_node_config_inner(
     if group.group_type == "monitor" {
         return Ok(empty_node_config(credential_revisions));
     }
+    let entry_blocked_protocols = decode_blocked_protocols(&group.blocked_protocols);
     let mut admin_group_cache = HashMap::from([(group.id, true)]);
 
     // 2. Filtered rule query. The JOIN on users is the fix for the v0.3.5 WS
@@ -288,6 +304,7 @@ async fn build_node_config_inner(
                 &effective_rule,
                 vec![address.clone()],
             );
+            apply_public_entry_protocol_policy(&mut entry_listeners, &entry_blocked_protocols);
             let client_config = TunnelClientConfig {
                 tunnel_id: tunnel.id,
                 rule_id: rule.id,
@@ -371,6 +388,7 @@ async fn build_node_config_inner(
                 entry.listen_port as u16,
                 true, // entry bills traffic
             );
+            apply_public_entry_protocol_policy(&mut hop_listeners, &entry_blocked_protocols);
             set_target_weights(&mut hop_listeners, targets.weights);
             if uot_ready {
                 apply_uot_role(db, rule, &hops, 0, &mut hop_listeners, enable_uot_ingress).await?;
@@ -383,6 +401,7 @@ async fn build_node_config_inner(
         let targets = resolve_targets(db, rule).await?;
         let mut direct_listeners =
             relay_shared::protocol::build_listeners_for_rule(&effective_rule, targets.addrs);
+        apply_public_entry_protocol_policy(&mut direct_listeners, &entry_blocked_protocols);
         set_target_weights(&mut direct_listeners, targets.weights);
         listeners.extend(direct_listeners);
     }
@@ -479,6 +498,7 @@ async fn build_node_config_inner(
         route_transition_rule_ids,
         route_staging_rule_ids,
         route_drain_rule_ids,
+        public_entry_blocked_protocols: entry_blocked_protocols,
     })
 }
 
@@ -1115,10 +1135,70 @@ mod tests {
         add_user(&pool, 2).await;
         add_group(&pool, 10, "in", 1).await;
         add_rule(&pool, 100, 2, 10, 20000).await;
+        sqlx::query("UPDATE device_groups SET blocked_protocols='[\"tls\"]' WHERE id=10")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let cfg = build_node_config(&repo(&pool), 10).await.unwrap();
         assert_eq!(cfg.listeners.len(), 1);
         assert_eq!(cfg.listeners[0].port, 20000);
+        assert_eq!(
+            cfg.listeners[0].blocked_protocols,
+            vec![BlockedProtocol::Tls]
+        );
+        assert_eq!(
+            cfg.public_entry_blocked_protocols,
+            vec![BlockedProtocol::Tls]
+        );
+    }
+
+    #[tokio::test]
+    async fn group_policy_is_sent_even_when_snapshot_has_no_current_listener() {
+        let pool = pool().await;
+        add_group(&pool, 10, "in", 1).await;
+        sqlx::query("UPDATE device_groups SET blocked_protocols='[\"tls\"]' WHERE id=10")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let cfg = build_node_config(&repo(&pool), 10).await.unwrap();
+        assert!(cfg.listeners.is_empty());
+        assert_eq!(
+            cfg.public_entry_blocked_protocols,
+            vec![BlockedProtocol::Tls]
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_udp_entry_policy_applies_only_to_tcp_component() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 1).await;
+        add_rule(&pool, 100, 2, 10, 20000).await;
+        sqlx::query("UPDATE device_groups SET blocked_protocols='[\"tls\"]' WHERE id=10")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE forward_rules SET protocol='tcp_udp' WHERE id=100")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let cfg = build_node_config(&repo(&pool), 10).await.unwrap();
+        assert_eq!(cfg.listeners.len(), 2);
+        let tcp = cfg
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Tcp)
+            .unwrap();
+        let udp = cfg
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == Protocol::Udp)
+            .unwrap();
+        assert_eq!(tcp.blocked_protocols, vec![BlockedProtocol::Tls]);
+        assert!(udp.blocked_protocols.is_empty());
     }
 
     /// A banned user's rule must NOT appear — this is the regression the WS path
@@ -1194,8 +1274,8 @@ mod tests {
         add_user(&pool, 2).await;
         // Entry + exit groups; exit needs connect_host for previous hop to dial.
         sqlx::query(
-            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
-             VALUES (10, 'entry', 'in', 'tok-10', 1, '1.1.1.1')",
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host, blocked_protocols) \
+             VALUES (10, 'entry', 'in', 'tok-10', 1, '1.1.1.1', '[\"tls\"]')",
         )
         .execute(&pool)
         .await
@@ -1240,6 +1320,10 @@ mod tests {
             vec!["2.2.2.2:30000".to_string()]
         );
         assert!(entry_cfg.listeners[0].count_traffic);
+        assert_eq!(
+            entry_cfg.listeners[0].blocked_protocols,
+            vec![BlockedProtocol::Tls]
+        );
 
         let exit_cfg = build_node_config(&repo(&pool), 20).await.unwrap();
         assert_eq!(exit_cfg.listeners.len(), 1);
@@ -1250,6 +1334,10 @@ mod tests {
         );
         assert_eq!(exit_cfg.listeners[0].target_weights, vec![30, 70]);
         assert!(!exit_cfg.listeners[0].count_traffic);
+        assert!(
+            exit_cfg.listeners[0].blocked_protocols.is_empty(),
+            "downstream listeners must never inherit ingress protocol policy"
+        );
     }
 
     #[tokio::test]

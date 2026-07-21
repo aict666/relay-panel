@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, useNavigate } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DeviceGroup, DiagnoseResponse, ForwardRule } from '../api/types';
+import type { DeviceGroup, DiagnoseResponse, ForwardRule, Tunnel } from '../api/types';
 
 const { mockGet, mockPost, mockPut, authState } = vi.hoisted(() => ({
   mockGet: vi.fn(),
@@ -102,6 +102,49 @@ beforeEach(() => {
 });
 
 describe('Rules import interaction', () => {
+  it('shows the TLS policy on a shared preset tunnel entry', async () => {
+    authState.isAdmin = false;
+    authState.user = { id: 2, username: 'member' };
+    const user = userEvent.setup();
+    const sharedEntry = { ...group, blocked_protocols: ['tls'] as const };
+    const tunnel: Tunnel = {
+      id: 77,
+      name: 'shared-path',
+      enabled: true,
+      shared: true,
+      uid: 1,
+      created_at: '2026-01-01',
+      bound_rule_count: 0,
+      hops: [{
+        id: 701,
+        tunnel_id: 77,
+        position: 0,
+        device_group_id: sharedEntry.id,
+        listen_port: null,
+        created_at: '2026-01-01',
+        group_name: sharedEntry.name,
+      }],
+    };
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/rules') return Promise.resolve(ok([]));
+      if (url === '/tunnels') return Promise.resolve(ok([tunnel]));
+      if (url === '/groups/shared') return Promise.resolve(ok([sharedEntry]));
+      if (url === '/user/me') return Promise.resolve(ok(null));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    render(<MemoryRouter><Rules /></MemoryRouter>);
+    await user.click(await screen.findByRole('button', { name: /addRule/ }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.mouseDown(within(dialog).getByLabelText('forwardMode'));
+    const presetOptions = await screen.findAllByText('modePresetTunnel');
+    await user.click(presetOptions[presetOptions.length - 1]);
+
+    fireEvent.mouseDown(within(dialog).getByLabelText('modePresetTunnel'));
+    expect(await screen.findByText(/shared-path/)).toBeInTheDocument();
+    expect(await screen.findByText('tlsBlocked')).toBeInTheDocument();
+  });
+
   it('cannot be closed or edited while sequential imports are running', async () => {
     const user = userEvent.setup();
     mockPost.mockImplementation(() => new Promise(() => {}));

@@ -844,6 +844,7 @@ async fn active_rule_leases_protect_group_mutation_until_expiry() {
             None,
             None,
             None,
+            None,
         )
         .await,
         Err(DbError::RuleGroupInvariant { entry_rules: 1, .. })
@@ -855,6 +856,7 @@ async fn active_rule_leases_protect_group_mutation_until_expiry() {
             None,
             None,
             Some(" "),
+            None,
             None,
             None,
             None,
@@ -890,9 +892,11 @@ async fn active_rule_leases_protect_group_mutation_until_expiry() {
             None,
             None,
             None,
+            None,
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .rows_affected,
         1
     );
     assert_eq!(
@@ -905,9 +909,11 @@ async fn active_rule_leases_protect_group_mutation_until_expiry() {
             None,
             None,
             None,
+            None,
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .rows_affected,
         1
     );
     assert_eq!(
@@ -2008,6 +2014,7 @@ async fn group_insert_then_find_by_token_round_trip() {
         "20000-30000",
         1.0,
         false,
+        "[]",
     )
     .await
     .unwrap();
@@ -2053,7 +2060,7 @@ async fn group_insert_then_find_by_token_round_trip() {
 #[tokio::test]
 async fn group_update_token_returns_rows_affected() {
     let db = repo().await;
-    db.insert_group("gin", "in", "tok-1", 1, "", "", 1.0, false)
+    db.insert_group("gin", "in", "tok-1", 1, "", "", 1.0, false, "[]")
         .await
         .unwrap();
     let g = db.find_by_token("tok-1").await.unwrap().unwrap();
@@ -3084,6 +3091,33 @@ async fn upgrade_from_revision_28_adds_credential_revision() {
     assert_eq!(column_count, 1);
 }
 
+/// Simulate a pre-Migration-50 SQLite database and verify production startup
+/// restores the policy column with its safe empty-array default. This is the
+/// SQLite twin of `pg_upgrade_from_revision_33_adds_blocked_protocols` (the two
+/// backends have independent migration revision numbers).
+#[tokio::test]
+async fn upgrade_from_revision_33_adds_blocked_protocols() {
+    let db = repo().await;
+    sqlx::query("ALTER TABLE device_groups DROP COLUMN blocked_protocols")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    crate::db::schema::run_migrations(&db.pool)
+        .await
+        .expect("Migration 50 must restore blocked_protocols");
+
+    let row: (i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), dflt_value FROM pragma_table_info('device_groups') \
+         WHERE name='blocked_protocols'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, 1);
+    assert_eq!(row.1.as_deref(), Some("'[]'"));
+}
+
 /// v0.4.21 PR2: allowed_plan_ids round-trips through set_registration_settings
 /// and insert_settings_if_absent (multi-plan, order preserved). Mirrors the PG
 /// test pg_settings_allowed_plan_ids_round_trip for two-backend parity.
@@ -3607,10 +3641,14 @@ async fn update_group_fields_owner_scope_rejects_wrong_owner() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
-    assert_eq!(n, 1, "owner 2 must be able to rename their group");
+    assert_eq!(
+        n.rows_affected, 1,
+        "owner 2 must be able to rename their group"
+    );
 
     // User 3 must NOT be able to rename user 2's group.
     let n = db
@@ -3623,10 +3661,11 @@ async fn update_group_fields_owner_scope_rejects_wrong_owner() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
-    assert_eq!(n, 0, "user 3 must NOT rename user 2's group");
+    assert_eq!(n.rows_affected, 0, "user 3 must NOT rename user 2's group");
 
     // Verify name unchanged after rejected update.
     let name = db
@@ -3635,6 +3674,75 @@ async fn update_group_fields_owner_scope_rejects_wrong_owner() {
         .unwrap()
         .unwrap();
     assert_eq!(name, "renamed", "name must survive rejected update");
+}
+
+#[tokio::test]
+async fn group_protocol_policy_is_checked_and_cleared_under_the_write_lock() {
+    let db = repo().await;
+    seed_user(&db, 2, false).await;
+    seed_group_typed(&db, 10, 2, "in").await;
+
+    let enabled = db
+        .update_group_fields(
+            10,
+            &ResourceScope::All,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("[\"tls\"]"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enabled.blocked_protocols_before.as_deref(), Some("[]"));
+    assert_eq!(
+        enabled.blocked_protocols_after.as_deref(),
+        Some("[\"tls\"]")
+    );
+
+    let changed_type = db
+        .update_group_fields(
+            10,
+            &ResourceScope::All,
+            None,
+            Some("out"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed_type.blocked_protocols_before.as_deref(),
+        Some("[\"tls\"]")
+    );
+    assert_eq!(changed_type.blocked_protocols_after.as_deref(), Some("[]"));
+
+    assert!(matches!(
+        db.update_group_fields(
+            10,
+            &ResourceScope::All,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("[\"tls\"]"),
+        )
+        .await,
+        Err(DbError::GroupProtocolPolicyInvariant)
+    ));
+    let stored: String =
+        sqlx::query_scalar("SELECT blocked_protocols FROM device_groups WHERE id=10")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, "[]");
 }
 
 /// Owner scope: delete_group succeeds for own group, fails for another user's group.
@@ -5940,6 +6048,7 @@ async fn reusable_tunnel_repository_contract() {
             None,
             None,
             None,
+            None,
         )
         .await,
         Err(DbError::RuleGroupInvariant { entry_rules: 1, .. })
@@ -5951,6 +6060,7 @@ async fn reusable_tunnel_repository_contract() {
             None,
             None,
             Some("  "),
+            None,
             None,
             None,
             None,
@@ -6724,6 +6834,7 @@ async fn group_token_revision_and_preset_tunnel_invariants_are_atomic() {
             None,
             None,
             None,
+            None,
         )
         .await,
         Err(DbError::TunnelGroupInvariant {
@@ -6738,6 +6849,7 @@ async fn group_token_revision_and_preset_tunnel_invariants_are_atomic() {
             None,
             Some("monitor"),
             Some(""),
+            None,
             None,
             None,
             None,

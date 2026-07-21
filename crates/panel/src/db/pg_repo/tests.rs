@@ -690,6 +690,7 @@ async fn pg_active_rule_leases_protect_group_mutation_until_expiry() {
             None,
             None,
             None,
+            None,
         )
         .await,
         Err(DbError::RuleGroupInvariant { entry_rules: 1, .. })
@@ -701,6 +702,7 @@ async fn pg_active_rule_leases_protect_group_mutation_until_expiry() {
             None,
             None,
             Some(" "),
+            None,
             None,
             None,
             None,
@@ -742,9 +744,11 @@ async fn pg_active_rule_leases_protect_group_mutation_until_expiry() {
             None,
             None,
             None,
+            None,
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .rows_affected,
         1
     );
     assert_eq!(
@@ -757,9 +761,11 @@ async fn pg_active_rule_leases_protect_group_mutation_until_expiry() {
             None,
             None,
             None,
+            None,
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .rows_affected,
         1
     );
     assert_eq!(
@@ -825,6 +831,40 @@ async fn pg_upgrade_from_revision_28_adds_credential_revision() {
         .await
         .unwrap();
     assert_eq!(column_count, 1);
+    assert_eq!(revision, crate::db::pg_schema::PG_SCHEMA_VERSION);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_upgrade_from_revision_33_adds_blocked_protocols() {
+    let Some(db) = repo("upgrade_rev33_blocked_protocols").await else {
+        return;
+    };
+    sqlx::query("ALTER TABLE device_groups DROP COLUMN blocked_protocols")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version >= 34")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    apply_pg_schema(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+
+    let default_value: String = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='device_groups' \
+           AND column_name='blocked_protocols'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let revision: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(default_value.contains("[]"));
     assert_eq!(revision, crate::db::pg_schema::PG_SCHEMA_VERSION);
     cleanup(&db).await;
 }
@@ -1922,6 +1962,7 @@ async fn pg_group_insert_then_find_by_token_round_trip() {
         "20000-30000",
         1.0,
         false,
+        "[]",
     )
     .await
     .unwrap();
@@ -1972,7 +2013,7 @@ async fn pg_group_update_token_returns_rows_affected() {
     let Some(db) = repo("group_tok").await else {
         return;
     };
-    db.insert_group("gin", "in", "tok-1", 1, "", "", 1.0, false)
+    db.insert_group("gin", "in", "tok-1", 1, "", "", 1.0, false, "[]")
         .await
         .unwrap();
     let g = db.find_by_token("tok-1").await.unwrap().unwrap();
@@ -3582,10 +3623,14 @@ async fn pg_update_group_fields_owner_scope_rejects_wrong_owner() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
-    assert_eq!(n, 1, "owner 2 must be able to rename their group (PG)");
+    assert_eq!(
+        n.rows_affected, 1,
+        "owner 2 must be able to rename their group (PG)"
+    );
 
     let n = db
         .update_group_fields(
@@ -3597,10 +3642,14 @@ async fn pg_update_group_fields_owner_scope_rejects_wrong_owner() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
-    assert_eq!(n, 0, "user 3 must NOT rename user 2's group (PG)");
+    assert_eq!(
+        n.rows_affected, 0,
+        "user 3 must NOT rename user 2's group (PG)"
+    );
 
     let name = db
         .find_name_by_id(10, &ResourceScope::All)
@@ -3608,6 +3657,83 @@ async fn pg_update_group_fields_owner_scope_rejects_wrong_owner() {
         .unwrap()
         .unwrap();
     assert_eq!(name, "renamed", "name must survive rejected update (PG)");
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_group_protocol_policy_is_checked_and_cleared_under_the_write_lock() {
+    let Some(db) = repo("group_protocol_policy_lock").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (10, 'entry-policy-lock', 'in', 'entry-policy-lock-token', 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let enabled = db
+        .update_group_fields(
+            10,
+            &ResourceScope::All,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("[\"tls\"]"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enabled.blocked_protocols_before.as_deref(), Some("[]"));
+    assert_eq!(
+        enabled.blocked_protocols_after.as_deref(),
+        Some("[\"tls\"]")
+    );
+
+    let changed_type = db
+        .update_group_fields(
+            10,
+            &ResourceScope::All,
+            None,
+            Some("out"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed_type.blocked_protocols_before.as_deref(),
+        Some("[\"tls\"]")
+    );
+    assert_eq!(changed_type.blocked_protocols_after.as_deref(), Some("[]"));
+
+    assert!(matches!(
+        db.update_group_fields(
+            10,
+            &ResourceScope::All,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("[\"tls\"]"),
+        )
+        .await,
+        Err(DbError::GroupProtocolPolicyInvariant)
+    ));
+    let stored: String =
+        sqlx::query_scalar("SELECT blocked_protocols FROM device_groups WHERE id=10")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, "[]");
     cleanup(&db).await;
 }
 
@@ -6196,6 +6322,7 @@ async fn pg_reusable_tunnel_repository_contract() {
             None,
             None,
             None,
+            None,
         )
         .await,
         Err(DbError::RuleGroupInvariant { entry_rules: 1, .. })
@@ -6207,6 +6334,7 @@ async fn pg_reusable_tunnel_repository_contract() {
             None,
             None,
             Some("  "),
+            None,
             None,
             None,
             None,
@@ -6980,6 +7108,7 @@ async fn pg_group_token_revision_and_preset_tunnel_invariants_are_atomic() {
             None,
             None,
             None,
+            None,
         )
         .await,
         Err(DbError::TunnelGroupInvariant {
@@ -6994,6 +7123,7 @@ async fn pg_group_token_revision_and_preset_tunnel_invariants_are_atomic() {
             None,
             Some("monitor"),
             Some(""),
+            None,
             None,
             None,
             None,
