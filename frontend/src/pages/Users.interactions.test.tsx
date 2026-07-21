@@ -83,7 +83,7 @@ describe('Users mutation locking', () => {
       expect(screen.getByRole('button', { name: /addUser/ })).toBeDisabled();
       expect(screen.getByRole('button', { name: /edit/ })).toBeDisabled();
     });
-    expect(screen.getByText('loadFailedRetry')).toBeInTheDocument();
+    expect(screen.getByText('loadFailed')).toBeInTheDocument();
   });
 
   it('locks the main edit modal while a plan purchase is running', async () => {

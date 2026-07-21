@@ -139,11 +139,16 @@ describe('Rules import interaction', () => {
     fireEvent.mouseDown(within(dialog).getByLabelText('forwardMode'));
     const presetOptions = await screen.findAllByText('modePresetTunnel');
     await user.click(presetOptions[presetOptions.length - 1]);
+    expect(within(dialog).queryByText('tunnelSelectHint')).not.toBeInTheDocument();
 
     fireEvent.mouseDown(within(dialog).getByLabelText('modePresetTunnel'));
-    expect(await screen.findByText(/shared-path/)).toBeInTheDocument();
+    const tunnelOption = await screen.findByText(/shared-path/);
+    expect(tunnelOption).toBeInTheDocument();
     expect(await screen.findByText('httpBlocked')).toBeInTheDocument();
     expect(await screen.findByText('tlsBlocked')).toBeInTheDocument();
+
+    await user.click(tunnelOption);
+    expect(within(dialog).queryByText('tunnelPortsReused')).not.toBeInTheDocument();
   });
 
   it('cannot be closed or edited while sequential imports are running', async () => {
@@ -259,7 +264,7 @@ describe('Rules import interaction', () => {
     failRulesLoad = true;
     await user.click(screen.getByRole('button', { name: /refresh/ }));
 
-    expect(await screen.findByText('loadFailedRetry')).toBeInTheDocument();
+    expect(await screen.findByText('loadFailed')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /addRule/ })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'action' })).toBeDisabled();
     expect(screen.getByRole('checkbox', { name: 'select #1' })).toBeDisabled();

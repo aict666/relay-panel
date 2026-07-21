@@ -135,14 +135,12 @@ export default function Shop() {
         />
       )}
 
-      {/* Balance + the "流量叠加" note. */}
+      {/* Current balance. Purchase effects are shown in confirmation. */}
       {me && (
         <Card size="small" style={{ marginBottom: 16 }}>
-          <Space wrap>
+          <Space>
             <Text strong>{t('accountBalance')}:</Text>
             <span className="rp-mono">{me.balance}</span>
-            <Text type="secondary" style={{ marginLeft: 16 }}>·</Text>
-            <Text type="secondary">{t('shopTrafficStacksHint')}</Text>
           </Space>
         </Card>
       )}

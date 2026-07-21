@@ -1,11 +1,9 @@
-import { Card, Form, Switch, Select, Button, Input, message, Spin, Result, Typography } from 'antd';
+import { Card, Form, Switch, Select, Button, Input, message, Spin, Result } from 'antd';
 import { useEffect, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, Plan, RegistrationSettings } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useSiteConfig } from '../site/useSiteConfig';
-
-const { Text } = Typography;
 
 /** v0.4.10 PR3 / v0.4.21 PR2: admin system settings page.
  *  Manages registration toggle, allowed registration plans (multi-select),
@@ -127,7 +125,6 @@ export default function SystemSettings() {
         <Form.Item
           name="site_name"
           label={t('siteName')}
-          extra={t('siteNameHint')}
           rules={[
             { required: true, whitespace: true, message: t('siteNameRequired') },
             { max: 64, message: t('siteNameTooLong') },
@@ -147,7 +144,6 @@ export default function SystemSettings() {
         <Form.Item
           name="allowed_plan_ids"
           label={t('allowedPlans')}
-          extra={t('allowedPlansHint')}
           rules={[{ required: true, message: t('allowedPlansRequired') }]}
         >
           <Select
@@ -167,7 +163,6 @@ export default function SystemSettings() {
                 name="default_registration_plan_id"
                 label={t('defaultPlan')}
                 rules={[{ required: true, message: t('defaultPlanRequired') }]}
-                extra={allowedIds.length === 0 ? t('allowedPlansRequired') : undefined}
               >
                 <Select
                   options={defaultOptions}
@@ -178,10 +173,6 @@ export default function SystemSettings() {
             );
           }}
         </Form.Item>
-
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          {t('registrationSettingsHint')}
-        </Text>
       </Form>
     </Card>
   );

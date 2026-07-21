@@ -506,7 +506,6 @@ export default function Users() {
           showIcon
           style={{ marginBottom: 14 }}
           title={t('loadFailed')}
-          description={t('loadFailedRetry')}
         />
       )}
       <div className="rp-list-filters">
@@ -638,7 +637,6 @@ export default function Users() {
             </p>
 
             <div style={{ marginBottom: 4 }}><strong>{t('assignPlan')}</strong></div>
-            <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>{t('assignPlanHint')}</div>
             <Space.Compact style={{ width: '100%' }}>
               <Select
                 style={{ flex: 1 }}
@@ -655,30 +653,25 @@ export default function Users() {
                 {isRenewSamePlan ? t('renewAndCharge') : t('assignAndCharge')}
               </Button>
             </Space.Compact>
-            {isRenewSamePlan && (
-              <div style={{ color: '#999', fontSize: 12, marginTop: 4 }}>{t('renewSamePlanHint')}</div>
-            )}
 
-            <Divider style={{ margin: '12px 0' }} />
-
-            <div style={{ marginBottom: 8 }}>
-              <strong>{t('editExpiry')}</strong>
-              <span style={{ color: '#999', fontSize: 12, marginLeft: 6 }}>(UTC)</span>
-            </div>
-            {/* v1.0.8: only TIME plans have an expiry. For a data (unlimited-
-                duration) plan or no plan, the expiry editor is disabled. */}
-            {!isTimePlan && (
-              <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>{t('expiryOnlyForTimePlan')}</div>
+            {isTimePlan && (
+              <>
+                <Divider style={{ margin: '12px 0' }} />
+                <div style={{ marginBottom: 8 }}>
+                  <strong>{t('editExpiry')}</strong>
+                  <span style={{ color: '#999', fontSize: 12, marginLeft: 6 }}>(UTC)</span>
+                </div>
+                <Space wrap>
+                  <DatePicker showTime disabled={userBusy} value={planExpire} onChange={setPlanExpire} placeholder={t('neverExpires')} />
+                  <Button loading={planBusy} disabled={userBusy} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
+                    {t('saveExpiry')}
+                  </Button>
+                  <Button loading={planBusy} disabled={userBusy} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
+                    {t('setNeverExpires')}
+                  </Button>
+                </Space>
+              </>
             )}
-            <Space wrap>
-              <DatePicker showTime disabled={userBusy || !isTimePlan} value={planExpire} onChange={setPlanExpire} placeholder={t('neverExpires')} />
-              <Button loading={planBusy} disabled={userBusy || !isTimePlan} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
-                {t('saveExpiry')}
-              </Button>
-              <Button loading={planBusy} disabled={userBusy || !isTimePlan} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
-                {t('setNeverExpires')}
-              </Button>
-            </Space>
 
             <Divider style={{ margin: '12px 0' }} />
 
@@ -730,7 +723,6 @@ export default function Users() {
           >
             <Input.Password autoComplete="new-password" placeholder="••••••" />
           </Form.Item>
-          <p style={{ color: '#888', fontSize: 12, margin: 0 }}>{t('createUserRoleNote')}</p>
         </Form>
       </Modal>
 

@@ -86,7 +86,7 @@ describe('Tunnels loading interaction', () => {
     failLoad = true;
     await user.click(screen.getByRole('button', { name: /refresh/ }));
 
-    expect(await screen.findByText('loadFailedRetry')).toBeInTheDocument();
+    expect(await screen.findByText('loadFailed')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /createTunnel/ })).toBeDisabled();
     expect(screen.getByRole('button', { name: /edit/ })).toBeDisabled();
     expect(screen.getByRole('switch')).toBeDisabled();
