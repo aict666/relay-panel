@@ -249,6 +249,9 @@ html, body, #root {
 
 /* User chip: avatar + name, opens the account menu. */
 .rp-user-chip {
+  border: 0;
+  background: transparent;
+  font: inherit;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -261,6 +264,12 @@ html, body, #root {
 
 .rp-user-chip:hover {
   background: var(--rp-hover);
+}
+
+.rp-user-chip:focus-visible,
+.rp-stat-card-link:focus-visible {
+  outline: 2px solid var(--rp-primary);
+  outline-offset: 2px;
 }
 
 .rp-user-chip-name {
@@ -752,6 +761,17 @@ html, body, #root {
 
 .rp-toolbar-filter {
   min-width: 180px;
+}
+
+.rp-rules-search {
+  width: 280px;
+}
+
+.rp-list-filters {
+  display: grid;
+  grid-template-columns: minmax(220px, 360px) 180px;
+  gap: 10px;
+  margin-bottom: 14px;
 }
 
 /* ---- Auth pages ---- */
@@ -1278,9 +1298,22 @@ html, body, #root {
     justify-content: flex-start;
   }
 
+  .rp-list-filters {
+    grid-template-columns: 1fr;
+  }
+
   .rp-rules-toolbar .rp-toolbar-filter {
     flex: 1 1 100%;
     width: 100%;
+  }
+
+  .rp-rules-toolbar .rp-rules-search {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  .rp-rules-toolbar > .ant-space-item:has(.rp-rules-search) {
+    flex: 1 1 100%;
   }
 
   .rp-rules-toolbar > .ant-space-item:first-child {

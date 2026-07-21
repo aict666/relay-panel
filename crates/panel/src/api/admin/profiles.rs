@@ -79,6 +79,7 @@ pub async fn create_tunnel_profile(
             Json(ApiResponse::success(p))
         }
         Err(CreateProfileError::EmptyName) => Json(err(400, "名称不能为空")),
+        Err(CreateProfileError::DuplicateName) => Json(err(409, "模板名称已存在")),
         Err(CreateProfileError::InvalidTransport) => {
             Json(err(400, "传输协议必须是以下之一: ws, tls_simple"))
         }
@@ -117,18 +118,20 @@ pub async fn update_tunnel_profile(
         }
         Err(UpdateProfileError::NotFound) => Json(err(404, "模板不存在")),
         Err(UpdateProfileError::BuiltinReadOnly) => Json(err(400, "内置模板不可编辑")),
+        Err(UpdateProfileError::EmptyName) => Json(err(400, "名称不能为空")),
+        Err(UpdateProfileError::DuplicateName) => Json(err(409, "模板名称已存在")),
         Err(UpdateProfileError::InvalidTransport) => {
             Json(err(400, "传输协议必须是以下之一: ws, tls_simple"))
         }
         // v0.4.8 fix: a transport change must stay compatible with every rule
         // already bound to this profile — surface a concrete count + protocol so
         // the admin knows what to rebind.
-        Err(UpdateProfileError::TransportConflict { count, protocol }) => {
+        Err(UpdateProfileError::TransportConflict { count, sample }) => {
             let t = req.transport.as_deref().unwrap_or("");
             Json(err(
                 400,
                 format!(
-                    "该模板被 {count} 条协议为 {protocol} 的规则使用，不能改为 {t}（ws/tls_simple 仅兼容 TCP）"
+                    "该模板被 {count} 条规则使用，其中 {sample} 与 {t} 不兼容，请先修改规则绑定"
                 ),
             ))
         }

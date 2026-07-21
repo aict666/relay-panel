@@ -77,6 +77,8 @@ export default function Account() {
       message.success(t('passwordChanged'));
       setChangePwOpen(false);
       pwForm.resetFields();
+      // Password changes revoke every session, including this token.
+      logout();
     } catch {
       message.error(t('passwordChangeFailed'));
     } finally {
@@ -177,13 +179,17 @@ export default function Account() {
       <Modal
         title={t('changePassword')}
         open={changePwOpen}
-        onCancel={() => { setChangePwOpen(false); pwForm.resetFields(); }}
+        onCancel={() => { if (!pwSubmitting) { setChangePwOpen(false); pwForm.resetFields(); } }}
         onOk={() => pwForm.submit()}
         okText={t('save')}
         cancelText={t('cancel')}
         confirmLoading={pwSubmitting}
+        closable={!pwSubmitting}
+        mask={{ closable: !pwSubmitting }}
+        keyboard={!pwSubmitting}
+        cancelButtonProps={{ disabled: pwSubmitting }}
       >
-        <Form form={pwForm} onFinish={handleChangePassword} layout="vertical">
+        <Form form={pwForm} onFinish={handleChangePassword} layout="vertical" disabled={pwSubmitting}>
           <Form.Item
             name="current_password"
             label={t('currentPassword')}

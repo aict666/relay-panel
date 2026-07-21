@@ -1,5 +1,5 @@
 use crate::db::error::DbError;
-use crate::db::repo::{RegistrationSettings, Repository};
+use crate::db::repo::{RegistrationSettings, RegistrationSettingsWriteError, Repository};
 
 pub const DEFAULT_REGISTRATION_PLAN_ID: i64 = 1;
 pub const DEFAULT_SITE_NAME: &str = "RelayPanel";
@@ -70,30 +70,33 @@ pub async fn update_registration_settings(
         return Err(RegistrationSettingsError::AllowedPlansEmpty);
     }
 
-    // Validate the default plan exists.
-    match db.find_plan_name_by_id(default_plan_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return Err(RegistrationSettingsError::DefaultPlanMissing),
-        Err(e) => return Err(RegistrationSettingsError::Database(e)),
-    }
-
     // default_plan_id must be in allowed_plan_ids.
     if !allowed.contains(&default_plan_id) {
         return Err(RegistrationSettingsError::DefaultPlanNotInAllowed);
     }
 
-    // Validate every allowed plan exists.
-    for &id in &allowed {
-        match db.find_plan_name_by_id(id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return Err(RegistrationSettingsError::AllowedPlanNotFound(id)),
-            Err(e) => return Err(RegistrationSettingsError::Database(e)),
-        }
-    }
-
-    db.set_system_settings(enabled, default_plan_id, &allowed, &site_name)
+    // Existence validation and the settings write share one repository
+    // transaction. Its plan locks serialize with checked plan deletion, so a
+    // valid non-default allowed plan cannot disappear between check and write.
+    db.set_system_settings_checked(enabled, default_plan_id, &allowed, &site_name)
         .await
-        .map_err(RegistrationSettingsError::Database)?;
+        .map_err(|error| match error {
+            RegistrationSettingsWriteError::AllowedPlansEmpty => {
+                RegistrationSettingsError::AllowedPlansEmpty
+            }
+            RegistrationSettingsWriteError::DefaultPlanNotInAllowed => {
+                RegistrationSettingsError::DefaultPlanNotInAllowed
+            }
+            RegistrationSettingsWriteError::PlanNotFound(id) if id == default_plan_id => {
+                RegistrationSettingsError::DefaultPlanMissing
+            }
+            RegistrationSettingsWriteError::PlanNotFound(id) => {
+                RegistrationSettingsError::AllowedPlanNotFound(id)
+            }
+            RegistrationSettingsWriteError::Database(error) => {
+                RegistrationSettingsError::Database(error)
+            }
+        })?;
 
     Ok(RegistrationSettings {
         registration_enabled: enabled,

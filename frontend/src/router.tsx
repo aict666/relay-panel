@@ -5,7 +5,7 @@
 // not a blanket suppression of real warnings).
 /* eslint-disable react-refresh/only-export-components */
 import { lazy, Suspense } from 'react';
-import { createBrowserRouter } from 'react-router-dom';
+import { createBrowserRouter, Navigate } from 'react-router-dom';
 import { Spin } from 'antd';
 // EAGER: the authenticated shell + its route guards load up front so the
 // sidebar/menu renders immediately after login (and the guards run before any
@@ -63,7 +63,8 @@ export const router = createBrowserRouter([
       // regular users are redirected to /account (the regular-user dashboard
       // was removed in v1.0.7). No RequireAdmin — regular users land here.
       { index: true, element: <RoleHome /> },
-      // Owner-scoped resources — any authenticated user manages their own.
+      // Rules are owner-scoped. Groups remain readable for legacy regular-user
+      // rows, but their mutation endpoints and UI controls are administrator-only.
       { path: 'rules', element: <Rules /> },
       { path: 'groups', element: <Groups /> },
       { path: 'nodes', element: <NodeStatus /> },
@@ -81,6 +82,9 @@ export const router = createBrowserRouter([
       // v0.4.10: explicit 403 page for admin-only routes a regular user
       // navigates to directly (vs the old silent redirect to /account).
       { path: '403', element: <Forbidden /> },
+      // Old bookmarks and mistyped URLs should recover inside the product,
+      // rather than exposing React Router's developer-facing error boundary.
+      { path: '*', element: <Navigate to="/" replace /> },
     ],
   },
 ]);

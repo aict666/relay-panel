@@ -225,7 +225,10 @@ pub async fn update_rule(
         Err(UpdateRuleError::Forbidden(msg)) => Json(err(403, msg)),
         Err(UpdateRuleError::NotFound) => Json(err(404, "规则不存在")),
         Err(UpdateRuleError::PortConflict) => Json(err(409, "监听端口在此入口分组上已被占用")),
-        Err(UpdateRuleError::Internal(msg)) => Json(err(500, msg)),
+        Err(UpdateRuleError::Internal(msg)) => {
+            tracing::error!("update_rule {}: internal error: {}", id, msg);
+            Json(err(500, "服务器内部错误"))
+        }
         Err(UpdateRuleError::Database(e)) => {
             tracing::error!("update_rule {}: service failed: {}", id, e);
             Json(err(500, "数据库错误"))

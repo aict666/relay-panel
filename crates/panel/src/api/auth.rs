@@ -153,13 +153,16 @@ pub async fn login(
         });
     }
 
-    let user: Option<User> = match state.db.find_by_username_not_banned(&req.username).await {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::error!("login: db lookup failed for {:?}: {}", req.username, e);
-            None
-        }
-    };
+    let (user, lookup_failed): (Option<User>, bool) =
+        match state.db.find_by_username_not_banned(&req.username).await {
+            Ok(u) => (u, false),
+            Err(e) => {
+                tracing::error!("login: db lookup failed for {:?}: {}", req.username, e);
+                // Still run the dummy bcrypt check below so a transient database
+                // failure does not create a cheap username-enumeration oracle.
+                (None, true)
+            }
+        };
 
     // Always perform a bcrypt verification to prevent timing attacks that
     // reveal whether a username exists. Run it on the blocking pool and cap
@@ -183,9 +186,21 @@ pub async fn login(
         }
         Err(e) => {
             tracing::error!("login: bcrypt worker failed: {}", e);
-            false
+            return Json(ApiResponse {
+                code: 500,
+                message: "Password service failed. Please try again later.".into(),
+                data: None,
+            });
         }
     };
+
+    if lookup_failed {
+        return Json(ApiResponse {
+            code: 500,
+            message: "database error".into(),
+            data: None,
+        });
+    }
 
     if verified {
         if let Some(user) = user {
@@ -196,12 +211,21 @@ pub async fn login(
                 token_version: user.token_version,
                 exp: chrono::Utc::now().timestamp_millis() as usize / 1000 + 86400,
             };
-            let token = encode(
+            let token = match encode(
                 &Header::default(),
                 &claims,
                 &EncodingKey::from_secret(state.config.jwt_secret.as_bytes()),
-            )
-            .unwrap_or_default();
+            ) {
+                Ok(token) => token,
+                Err(e) => {
+                    tracing::error!("login: JWT encoding failed: {}", e);
+                    return Json(ApiResponse {
+                        code: 500,
+                        message: "token service failed".into(),
+                        data: None,
+                    });
+                }
+            };
 
             return Json(ApiResponse::success(LoginResponse {
                 token,
@@ -305,32 +329,38 @@ pub async fn register(
             });
         }
         Err(e) => {
+            tracing::error!("register: password hashing failed: {}", e);
             return Json(ApiResponse {
                 code: 500,
-                message: format!("Failed to hash password: {}", e),
+                message: "Password service failed. Please try again later.".into(),
                 data: None,
             });
         }
     };
 
-    // v0.4.10 PR3: insert_user_from_plan atomically copies the plan's quota
-    // fields (max_rules/traffic_limit/speed_limit/ip_limit) via INSERT...SELECT,
-    // closing the "validate plan then plan changes" race. The default plan_id
-    // comes from app_settings. Match order matters:
-    //   Ok(1)                    → registered
-    //   Ok(0)                    → plan missing (deleted out from under us) → 500
-    //   Err(UniqueViolation)     → concurrent same-username register → 409
-    //   Err(other)               → 500
-    let plan_id = selected_plan_id;
+    // Re-check the registration switch, current default/allowed list and plan
+    // existence in the same transaction that copies quotas and inserts the
+    // user. `req.plan_id=None` intentionally resolves the default again here,
+    // so a default changed during bcrypt cannot provision the stale plan.
     match state
         .db
-        .insert_user_from_plan(&req.username, &hashed, plan_id)
+        .insert_public_registered_user(&req.username, &hashed, req.plan_id)
         .await
     {
-        Ok(1) => Json(ApiResponse::success(())),
-        Ok(0) => {
+        Ok(crate::db::repo::UserProvisionOutcome::Created) => Json(ApiResponse::success(())),
+        Ok(crate::db::repo::UserProvisionOutcome::RegistrationDisabled) => Json(ApiResponse {
+            code: 403,
+            message: "Registration is disabled. Ask an admin to create your account.".into(),
+            data: None,
+        }),
+        Ok(crate::db::repo::UserProvisionOutcome::PlanNotAllowed) => Json(ApiResponse {
+            code: 400,
+            message: "Selected plan is not available for registration.".into(),
+            data: None,
+        }),
+        Ok(crate::db::repo::UserProvisionOutcome::PlanMissing(plan_id)) => {
             tracing::error!(
-                "register: default plan {} is missing; no user created",
+                "register: selected/default plan {} is missing; no user created",
                 plan_id
             );
             Json(ApiResponse {
@@ -341,12 +371,6 @@ pub async fn register(
                 data: None,
             })
         }
-        Ok(_) => Json(ApiResponse {
-            // Should not happen for a single-row insert; defensive.
-            code: 500,
-            message: "database error".into(),
-            data: None,
-        }),
         Err(crate::db::error::DbError::UniqueViolation) => Json(ApiResponse {
             code: 409,
             message: "Username already exists".into(),

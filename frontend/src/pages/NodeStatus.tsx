@@ -141,7 +141,7 @@ export default function NodeStatus() {
       onOk: async () => {
         try {
           const res = await api.post<unknown, ApiEnvelope<null>>(
-            `/nodes/${row.group_id}/upgrade/${row.node_id}`,
+            `/nodes/${row.group_id}/upgrade/${encodeURIComponent(row.node_id)}`,
             {},
           );
           if (res.code !== 0) { message.error(res.message); return; }

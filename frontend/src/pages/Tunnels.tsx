@@ -5,7 +5,7 @@ import {
 import {
   ApiOutlined, DeleteOutlined, EditOutlined, PlusOutlined, QuestionCircleOutlined, ReloadOutlined,
 } from '@ant-design/icons';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, DeviceGroup, Tunnel } from '../api/types';
 import { useI18n } from '../i18n/context';
@@ -33,31 +33,43 @@ export default function Tunnels() {
   const [tunnels, setTunnels] = useState<Tunnel[]>([]);
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [busyTunnelId, setBusyTunnelId] = useState<number | null>(null);
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Tunnel | null>(null);
   const [form] = Form.useForm<TunnelFormValue>();
   const watchedHops = Form.useWatch('hops', form) ?? [];
   const watchedShared = Form.useWatch('shared', form) ?? false;
+  const loadGenerationRef = useRef(0);
 
   const load = useCallback(async () => {
+    const requestId = ++loadGenerationRef.current;
     setLoading(true);
-    setTunnels([]);
-    setGroups([]);
+    setLoadFailed(false);
     try {
       const [tr, gr] = await Promise.all([
         api.get<unknown, ApiEnvelope<Tunnel[]>>('/admin/tunnels'),
         api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
       ]);
+      if (requestId !== loadGenerationRef.current) return false;
       setTunnels(tr.data ?? []);
       setGroups(gr.data ?? []);
+      setLoadFailed(false);
+      return true;
     } catch {
-      message.error(t('loadFailed'));
+      if (requestId === loadGenerationRef.current) {
+        setLoadFailed(true);
+        message.error(t('loadFailed'));
+      }
+      return false;
     } finally {
-      setLoading(false);
+      if (requestId === loadGenerationRef.current) setLoading(false);
     }
   }, [t]);
 
   useEffect(() => { load(); }, [load]);
+  const mutationsBlocked = loading || loadFailed || submitting || busyTunnelId !== null;
 
   const groupMap = useMemo(() => new Map(groups.map(group => [group.id, group])), [groups]);
   const entryGroups = groups.filter(group => group.group_type === 'in' || group.group_type === 'both');
@@ -71,6 +83,7 @@ export default function Tunnels() {
     : undefined;
 
   const beginCreate = () => {
+    if (mutationsBlocked) return;
     setEditing(null);
     form.resetFields();
     form.setFieldsValue({
@@ -86,6 +99,7 @@ export default function Tunnels() {
   };
 
   const beginEdit = (tunnel: Tunnel) => {
+    if (mutationsBlocked) return;
     setEditing(tunnel);
     form.resetFields();
     form.setFieldsValue({
@@ -105,6 +119,7 @@ export default function Tunnels() {
   };
 
   const submit = async (values: TunnelFormValue) => {
+    if (mutationsBlocked) return;
     const ids = values.hops.map(hop => hop.device_group_id);
     if (new Set(ids).size !== ids.length) {
       message.error(t('tunnelDuplicateHop'));
@@ -117,6 +132,7 @@ export default function Tunnels() {
         : (hop.listen_port ?? null),
     }));
     const pathChanged = editing ? tunnelPathChanged(editing, values.hops) : true;
+    setSubmitting(true);
     try {
       const response = editing
         ? await api.put<unknown, ApiEnvelope<Tunnel>>(`/admin/tunnels/${editing.id}`, {
@@ -129,27 +145,39 @@ export default function Tunnels() {
         return;
       }
       message.success(editing ? t('tunnelUpdated') : t('tunnelCreated'));
+      setTunnels(current => editing
+        ? current.map(tunnel => tunnel.id === response.data!.id ? response.data! : tunnel)
+        : [...current, response.data!]);
       setOpen(false);
-      await load();
     } catch {
       message.error(editing ? t('tunnelUpdateFailed') : t('tunnelCreateFailed'));
+    } finally {
+      setSubmitting(false);
     }
   };
 
   const toggle = async (tunnel: Tunnel, enabled: boolean) => {
+    if (mutationsBlocked) return;
+    setBusyTunnelId(tunnel.id);
     try {
       const response = await api.put<unknown, ApiEnvelope<Tunnel>>(`/admin/tunnels/${tunnel.id}`, { enabled });
       if (response.code !== 0) {
         message.error(response.message);
         return;
       }
-      await load();
+      setTunnels(current => current.map(item => item.id === tunnel.id
+        ? (response.data ?? { ...item, enabled })
+        : item));
     } catch {
       message.error(t('tunnelUpdateFailed'));
+    } finally {
+      setBusyTunnelId(null);
     }
   };
 
   const removeTunnel = async (tunnel: Tunnel) => {
+    if (mutationsBlocked) return;
+    setBusyTunnelId(tunnel.id);
     try {
       const response = await api.delete<unknown, ApiEnvelope<null>>(`/admin/tunnels/${tunnel.id}`);
       if (response.code !== 0) {
@@ -157,9 +185,11 @@ export default function Tunnels() {
         return;
       }
       message.success(t('tunnelDeleted'));
-      await load();
+      setTunnels(current => current.filter(item => item.id !== tunnel.id));
     } catch {
       message.error(t('tunnelDeleteFailed'));
+    } finally {
+      setBusyTunnelId(null);
     }
   };
 
@@ -173,13 +203,13 @@ export default function Tunnels() {
 
   const actions = (tunnel: Tunnel) => (
     <Space size={4}>
-      <Button type="text" size="small" icon={<EditOutlined />} onClick={() => beginEdit(tunnel)}>{t('edit')}</Button>
+      <Button type="text" size="small" icon={<EditOutlined />} disabled={mutationsBlocked} onClick={() => beginEdit(tunnel)}>{t('edit')}</Button>
       <Popconfirm
         title={t('deleteTunnelConfirm')}
         description={tunnel.bound_rule_count > 0 ? t('tunnelDeleteInUseHint') : undefined}
         onConfirm={() => removeTunnel(tunnel)}
       >
-        <Button type="text" size="small" danger icon={<DeleteOutlined />}>{t('delete')}</Button>
+        <Button type="text" size="small" danger icon={<DeleteOutlined />} loading={busyTunnelId === tunnel.id} disabled={mutationsBlocked}>{t('delete')}</Button>
       </Popconfirm>
     </Space>
   );
@@ -190,7 +220,7 @@ export default function Tunnels() {
       title: t('status'), key: 'enabled', width: 110,
       render: (_: unknown, tunnel: Tunnel) => (
         <Space>
-          <Switch size="small" checked={tunnel.enabled} onChange={enabled => toggle(tunnel, enabled)} />
+          <Switch size="small" checked={tunnel.enabled} loading={busyTunnelId === tunnel.id} disabled={mutationsBlocked} onChange={enabled => toggle(tunnel, enabled)} />
           <Tag color={tunnel.enabled ? 'green' : 'default'}>{t(tunnel.enabled ? 'enabled' : 'disabled')}</Tag>
         </Space>
       ),
@@ -220,10 +250,14 @@ export default function Tunnels() {
       <div className="rp-page-header">
         <h2 className="rp-page-title"><ApiOutlined /> {t('tunnelManagement')}</h2>
         <Space className="rp-page-actions">
-          <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={beginCreate}>{t('createTunnel')}</Button>
+          <Button icon={<ReloadOutlined />} loading={loading} disabled={submitting || busyTunnelId !== null || open} onClick={load}>{t('refresh')}</Button>
+          <Button type="primary" icon={<PlusOutlined />} disabled={mutationsBlocked} onClick={beginCreate}>{t('createTunnel')}</Button>
         </Space>
       </div>
+
+      {loadFailed && (
+        <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} description={t('loadFailedRetry')} />
+      )}
 
       {mobile ? (
         <List
@@ -235,7 +269,7 @@ export default function Tunnels() {
               <Card size="small" style={{ width: '100%' }} title={tunnel.name} extra={actions(tunnel)}>
                 <Space orientation="vertical" style={{ width: '100%' }}>
                   <Space>
-                    <Switch size="small" checked={tunnel.enabled} onChange={enabled => toggle(tunnel, enabled)} />
+                    <Switch size="small" checked={tunnel.enabled} loading={busyTunnelId === tunnel.id} disabled={mutationsBlocked} onChange={enabled => toggle(tunnel, enabled)} />
                     <Tag color={tunnel.enabled ? 'green' : 'default'}>{t(tunnel.enabled ? 'enabled' : 'disabled')}</Tag>
                     <Tag color={tunnel.shared ? 'blue' : 'default'}>{t(tunnel.shared ? 'tunnelSharedWithUsers' : 'tunnelAdminOnly')}</Tag>
                     <Text type="secondary">{t('boundRuleCount')}: {tunnel.bound_rule_count}</Text>
@@ -254,14 +288,16 @@ export default function Tunnels() {
       <Modal
         title={editing ? t('editTunnel') : t('createTunnel')}
         open={open}
-        onCancel={() => setOpen(false)}
+        onCancel={() => { if (!submitting) setOpen(false); }}
         onOk={() => form.submit()}
+        confirmLoading={submitting}
+        okButtonProps={{ disabled: loading || loadFailed }}
         width={780}
         okText={t('save')}
         cancelText={t('cancel')}
         className="rp-tunnel-modal"
       >
-        <Form form={form} layout="vertical" onFinish={submit} className="rp-tunnel-form">
+        <Form form={form} layout="vertical" onFinish={submit} disabled={submitting || loading || loadFailed} className="rp-tunnel-form">
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]} className="rp-tunnel-name-field">
             <Input maxLength={100} />
           </Form.Item>
@@ -354,7 +390,7 @@ export default function Tunnels() {
                                 rules={[{ required: true, message: t('listenPortHint') }]}
                                 className="rp-tunnel-fixed-port"
                               >
-                                <InputNumber min={1} max={65535} placeholder={t('port')} style={{ width: '100%' }} />
+                                <InputNumber min={1} max={65535} precision={0} placeholder={t('port')} style={{ width: '100%' }} />
                               </Form.Item>
                             )}
                           </div>

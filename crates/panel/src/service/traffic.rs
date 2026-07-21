@@ -32,6 +32,23 @@ pub enum TrafficReportError {
     Database(DbError),
 }
 
+/// Apply the configured floating-point billing multiplier without relying on
+/// Rust's saturating float-to-int cast at the i64 boundary. `i64::MAX as f64`
+/// rounds up to 2^63, so a simple `<= i64::MAX as f64` check accidentally
+/// accepts an out-of-range result and silently clamps it to i64::MAX.
+pub(crate) fn billed_traffic_delta(real_delta: i64, rate: f64) -> Option<i64> {
+    if real_delta < 0 || !(0.1..=100.0).contains(&rate) {
+        return None;
+    }
+    if rate == 1.0 {
+        return Some(real_delta);
+    }
+    const I64_EXCLUSIVE_UPPER_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+    let rounded = ((real_delta as f64) * rate).round();
+    (rounded.is_finite() && (0.0..I64_EXCLUSIVE_UPPER_AS_F64).contains(&rounded))
+        .then_some(rounded as i64)
+}
+
 /// Apply a node's traffic report atomically.
 ///
 /// Business rules (all preserved from the original handler):
@@ -166,6 +183,14 @@ mod tests {
     use super::*;
     use crate::db::sqlite_repo::SqliteRepository;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+
+    #[test]
+    fn billing_delta_rejects_float_cast_saturation_at_i64_boundary() {
+        assert_eq!(billed_traffic_delta(i64::MAX, 1.0), Some(i64::MAX));
+        assert_eq!(billed_traffic_delta(i64::MAX, 2.0), None);
+        assert_eq!(billed_traffic_delta(5, 0.5), Some(3));
+        assert_eq!(billed_traffic_delta(1, f64::NAN), None);
+    }
 
     /// Minimal in-memory DB with just the kvs table (all the status functions
     /// touch). Faster than full fresh_pool and isolates these tests from the

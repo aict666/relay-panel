@@ -1,7 +1,7 @@
 import { Form, Input, Button, Card, message, Typography, Segmented, Result, Spin, Select } from 'antd';
 import { UserOutlined, LockOutlined, ThunderboltFilled } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, RegistrationStatus, Plan } from '../api/types';
 import { useI18n } from '../i18n/context';
@@ -20,6 +20,7 @@ export default function Register() {
   const [status, setStatus] = useState<RegistrationStatus | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const [selectedPlanId, setSelectedPlanId] = useState<number | undefined>(undefined);
 
   const checkStatus = async () => {
@@ -56,6 +57,8 @@ export default function Register() {
   }, [status, navigate, t]);
 
   const onFinish = async (values: { username: string; password: string }) => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       const body: Record<string, unknown> = {
@@ -76,6 +79,7 @@ export default function Register() {
     } catch {
       message.error(t('registerFailed'));
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -173,6 +177,11 @@ export default function Register() {
             </Form.Item>
           </Form>
         )}
+        <div style={{ marginTop: 12, textAlign: 'center' }}>
+          <Button type="link" size="small" disabled={submitting} onClick={() => navigate('/login')}>
+            {t('backToLogin')}
+          </Button>
+        </div>
       </Card>
     </div>
   );

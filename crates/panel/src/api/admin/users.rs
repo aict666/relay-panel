@@ -1,7 +1,8 @@
 use super::{err, UserPublic};
 use crate::api::middleware::AdminOnly;
 use crate::api::AppState;
-use crate::db::repo::BuyPlanError;
+use crate::db::error::DbError;
+use crate::db::repo::{AdminUserPlanEditOutcome, AdminUserUpdate, BuyPlanError};
 use crate::service::password::PasswordValidationError;
 use crate::service::users::CreateUserError;
 use axum::{
@@ -63,7 +64,10 @@ pub async fn create_user(
         Err(CreateUserError::Password(PasswordValidationError::TooLong)) => {
             Json(err(400, "密码最多72字节"))
         }
-        Err(CreateUserError::Hash(e)) => Json(err(500, format!("Failed to hash password: {}", e))),
+        Err(CreateUserError::Hash(e)) => {
+            tracing::error!("create_user: password hashing failed: {}", e);
+            Json(err(500, "密码服务失败，请稍后重试"))
+        }
         Err(CreateUserError::DuplicateUsername) => Json(err(409, "用户名已存在")),
         Err(CreateUserError::DefaultPlanMissing(plan_id)) => {
             tracing::error!(
@@ -131,6 +135,22 @@ pub async fn delete_user(
                 "该用户仍拥有 {groups} 个被 {tunnels} 条预设隧道引用的设备组，请先修改或删除相关隧道"
             ),
         )),
+        Err(crate::db::error::DbError::UserGroupReferenceConflict {
+            rules,
+            fallback_groups,
+            plans,
+        }) => Json(err(
+            409,
+            format!(
+                "该用户的设备组仍被引用（规则 {rules}、回退分组 {fallback_groups}、套餐 {plans}），请先解除相关引用"
+            ),
+        )),
+        Err(crate::db::error::DbError::UserOwnedTunnelConflict { tunnels, rules }) => Json(err(
+            409,
+            format!(
+                "该用户仍拥有 {tunnels} 条被其他用户的 {rules} 条规则引用的预设隧道，请先解绑相关规则"
+            ),
+        )),
         Err(e) => {
             tracing::error!("delete_user {}: cascade delete failed: {}", id, e);
             Json(err(500, "数据库错误"))
@@ -188,148 +208,87 @@ pub async fn update_user(
         },
     };
 
-    // Authorization-only updates do not pass through update_user_fields, so
-    // their repository calls can legitimately affect zero rows. Verify the
-    // resource once up front to avoid reporting success for a nonexistent id.
-    match state.db.exists_by_id(id).await {
-        Ok(true) => {}
-        Ok(false) => return Json(err(404, "用户不存在")),
+    // Cannot ban or suspend an admin user (privilege protection). The role is
+    // immutable through this endpoint; the transactional update below still
+    // decides whether a missing target is a 404.
+    if req.banned == Some(true) || req.suspended == Some(true) {
+        let is_admin = match state.db.is_admin(id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("update_user {}: is_admin lookup failed: {}", id, e);
+                return Json(err(500, "数据库错误"));
+            }
+        };
+        if is_admin {
+            return if req.banned == Some(true) {
+                Json(err(400, "无法封禁管理员用户"))
+            } else {
+                Json(err(400, "无法暂停管理员用户"))
+            };
+        }
+    }
+
+    // Scalar fields, both authorization representations, and the consequent
+    // rule pauses are one logical edit. Keeping them in one repository
+    // transaction prevents a bad group id (or a later SQL failure) from
+    // committing only the balance/quota or only half of the authorization.
+    let outcome = match state
+        .db
+        .update_user_with_authorization(
+            id,
+            AdminUserUpdate {
+                balance: canonical_balance.as_deref(),
+                max_rules: req.max_rules,
+                traffic_limit: req.traffic_limit,
+                banned: req.banned,
+                suspended: req.suspended,
+                all_device_groups: req.all_device_groups,
+                device_group_ids: req.device_group_ids.as_deref(),
+            },
+        )
+        .await
+    {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return Json(err(404, "用户不存在")),
+        Err(DbError::ForeignKeyViolation | DbError::UserDeviceGroupInvalid) => {
+            return Json(err(400, "设备分组列表只能包含管理员拥有的入站分组"));
+        }
         Err(e) => {
-            tracing::error!("update_user {}: existence lookup failed: {}", id, e);
-            return Json(err(500, "数据库错误"));
-        }
-    }
-
-    // Cannot ban an admin user (privilege protection).
-    if req.banned == Some(true) {
-        let is_admin = match state.db.is_admin(id).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("update_user {}: is_admin lookup failed: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
-        };
-        if is_admin {
-            return Json(err(400, "无法封禁管理员用户"));
-        }
-    }
-
-    // v1.0.8: cannot suspend an admin user either (same privilege protection).
-    if req.suspended == Some(true) {
-        let is_admin = match state.db.is_admin(id).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("update_user {}: is_admin lookup failed: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
-        };
-        if is_admin {
-            return Json(err(400, "无法暂停管理员用户"));
-        }
-    }
-
-    // v1.0.4: apply field updates only when field-update args are present
-    // (a group_id-only request must NOT hit update_user_fields, whose all-None
-    // UPDATE would return 0 rows and be misread as "User not found").
-    let has_field_update = req.balance.is_some()
-        || req.max_rules.is_some()
-        || req.traffic_limit.is_some()
-        || req.banned.is_some()
-        || req.suspended.is_some();
-
-    if has_field_update {
-        match state
-            .db
-            .update_user_fields(
-                id,
-                canonical_balance.as_deref(),
-                req.max_rules,
-                req.traffic_limit,
-                req.banned,
-                req.suspended,
-            )
-            .await
-        {
-            Ok(0) => return Json(err(404, "用户不存在")),
-            Ok(_) => {
-                if let Some(banned) = req.banned {
-                    tracing::warn!(
-                        action = if banned { "ban_user" } else { "unban_user" },
-                        target_user_id = id,
-                        actor_admin_id = _admin.user_id,
-                        "destructive admin op"
-                    );
-                }
-                if let Some(suspended) = req.suspended {
-                    tracing::warn!(
-                        action = if suspended {
-                            "suspend_user"
-                        } else {
-                            "unsuspend_user"
-                        },
-                        target_user_id = id,
-                        actor_admin_id = _admin.user_id,
-                        "admin op"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!("update_user {}: update_user_fields failed: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
-        }
-    }
-
-    // v1.0.7: device-group authorization change. The per-user all_device_groups
-    // flag and/or the explicit device-group assignments are applied here. After
-    // re-authorizing, pause any of the user's rules whose inbound group is no
-    // longer allowed — the rules + their data are kept so an admin can
-    // re-authorize and resume. (set_user_all_device_groups is a no-op for admins,
-    // who are always all-allowed.)
-    let authz_changed = req.all_device_groups.is_some() || req.device_group_ids.is_some();
-    if let Some(all) = req.all_device_groups {
-        if let Err(e) = state.db.set_user_all_device_groups(id, all).await {
             tracing::error!(
-                "update_user {}: set_user_all_device_groups failed: {}",
+                "update_user {}: transactional user update failed: {}",
                 id,
                 e
             );
             return Json(err(500, "数据库错误"));
         }
+    };
+
+    if let Some(banned) = req.banned {
+        tracing::warn!(
+            action = if banned { "ban_user" } else { "unban_user" },
+            target_user_id = id,
+            actor_admin_id = _admin.user_id,
+            "destructive admin op"
+        );
     }
-    if let Some(ref ids) = req.device_group_ids {
-        if let Err(e) = state.db.set_user_device_groups(id, ids).await {
-            tracing::error!("update_user {}: set_user_device_groups failed: {}", id, e);
-            return Json(err(500, "数据库错误"));
-        }
+    if let Some(suspended) = req.suspended {
+        tracing::warn!(
+            action = if suspended {
+                "suspend_user"
+            } else {
+                "unsuspend_user"
+            },
+            target_user_id = id,
+            actor_admin_id = _admin.user_id,
+            "admin op"
+        );
     }
-    if authz_changed {
-        // Pause rules outside the user's NEW authorization.
-        let allowed = match state.db.authorized_device_group_ids(id).await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!("update_user {}: authz lookup for pause failed: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
-        };
-        match state.db.pause_rules_outside_groups(id, &allowed).await {
-            Ok(n) if n > 0 => {
-                tracing::warn!(
-                    "update_user {}: paused {} rule(s) outside new authorization",
-                    id,
-                    n
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!(
-                    "update_user {}: pause_rules_outside_groups failed: {}",
-                    id,
-                    e
-                );
-                return Json(err(500, "数据库错误"));
-            }
-        }
+    if outcome.paused_rules > 0 {
+        tracing::warn!(
+            "update_user {}: paused {} rule(s) outside new authorization",
+            id,
+            outcome.paused_rules
+        );
     }
 
     // A field update (ban) or an authorization change (pause) both alter what
@@ -394,6 +353,15 @@ pub async fn admin_buy_plan_for_user(
     Path(id): Path<i64>,
     Json(req): Json<AdminBuyPlanRequest>,
 ) -> Json<ApiResponse<()>> {
+    if req.expected_current_plan_id < 0 {
+        return Json(err(400, "expected_current_plan_id 不能为负数"));
+    }
+    let expected_current_plan_id = if req.expected_current_plan_id == 0 {
+        None
+    } else {
+        Some(req.expected_current_plan_id)
+    };
+
     // Target must exist and be a non-admin.
     match crate::db::repo::UserRepository::find_by_id(state.db.as_ref(), id).await {
         Ok(Some(u)) if u.admin => return Json(err(400, "无法给管理员用户分配套餐")),
@@ -413,6 +381,13 @@ pub async fn admin_buy_plan_for_user(
             return Json(err(500, "数据库错误"));
         }
     };
+    if let Some(expected_price) = req.expected_price.as_deref() {
+        match relay_shared::money::parse_balance(expected_price) {
+            Ok(expected) if expected == plan.price => {}
+            Ok(_) => return Json(err(409, "套餐价格已变更，请刷新后重新确认")),
+            Err(reason) => return Json(err(400, reason)),
+        }
+    }
     if plan.plan_type == "time" && plan.duration_days <= 0 {
         return Json(err(400, "该套餐无有效时长"));
     }
@@ -449,27 +424,23 @@ pub async fn admin_buy_plan_for_user(
             }
         }
     };
-
-    // v1.0.8: compute the new authorized set (mirrors shop.rs buy_plan).
-    let new_authorized_group_ids: Vec<i64> = if plan.grant_all_groups {
-        match state.db.list_all_inbound_group_ids().await {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::error!(
-                    "admin_buy_plan_for_user {}: list_all_inbound_group_ids failed: {}",
-                    id,
-                    e
-                );
-                return Json(err(500, "数据库错误"));
-            }
+    if let Some(expected_revision) = req.expected_revision.as_deref() {
+        if expected_revision != super::plans::purchase_revision(&plan, &device_group_ids) {
+            return Json(err(409, "套餐内容已变更，请刷新后重新确认"));
         }
+    }
+
+    // Grant-all is evaluated inside the purchase transaction. Only per-group
+    // plans need an explicit authorization set here.
+    let new_authorized_group_ids = if plan.grant_all_groups {
+        Vec::new()
     } else {
         device_group_ids.clone()
     };
 
     match state
         .db
-        .buy_plan(
+        .buy_plan_guarded(
             id,
             plan.id,
             &plan.name,
@@ -481,6 +452,8 @@ pub async fn admin_buy_plan_for_user(
             plan.grant_all_groups,
             &device_group_ids,
             &new_authorized_group_ids,
+            false,
+            Some(expected_current_plan_id),
         )
         .await
     {
@@ -499,6 +472,11 @@ pub async fn admin_buy_plan_for_user(
             Json(ApiResponse::success(()))
         }
         Err(BuyPlanError::InsufficientBalance) => Json(err(400, "余额不足")),
+        Err(BuyPlanError::PlanChanged) => Json(err(409, "套餐已变更，请刷新后重新确认")),
+        Err(BuyPlanError::UserPlanChanged) => {
+            Json(err(409, "用户当前套餐已变更，请刷新后重新确认"))
+        }
+        Err(BuyPlanError::QuotaOverflow) => Json(err(409, "累计流量额度超出系统上限")),
         Err(BuyPlanError::Database(e)) => {
             tracing::error!("admin_buy_plan_for_user {}: db error: {}", id, e);
             Json(err(500, "数据库错误"))
@@ -517,38 +495,52 @@ pub async fn admin_set_user_plan(
     Path(id): Path<i64>,
     Json(req): Json<AdminSetUserPlanRequest>,
 ) -> Json<ApiResponse<()>> {
-    // v1.0.9: the clear path (remove plan) is now ONE atomic op — null the
-    // plan, revoke device-group authorization, and system-pause the user's
-    // rules together, so a mid-operation failure can't leave a half-revoked
-    // user. The non-clear path just keeps the current plan_id and writes the
-    // new expiry (None = no expiry).
-    if req.clear {
-        match state.db.clear_user_plan(id).await {
-            Ok(0) => return Json(err(404, "用户不存在（或为管理员）")),
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("admin_set_user_plan {}: clear_user_plan failed: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
+    if req.expected_plan_id <= 0 {
+        return Json(err(400, "expected_plan_id 必须为正整数"));
+    }
+    if req.clear && req.plan_expire_at.is_some() {
+        return Json(err(400, "移除套餐时不能同时设置到期时间"));
+    }
+    if let Some(expire) = req.plan_expire_at.as_deref() {
+        let canonical = chrono::NaiveDateTime::parse_from_str(expire, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string());
+        if canonical.as_deref() != Some(expire) {
+            return Json(err(
+                400,
+                "到期时间必须为 YYYY-MM-DD HH:MM:SS 格式的有效 UTC 时间",
+            ));
         }
-    } else {
-        let (plan_id, expire) =
-            match crate::db::repo::UserRepository::find_by_id(state.db.as_ref(), id).await {
-                Ok(Some(u)) if u.admin => return Json(err(400, "无法修改管理员用户的套餐")),
-                Ok(Some(u)) => (u.plan_id, req.plan_expire_at.clone()),
-                Ok(None) => return Json(err(404, "用户不存在")),
-                Err(e) => {
-                    tracing::error!("admin_set_user_plan {}: find_by_id failed: {}", id, e);
-                    return Json(err(500, "数据库错误"));
-                }
-            };
-        match state.db.admin_set_user_plan(id, plan_id, expire).await {
-            Ok(0) => return Json(err(404, "用户不存在（或为管理员）")),
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("admin_set_user_plan {}: db error: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
+    }
+
+    match state
+        .db
+        .admin_edit_user_plan(
+            id,
+            req.expected_plan_id,
+            req.clear,
+            req.plan_expire_at.as_deref(),
+        )
+        .await
+    {
+        Ok(AdminUserPlanEditOutcome::Updated) => {}
+        Ok(AdminUserPlanEditOutcome::NotFound) => return Json(err(404, "用户不存在")),
+        Ok(AdminUserPlanEditOutcome::AdminTarget) => {
+            return Json(err(400, "无法修改管理员用户的套餐"));
+        }
+        Ok(AdminUserPlanEditOutcome::PlanChanged) => {
+            return Json(err(409, "用户套餐已变更，请刷新后重新确认"));
+        }
+        Ok(AdminUserPlanEditOutcome::ExpiryNotApplicable) => {
+            return Json(err(400, "只有时长套餐可以设置到期时间"));
+        }
+        Err(e) => {
+            tracing::error!(
+                "admin_set_user_plan {}: transactional edit failed: {}",
+                id,
+                e
+            );
+            return Json(err(500, "数据库错误"));
         }
     }
 

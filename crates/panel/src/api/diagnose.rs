@@ -471,7 +471,7 @@ pub async fn diagnose_rule(
         rule_id,
         challenge,
     ))
-    .unwrap_or_default();
+    .expect("diagnose-rule message is serializable");
     let mut expected: Vec<String> = Vec::new();
     // Index nodes by node_id so the send loop can carry group_name/public_ip
     // onto any reclassified ControlChannelOffline (the candidates vec only

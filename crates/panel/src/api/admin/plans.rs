@@ -1,12 +1,15 @@
 use super::err;
 use crate::api::middleware::AdminOnly;
 use crate::api::AppState;
+use crate::db::error::DbError;
+use crate::db::repo::PlanDeleteOutcome;
 use axum::{
     extract::{Path, State},
     Json,
 };
 use relay_shared::models::*;
 use relay_shared::protocol::*;
+use sha2::{Digest, Sha256};
 
 // === Plans (v1.0.8) ===
 //
@@ -28,12 +31,35 @@ pub struct PlanWithGroups {
     /// would fall back to "#<id>". Resolving server-side fixes that. Order is
     /// by name (not id); it's a display-only set.
     pub device_group_names: Vec<String>,
+    /// Opaque optimistic-concurrency token over every field that affects a
+    /// purchase. Clients echo it when buying so changed quota/grants require a
+    /// fresh confirmation instead of silently applying a different snapshot.
+    pub purchase_revision: String,
+}
+
+pub fn purchase_revision(plan: &Plan, device_group_ids: &[i64]) -> String {
+    let mut ids = device_group_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let snapshot = serde_json::to_vec(&(
+        plan.id,
+        &plan.name,
+        plan.max_rules,
+        plan.traffic,
+        &plan.price,
+        &plan.plan_type,
+        plan.duration_days,
+        plan.hidden,
+        plan.reset_traffic,
+        plan.grant_all_groups,
+        ids,
+    ))
+    .expect("purchase revision snapshot is serializable");
+    format!("{:x}", Sha256::digest(snapshot))
 }
 
 /// Validate the invariant fields shared by create + update. Returns the
 /// canonicalized price on success, or an error message on failure.
-/// `name_required` controls whether an empty name is rejected (create) or
-/// allowed through (update, where None means "leave unchanged").
 fn validate_plan_fields(
     name: Option<&str>,
     max_rules: Option<i32>,
@@ -41,14 +67,13 @@ fn validate_plan_fields(
     price: Option<&str>,
     plan_type: Option<&str>,
     duration_days: Option<i32>,
-    name_required: bool,
 ) -> Result<Option<String>, String> {
     if let Some(n) = name {
         let trimmed = n.trim();
-        if name_required && trimmed.is_empty() {
+        if trimmed.is_empty() {
             return Err("名称不能为空".into());
         }
-        if trimmed.len() > 100 {
+        if trimmed.chars().count() > 100 {
             return Err("名称不能超过100个字符".into());
         }
     }
@@ -129,10 +154,12 @@ pub async fn list_plans(
                 return Json(err(500, "数据库错误"));
             }
         };
+        let purchase_revision = purchase_revision(&plan, &device_group_ids);
         out.push(PlanWithGroups {
             plan,
             device_group_ids,
             device_group_names,
+            purchase_revision,
         });
     }
     Json(ApiResponse::success(out))
@@ -143,16 +170,17 @@ pub async fn create_plan(
     State(state): State<AppState>,
     Json(req): Json<CreatePlanRequest>,
 ) -> Json<ApiResponse<i64>> {
+    let canonical_name = req.name.trim();
     let canonical_price = match validate_plan_fields(
-        Some(&req.name),
+        Some(canonical_name),
         Some(req.max_rules),
         Some(req.traffic),
         Some(&req.price),
         Some(&req.plan_type),
         Some(req.duration_days),
-        true,
     ) {
-        Ok(p) => p.unwrap_or_default(),
+        Ok(Some(price)) => price,
+        Ok(None) => return Json(err(400, "价格不能为空")),
         Err(msg) => return Json(err(400, msg)),
     };
 
@@ -161,7 +189,7 @@ pub async fn create_plan(
     let id = match state
         .db
         .create_plan_with_groups(
-            &req.name,
+            canonical_name,
             req.max_rules,
             req.traffic,
             &canonical_price,
@@ -176,6 +204,9 @@ pub async fn create_plan(
         .await
     {
         Ok(id) => id,
+        Err(DbError::ForeignKeyViolation | DbError::PlanDeviceGroupInvalid) => {
+            return Json(err(400, "套餐只能包含管理员拥有的入站设备分组"));
+        }
         Err(e) => {
             tracing::error!("create_plan: db error: {}", e);
             return Json(err(500, "数据库错误"));
@@ -212,14 +243,14 @@ pub async fn update_plan(
     // cheaply, so we only enforce the cross-field rule when plan_type is
     // present in the request.
     let effective_plan_type = req.plan_type.as_deref();
+    let canonical_name = req.name.as_deref().map(str::trim);
     let canonical_price = match validate_plan_fields(
-        req.name.as_deref(),
+        canonical_name,
         req.max_rules,
         req.traffic,
         req.price.as_deref(),
         effective_plan_type,
         req.duration_days,
-        false,
     ) {
         Ok(p) => p,
         Err(msg) => return Json(err(400, msg)),
@@ -264,64 +295,37 @@ pub async fn update_plan(
         }
     }
 
-    // v1.0.9: `device_group_ids` is NOT a plans-table column (it lives in
-    // plan_device_groups), so a request carrying ONLY device_group_ids would
-    // make update_plan_fields a no-op (0 rows) and be misread as 404. Split the
-    // two: apply scalar fields via update_plan_fields ONLY when present, and
-    // replace the grant set separately. Track existence so the right error wins.
-    let has_scalar_update = req.name.is_some()
-        || req.max_rules.is_some()
-        || req.traffic.is_some()
-        || req.price.is_some()
-        || req.plan_type.is_some()
-        || req.duration_days.is_some()
-        || req.hidden.is_some()
-        || req.reset_traffic.is_some()
-        || req.description.is_some()
-        || req.grant_all_groups.is_some();
-
-    if has_scalar_update {
-        match state
-            .db
-            .update_plan_fields(
-                id,
-                req.name.as_deref(),
-                req.max_rules,
-                req.traffic,
-                canonical_price.as_deref(),
-                req.plan_type.as_deref(),
-                req.duration_days,
-                req.hidden,
-                req.reset_traffic,
-                req.description.as_deref(),
-                req.grant_all_groups,
-            )
-            .await
-        {
-            Ok(0) => return Json(err(404, "套餐不存在")),
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("update_plan {}: db error: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
+    // Scalar fields and the optional grant-set replacement must succeed or
+    // fail together. This also handles a request containing only group ids:
+    // the repository locks/checks the plan before replacing its grants.
+    match state
+        .db
+        .update_plan_fields(
+            id,
+            canonical_name,
+            req.max_rules,
+            req.traffic,
+            canonical_price.as_deref(),
+            req.plan_type.as_deref(),
+            req.duration_days,
+            req.hidden,
+            req.reset_traffic,
+            req.description.as_deref(),
+            req.grant_all_groups,
+            req.device_group_ids.as_deref(),
+        )
+        .await
+    {
+        Ok(0) => return Json(err(404, "套餐不存在")),
+        Ok(_) => {}
+        Err(DbError::PlanInvariant) => {
+            return Json(err(400, "限时套餐的时长天数必须大于 0"));
         }
-    } else {
-        // Only a grant-set change: confirm the plan exists so we still 404.
-        match state.db.find_plan_by_id(id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return Json(err(404, "套餐不存在")),
-            Err(e) => {
-                tracing::error!("update_plan {}: existence check failed: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
+        Err(DbError::ForeignKeyViolation | DbError::PlanDeviceGroupInvalid) => {
+            return Json(err(400, "套餐只能包含管理员拥有的入站设备分组"));
         }
-    }
-
-    // v1.0.9: REPLACE the grant set when device_group_ids is provided. None =
-    // leave the existing grants untouched.
-    if let Some(ref ids) = req.device_group_ids {
-        if let Err(e) = state.db.set_plan_device_groups(id, ids).await {
-            tracing::error!("update_plan {}: set_plan_device_groups failed: {}", id, e);
+        Err(e) => {
+            tracing::error!("update_plan {}: db error: {}", id, e);
             return Json(err(500, "数据库错误"));
         }
     }
@@ -338,54 +342,53 @@ pub async fn delete_plan(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
-    // Resolve the target before checking settings so a missing plan still gets
-    // the expected 404 instead of being mistaken for the fallback default.
-    match state.db.find_plan_name_by_id(id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return Json(err(404, "套餐不存在")),
-        Err(e) => {
-            tracing::error!("delete_plan {}: existence check failed: {}", id, e);
-            return Json(err(500, "数据库错误"));
-        }
-    }
-
-    let settings =
-        match crate::service::settings::get_registration_settings(state.db.as_ref()).await {
-            Ok(settings) => settings,
-            Err(e) => {
-                tracing::error!("delete_plan {}: settings lookup failed: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
-        };
-    if settings.default_registration_plan_id == id {
-        return Json(err(
+    // Every guard is evaluated under the same transaction/locks as DELETE.
+    // This also protects non-default plans referenced by allowed_plan_ids,
+    // which is a JSON column and therefore has no database foreign key.
+    match state.db.delete_plan_checked(id).await {
+        Ok(PlanDeleteOutcome::Deleted) => Json(ApiResponse::success(())),
+        Ok(PlanDeleteOutcome::NotFound) => Json(err(404, "套餐不存在")),
+        Ok(PlanDeleteOutcome::RegistrationDefault) => Json(err(
             409,
             "该套餐是当前默认套餐，请先在系统设置中更换默认套餐。",
-        ));
-    }
-
-    // Pre-delete safety check: refuse if any user's plan_id references this
-    // plan. Deleting would orphan the FK and leave users on a ghost plan.
-    let in_use = match state.db.count_users_on_plan(id).await {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::error!("delete_plan {}: count_users_on_plan failed: {}", id, e);
-            return Json(err(500, "数据库错误"));
+        )),
+        Ok(PlanDeleteOutcome::RegistrationAllowed) => {
+            Json(err(409, "该套餐仍在允许注册列表中，请先修改系统设置。"))
         }
-    };
-    if in_use > 0 {
-        return Json(err(
+        Ok(PlanDeleteOutcome::InUse { users }) => Json(err(
             409,
-            format!("该套餐仍被 {} 个用户使用，请先迁移用户。", in_use),
-        ));
-    }
-
-    match state.db.delete_plan(id).await {
-        Ok(0) => Json(err(404, "套餐不存在")),
-        Ok(_) => Json(ApiResponse::success(())),
+            format!("该套餐仍被 {} 个用户使用，请先迁移用户。", users),
+        )),
         Err(e) => {
-            tracing::error!("delete_plan {}: db error: {}", id, e);
+            tracing::error!("delete_plan {}: checked delete failed: {}", id, e);
             Json(err(500, "数据库错误"))
         }
+    }
+}
+
+#[cfg(test)]
+mod field_validation_tests {
+    use super::validate_plan_fields;
+
+    #[test]
+    fn update_rejects_a_blank_name() {
+        let result = validate_plan_fields(Some("  \t"), None, None, None, None, None);
+        assert_eq!(result.unwrap_err(), "名称不能为空");
+    }
+
+    #[test]
+    fn name_limit_counts_characters_instead_of_utf8_bytes() {
+        let hundred_chinese_characters = "套".repeat(100);
+        assert!(validate_plan_fields(
+            Some(&hundred_chinese_characters),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_ok());
+        let too_long = "套".repeat(101);
+        assert!(validate_plan_fields(Some(&too_long), None, None, None, None, None).is_err());
     }
 }

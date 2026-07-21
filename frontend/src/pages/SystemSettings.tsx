@@ -119,11 +119,11 @@ export default function SystemSettings() {
   return (
     <Card
       title={t('systemSettings')}
-      extra={<Button type="primary" loading={saving} onClick={onSave}>{t('save')}</Button>}
+      extra={<Button type="primary" loading={saving} disabled={saving} onClick={onSave}>{t('save')}</Button>}
     >
       {/* Capped width: full-bleed inputs across a 1500px card are unreadable
           and make the page look empty. */}
-      <Form form={form} layout="vertical" style={{ maxWidth: 620 }}>
+      <Form form={form} layout="vertical" disabled={saving} style={{ maxWidth: 620 }}>
         <Form.Item
           name="site_name"
           label={t('siteName')}

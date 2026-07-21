@@ -1,4 +1,4 @@
-use crate::api::middleware::{AdminOnly, AuthUser};
+use crate::api::middleware::AdminOnly;
 use crate::api::AppState;
 use axum::{
     extract::{Query, State},
@@ -59,6 +59,17 @@ pub(crate) fn public_ips_from_status_json(raw: &str) -> Option<Vec<String>> {
     ips.sort();
     ips.dedup();
     Some(ips)
+}
+
+fn public_ips_referenced_by_other_statuses(
+    rows: &[(String, String)],
+    excluded_key: &str,
+) -> std::collections::HashSet<String> {
+    rows.iter()
+        .filter(|(key, _)| key != excluded_key)
+        .filter_map(|(_, raw)| public_ips_from_status_json(raw))
+        .flatten()
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -355,7 +366,7 @@ pub async fn get_dashboard_history(
 }
 
 pub async fn get_node_status(
-    user: AuthUser,
+    _admin: AdminOnly,
     State(state): State<AppState>,
 ) -> Json<ApiResponse<Vec<serde_json::Value>>> {
     // v0.3.2: sweep stale entries on READ too, not just on report. Previously
@@ -364,13 +375,11 @@ pub async fn get_node_status(
     // Now opening the node-status page cleans up entries older than 2 min.
     let _ = crate::service::traffic::sweep_stale_status(state.db.as_ref()).await;
 
-    // v0.4.10: node-status rows are keyed by group, so we owner-filter them via
-    // the group's ownership. An admin (scope All) sees every group's nodes; a
-    // regular user only sees status rows for groups they own. The scoped
-    // find_name_by_id returns None both for "group gone" and "group not yours"
-    // (indistinguishable by design); a non-admin treats None as "not mine" and
-    // drops the row, while an admin keeps it with a fallback name.
-    let scope = user.resource_scope();
+    // Full status blobs include operator-only diagnostics such as listener
+    // errors and installation details, so this endpoint is administrator-only.
+    // Regular users use /nodes/shared, whose typed DTO explicitly allow-lists
+    // safe availability fields.
+    let scope = crate::db::repo::ResourceScope::All;
 
     let rows: Vec<(String, String)> = match state.db.scan_prefix("node_status:").await {
         Ok(rows) => rows,
@@ -399,19 +408,20 @@ pub async fn get_node_status(
             Ok(v) => v,
             Err(_) => continue,
         };
+        if !status.is_object() {
+            tracing::warn!(
+                key,
+                "get_node_status: ignored valid JSON with a non-object root"
+            );
+            continue;
+        }
 
-        // Look up the group name from device_groups, scoped to the caller.
-        // For a non-admin, a None result means the group is gone OR not theirs —
-        // either way the row is dropped so users only see their own nodes.
+        // Look up the group name from device_groups. Orphaned status rows are
+        // retained with a fallback name so an administrator can still inspect
+        // and remove them.
         let group_name = match state.db.find_name_by_id(group_id, &scope).await {
             Ok(Some(n)) => Some(n),
-            Ok(None) => {
-                if scope.owner_id().is_some() {
-                    // Non-admin: not our group (or gone) → hide this status row.
-                    continue;
-                }
-                None
-            }
+            Ok(None) => None,
             Err(e) => {
                 tracing::error!("get_node_status: find_name_by_id failed: {}", e);
                 return Json(ApiResponse {
@@ -469,10 +479,10 @@ pub async fn get_node_status(
 /// reappears on its next report. Use case: clear a stale/ghost entry that the
 /// auto-sweep hasn't caught, or remove a decommissioned node's leftover row.
 ///
-/// v0.4.10: usable by regular users for their OWN groups only. Before touching
-/// kvs we verify the caller owns `group_id` via the scoped group lookup — a
-/// non-admin deleting a status row for a group they don't own (or one that
-/// doesn't exist) gets a uniform 404. An admin (scope All) may delete any.
+/// Administrator-only: before touching kvs, verify that `group_id` still
+/// resolves to a real group. Orphaned rows remain visible on the full status
+/// board but cannot be removed through a group-scoped URL after the group is
+/// gone; the stale-status sweeper eventually removes them.
 ///
 /// Security: the key is CONSTRUCTED from the validated group_id + node_id
 /// params, never interpolated from raw user input. The DELETE's WHERE clause
@@ -540,9 +550,38 @@ pub async fn delete_node_status(
     // We read the JSON BEFORE the delete so deleted_by is unambiguous, and
     // we deduplicate IPs so the same IP from public_ip / public_ipv4 /
     // public_ipv6 only triggers one geoip delete.
-    if let Ok(Some(raw)) = state.db.get(&key).await {
-        if let Some(ips) = public_ips_from_status_json(&raw) {
-            for ip in &ips {
+    let raw_status = match state.db.get(&key).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::warn!(
+                "failed to read node status {} before geoip cleanup: {}",
+                key,
+                error
+            );
+            None
+        }
+    };
+    if let Some(ips) = raw_status.as_deref().and_then(public_ips_from_status_json) {
+        // GeoIP entries are global per-IP cache rows. Preserve any IP still
+        // referenced by another node (including a node in another group).
+        // If this best-effort scan fails, keep every cache row rather than
+        // guessing that the target node was its sole consumer.
+        let other_references = match state.db.scan_prefix("node_status:").await {
+            Ok(rows) => Some(public_ips_referenced_by_other_statuses(&rows, &key)),
+            Err(error) => {
+                tracing::warn!(
+                    "failed to scan sibling node statuses during {} cleanup: {}",
+                    key,
+                    error
+                );
+                None
+            }
+        };
+        if let Some(other_references) = other_references {
+            for ip in ips
+                .iter()
+                .filter(|ip| !other_references.contains(ip.as_str()))
+            {
                 let geoip_key = format!("geoip:{}", ip);
                 match state.db.delete(&geoip_key).await {
                     Ok(n) if n > 0 => {
@@ -617,14 +656,13 @@ pub async fn upgrade_node(
     State(state): State<AppState>,
     axum::extract::Path((group_id, node_id)): axum::extract::Path<(i64, String)>,
 ) -> Json<ApiResponse<()>> {
-    let node_id = node_id.trim().to_string();
-    if node_id.is_empty() {
+    let Some(node_id) = crate::api::node::normalize_node_id(&node_id) else {
         return Json(ApiResponse {
             code: 400,
-            message: "node_id required".into(),
+            message: "invalid node_id".into(),
             data: None,
         });
-    }
+    };
     // v1.2: resolve the upgrade target from the latest node release. This MUST
     // NOT fall back to the panel version under any circumstance.
     let target_version = match state.release_cache.resolve_latest_node_version().await {
@@ -864,6 +902,30 @@ mod tests {
     #[test]
     fn public_ips_from_status_json_returns_none_for_corrupt_json() {
         assert!(super::public_ips_from_status_json("not-json{{{").is_none());
+    }
+
+    #[test]
+    fn geoip_cleanup_preserves_ips_referenced_by_any_other_node() {
+        let rows = vec![
+            (
+                "node_status:5:A".to_string(),
+                r#"{"public_ipv4":"1.1.1.1","public_ipv6":"2001::shared"}"#.to_string(),
+            ),
+            (
+                "node_status:5:B".to_string(),
+                r#"{"public_ipv4":"2.2.2.2","public_ipv6":"2001::shared"}"#.to_string(),
+            ),
+            (
+                "node_status:6:C".to_string(),
+                r#"{"public_ip":"2.2.2.2"}"#.to_string(),
+            ),
+            ("node_status:7:corrupt".to_string(), "not-json".to_string()),
+        ];
+
+        let referenced = super::public_ips_referenced_by_other_statuses(&rows, "node_status:5:A");
+        assert!(!referenced.contains("1.1.1.1"));
+        assert!(referenced.contains("2001::shared"));
+        assert!(referenced.contains("2.2.2.2"));
     }
 
     #[tokio::test]
@@ -1127,6 +1189,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
+
+        for uri in ["/nodes", "/groups"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("Authorization", format!("Bearer {}", token(2, false)))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{uri} must keep full operator data administrator-only"
+            );
+        }
+
+        let safe_legacy_groups = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/groups/owned")
+                    .header("Authorization", format!("Bearer {}", token(2, false)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(safe_legacy_groups.status(), StatusCode::OK);
 
         let admin = app
             .clone()

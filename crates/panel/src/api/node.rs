@@ -16,6 +16,24 @@ pub(crate) fn extract_node_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Canonicalize the stable node identity used by status KVS keys, URL path
+/// segments and directed WebSocket control. Restricting it to the portable
+/// filename/URL-safe alphabet keeps all three representations identical;
+/// bounding it also prevents a valid group token from creating arbitrarily
+/// large KVS keys.
+pub(crate) fn normalize_node_id(raw: &str) -> Option<String> {
+    let node_id = raw.trim();
+    if node_id.is_empty()
+        || node_id.len() > 128
+        || !node_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(node_id.to_string())
+}
+
 /// v0.4.0: read the node's config-protocol version from the
 /// `X-Config-Protocol-Version` request header. Returns None if absent (treated
 /// as incompatible — the node is too old to know about the gate).
@@ -89,7 +107,28 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     // An empty Ok result is a legitimate "no matching rules" state. A DB Err is
     // a transient backend failure → HTTP 503.
     match crate::service::node_config::build_node_config(state.db.as_ref(), group.id).await {
-        Ok(cfg) => Json(cfg).into_response(),
+        Ok(cfg) => {
+            // Building a snapshot performs several queries and may include
+            // freshly derived inter-node credentials. Revalidate after all of
+            // them: a token rotated during the build must not receive a
+            // snapshot derived from the replacement credential.
+            match state.db.find_by_token(&token).await {
+                Ok(Some(current)) if current.id == group.id => Json(cfg).into_response(),
+                Ok(_) => (StatusCode::UNAUTHORIZED, "invalid node credential").into_response(),
+                Err(e) => {
+                    tracing::error!(
+                        "get_config: post-build token revalidation failed for group {}: {}",
+                        group.id,
+                        e
+                    );
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "config unavailable: transient database error",
+                    )
+                        .into_response()
+                }
+            }
+        }
         Err(e) => {
             tracing::error!(
                 "get_config: build_node_config failed for group {}: {}",
@@ -207,18 +246,45 @@ pub async fn report_status(
         });
     };
 
-    // Verify token and update node status in kvs
-    let group: Option<DeviceGroup> = match state.db.find_by_token(&token).await {
-        Ok(g) => g,
+    // Verify token before accepting status or renewing any drain lease. Keep
+    // the reporting endpoint's HTTP-200 compatibility, but distinguish an
+    // invalid credential from a transient backend failure in the business
+    // response instead of acknowledging both as a successful report.
+    let group = match state.db.find_by_token(&token).await {
+        Ok(Some(group)) => group,
+        Ok(None) => {
+            return Json(ApiResponse {
+                code: 401,
+                message: "Invalid token".into(),
+                data: None,
+            });
+        }
         Err(e) => {
             tracing::error!("report_status: find_by_token failed: {}", e);
-            // Match the original swallow-and-empty behavior: a transient DB
-            // failure shouldn't make the node think its report was rejected.
-            None
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            });
         }
     };
 
-    if let Some(g) = group {
+    let node_id = match req.node_id.as_deref() {
+        Some(raw) => match normalize_node_id(raw) {
+            Some(node_id) => Some(node_id),
+            None => {
+                return Json(ApiResponse {
+                    code: 400,
+                    message: "Invalid node_id".into(),
+                    data: None,
+                });
+            }
+        },
+        None => None,
+    };
+
+    {
+        let g = group;
         let mut draining_rule_ids: Vec<i64> = req
             .draining_rule_ids
             .iter()
@@ -232,7 +298,6 @@ pub async fn report_status(
             // tails. A large shared tunnel can have more than 4096 rules
             // draining at once after an entry move.
             let mut renewed = 0u64;
-            let mut renewal_failed = false;
             for rule_ids in draining_rule_ids.chunks(4096) {
                 match state
                     .db
@@ -241,16 +306,19 @@ pub async fn report_status(
                 {
                     Ok(count) => renewed = renewed.saturating_add(count),
                     Err(error) => {
-                        renewal_failed = true;
-                        tracing::warn!(
+                        tracing::error!(
                             group_id = g.id,
                             "failed to renew entry-drain leases: {error}"
                         );
-                        break;
+                        return Json(ApiResponse {
+                            code: 500,
+                            message: "database error".into(),
+                            data: None,
+                        });
                     }
                 }
             }
-            if !renewal_failed && renewed < draining_rule_ids.len() as u64 {
+            if renewed < draining_rule_ids.len() as u64 {
                 tracing::debug!(
                     group_id = g.id,
                     requested = draining_rule_ids.len(),
@@ -265,11 +333,11 @@ pub async fn report_status(
         // poller::get_or_create_node_id). Older nodes that don't send node_id
         // fall back to the legacy per-group key (no regression — a single-node
         // group behaves exactly as before).
-        let status_key = match &req.node_id {
-            Some(nid) if !nid.trim().is_empty() => format!("node_status:{}:{}", g.id, nid.trim()),
+        let status_key = match &node_id {
+            Some(nid) => format!("node_status:{}:{}", g.id, nid),
             _ => format!("node_status:{}", g.id), // legacy fallback
         };
-        let node_id_for_json = req.node_id.clone();
+        let node_id_for_json = node_id.clone();
         // Store every reported metric in the status JSON. New optional fields
         // are only included when the node actually reported them (older nodes
         // omit them and the panel renders "-" for missing values).
@@ -321,13 +389,17 @@ pub async fn report_status(
             // hiding the upgrade button on legitimately systemd-managed nodes.
             "install_method": req.install_method,
         });
-        // Status persistence is best-effort: the original used .ok() to swallow
-        // any DB error so a transient failure never broke the report cycle.
-        let _ = state
-            .db
-            .set(&status_key, &status.to_string())
-            .await
-            .map_err(|e| tracing::warn!("report_status: kvs set failed: {}", e));
+        // Do not acknowledge a status report that was not persisted. Nodes
+        // report periodically and may retry safely; returning success here
+        // would instead hide the outage and leave the panel with stale state.
+        if let Err(error) = state.db.set(&status_key, &status.to_string()).await {
+            tracing::error!("report_status: kvs set failed: {}", error);
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            });
+        }
 
         // v0.4.19: async GeoIP enrichment — fire-and-forget, never blocks the
         // status report or node forwarding. Only runs when GEOIP_ENABLED=true.
@@ -358,8 +430,8 @@ pub async fn report_status(
         // node_id AND a public_ip, delete the legacy key for the same group
         // IF AND ONLY IF its stored public_ip matches (so a different-IP node
         // sharing the group isn't wrongly deleted).
-        if let (Some(nid), Some(ref ip)) = (&req.node_id, &req.public_ip) {
-            if !nid.trim().is_empty() && !ip.is_empty() {
+        if let (Some(_), Some(ref ip)) = (&node_id, &req.public_ip) {
+            if !ip.is_empty() {
                 crate::service::traffic::cleanup_legacy_status(state.db.as_ref(), g.id, ip).await;
             }
         }
@@ -394,6 +466,19 @@ mod tests {
     use relay_shared::protocol::{TrafficEntry, TrafficReport};
     use std::sync::Arc;
 
+    #[test]
+    fn node_id_normalization_is_bounded_and_key_safe() {
+        assert_eq!(
+            normalize_node_id("  node-a_1.2  ").as_deref(),
+            Some("node-a_1.2")
+        );
+        assert!(normalize_node_id("").is_none());
+        assert!(normalize_node_id("group:node").is_none());
+        assert!(normalize_node_id("node id").is_none());
+        assert!(normalize_node_id("node/path?query").is_none());
+        assert!(normalize_node_id(&"a".repeat(129)).is_none());
+    }
+
     async fn full_state() -> (AppState, SqlitePool) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -425,8 +510,8 @@ mod tests {
         (state, pool)
     }
 
-    /// Seed: user 2 (non-admin), inbound group 10 with token "tok-A", rule 100
-    /// owned by user 2 on group 10, port 20000. Returns the AppState + pool.
+    /// Seed: administrator-owned inbound group 10 with token "tok-A", plus a
+    /// rule owned by regular user 2 on that group. Returns AppState + pool.
     async fn seeded_state() -> (AppState, SqlitePool) {
         let (state, pool) = full_state().await;
         let hash = bcrypt::hash("pw-2", 4).unwrap();
@@ -437,7 +522,7 @@ mod tests {
             .unwrap();
         sqlx::query(
             "INSERT INTO device_groups (id, name, group_type, token, uid) \
-             VALUES (10, 'gin', 'in', 'tok-A', 2)",
+             VALUES (10, 'gin', 'in', 'tok-A', 1)",
         )
         .execute(&pool)
         .await
@@ -463,6 +548,37 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
         h
+    }
+
+    fn empty_status_report() -> StatusReport {
+        StatusReport {
+            cpu_usage: 0.0,
+            mem_usage: 0.0,
+            active_connections: 0,
+            capacity_score: None,
+            predicted_spare_connections: None,
+            anomaly_detected: None,
+            uptime_secs: 0,
+            public_ip: None,
+            public_ipv4: None,
+            public_ipv6: None,
+            disk_total: None,
+            disk_used: None,
+            disk_usage_percent: None,
+            disk_mount: None,
+            upload_bps: None,
+            download_bps: None,
+            boot_upload_bytes: None,
+            boot_download_bytes: None,
+            network_interface: None,
+            node_id: None,
+            process_uptime_secs: None,
+            node_version: None,
+            config_protocol_version: None,
+            listener_errors: None,
+            install_method: None,
+            draining_rule_ids: vec![],
+        }
     }
 
     async fn user_traffic(pool: &SqlitePool, uid: i64) -> i64 {
@@ -689,39 +805,40 @@ mod tests {
     /// report_status with NO Authorization header → HTTP 200, JSON code 401.
     #[tokio::test]
     async fn node_http_status_compat_status_missing_token_is_http200_business401() {
-        use relay_shared::protocol::StatusReport;
         let (state, _pool) = seeded_state().await;
         let h = HeaderMap::new(); // no Authorization
-        let req = StatusReport {
-            cpu_usage: 0.0,
-            mem_usage: 0.0,
-            active_connections: 0,
-            capacity_score: None,
-            predicted_spare_connections: None,
-            anomaly_detected: None,
-            uptime_secs: 0,
-            public_ip: None,
-            public_ipv4: None,
-            public_ipv6: None,
-            disk_total: None,
-            disk_used: None,
-            disk_usage_percent: None,
-            disk_mount: None,
-            upload_bps: None,
-            download_bps: None,
-            boot_upload_bytes: None,
-            boot_download_bytes: None,
-            network_interface: None,
-            node_id: None,
-            process_uptime_secs: None,
-            node_version: None,
-            config_protocol_version: None,
-            listener_errors: None,
-            install_method: None,
-            draining_rule_ids: vec![],
-        };
-        let Json(resp) = report_status(State(state.clone()), h, Json(req)).await;
+        let Json(resp) = report_status(State(state.clone()), h, Json(empty_status_report())).await;
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
+    }
+
+    #[tokio::test]
+    async fn report_status_unknown_token_is_business401() {
+        let (state, _pool) = seeded_state().await;
+        let Json(resp) = report_status(
+            State(state),
+            auth_headers("rotated-or-unknown-token"),
+            Json(empty_status_report()),
+        )
+        .await;
+        assert_eq!(resp.code, 401);
+        assert_eq!(resp.message, "Invalid token");
+    }
+
+    #[tokio::test]
+    async fn report_status_lookup_failure_is_business500() {
+        let (state, pool) = full_state().await;
+        sqlx::query("DROP TABLE users")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Json(resp) = report_status(
+            State(state),
+            auth_headers("any-token"),
+            Json(empty_status_report()),
+        )
+        .await;
+        assert_eq!(resp.code, 500);
+        assert_eq!(resp.message, "database error");
     }
 
     /// Config protocol v8 treats a missing credential as authoritative
@@ -884,5 +1001,87 @@ mod tests {
             Some("systemd"),
             "install_method must be persisted so the upgrade UI can offer a self-upgrade"
         );
+    }
+
+    #[tokio::test]
+    async fn report_status_rejects_node_id_that_cannot_round_trip_through_key() {
+        use relay_shared::protocol::StatusReport;
+        let (state, _pool) = seeded_state().await;
+        let req = StatusReport {
+            cpu_usage: 0.0,
+            mem_usage: 0.0,
+            active_connections: 0,
+            capacity_score: None,
+            predicted_spare_connections: None,
+            anomaly_detected: None,
+            uptime_secs: 0,
+            public_ip: None,
+            public_ipv4: None,
+            public_ipv6: None,
+            disk_total: None,
+            disk_used: None,
+            disk_usage_percent: None,
+            disk_mount: None,
+            upload_bps: None,
+            download_bps: None,
+            boot_upload_bytes: None,
+            boot_download_bytes: None,
+            network_interface: None,
+            node_id: Some("forged:segment".into()),
+            process_uptime_secs: None,
+            node_version: None,
+            config_protocol_version: None,
+            listener_errors: None,
+            install_method: None,
+            draining_rule_ids: vec![],
+        };
+
+        let Json(resp) =
+            report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;
+        assert_eq!(resp.code, 400);
+        assert!(state
+            .db
+            .scan_prefix("node_status:")
+            .await
+            .expect("scan status keys")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn report_status_does_not_acknowledge_failed_persistence() {
+        use relay_shared::protocol::StatusReport;
+        let (state, pool) = seeded_state().await;
+        sqlx::query("DROP TABLE kvs").execute(&pool).await.unwrap();
+        let req = StatusReport {
+            cpu_usage: 0.0,
+            mem_usage: 0.0,
+            active_connections: 0,
+            capacity_score: None,
+            predicted_spare_connections: None,
+            anomaly_detected: None,
+            uptime_secs: 0,
+            public_ip: None,
+            public_ipv4: None,
+            public_ipv6: None,
+            disk_total: None,
+            disk_used: None,
+            disk_usage_percent: None,
+            disk_mount: None,
+            upload_bps: None,
+            download_bps: None,
+            boot_upload_bytes: None,
+            boot_download_bytes: None,
+            network_interface: None,
+            node_id: Some("n1".into()),
+            process_uptime_secs: None,
+            node_version: None,
+            config_protocol_version: None,
+            listener_errors: None,
+            install_method: None,
+            draining_rule_ids: vec![],
+        };
+
+        let Json(resp) = report_status(State(state), auth_headers("tok-A"), Json(req)).await;
+        assert_eq!(resp.code, 500);
     }
 }

@@ -10,14 +10,49 @@ use relay_shared::models::*;
 use relay_shared::protocol::*;
 // === Device Groups ===
 pub async fn list_groups(
-    user: AuthUser,
+    _admin: AdminOnly,
     State(state): State<AppState>,
 ) -> Json<ApiResponse<Vec<DeviceGroup>>> {
-    let scope = user.resource_scope();
-    match state.db.list_groups(&scope).await {
+    match state
+        .db
+        .list_groups(&crate::db::repo::ResourceScope::All)
+        .await
+    {
         Ok(groups) => Json(ApiResponse::success(groups)),
         Err(e) => {
             tracing::error!("list_groups: db error: {}", e);
+            Json(err(500, "数据库错误"))
+        }
+    }
+}
+
+/// Read-only compatibility catalog for regular users that still own groups
+/// created by an older release. Node credentials and internal group config
+/// must never cross this boundary; current releases only let administrators
+/// create and manage groups.
+pub async fn list_owned_group_summaries(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> Json<ApiResponse<Vec<SharedGroupSummary>>> {
+    let scope = crate::db::repo::ResourceScope::Owner(user.user_id);
+    match state.db.list_groups(&scope).await {
+        Ok(groups) => Json(ApiResponse::success(
+            groups
+                .into_iter()
+                .map(|group| SharedGroupSummary {
+                    id: group.id,
+                    name: group.name,
+                    group_type: group.group_type,
+                    connect_host: group.connect_host,
+                    capabilities: group.capabilities,
+                    region: group.region,
+                    line_type: group.line_type,
+                    hidden: group.hidden,
+                })
+                .collect(),
+        )),
+        Err(e) => {
+            tracing::error!("list_owned_group_summaries: db error: {}", e);
             Json(err(500, "数据库错误"))
         }
     }
@@ -54,6 +89,7 @@ pub async fn create_group(
     .await
     {
         Ok(g) => Json(ApiResponse::success(g)),
+        Err(CreateGroupError::InvalidName) => Json(err(400, "分组名称不能为空")),
         Err(CreateGroupError::FetchFailed) => Json(err(500, "Failed to fetch created group")),
         Err(CreateGroupError::Database(e)) => {
             tracing::error!("create_group: db error: {}", e);
@@ -154,6 +190,7 @@ pub async fn update_group(
                 .await;
             Json(ApiResponse::success(()))
         }
+        Err(UpdateGroupError::InvalidName) => Json(err(400, "分组名称不能为空")),
         Err(UpdateGroupError::NoFields) => Json(err(400, "无需要更新的字段")),
         // v0.3.6: 0 rows = group id didn't exist. 404 + no broadcast.
         Err(UpdateGroupError::NotFound) => Json(err(404, "Group not found")),
@@ -166,6 +203,20 @@ pub async fn update_group(
                 "该设备组正被预设隧道引用，当前修改会破坏路径（入口 {} 条，后续节点 {} 条）",
                 entry_tunnels, downstream_tunnels
             ),
+        )),
+        Err(UpdateGroupError::RuleInvariant {
+            entry_rules,
+            downstream_rules,
+        }) => Json(err(
+            409,
+            format!(
+                "该设备组正被转发规则引用，当前修改会破坏路径（入口 {} 条，后续节点 {} 条）",
+                entry_rules, downstream_rules
+            ),
+        )),
+        Err(UpdateGroupError::PlanInvariant { plans }) => Json(err(
+            409,
+            format!("该设备组正被 {} 个套餐授权，不能改为非入站类型", plans),
         )),
         Err(UpdateGroupError::Database(e)) => {
             tracing::error!("update_group {}: update_group_fields failed: {}", id, e);
@@ -204,8 +255,11 @@ pub async fn delete_group(
                 return Json(err(
                     409,
                     format!(
-                        "该分组仍被 {} 条规则、{} 条预设隧道和 {} 个分组回退配置引用，请先迁移对应配置。",
-                        in_use.rule_count, in_use.tunnel_count, in_use.fallback_group_count
+                        "该分组仍被 {} 条规则、{} 条预设隧道、{} 个分组回退配置和 {} 个套餐引用，请先迁移对应配置。",
+                        in_use.rule_count,
+                        in_use.tunnel_count,
+                        in_use.fallback_group_count,
+                        in_use.plan_count
                     ),
                 ));
             }

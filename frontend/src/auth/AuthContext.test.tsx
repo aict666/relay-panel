@@ -13,7 +13,7 @@
  * drive the interceptor behavior directly.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, waitFor } from '@testing-library/react';
+import { fireEvent, render, waitFor } from '@testing-library/react';
 
 // --- mock the axios client before importing anything that uses it ---
 // vi.mock factories are hoisted ABOVE all imports, so they cannot reference
@@ -43,7 +43,7 @@ import type { UserSelf } from '../api/types';
 
 // A consumer that surfaces the live auth state so tests can assert on it.
 function StateProbe() {
-  const { token, isAdmin, user, authReady, mustChangePassword } = useAuth();
+  const { token, isAdmin, user, authReady, mustChangePassword, login } = useAuth();
   return (
     <div>
       <span data-testid="token">{token ?? 'null'}</span>
@@ -51,6 +51,7 @@ function StateProbe() {
       <span data-testid="authReady">{String(authReady)}</span>
       <span data-testid="username">{user?.username ?? 'null'}</span>
       <span data-testid="mustChange">{String(mustChangePassword)}</span>
+      <button onClick={() => { void login('new-session-token').catch(() => undefined); }}>login-test</button>
     </div>
   );
 }
@@ -170,6 +171,7 @@ describe('AuthProvider', () => {
 
   it('does NOT log out when /user/me returns a non-401 error (e.g. 500)', async () => {
     localStorage.setItem('token', 'jwt-abc');
+    localStorage.setItem('admin', 'true');
     // A 500 (not 401) — AuthProvider catches it and leaves existing state.
     mockGet.mockRejectedValueOnce({ response: { status: 500 } });
 
@@ -179,6 +181,21 @@ describe('AuthProvider', () => {
     });
     // Not logged out: token survives a transient server error.
     expect(getByTestId('token').textContent).toBe('jwt-abc');
+    // But the unverified cached role fails closed.
+    expect(getByTestId('isAdmin').textContent).toBe('false');
+    expect(localStorage.getItem('admin')).toBeNull();
+  });
+
+  it('rolls back a new login when the server cannot resolve /user/me', async () => {
+    mockGet.mockRejectedValueOnce({ response: { status: 500 } });
+    const { getByRole, getByTestId } = renderWithProvider();
+    await waitFor(() => expect(getByTestId('authReady').textContent).toBe('true'));
+
+    fireEvent.click(getByRole('button', { name: 'login-test' }));
+
+    await waitFor(() => expect(getByTestId('token').textContent).toBe('null'));
+    expect(localStorage.getItem('token')).toBeNull();
+    expect(getByTestId('isAdmin').textContent).toBe('false');
   });
 
   // ── v0.4.10 PR4: must_change_password + PASSWORD_CHANGE_REQUIRED ──

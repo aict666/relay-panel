@@ -95,7 +95,9 @@ pub async fn hash_default_admin_password_if_placeholder(
         .await
         .map_err(db_err_to_sqlx)?;
     if needs_hash > 0 {
-        let hashed = bcrypt::hash("admin123", 12).unwrap_or_default();
+        let hashed = bcrypt::hash("admin123", 12).map_err(|e| {
+            sqlx::Error::Configuration(format!("hash default admin password: {e}").into())
+        })?;
         repo.replace_placeholder_admin_password(&hashed)
             .await
             .map_err(db_err_to_sqlx)?;
@@ -176,7 +178,9 @@ async fn hash_default_admin_password_if_placeholder_pg(
         .await
         .map_err(db_err_to_sqlx)?;
     if needs_hash > 0 {
-        let hashed = bcrypt::hash("admin123", 12).unwrap_or_default();
+        let hashed = bcrypt::hash("admin123", 12).map_err(|e| {
+            sqlx::Error::Configuration(format!("hash default admin password: {e}").into())
+        })?;
         repo.replace_placeholder_admin_password(&hashed)
             .await
             .map_err(db_err_to_sqlx)?;

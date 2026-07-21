@@ -1,7 +1,7 @@
 import { Form, Input, Button, Card, message, Typography, Segmented, Alert } from 'antd';
 import { UserOutlined, LockOutlined, InfoCircleOutlined, ThunderboltFilled } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, LoginResponse, RegistrationStatus } from '../api/types';
 import { useI18n } from '../i18n/context';
@@ -22,6 +22,8 @@ export default function Login() {
   // v0.4.22: whether to show the "change default password" security banner.
   // Driven by the server's must_change_password flag on the admin account.
   const [showPwdWarning, setShowPwdWarning] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
 
   useEffect(() => {
     api
@@ -34,6 +36,9 @@ export default function Login() {
   }, []);
 
   const onFinish = async (values: { username: string; password: string }) => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
     try {
       const res = await api.post<unknown, ApiEnvelope<LoginResponse>>('/auth/login', values);
       if (res.code !== 0 || !res.data) {
@@ -49,6 +54,9 @@ export default function Login() {
       navigate('/');
     } catch {
       message.error(t('loginFailed'));
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
     }
   };
 
@@ -89,18 +97,18 @@ export default function Login() {
 
         <Form onFinish={onFinish} size="large">
           <Form.Item name="username" rules={[{ required: true, message: t('usernameRequired') }]}>
-            <Input prefix={<UserOutlined style={{ color: 'var(--rp-text-tertiary)' }} />} placeholder={t('username')} aria-label={t('username')} />
+            <Input autoComplete="username" prefix={<UserOutlined style={{ color: 'var(--rp-text-tertiary)' }} />} placeholder={t('username')} aria-label={t('username')} />
           </Form.Item>
           <Form.Item name="password" rules={[{ required: true, message: t('passwordRequired') }]}>
-            <Input.Password prefix={<LockOutlined style={{ color: 'var(--rp-text-tertiary)' }} />} placeholder={t('password')} aria-label={t('password')} />
+            <Input.Password autoComplete="current-password" prefix={<LockOutlined style={{ color: 'var(--rp-text-tertiary)' }} />} placeholder={t('password')} aria-label={t('password')} />
           </Form.Item>
           <Form.Item style={{ marginBottom: 12 }}>
-            <Button type="primary" htmlType="submit" block>{t('login')}</Button>
+            <Button type="primary" htmlType="submit" block loading={submitting}>{t('login')}</Button>
           </Form.Item>
         </Form>
         {regEnabled && (
           <div style={{ marginTop: 4, textAlign: 'center' }}>
-            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => navigate('/register')}>
+            <Button type="link" size="small" style={{ padding: 0 }} disabled={submitting} onClick={() => navigate('/register')}>
               {t('createAccount')}
             </Button>
           </div>

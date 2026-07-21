@@ -7,9 +7,8 @@
 //! user-facing (Chinese) error text, mapping each error variant to a message.
 
 use crate::db::error::DbError;
-use crate::db::repo::ResourceScope;
+use crate::db::repo::{ProfileDeleteOutcome, ProfileUpdateOutcome};
 use crate::db::Repository;
-use crate::service::rules::validate_protocol_transport;
 use relay_shared::models::TunnelProfile;
 
 /// Normalize a profile transport value. `"tls"` is an accepted alias for
@@ -32,6 +31,7 @@ pub fn is_valid_transport(transport: &str) -> bool {
 #[derive(Debug)]
 pub enum CreateProfileError {
     EmptyName,
+    DuplicateName,
     InvalidTransport,
     /// INSERT succeeded but the follow-up SELECT-by-name found nothing.
     FetchFailed,
@@ -42,12 +42,14 @@ pub enum CreateProfileError {
 pub enum UpdateProfileError {
     NotFound,
     BuiltinReadOnly,
+    EmptyName,
+    DuplicateName,
     InvalidTransport,
-    /// A transport change would break `count` already-bound rules; `protocol`
-    /// is the first conflicting protocol (for the user-facing message).
+    /// A transport change would break `count` already-bound rules; `sample`
+    /// is one stored protocol/public-transport pair.
     TransportConflict {
         count: usize,
-        protocol: String,
+        sample: String,
     },
     NoFields,
     Database(DbError),
@@ -85,9 +87,14 @@ pub async fn create_profile(
         return Err(CreateProfileError::InvalidTransport);
     }
 
-    db.insert_profile(name, &transport, tls_mode, ws_path, host_header, sni, uid)
+    match db
+        .insert_profile(name, &transport, tls_mode, ws_path, host_header, sni, uid)
         .await
-        .map_err(CreateProfileError::Database)?;
+    {
+        Ok(()) => {}
+        Err(DbError::UniqueViolation) => return Err(CreateProfileError::DuplicateName),
+        Err(error) => return Err(CreateProfileError::Database(error)),
+    }
 
     // INSERT-then-SELECT-by-name: name has a UNIQUE constraint so this hits the
     // just-inserted row.
@@ -112,39 +119,17 @@ pub async fn update_profile(
     host_header: Option<&str>,
     sni: Option<&str>,
 ) -> Result<(), UpdateProfileError> {
-    // Builtin guard: builtin profiles are read-only.
-    match db
-        .find_builtin_flag_by_id(id, &ResourceScope::All)
-        .await
-        .map_err(UpdateProfileError::Database)?
-    {
-        None => return Err(UpdateProfileError::NotFound),
-        Some(true) => return Err(UpdateProfileError::BuiltinReadOnly),
-        Some(false) => {}
+    let canonical_name = name.map(str::trim);
+    if canonical_name.is_some_and(str::is_empty) {
+        return Err(UpdateProfileError::EmptyName);
     }
 
-    // Normalize + validate transport if provided, then check it stays
-    // compatible with every rule already bound to this profile (otherwise a
-    // profile edit could make a bound rule silently get skipped at config-build
-    // time).
+    // Normalize + validate transport if provided. Bound-rule compatibility is
+    // checked under the profile write lock in the repository.
     let normalized_transport = transport.map(normalize_transport);
     if let Some(ref t) = normalized_transport {
         if !is_valid_transport(t) {
             return Err(UpdateProfileError::InvalidTransport);
-        }
-        let protocols = db
-            .list_rule_protocols_by_profile(id, &ResourceScope::All)
-            .await
-            .map_err(UpdateProfileError::Database)?;
-        let incompatible: Vec<&String> = protocols
-            .iter()
-            .filter(|p| validate_protocol_transport(p, t.as_str()).is_some())
-            .collect();
-        if !incompatible.is_empty() {
-            return Err(UpdateProfileError::TransportConflict {
-                count: incompatible.len(),
-                protocol: incompatible[0].clone(),
-            });
         }
     }
 
@@ -159,10 +144,9 @@ pub async fn update_profile(
     }
 
     match db
-        .update_profile_fields(
+        .update_profile_checked(
             id,
-            &ResourceScope::All,
-            name.map(str::trim),
+            canonical_name,
             normalized_transport.as_deref(),
             tls_mode,
             ws_path,
@@ -170,10 +154,18 @@ pub async fn update_profile(
             sni,
         )
         .await
-        .map_err(UpdateProfileError::Database)?
     {
-        0 => Err(UpdateProfileError::NotFound),
-        _ => Ok(()),
+        Ok(ProfileUpdateOutcome::Updated) => Ok(()),
+        Ok(ProfileUpdateOutcome::NotFound) => Err(UpdateProfileError::NotFound),
+        Ok(ProfileUpdateOutcome::BuiltinReadOnly) => Err(UpdateProfileError::BuiltinReadOnly),
+        Ok(ProfileUpdateOutcome::BindingConflict { count, sample }) => {
+            Err(UpdateProfileError::TransportConflict {
+                count: count as usize,
+                sample,
+            })
+        }
+        Err(DbError::UniqueViolation) => Err(UpdateProfileError::DuplicateName),
+        Err(error) => Err(UpdateProfileError::Database(error)),
     }
 }
 
@@ -182,31 +174,12 @@ pub async fn update_profile(
 /// ON DELETE clause, so a raw delete would fail anyway — we surface a friendly
 /// count instead).
 pub async fn delete_profile(db: &dyn Repository, id: i64) -> Result<(), DeleteProfileError> {
-    match db
-        .find_builtin_flag_by_id(id, &ResourceScope::All)
-        .await
-        .map_err(DeleteProfileError::Database)?
-    {
-        None => return Err(DeleteProfileError::NotFound),
-        Some(true) => return Err(DeleteProfileError::BuiltinReadOnly),
-        Some(false) => {}
-    }
-
-    let usage = db
-        .count_rules_by_profile(id, &ResourceScope::All)
-        .await
-        .map_err(DeleteProfileError::Database)?;
-    if usage > 0 {
-        return Err(DeleteProfileError::InUse(usage as usize));
-    }
-
-    match db
-        .delete_profile(id, &ResourceScope::All)
-        .await
-        .map_err(DeleteProfileError::Database)?
-    {
-        0 => Err(DeleteProfileError::NotFound),
-        _ => Ok(()),
+    match db.delete_profile_checked(id).await {
+        Ok(ProfileDeleteOutcome::Deleted) => Ok(()),
+        Ok(ProfileDeleteOutcome::NotFound) => Err(DeleteProfileError::NotFound),
+        Ok(ProfileDeleteOutcome::BuiltinReadOnly) => Err(DeleteProfileError::BuiltinReadOnly),
+        Ok(ProfileDeleteOutcome::InUse { rules }) => Err(DeleteProfileError::InUse(rules as usize)),
+        Err(error) => Err(DeleteProfileError::Database(error)),
     }
 }
 

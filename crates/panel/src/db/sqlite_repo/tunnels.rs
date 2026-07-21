@@ -137,20 +137,27 @@ impl TunnelRepository for SqliteRepository {
         // earlier service-layer read is not authoritative because it happened
         // before the SQLite writer lock was acquired.
         for (position, (group_id, port)) in hops.iter().enumerate() {
-            let group: Option<(String, String)> = try_!(
-                sqlx::query_as("SELECT group_type, connect_host FROM device_groups WHERE id = ?",)
-                    .bind(group_id)
-                    .fetch_optional(&mut *conn)
-                    .await
+            let group: Option<(String, String, bool)> = try_!(
+                sqlx::query_as(
+                    "SELECT dg.group_type, dg.connect_host, owner.admin \
+                     FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+                     WHERE dg.id = ?",
+                )
+                .bind(group_id)
+                .fetch_optional(&mut *conn)
+                .await
             );
-            let Some((group_type, connect_host)) = group else {
+            let Some((group_type, connect_host, owner_is_admin)) = group else {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                 return Err(DbError::TunnelUnavailable);
             };
             let valid = if position == 0 {
-                port.is_none() && matches!(group_type.as_str(), "in" | "both")
+                port.is_none() && matches!(group_type.as_str(), "in" | "both") && owner_is_admin
             } else {
-                port.is_some() && group_type != "monitor" && !connect_host.trim().is_empty()
+                port.is_some()
+                    && group_type != "monitor"
+                    && !connect_host.trim().is_empty()
+                    && owner_is_admin
             };
             if !valid {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
@@ -268,22 +275,27 @@ impl TunnelRepository for SqliteRepository {
                 return Err(DbError::TunnelUnavailable);
             }
             for (position, (group_id, port)) in hops.iter().enumerate() {
-                let group: Option<(String, String)> = try_!(
+                let group: Option<(String, String, bool)> = try_!(
                     sqlx::query_as(
-                        "SELECT group_type, connect_host FROM device_groups WHERE id = ?",
+                        "SELECT dg.group_type, dg.connect_host, owner.admin \
+                         FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+                         WHERE dg.id = ?",
                     )
                     .bind(group_id)
                     .fetch_optional(&mut *conn)
                     .await
                 );
-                let Some((group_type, connect_host)) = group else {
+                let Some((group_type, connect_host, owner_is_admin)) = group else {
                     let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                     return Err(DbError::TunnelUnavailable);
                 };
                 let valid = if position == 0 {
-                    port.is_none() && matches!(group_type.as_str(), "in" | "both")
+                    port.is_none() && matches!(group_type.as_str(), "in" | "both") && owner_is_admin
                 } else {
-                    port.is_some() && group_type != "monitor" && !connect_host.trim().is_empty()
+                    port.is_some()
+                        && group_type != "monitor"
+                        && !connect_host.trim().is_empty()
+                        && owner_is_admin
                 };
                 if !valid {
                     let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
@@ -546,6 +558,10 @@ impl TunnelRepository for SqliteRepository {
                (u.all_device_groups=1 OR EXISTS (SELECT 1 FROM user_device_groups udg \
                  WHERE udg.user_id=u.id AND udg.device_group_id=fr.device_group_in)))) \
              AND fr.paused=0 AND u.banned=0 AND u.suspended=0 \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=1) \
              AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at>datetime('now')) ORDER BY fr.id",
         ).bind(tunnel_id).fetch_all(&self.pool).await?;
@@ -585,6 +601,10 @@ impl TunnelRepository for SqliteRepository {
                (SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
                 AND udg.device_group_id=fr.device_group_in)))) \
              AND fr.paused=0 AND u.banned=0 AND u.suspended=0 \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=1) \
              AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at>datetime('now')) ORDER BY fr.id",
         )
@@ -602,6 +622,10 @@ impl TunnelRepository for SqliteRepository {
                  (SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
                   AND udg.device_group_id=fr.device_group_in)))) \
                AND fr.paused=0 AND u.banned=0 AND u.suspended=0 \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=1) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at>datetime('now'))) \
              ORDER BY rt.rule_id,rt.position,rt.id",
@@ -694,6 +718,10 @@ impl TunnelRepository for SqliteRepository {
                AND fr.tunnel_id=re.tunnel_id \
                AND source_tunnel.enabled=1 AND fr.paused=0 \
                AND u.banned=0 AND u.suspended=0 \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=re.device_group_id AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=1) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at>datetime('now')) \
                AND (u.admin=1 OR (source_tunnel.shared=1 AND (u.all_device_groups=1 OR EXISTS( \
@@ -717,12 +745,17 @@ impl TunnelRepository for SqliteRepository {
              LEFT JOIN tunnels t ON t.id=fr.tunnel_id \
              WHERE rt.device_group_id=? AND rt.expires_at>=unixepoch() \
                AND fr.paused=0 AND u.banned=0 AND u.suspended=0 \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=1) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at>datetime('now')) \
-               AND (fr.tunnel_id IS NULL OR (t.enabled=1 AND \
-                 (u.admin=1 OR (t.shared=1 AND (u.all_device_groups=1 OR EXISTS( \
+               AND (fr.tunnel_id IS NULL OR t.enabled=1) \
+               AND (u.admin=1 OR ((fr.tunnel_id IS NULL OR t.shared=1) AND \
+                 (u.all_device_groups=1 OR EXISTS( \
                    SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
-                     AND udg.device_group_id=fr.device_group_in)))))) \
+                     AND udg.device_group_id=fr.device_group_in)))) \
              ORDER BY fr.id",
         )
         .bind(group_id)
@@ -744,15 +777,19 @@ impl TunnelRepository for SqliteRepository {
                  SELECT 1 FROM forward_rule_retired_entries re WHERE re.rule_id=fr.id \
                    AND re.device_group_id=? AND re.expires_at>=unixepoch())) \
                AND fr.paused=0 AND u.banned=0 AND u.suspended=0 \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=1) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at>datetime('now')) \
-               AND (fr.tunnel_id IS NULL OR (t.enabled=1 AND \
-                 (u.admin=1 OR (t.shared=1 AND (u.all_device_groups=1 OR EXISTS( \
+               AND (fr.tunnel_id IS NULL OR t.enabled=1) \
+               AND (u.admin=1 OR ((fr.tunnel_id IS NULL OR t.shared=1) AND \
+                 (u.all_device_groups=1 OR EXISTS( \
                    SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
-                     AND udg.device_group_id=?)))))) \
+                     AND udg.device_group_id=fr.device_group_in)))) \
              ORDER BY fr.id",
         )
-        .bind(group_id)
         .bind(group_id)
         .bind(group_id)
         .fetch_all(&self.pool)
@@ -770,12 +807,17 @@ impl TunnelRepository for SqliteRepository {
              LEFT JOIN tunnels t ON t.id=fr.tunnel_id \
              WHERE rt.device_group_id=? AND rt.expires_at<unixepoch() \
                AND fr.paused=0 AND u.banned=0 AND u.suspended=0 \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=1) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at>datetime('now')) \
-               AND (fr.tunnel_id IS NULL OR (t.enabled=1 AND \
-                 (u.admin=1 OR (t.shared=1 AND (u.all_device_groups=1 OR EXISTS( \
+               AND (fr.tunnel_id IS NULL OR t.enabled=1) \
+               AND (u.admin=1 OR ((fr.tunnel_id IS NULL OR t.shared=1) AND \
+                 (u.all_device_groups=1 OR EXISTS( \
                    SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
-                     AND udg.device_group_id=fr.device_group_in)))))) \
+                     AND udg.device_group_id=fr.device_group_in)))) \
              ORDER BY fr.id",
         )
         .bind(group_id)

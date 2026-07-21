@@ -289,11 +289,17 @@ pub async fn node_ws_handler(
     // v0.4.14: optional per-node identity. None for an older node that didn't
     // send X-Node-ID — it still connects and gets config_changed, it just can't
     // be targeted by directed diagnosis.
-    let node_id = headers
-        .get("X-Node-ID")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let node_id = match headers.get("X-Node-ID") {
+        None => None,
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(crate::api::node::normalize_node_id)
+        {
+            Some(node_id) => Some(node_id),
+            None => return axum::http::StatusCode::BAD_REQUEST.into_response(),
+        },
+    };
     // Clone the Arc<dyn Repository> so the WS task can keep using it after the
     // upgrade handler returns. The pool snapshot is shared read-only.
     let db = state.db.clone();
@@ -360,7 +366,7 @@ async fn handle_node_ws(
     // Send initial config snapshot so a freshly-connected node has its config
     // immediately, without waiting for the first HTTP poll. None (DB error) →
     // skip the push; the node will get its config on the next HTTP poll.
-    if let Some(config) = build_config_snapshot(db.as_ref(), group_id).await {
+    if let Some(config) = build_config_snapshot(db.as_ref(), group_id, &token).await {
         if let Ok(config_json) = serde_json::to_string(&config) {
             let _ = sender.send(Message::Text(config_json.into())).await;
         }
@@ -424,6 +430,7 @@ async fn handle_node_ws(
 async fn build_config_snapshot(
     db: &dyn crate::db::Repository,
     group_id: i64,
+    token: &str,
 ) -> Option<NodeConfigResponse> {
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
@@ -436,7 +443,24 @@ async fn build_config_snapshot(
     // than pushing an empty config that would incorrectly tear down the node's
     // listeners). An empty Ok is a legitimate "no rules" snapshot.
     match crate::service::node_config::build_node_config(db, group_id).await {
-        Ok(cfg) => Some(cfg),
+        Ok(cfg) => match db.find_by_token(token).await {
+            Ok(Some(group)) if group.id == group_id => Some(cfg),
+            Ok(_) => {
+                tracing::warn!(
+                    "build_config_snapshot: token rotated during build for group {}",
+                    group_id
+                );
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    "build_config_snapshot: post-build token revalidation failed for group {}: {}",
+                    group_id,
+                    e
+                );
+                None
+            }
+        },
         Err(e) => {
             tracing::error!(
                 "build_config_snapshot: build_node_config failed for group {}: {}",

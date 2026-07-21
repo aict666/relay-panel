@@ -1,5 +1,5 @@
 use super::err;
-use super::PlanWithGroups;
+use super::{purchase_revision, PlanWithGroups};
 use crate::api::middleware::AuthUser;
 use crate::api::AppState;
 use crate::db::repo::BuyPlanError;
@@ -29,6 +29,14 @@ pub async fn list_public_plans(
             return Json(err(500, "数据库错误"));
         }
     };
+    let valid_group_ids: std::collections::HashSet<i64> =
+        match state.db.list_all_inbound_group_ids().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                tracing::error!("list_public_plans: valid group catalog failed: {}", e);
+                return Json(err(500, "数据库错误"));
+            }
+        };
     let mut out = Vec::with_capacity(plans.len());
     for plan in plans {
         // grant_all_groups plans grant everything — the explicit list is moot,
@@ -48,6 +56,16 @@ pub async fn list_public_plans(
                 }
             }
         };
+        if device_group_ids
+            .iter()
+            .any(|group_id| !valid_group_ids.contains(group_id))
+        {
+            tracing::warn!(
+                plan_id = plan.id,
+                "list_public_plans: hiding historical plan with an unusable device-group grant"
+            );
+            continue;
+        }
         let device_group_names = match state.db.list_group_names_by_ids(&device_group_ids).await {
             Ok(names) => names,
             Err(e) => {
@@ -59,10 +77,12 @@ pub async fn list_public_plans(
                 return Json(err(500, "数据库错误"));
             }
         };
+        let purchase_revision = purchase_revision(&plan, &device_group_ids);
         out.push(PlanWithGroups {
             plan,
             device_group_ids,
             device_group_names,
+            purchase_revision,
         });
     }
     Json(ApiResponse::success(out))
@@ -88,6 +108,13 @@ pub async fn buy_plan(
     if plan.hidden {
         // Don't reveal existence — same 404 as a missing plan.
         return Json(err(404, "套餐不存在"));
+    }
+    if let Some(expected_price) = req.expected_price.as_deref() {
+        match relay_shared::money::parse_balance(expected_price) {
+            Ok(expected) if expected == plan.price => {}
+            Ok(_) => return Json(err(409, "套餐价格已变更，请刷新后重新确认")),
+            Err(reason) => return Json(err(400, reason)),
+        }
     }
     // A time plan must have a positive duration (the CRUD layer enforces this
     // too, but a pre-existing bad row shouldn't crash the purchase).
@@ -136,29 +163,24 @@ pub async fn buy_plan(
             }
         }
     };
-
-    // v1.0.8: compute the new authorized set that will drive pause_rules_outside
-    // _groups inside buy_plan. grant_all_groups → all inbound groups (nothing
-    // paused), else the plan's own groups.
-    let new_authorized_group_ids: Vec<i64> = if plan.grant_all_groups {
-        match state.db.list_all_inbound_group_ids().await {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::error!(
-                    "buy_plan {}: list_all_inbound_group_ids failed: {}",
-                    plan.id,
-                    e
-                );
-                return Json(err(500, "数据库错误"));
-            }
+    if let Some(expected_revision) = req.expected_revision.as_deref() {
+        if expected_revision != purchase_revision(&plan, &device_group_ids) {
+            return Json(err(409, "套餐内容已变更，请刷新后重新确认"));
         }
+    }
+
+    // Per-group plans use their grant set for pause/resume. Grant-all semantics
+    // are handled directly inside the purchase transaction, avoiding a stale
+    // pre-transaction snapshot of the global group catalog.
+    let new_authorized_group_ids = if plan.grant_all_groups {
+        Vec::new()
     } else {
         device_group_ids.clone()
     };
 
     match state
         .db
-        .buy_plan(
+        .buy_plan_guarded(
             user.user_id,
             plan.id,
             &plan.name,
@@ -170,6 +192,8 @@ pub async fn buy_plan(
             plan.grant_all_groups,
             &device_group_ids,
             &new_authorized_group_ids,
+            true,
+            None,
         )
         .await
     {
@@ -184,6 +208,9 @@ pub async fn buy_plan(
             Json(ApiResponse::success(()))
         }
         Err(BuyPlanError::InsufficientBalance) => Json(err(400, "余额不足")),
+        Err(BuyPlanError::PlanChanged) => Json(err(409, "套餐已变更，请刷新后重新确认")),
+        Err(BuyPlanError::UserPlanChanged) => Json(err(409, "当前套餐已变更，请刷新后重新确认")),
+        Err(BuyPlanError::QuotaOverflow) => Json(err(409, "累计流量额度超出系统上限")),
         Err(BuyPlanError::Database(e)) => {
             tracing::error!("buy_plan {}: db error: {}", plan.id, e);
             Json(err(500, "数据库错误"))

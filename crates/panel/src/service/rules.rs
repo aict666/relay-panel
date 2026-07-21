@@ -419,6 +419,16 @@ async fn validate_chain_hops(
         }
         match GroupRepository::find_by_id(db, gid, &ResourceScope::All).await {
             Ok(Some(g)) => {
+                let owner_is_admin = db.is_admin(g.uid).await.map_err(|e| {
+                    tracing::error!("{}: hop owner lookup failed: {}", context, e);
+                    CreateRuleError::Database(e)
+                })?;
+                if !owner_is_admin {
+                    return Err(CreateRuleError::BadRequest(format!(
+                        "hops[{}]: device group {} is not administrator-managed",
+                        i, gid
+                    )));
+                }
                 if g.group_type == "monitor" {
                     return Err(CreateRuleError::BadRequest(format!(
                         "hops[{}]: monitor groups cannot be used as chain hops",
@@ -486,6 +496,10 @@ pub async fn create_rule(
     caller_admin: bool,
     req: &CreateRuleRequest,
 ) -> Result<(), CreateRuleError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(CreateRuleError::BadRequest("规则名称不能为空".into()));
+    }
     if req.protocol == Protocol::Uot {
         return Err(CreateRuleError::BadRequest(
             "protocol 'uot' is internal-only; create an UDP or TCP+UDP chain instead".into(),
@@ -554,6 +568,8 @@ pub async fn create_rule(
                 "tunnel_id: tunnel path is incomplete".into(),
             ));
         }
+        let tunnel_hop_ids: Vec<i64> = tunnel.hops.iter().map(|hop| hop.device_group_id).collect();
+        validate_chain_hops(db, &tunnel_hop_ids, "create_rule preset tunnel").await?;
         Some(tunnel)
     } else {
         None
@@ -734,8 +750,23 @@ pub async fn create_rule(
     };
 
     let lb_db = req.load_balance_strategy.to_db_str();
-    let up_mbps = req.upload_limit_mbps.unwrap_or(0).max(0);
-    let down_mbps = req.download_limit_mbps.unwrap_or(0).max(0);
+    let up_mbps = req.upload_limit_mbps.unwrap_or(0);
+    let down_mbps = req.download_limit_mbps.unwrap_or(0);
+    let max_connections = req.max_connections.unwrap_or(0);
+    let auto_restart_minutes = req.auto_restart_minutes.unwrap_or(0);
+    if up_mbps < 0 || down_mbps < 0 || max_connections < 0 || auto_restart_minutes < 0 {
+        return Err(CreateRuleError::BadRequest(
+            "速率、连接数上限和自动重启间隔不能为负数".into(),
+        ));
+    }
+    if auto_restart_minutes != 0
+        && auto_restart_minutes < relay_shared::models::MIN_AUTO_RESTART_MINUTES
+    {
+        return Err(CreateRuleError::BadRequest(format!(
+            "自动重启间隔最小 {} 分钟（0 = 关闭）",
+            relay_shared::models::MIN_AUTO_RESTART_MINUTES
+        )));
+    }
 
     let mut attempt = 0u32;
     let max_attempts = if req.listen_port.is_some() { 1 } else { 8 };
@@ -773,7 +804,7 @@ pub async fn create_rule(
 
         match db
             .create_rule_full_with_tunnel(
-                &req.name,
+                name,
                 owner_uid,
                 port as i32,
                 protocol_str,
@@ -794,6 +825,8 @@ pub async fn create_rule(
                 down_mbps,
                 req.tunnel_profile_id,
                 req.tunnel_id,
+                max_connections,
+                auto_restart_minutes,
             )
             .await
         {
@@ -818,8 +851,22 @@ pub async fn create_rule(
     match result {
         Ok(None) => {
             // Quota exhausted: the guarded INSERT matched 0 rows.
-            let current_count: i64 = db.count_by_uid(owner_uid).await.unwrap_or(0);
-            let max_rules: i32 = db.max_rules_for_uid(owner_uid).await.unwrap_or(0);
+            let current_count = db.count_by_uid(owner_uid).await.map_err(|error| {
+                tracing::error!(
+                    "create_rule: count_by_uid({}) after quota rejection failed: {}",
+                    owner_uid,
+                    error
+                );
+                CreateRuleError::Database(error)
+            })?;
+            let max_rules = db.max_rules_for_uid(owner_uid).await.map_err(|error| {
+                tracing::error!(
+                    "create_rule: max_rules_for_uid({}) after quota rejection failed: {}",
+                    owner_uid,
+                    error
+                );
+                CreateRuleError::Database(error)
+            })?;
             Err(CreateRuleError::BadRequest(format!(
                 "Rule limit reached: you have {} rules, max is {}",
                 current_count, max_rules
@@ -834,6 +881,16 @@ pub async fn create_rule(
         )),
         Err(DbError::TunnelAccessDenied) => Err(CreateRuleError::Forbidden(
             "该隧道未共享给您，或您的套餐未授权其入口线路".into(),
+        )),
+        Err(DbError::ProfileUnavailable) => Err(CreateRuleError::BadRequest(
+            "tunnel_profile_id: template changed or no longer matches the selected transport"
+                .into(),
+        )),
+        Err(DbError::RuleGroupUnavailable) => Err(CreateRuleError::BadRequest(
+            "device_group_in or a downstream hop is no longer available".into(),
+        )),
+        Err(DbError::RuleGroupAccessDenied) => Err(CreateRuleError::Forbidden(
+            "device_group_in 不在规则所有者当前允许的分组列表中".into(),
         )),
         Err(e) => {
             tracing::error!("create_rule: create_rule_full failed: {}", e);
@@ -892,7 +949,60 @@ pub async fn update_rule(
             return Err(UpdateRuleError::Database(e));
         }
     };
+    let name = match req.name.as_deref() {
+        Some(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(UpdateRuleError::BadRequest("规则名称不能为空".into()));
+            }
+            Some(name.to_owned())
+        }
+        None => None,
+    };
     let _owner_scope = ResourceScope::Owner(existing.uid);
+
+    // A pure pause is always a safe operation.  Do it before validating the
+    // currently stored route/profile so operators can stop legacy rows that
+    // have become invalid.  Resume and every other edit still take the normal
+    // validation path below.
+    let pause_only = req.paused == Some(true)
+        && req.name.is_none()
+        && req.listen_port.is_none()
+        && req.protocol.is_none()
+        && req.device_group_in.is_none()
+        && req.device_group_out.is_none()
+        && req.forward_mode.is_none()
+        && req.route_mode.is_none()
+        && req.hops.is_none()
+        && req.tunnel_id.is_none()
+        && req.public_transport.is_none()
+        && req.ws_path.is_none()
+        && req.target_addr.is_none()
+        && req.target_port.is_none()
+        && req.targets.is_none()
+        && req.load_balance_strategy.is_none()
+        && req.upload_limit_mbps.is_none()
+        && req.download_limit_mbps.is_none()
+        && req.tunnel_profile_id.is_none()
+        && req.max_connections.is_none()
+        && req.auto_restart_minutes.is_none();
+    if pause_only {
+        let update = RuleUpdateData {
+            id,
+            owner_uid: scope.owner_id(),
+            effective_device_group_in: existing.device_group_in,
+            paused: Some(true),
+            ..Default::default()
+        };
+        return match db.update_rule_full(&update).await {
+            Ok(0) => Err(UpdateRuleError::NotFound),
+            Ok(_) => Ok(()),
+            Err(error) => {
+                tracing::error!("update_rule {}: pause failed: {}", id, error);
+                Err(UpdateRuleError::Database(error))
+            }
+        };
+    }
 
     if req.hops.is_some()
         && (matches!(req.tunnel_id, Some(Some(_)))
@@ -963,6 +1073,10 @@ pub async fn update_rule(
                 "tunnel_id: tunnel path is incomplete".into(),
             ));
         }
+        let tunnel_hop_ids: Vec<i64> = tunnel.hops.iter().map(|hop| hop.device_group_id).collect();
+        validate_chain_hops(db, &tunnel_hop_ids, "update_rule preset tunnel")
+            .await
+            .map_err(map_create_rule_validation_error)?;
         Some(tunnel)
     } else {
         None
@@ -1353,14 +1467,16 @@ pub async fn update_rule(
         };
 
     let rate_limits = if req.upload_limit_mbps.is_some() || req.download_limit_mbps.is_some() {
-        Some((
-            req.upload_limit_mbps
-                .unwrap_or(existing.upload_limit_mbps)
-                .max(0),
-            req.download_limit_mbps
-                .unwrap_or(existing.download_limit_mbps)
-                .max(0),
-        ))
+        let upload_limit_mbps = req.upload_limit_mbps.unwrap_or(existing.upload_limit_mbps);
+        let download_limit_mbps = req
+            .download_limit_mbps
+            .unwrap_or(existing.download_limit_mbps);
+        if upload_limit_mbps < 0 || download_limit_mbps < 0 {
+            return Err(UpdateRuleError::BadRequest(
+                "上传和下载速率不能为负数".into(),
+            ));
+        }
+        Some((upload_limit_mbps, download_limit_mbps))
     } else {
         None
     };
@@ -1370,14 +1486,15 @@ pub async fn update_rule(
     // counterparts without a second post-update read.
     let connection_controls = if req.max_connections.is_some() || req.auto_restart_minutes.is_some()
     {
-        let max_connections = req
-            .max_connections
-            .unwrap_or(existing.max_connections)
-            .max(0);
+        let max_connections = req.max_connections.unwrap_or(existing.max_connections);
         let auto_restart_minutes = req
             .auto_restart_minutes
-            .unwrap_or(existing.auto_restart_minutes)
-            .max(0);
+            .unwrap_or(existing.auto_restart_minutes);
+        if max_connections < 0 || auto_restart_minutes < 0 {
+            return Err(UpdateRuleError::BadRequest(
+                "连接数上限和自动重启间隔不能为负数".into(),
+            ));
+        }
         if auto_restart_minutes != 0
             && auto_restart_minutes < relay_shared::models::MIN_AUTO_RESTART_MINUTES
         {
@@ -1395,7 +1512,7 @@ pub async fn update_rule(
         id,
         owner_uid: scope.owner_id(),
         effective_device_group_in: device_group_in_arg.unwrap_or(existing.device_group_in),
-        name: req.name.clone(),
+        name,
         listen_port: req.listen_port.map(|port| port as i32),
         protocol: req
             .protocol
@@ -1437,6 +1554,16 @@ pub async fn update_rule(
         )),
         Err(DbError::TunnelAccessDenied) => Err(UpdateRuleError::Forbidden(
             "该隧道未共享给您，或您的套餐未授权其入口线路".into(),
+        )),
+        Err(DbError::ProfileUnavailable) => Err(UpdateRuleError::BadRequest(
+            "tunnel_profile_id: template changed or no longer matches the selected transport"
+                .into(),
+        )),
+        Err(DbError::RuleGroupUnavailable) => Err(UpdateRuleError::BadRequest(
+            "device_group_in or a downstream hop is no longer available".into(),
+        )),
+        Err(DbError::RuleGroupAccessDenied) => Err(UpdateRuleError::Forbidden(
+            "device_group_in 不在规则所有者当前允许的分组列表中".into(),
         )),
         Err(e) => {
             tracing::error!("update_rule {}: update_rule_fields failed: {}", id, e);

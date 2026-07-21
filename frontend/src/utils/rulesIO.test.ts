@@ -132,6 +132,9 @@ describe('validateImportEntry', () => {
     expect(validateImportEntry({ name: 'r1', listen_port: 0, dest: ['1.1.1.1:80'] })).toMatch(/listen_port/);
     expect(validateImportEntry({ name: 'r1', listen_port: 70000, dest: ['1.1.1.1:80'] })).toMatch(/listen_port/);
   });
+  it('rejects a fractional listen_port before calling the integer API', () => {
+    expect(validateImportEntry({ name: 'r1', listen_port: 10000.5, dest: ['1.1.1.1:80'] })).toMatch(/listen_port/);
+  });
   it('rejects an empty dest array', () => {
     expect(validateImportEntry({ name: 'r1', listen_port: 10000, dest: [] })).toMatch(/dest/);
   });

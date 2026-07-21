@@ -124,27 +124,32 @@ fn err<T: Serialize, S: Into<String>>(code: i32, msg: S) -> ApiResponse<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{change_password, reset_user_password, ResetPasswordRequest};
     use super::{
-        create_group, create_rule, create_user, delete_group, delete_plan, delete_rule,
-        delete_user, err, get_me, get_registration_settings, list_groups, list_rules,
-        reset_user_traffic, update_group, update_registration_settings, update_rule, update_user,
-        ApiResponse, ChangePasswordRequest, CreateUserRequest, ListRulesQuery,
+        admin_set_user_plan, create_group, create_plan, create_rule, create_tunnel_profile,
+        create_user, delete_group, delete_plan, delete_rule, delete_tunnel_profile, delete_user,
+        err, get_me, get_registration_settings, list_groups, list_owned_group_summaries,
+        list_public_plans, list_rules, reset_user_traffic, update_group, update_plan,
+        update_registration_settings, update_rule, update_tunnel_profile, update_user, ApiResponse,
+        ChangePasswordRequest, CreateUserRequest, ListRulesQuery,
     };
+    use super::{change_password, reset_user_password, ResetPasswordRequest};
     use crate::api::auth::{register, registration_status};
     use crate::api::middleware::{AdminOnly, AuthUser};
     use crate::api::system::ReleaseCache;
     use crate::api::ws::NodeConnections;
     use crate::api::AppState;
     use crate::config::Config;
+    use crate::db::error::DbError;
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
     use axum::extract::{Path, Query, State};
     use axum::Json;
     use relay_shared::protocol::{
-        CreateGroupRequest, CreateRuleRequest, CreateTunnelRequest, GroupType, Protocol,
-        PublicTransport, RegisterRequest, RegistrationSettingsRequest, TunnelHopRequest,
-        UpdateGroupRequest, UpdateRuleRequest, UpdateTunnelRequest, UpdateUserRequest,
+        AdminSetUserPlanRequest, CreateGroupRequest, CreatePlanRequest, CreateRuleRequest,
+        CreateTunnelProfileRequest, CreateTunnelRequest, GroupType, Protocol, PublicTransport,
+        RegisterRequest, RegistrationSettingsRequest, TunnelHopRequest, UpdateGroupRequest,
+        UpdatePlanRequest, UpdateRuleRequest, UpdateTunnelProfileRequest, UpdateTunnelRequest,
+        UpdateUserRequest,
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
@@ -402,6 +407,10 @@ mod tests {
         assert_eq!(sum2.0, 0);
         assert_eq!(user3.0, 222, "other user total must be untouched");
         assert_eq!(sum3.0, 555, "other user's rules must be untouched");
+
+        let Json(missing) =
+            reset_user_traffic(AdminOnly { user_id: 1 }, State(state), Path(999_999)).await;
+        assert_eq!(missing.code, 404);
     }
 
     #[tokio::test]
@@ -595,14 +604,15 @@ mod tests {
         let (state, pool) = test_state().await;
         sqlx::query(
             "INSERT INTO plans (id, name, max_rules, traffic) \
-             VALUES (2, 'configured-default', 10, 268435456000)",
+             VALUES (2, 'configured-default', 10, 268435456000), \
+                    (3, 'registration-option', 10, 268435456000)",
         )
         .execute(&pool)
         .await
         .unwrap();
         state
             .db
-            .set_registration_settings(false, 2, &[2])
+            .set_registration_settings(false, 2, &[2, 3])
             .await
             .unwrap();
 
@@ -618,6 +628,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(default_exists.0, 1, "the configured default must remain");
+
+        let Json(allowed_resp) =
+            delete_plan(AdminOnly { user_id: 1 }, State(state.clone()), Path(3)).await;
+        assert_eq!(allowed_resp.code, 409);
+        assert_eq!(
+            allowed_resp.message,
+            "该套餐仍在允许注册列表中，请先修改系统设置。"
+        );
+        let allowed_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE id = 3")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(allowed_exists, 1);
+
+        state
+            .db
+            .set_registration_settings(false, 2, &[2])
+            .await
+            .unwrap();
 
         // Once the default has moved away from the original free plan, that
         // otherwise-unused plan can be deleted normally.
@@ -648,7 +677,7 @@ mod tests {
 
         let Json(resp) = create_user(
             AdminOnly { user_id: 1 },
-            State(state),
+            State(state.clone()),
             Json(CreateUserRequest {
                 username: "missing_plan_user".into(),
                 password: "secret123".into(),
@@ -840,6 +869,21 @@ mod tests {
             resp.message
         );
 
+        let Json(resp) = update_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Path(200),
+            Json(UpdateRuleRequest {
+                max_connections: Some(-1),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 400, "negative caps must be rejected");
+
         // 0 = off is always allowed, and so is anything at/above the floor.
         for v in [0, relay_shared::models::MIN_AUTO_RESTART_MINUTES] {
             let Json(resp) = update_rule(
@@ -857,6 +901,144 @@ mod tests {
             .await;
             assert_eq!(resp.code, 0, "{} must be accepted: {}", v, resp.message);
         }
+    }
+
+    /// Creating a rule accepts the same connection controls as editing one and
+    /// persists them atomically with the new row. This pins the UI workflow so
+    /// users no longer need a second edit immediately after creation.
+    #[tokio::test]
+    async fn create_rule_persists_connection_controls() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 20, 1, "admin-in").await;
+
+        let Json(resp) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state),
+            Json(CreateRuleRequest {
+                max_connections: Some(321),
+                auto_restart_minutes: Some(relay_shared::models::MIN_AUTO_RESTART_MINUTES),
+                ..rule_req("create-with-controls", 21000, 20, None)
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 0, "{}", resp.message);
+
+        let stored: (i64, i64) = sqlx::query_as(
+            "SELECT max_connections, auto_restart_minutes FROM forward_rules WHERE name = 'create-with-controls'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored,
+            (321, relay_shared::models::MIN_AUTO_RESTART_MINUTES as i64)
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_names_are_trimmed_and_blank_names_are_rejected() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 20, 1, "admin-in").await;
+
+        let Json(blank_create) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(rule_req("  \t", 21010, 20, None)),
+        )
+        .await;
+        assert_eq!(blank_create.code, 400);
+
+        let Json(created) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(rule_req("  trimmed-rule  ", 21011, 20, None)),
+        )
+        .await;
+        assert_eq!(created.code, 0, "{}", created.message);
+        let rule_id: (i64,) =
+            sqlx::query_as("SELECT id FROM forward_rules WHERE name = 'trimmed-rule'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let Json(blank_update) = update_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state),
+            Path(rule_id.0),
+            Json(UpdateRuleRequest {
+                name: Some("  ".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(blank_update.code, 400);
+
+        let stored: (String,) = sqlx::query_as("SELECT name FROM forward_rules WHERE id = ?")
+            .bind(rule_id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored.0, "trimmed-rule");
+    }
+
+    #[tokio::test]
+    async fn create_rule_rejects_auto_restart_below_floor() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 20, 1, "admin-in").await;
+
+        let Json(resp) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(CreateRuleRequest {
+                auto_restart_minutes: Some(1),
+                ..rule_req("unsafe-restart", 21001, 20, None)
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 400, "{}", resp.message);
+
+        let Json(resp) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(CreateRuleRequest {
+                auto_restart_minutes: Some(-1),
+                ..rule_req("negative-restart", 21002, 20, None)
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 400, "negative intervals must be rejected");
+
+        let Json(resp) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state),
+            Json(CreateRuleRequest {
+                upload_limit_mbps: Some(-1),
+                ..rule_req("negative-rate", 21003, 20, None)
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 400, "negative rates must be rejected");
     }
 
     /// v1.2.0: setting ONLY max_connections must not switch off a rule's
@@ -926,6 +1108,21 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+
+        let Json(resp) = update_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Path(200),
+            Json(UpdateRuleRequest {
+                download_limit_mbps: Some(-1),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 400, "negative rates must be rejected");
 
         let Json(resp) = update_rule(
             AuthUser {
@@ -1087,6 +1284,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_mutations_validate_names_and_preserve_bound_rule_compatibility() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 20, 1, "admin-in").await;
+
+        let request = CreateTunnelProfileRequest {
+            name: "custom-ws".into(),
+            transport: "ws".into(),
+            tls_mode: "none".into(),
+            ws_path: "/relay".into(),
+            host_header: String::new(),
+            sni: String::new(),
+        };
+        let Json(created) = create_tunnel_profile(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(request),
+        )
+        .await;
+        assert_eq!(created.code, 0, "{}", created.message);
+        let profile_id = created.data.unwrap().id;
+
+        let Json(duplicate) = create_tunnel_profile(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(CreateTunnelProfileRequest {
+                name: "custom-ws".into(),
+                transport: "ws".into(),
+                tls_mode: "none".into(),
+                ws_path: "/other".into(),
+                host_header: String::new(),
+                sni: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(duplicate.code, 409);
+
+        let Json(blank) = update_tunnel_profile(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(profile_id),
+            Json(UpdateTunnelProfileRequest {
+                name: Some("   ".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(blank.code, 400);
+
+        // Repository-side snapshot validation is authoritative: even if a
+        // caller reached the write with stale profile metadata, no mismatched
+        // rule can be committed.
+        let stale_write = state
+            .db
+            .create_rule_full_with_tunnel(
+                "stale-profile",
+                1,
+                11999,
+                "tcp",
+                "tls_simple",
+                "tls_simple",
+                "direct",
+                "tls_simple",
+                None,
+                20,
+                None,
+                "direct",
+                "127.0.0.1",
+                80,
+                &[],
+                &[],
+                "first",
+                0,
+                0,
+                Some(profile_id),
+                None,
+                0,
+                0,
+            )
+            .await;
+        assert!(matches!(stale_write, Err(DbError::ProfileUnavailable)));
+        let stale_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE name='stale-profile'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stale_count, 0);
+
+        add_rule(&pool, 200, 1, 20, 12000, 0).await;
+        sqlx::query(
+            "UPDATE forward_rules SET public_transport='ws', node_transport='ws', \
+             entry_transport='ws', tunnel_profile_id=? WHERE id=200",
+        )
+        .bind(profile_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Protocol tcp remains valid for both transports, but the rule's
+        // stored public_transport='ws' would no longer match a tls template.
+        let Json(conflict) = update_tunnel_profile(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(profile_id),
+            Json(UpdateTunnelProfileRequest {
+                transport: Some("tls_simple".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(conflict.code, 400);
+        let transport: String =
+            sqlx::query_scalar("SELECT transport FROM tunnel_profiles WHERE id = ?")
+                .bind(profile_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(transport, "ws", "conflicting edit must roll back");
+
+        let Json(in_use) = delete_tunnel_profile(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(profile_id),
+        )
+        .await;
+        assert_eq!(in_use.code, 409);
+
+        sqlx::query("DELETE FROM forward_rules WHERE id = 200")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Json(deleted) =
+            delete_tunnel_profile(AdminOnly { user_id: 1 }, State(state), Path(profile_id)).await;
+        assert_eq!(deleted.code, 0, "{}", deleted.message);
+    }
+
+    #[tokio::test]
     async fn delete_rule_nonexistent_returns_404_no_broadcast() {
         let (state, _pool) = test_state().await;
         expect_broadcasts(&state, 0, async {
@@ -1193,6 +1526,15 @@ mod tests {
         assert_eq!(
             count2, 0,
             "after rule deletion, group should have 0 references"
+        );
+
+        sqlx::query("DROP TABLE forward_rule_hops")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            state.db.count_rules_by_group(30).await.is_err(),
+            "a failed hop-reference lookup must not be reported as zero"
         );
     }
 
@@ -1438,6 +1780,8 @@ mod tests {
             upload_limit_mbps: None,
             download_limit_mbps: None,
             tunnel_profile_id: None,
+            max_connections: None,
+            auto_restart_minutes: None,
         }
     }
 
@@ -1734,6 +2078,54 @@ mod tests {
         assert_eq!(deny.code, 403, "empty authorization must deny, not allow");
     }
 
+    #[tokio::test]
+    async fn admin_rule_writes_still_enforce_the_target_owners_authorization() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "admin-in-1").await;
+        assign_user_groups(&pool, 2, &[]).await;
+
+        // Admin actor privileges must not turn into forwarding privileges for
+        // the ordinary user who will own and run the rule.
+        let Json(create_denied) = create_rule(
+            auth(1, true),
+            State(state.clone()),
+            Json(rule_req("admin-created", 20001, 1, Some(2))),
+        )
+        .await;
+        assert_eq!(create_denied.code, 403, "{}", create_denied.message);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE name='admin-created'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+
+        // Seed a system-paused rule to exercise the transactional resume guard.
+        add_rule(&pool, 200, 2, 1, 20002, 0).await;
+        sqlx::query("UPDATE forward_rules SET paused=1,auto_paused=1 WHERE id=200")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Json(resume_denied) = update_rule(
+            auth(1, true),
+            State(state),
+            Path(200),
+            Json(UpdateRuleRequest {
+                paused: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resume_denied.code, 403, "{}", resume_denied.message);
+        let state: (bool, bool) =
+            sqlx::query_as("SELECT paused,auto_paused FROM forward_rules WHERE id=200")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, (true, true));
+    }
+
     /// A chain update takes its effective entry group from hops[0].  The API
     /// must authorize that value even when device_group_in is omitted; checking
     /// only the legacy field lets restricted users move their rules to shared
@@ -1945,6 +2337,138 @@ mod tests {
         assert_eq!(row.2, "50.00", "balance must ALSO be applied (not dropped)");
     }
 
+    /// REGRESSION: the user row, explicit group assignments, and consequent
+    /// rule pauses are one transaction. A bad group id must not leave any of
+    /// the earlier parts committed.
+    #[tokio::test]
+    async fn update_user_rolls_back_every_field_when_authorization_fails() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "admin-in").await;
+        assign_user_groups(&pool, 2, &[1]).await;
+        add_rule(&pool, 100, 2, 1, 20001, 0).await;
+
+        let Json(resp) = update_user(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Path(2),
+            Json(UpdateUserRequest {
+                balance: Some("99.00".into()),
+                max_rules: Some(42),
+                banned: Some(true),
+                suspended: Some(true),
+                all_device_groups: Some(false),
+                device_group_ids: Some(vec![999_999]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 400, "invalid group id must be rejected");
+
+        let user: (String, i64, bool, bool, i64, bool) = sqlx::query_as(
+            "SELECT balance, max_rules, banned, suspended, token_version, \
+             all_device_groups FROM users WHERE id = 2",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(user, ("0".into(), 5, false, false, 0, false));
+
+        let assignments: Vec<(i64,)> = sqlx::query_as(
+            "SELECT device_group_id FROM user_device_groups \
+             WHERE user_id = 2 ORDER BY device_group_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(assignments, vec![(1,)]);
+
+        let rule: (bool, bool) =
+            sqlx::query_as("SELECT paused, auto_paused FROM forward_rules WHERE id = 100")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rule, (false, false));
+    }
+
+    #[tokio::test]
+    async fn enabling_all_groups_ignores_submitted_explicit_list() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "admin-in").await;
+        assign_user_groups(&pool, 2, &[1]).await;
+
+        let Json(resp) = update_user(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Path(2),
+            Json(UpdateUserRequest {
+                balance: Some("12.30".into()),
+                all_device_groups: Some(true),
+                // The protocol says this field is ignored when the same
+                // request enables all groups. It must neither fail validation
+                // nor overwrite the dormant explicit grant set.
+                device_group_ids: Some(vec![999_999]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 0, "{}", resp.message);
+
+        let user: (String, bool) =
+            sqlx::query_as("SELECT balance, all_device_groups FROM users WHERE id = 2")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(user, ("12.30".into(), true));
+        let assignments: Vec<(i64,)> = sqlx::query_as(
+            "SELECT device_group_id FROM user_device_groups WHERE user_id = 2 ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(assignments, vec![(1,)]);
+    }
+
+    #[tokio::test]
+    async fn update_user_rejects_unusable_explicit_group_grants() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_user(&pool, 3, "bob", false).await;
+        add_group(&pool, 1, 1, "admin-in").await;
+        add_group(&pool, 2, 3, "regular-owned-in").await;
+        add_group_typed(&pool, 3, 1, "admin-out", "out").await;
+        assign_user_groups(&pool, 2, &[1]).await;
+
+        for invalid_group_id in [2, 3] {
+            let Json(resp) = update_user(
+                AdminOnly { user_id: 1 },
+                State(state.clone()),
+                Path(2),
+                Json(UpdateUserRequest {
+                    balance: Some("99.00".into()),
+                    device_group_ids: Some(vec![invalid_group_id]),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(resp.code, 400, "group {invalid_group_id}: {}", resp.message);
+        }
+
+        let balance: (String,) = sqlx::query_as("SELECT balance FROM users WHERE id = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(balance.0, "0");
+        let assignments: Vec<(i64,)> = sqlx::query_as(
+            "SELECT device_group_id FROM user_device_groups WHERE user_id = 2 ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(assignments, vec![(1,)]);
+    }
+
     #[tokio::test]
     async fn update_user_authz_only_returns_404_for_missing_user() {
         let (state, _pool) = test_state().await;
@@ -1958,6 +2482,10 @@ mod tests {
                 device_group_ids: Some(vec![]),
                 ..Default::default()
             },
+            UpdateUserRequest {
+                device_group_ids: Some(vec![999_999]),
+                ..Default::default()
+            },
         ] {
             let Json(resp) = update_user(
                 AdminOnly { user_id: 1 },
@@ -1968,6 +2496,125 @@ mod tests {
             .await;
             assert_eq!(resp.code, 404, "missing authz-only target must be 404");
         }
+    }
+
+    #[tokio::test]
+    async fn admin_plan_edit_validates_snapshot_expiry_and_clear_semantics() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 1, 1, "admin-in").await;
+        assign_user_groups(&pool, 2, &[1]).await;
+        add_rule(&pool, 100, 2, 1, 20001, 0).await;
+        sqlx::query(
+            "INSERT INTO plans (id, name, max_rules, traffic, plan_type, duration_days) VALUES \
+             (10, 'old-time', 5, 0, 'time', 30), \
+             (11, 'new-time', 5, 0, 'time', 30), \
+             (12, 'data', 5, 1000, 'data', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE users SET plan_id = 11 WHERE id = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A stale modal that still shows plan 10 must not remove plan 11.
+        let Json(stale) = admin_set_user_plan(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(2),
+            Json(AdminSetUserPlanRequest {
+                expected_plan_id: 10,
+                clear: true,
+                plan_expire_at: None,
+            }),
+        )
+        .await;
+        assert_eq!(stale.code, 409);
+
+        // Malformed values must never enter the lexically-compared TEXT field.
+        let Json(invalid_expiry) = admin_set_user_plan(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(2),
+            Json(AdminSetUserPlanRequest {
+                expected_plan_id: 11,
+                clear: false,
+                plan_expire_at: Some("2099-02-30 00:00:00".into()),
+            }),
+        )
+        .await;
+        assert_eq!(invalid_expiry.code, 400);
+
+        let Json(valid_expiry) = admin_set_user_plan(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(2),
+            Json(AdminSetUserPlanRequest {
+                expected_plan_id: 11,
+                clear: false,
+                plan_expire_at: Some("2099-12-31 23:59:59".into()),
+            }),
+        )
+        .await;
+        assert_eq!(valid_expiry.code, 0, "{}", valid_expiry.message);
+        let stored: (Option<i64>, Option<String>) =
+            sqlx::query_as("SELECT plan_id, plan_expire_at FROM users WHERE id = 2")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, (Some(11), Some("2099-12-31 23:59:59".into())));
+
+        // Data plans have no expiry editor at the product level; enforce that
+        // in the API too, then prove a matching clear still revokes everything.
+        sqlx::query("UPDATE users SET plan_id = 12, plan_expire_at = NULL WHERE id = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Json(data_expiry) = admin_set_user_plan(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(2),
+            Json(AdminSetUserPlanRequest {
+                expected_plan_id: 12,
+                clear: false,
+                plan_expire_at: None,
+            }),
+        )
+        .await;
+        assert_eq!(data_expiry.code, 400);
+
+        let Json(cleared) = admin_set_user_plan(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Path(2),
+            Json(AdminSetUserPlanRequest {
+                expected_plan_id: 12,
+                clear: true,
+                plan_expire_at: None,
+            }),
+        )
+        .await;
+        assert_eq!(cleared.code, 0, "{}", cleared.message);
+        let user: (Option<i64>, bool) =
+            sqlx::query_as("SELECT plan_id, all_device_groups FROM users WHERE id = 2")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(user, (None, false));
+        let assignments: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_device_groups WHERE user_id = 2")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(assignments, 0);
+        let rule: (bool, bool) =
+            sqlx::query_as("SELECT paused, auto_paused FROM forward_rules WHERE id = 100")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rule, (true, true));
     }
 
     /// v0.4.12 PR1: a regular user's OWN historical inbound group is NOT a valid
@@ -1989,6 +2636,34 @@ mod tests {
             resp.code, 400,
             "a user's own (non-admin) group must be rejected: {}",
             resp.message
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rule_rejects_historical_regular_owned_downstream_hop() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_user(&pool, 3, "legacy-node-owner", false).await;
+        add_group(&pool, 30, 1, "admin-entry").await;
+        add_group_typed(&pool, 31, 3, "legacy-out", "out").await;
+        sqlx::query("UPDATE device_groups SET connect_host='192.0.2.31' WHERE id=31")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut req = rule_req("unsafe-chain", 20001, 30, None);
+        req.forward_mode = "chain".into();
+        req.route_mode = relay_shared::protocol::RouteMode::Chain;
+        req.hops = Some(vec![30, 31]);
+        req.device_group_out = Some(31);
+
+        let Json(resp) = create_rule(auth(2, false), State(state), Json(req)).await;
+        assert_eq!(resp.code, 400, "{}", resp.message);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM forward_rules")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
         );
     }
 
@@ -2105,14 +2780,20 @@ mod tests {
         add_group(&pool, 10, 2, "alice-in").await;
         add_group(&pool, 11, 3, "bob-in").await;
 
-        // Alice lists only her group.
-        let Json(resp) = list_groups(auth(2, false), State(state.clone())).await;
+        // Alice's compatibility view lists only her group and serializes only
+        // the safe summary shape (most importantly, never the node token).
+        let Json(resp) = list_owned_group_summaries(auth(2, false), State(state.clone())).await;
         let groups = resp.data.unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].id, 10);
+        let json = serde_json::to_value(&groups[0]).unwrap();
+        assert!(json.get("token").is_none());
+        assert!(json.get("config").is_none());
+        assert!(json.get("fallback_group").is_none());
+        assert!(json.get("uid").is_none());
 
         // Admin lists both.
-        let Json(resp) = list_groups(auth(1, true), State(state.clone())).await;
+        let Json(resp) = list_groups(AdminOnly { user_id: 1 }, State(state.clone())).await;
         assert_eq!(resp.data.unwrap().len(), 2);
 
         // v0.4.12 PR1: delete_group is admin-only (scope All). An admin may
@@ -2158,6 +2839,270 @@ mod tests {
         assert_eq!(
             owner.0, 1,
             "owner_uid must be ignored; group belongs to the creating admin"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_names_are_trimmed_and_blank_names_are_rejected() {
+        let (state, pool) = test_state().await;
+
+        let Json(blank_create) = create_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(CreateGroupRequest {
+                name: " \t ".into(),
+                group_type: GroupType::In,
+                connect_host: "1.2.3.4".into(),
+                port_range: "20000-30000".into(),
+                owner_uid: None,
+                rate: None,
+                hidden: None,
+            }),
+        )
+        .await;
+        assert_eq!(blank_create.code, 400);
+
+        let Json(created) = create_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(CreateGroupRequest {
+                name: "  trimmed-group  ".into(),
+                group_type: GroupType::In,
+                connect_host: "1.2.3.4".into(),
+                port_range: "20000-30000".into(),
+                owner_uid: None,
+                rate: None,
+                hidden: None,
+            }),
+        )
+        .await;
+        assert_eq!(created.code, 0, "{}", created.message);
+        let group = created.data.unwrap();
+        assert_eq!(group.name, "trimmed-group");
+
+        let Json(blank_update) = update_group(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Path(group.id),
+            Json(UpdateGroupRequest {
+                name: Some("  ".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(blank_update.code, 400);
+
+        let stored: (String,) = sqlx::query_as("SELECT name FROM device_groups WHERE id = ?")
+            .bind(group.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored.0, "trimmed-group");
+    }
+
+    #[tokio::test]
+    async fn group_edits_cannot_invalidate_existing_rule_paths() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 40, 1, "rule-entry").await;
+        add_group_typed(&pool, 41, 1, "rule-exit", "out").await;
+        sqlx::query("UPDATE device_groups SET connect_host='2001:db8::41' WHERE id=41")
+            .execute(&pool)
+            .await
+            .unwrap();
+        add_rule(&pool, 140, 1, 40, 36_140, 0).await;
+        sqlx::query(
+            "UPDATE forward_rules SET route_mode='chain',forward_mode='chain',device_group_out=41 \
+             WHERE id=140",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops(rule_id,position,device_group_id,listen_port,tunnel_port) \
+             VALUES(140,0,40,36140,NULL),(140,1,41,36141,36142)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(entry_conflict) = update_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(40),
+            Json(UpdateGroupRequest {
+                group_type: Some(GroupType::Out),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(entry_conflict.code, 409);
+        assert!(entry_conflict.message.contains("转发规则"));
+
+        let Json(exit_conflict) = update_group(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Path(41),
+            Json(UpdateGroupRequest {
+                connect_host: Some("  ".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(exit_conflict.code, 409);
+        assert!(exit_conflict.message.contains("转发规则"));
+
+        let entry_type: String =
+            sqlx::query_scalar("SELECT group_type FROM device_groups WHERE id=40")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let exit_host: String =
+            sqlx::query_scalar("SELECT connect_host FROM device_groups WHERE id=41")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(entry_type, "in");
+        assert_eq!(exit_host, "2001:db8::41");
+    }
+
+    #[tokio::test]
+    async fn plan_grants_require_admin_inbound_groups_and_block_group_mutation() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "legacy-owner", false).await;
+        add_group(&pool, 29, 2, "legacy-user-in").await;
+        add_group_typed(&pool, 30, 1, "admin-out", "out").await;
+
+        let Json(missing_update) = update_plan(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(999_999),
+            Json(UpdatePlanRequest {
+                device_group_ids: Some(vec![999_999]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(missing_update.code, 404);
+
+        let Json(invalid_plan) = create_plan(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(CreatePlanRequest {
+                name: "invalid-grant".into(),
+                max_rules: 5,
+                traffic: 1024,
+                price: "1.00".into(),
+                plan_type: "data".into(),
+                duration_days: 0,
+                hidden: false,
+                reset_traffic: false,
+                description: String::new(),
+                grant_all_groups: false,
+                device_group_ids: vec![30],
+            }),
+        )
+        .await;
+        assert_eq!(invalid_plan.code, 400);
+        let invalid_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM plans WHERE name = 'invalid-grant'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(invalid_count.0, 0, "invalid plan creation must roll back");
+
+        let Json(user_owned_plan) = create_plan(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(CreatePlanRequest {
+                name: "user-owned-grant".into(),
+                max_rules: 5,
+                traffic: 1024,
+                price: "1.00".into(),
+                plan_type: "data".into(),
+                duration_days: 0,
+                hidden: false,
+                reset_traffic: false,
+                description: String::new(),
+                grant_all_groups: false,
+                device_group_ids: vec![29],
+            }),
+        )
+        .await;
+        assert_eq!(user_owned_plan.code, 400);
+
+        add_group(&pool, 31, 1, "plan-line").await;
+        sqlx::query(
+            "INSERT INTO plans (id, name, max_rules, traffic, price) \
+             VALUES (31, 'line-plan', 5, 1024, '1.00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO plan_device_groups (plan_id, device_group_id) VALUES (31, 31)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let Json(type_change) = update_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(31),
+            Json(UpdateGroupRequest {
+                group_type: Some(GroupType::Out),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(type_change.code, 409);
+
+        let Json(delete_response) =
+            delete_group(AdminOnly { user_id: 1 }, State(state), Path(31)).await;
+        assert_eq!(delete_response.code, 409);
+        assert!(delete_response.message.contains("1 个套餐"));
+        let group_type: (String,) =
+            sqlx::query_as("SELECT group_type FROM device_groups WHERE id = 31")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            group_type.0, "in",
+            "rejected mutations must preserve the group"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_plan_catalog_hides_historical_unusable_group_grants() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "legacy-owner", false).await;
+        add_group(&pool, 29, 2, "legacy-user-in").await;
+        add_group(&pool, 31, 1, "admin-in").await;
+        sqlx::query(
+            "INSERT INTO plans (id, name, max_rules, traffic, price) VALUES \
+             (31, 'valid-plan', 5, 1024, '1.00'), \
+             (32, 'historical-invalid-plan', 5, 1024, '1.00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO plan_device_groups (plan_id, device_group_id) VALUES (31, 31), (32, 29)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(response) = list_public_plans(auth(2, false), State(state)).await;
+        assert_eq!(response.code, 0, "{}", response.message);
+        let plan_ids: Vec<i64> = response
+            .data
+            .unwrap()
+            .into_iter()
+            .map(|item| item.plan.id)
+            .collect();
+        assert!(plan_ids.contains(&31), "valid plans must remain visible");
+        assert!(
+            !plan_ids.contains(&32),
+            "plans with historical unusable grants must fail closed"
         );
     }
 
@@ -2467,6 +3412,8 @@ mod tests {
             upload_limit_mbps: None,
             download_limit_mbps: None,
             tunnel_profile_id: profile_id,
+            max_connections: None,
+            auto_restart_minutes: None,
         }
     }
 
@@ -3228,6 +4175,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preset_tunnel_rejects_historical_regular_owned_downstream_hop() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        add_user(&pool, 52, "legacy-node-owner", false).await;
+        add_group_typed(&pool, 503, 52, "legacy-exit", "out").await;
+        sqlx::query(
+            "UPDATE device_groups SET connect_host='192.0.2.53', port_range='35100-35110' \
+             WHERE id=503",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut invalid = tunnel_request("legacy-downstream-create");
+        invalid.hops[1] = TunnelHopRequest {
+            device_group_id: 503,
+            listen_port: Some(35105),
+        };
+        let Json(rejected) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(invalid),
+        )
+        .await;
+        assert_eq!(rejected.code, 400, "{}", rejected.message);
+        assert!(state.db.list_tunnels().await.unwrap().is_empty());
+
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("valid-before-legacy-update")),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+        let Json(update_rejected) = super::tunnels::update_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+            Json(UpdateTunnelRequest {
+                hops: Some(vec![
+                    TunnelHopRequest {
+                        device_group_id: 501,
+                        listen_port: None,
+                    },
+                    TunnelHopRequest {
+                        device_group_id: 503,
+                        listen_port: Some(35105),
+                    },
+                ]),
+                expected_hops: Some(tunnel_path_snapshot(&tunnel)),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(update_rejected.code, 400, "{}", update_rejected.message);
+        let stored = state
+            .db
+            .find_tunnel_by_id(tunnel.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.hops[1].device_group_id, 502);
+
+        // Legacy data can still contain such a path.  New rule bindings must
+        // reject it, while an already-bound rule must remain pausable so an
+        // operator can stop unsafe historical state before repairing it.
+        let legacy_tunnel_id = sqlx::query(
+            "INSERT INTO tunnels(name,enabled,shared,uid) VALUES('legacy-invalid-binding',1,1,1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO tunnel_hops(tunnel_id,position,device_group_id,listen_port) \
+             VALUES(?,0,501,NULL),(?,1,503,35105)",
+        )
+        .bind(legacy_tunnel_id)
+        .bind(legacy_tunnel_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut bind_legacy = rule_req("must-not-bind-legacy-preset", 34019, 501, None);
+        bind_legacy.route_mode = relay_shared::protocol::RouteMode::Chain;
+        bind_legacy.forward_mode = "chain".into();
+        bind_legacy.device_group_out = Some(503);
+        bind_legacy.tunnel_id = Some(legacy_tunnel_id);
+        let Json(binding_rejected) =
+            create_rule(auth(1, true), State(state.clone()), Json(bind_legacy)).await;
+        assert_eq!(binding_rejected.code, 400, "{}", binding_rejected.message);
+
+        let legacy_rule_id = sqlx::query(
+            "INSERT INTO forward_rules(name,uid,listen_port,protocol,route_mode,forward_mode, \
+             device_group_in,device_group_out,target_addr,target_port,tunnel_id) \
+             VALUES('legacy-bound-rule',1,34020,'tcp','chain','chain',501,503,'127.0.0.1',80,?)",
+        )
+        .bind(legacy_tunnel_id)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let Json(paused) = update_rule(
+            auth(1, true),
+            State(state.clone()),
+            Path(legacy_rule_id),
+            Json(UpdateRuleRequest {
+                paused: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(paused.code, 0, "{}", paused.message);
+        let is_paused: bool = sqlx::query_scalar("SELECT paused FROM forward_rules WHERE id=?")
+            .bind(legacy_rule_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(is_paused);
+
+        let Json(resume_rejected) = update_rule(
+            auth(1, true),
+            State(state.clone()),
+            Path(legacy_rule_id),
+            Json(UpdateRuleRequest {
+                paused: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resume_rejected.code, 400, "{}", resume_rejected.message);
+        let remains_paused: bool =
+            sqlx::query_scalar("SELECT paused FROM forward_rules WHERE id=?")
+                .bind(legacy_rule_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(remains_paused);
+    }
+
+    #[tokio::test]
     async fn preset_tunnel_admin_crud_and_delete_protection() {
         let (state, pool) = test_state().await;
         seed_tunnel_groups(&pool).await;
@@ -3430,6 +4518,31 @@ mod tests {
         .await
         .unwrap();
 
+        // Reproduce a historical shared tunnel with a regular-user-owned
+        // downstream hop. It must not be advertised as selectable because
+        // current rule writes and runtime config reject that path.
+        add_group_typed(&pool, 503, 52, "legacy-user-exit", "out").await;
+        sqlx::query("UPDATE device_groups SET connect_host='192.0.2.53' WHERE id=503")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy_tunnel_id = sqlx::query(
+            "INSERT INTO tunnels(name,enabled,shared,uid) VALUES('legacy-invalid',1,1,1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO tunnel_hops(tunnel_id,position,device_group_id,listen_port) \
+             VALUES(?,0,501,NULL),(?,1,503,35006)",
+        )
+        .bind(legacy_tunnel_id)
+        .bind(legacy_tunnel_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let Json(visible) =
             super::tunnels::list_available_tunnels(auth(52, false), State(state.clone())).await;
         let tunnels = visible.data.unwrap();
@@ -3439,6 +4552,10 @@ mod tests {
             "普通用户目录不能泄露全局规则绑定数量"
         );
         assert!(tunnels[0].hops.iter().all(|hop| hop.connect_host.is_none()));
+        assert!(
+            tunnels[0].hops.iter().all(|hop| hop.listen_port.is_none()),
+            "普通用户目录不能泄露内部中继端口"
+        );
     }
 
     #[tokio::test]
@@ -3962,6 +5079,10 @@ mod tests {
         )
         .await;
         assert_eq!(created.code, 0, "{}", created.message);
+        sqlx::query("UPDATE device_groups SET group_type='both' WHERE id=502")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO forward_rules (name,uid,listen_port,protocol,device_group_in,target_addr,target_port) \
              VALUES ('udp-same-number',1,35005,'udp',502,'127.0.0.1',53)",

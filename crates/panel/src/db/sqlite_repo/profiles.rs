@@ -243,4 +243,169 @@ impl TunnelProfileRepository for SqliteRepository {
         .await?;
         Ok(result.rows_affected())
     }
+
+    async fn update_profile_checked(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        transport: Option<&str>,
+        tls_mode: Option<&str>,
+        ws_path: Option<&str>,
+        host_header: Option<&str>,
+        sni: Option<&str>,
+    ) -> Result<ProfileUpdateOutcome, DbError> {
+        let mut sets: Vec<&str> = Vec::new();
+        if name.is_some() {
+            sets.push("name = ?");
+        }
+        if transport.is_some() {
+            sets.push("transport = ?");
+        }
+        if tls_mode.is_some() {
+            sets.push("tls_mode = ?");
+        }
+        if ws_path.is_some() {
+            sets.push("ws_path = ?");
+        }
+        if host_header.is_some() {
+            sets.push("host_header = ?");
+        }
+        if sni.is_some() {
+            sets.push("sni = ?");
+        }
+
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_sql {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
+        }
+        macro_rules! reject {
+            ($outcome:expr) => {{
+                try_sql!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
+                return Ok($outcome);
+            }};
+        }
+
+        let builtin: Option<bool> = try_sql!(
+            sqlx::query_scalar("SELECT is_builtin FROM tunnel_profiles WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await
+        );
+        match builtin {
+            None => reject!(ProfileUpdateOutcome::NotFound),
+            Some(true) => reject!(ProfileUpdateOutcome::BuiltinReadOnly),
+            Some(false) => {}
+        }
+
+        if let Some(new_transport) = transport {
+            let (count, sample): (i64, Option<String>) = try_sql!(
+                sqlx::query_as(
+                    "SELECT COUNT(*), MIN(protocol || '/' || public_transport) \
+                     FROM forward_rules WHERE tunnel_profile_id = ? \
+                       AND (protocol <> 'tcp' OR public_transport <> ?)",
+                )
+                .bind(id)
+                .bind(new_transport)
+                .fetch_one(&mut *conn)
+                .await
+            );
+            if count > 0 {
+                reject!(ProfileUpdateOutcome::BindingConflict {
+                    count,
+                    sample: sample.unwrap_or_else(|| "unknown".into()),
+                });
+            }
+        }
+
+        if !sets.is_empty() {
+            let sql = format!(
+                "UPDATE tunnel_profiles SET {} WHERE id = ?",
+                sets.join(", ")
+            );
+            let mut query = sqlx::query(&sql);
+            if let Some(value) = name {
+                query = query.bind(value);
+            }
+            if let Some(value) = transport {
+                query = query.bind(value);
+            }
+            if let Some(value) = tls_mode {
+                query = query.bind(value);
+            }
+            if let Some(value) = ws_path {
+                query = query.bind(value);
+            }
+            if let Some(value) = host_header {
+                query = query.bind(value);
+            }
+            if let Some(value) = sni {
+                query = query.bind(value);
+            }
+            query = query.bind(id);
+            try_sql!(query.execute(&mut *conn).await);
+        }
+
+        try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
+        Ok(ProfileUpdateOutcome::Updated)
+    }
+
+    async fn delete_profile_checked(&self, id: i64) -> Result<ProfileDeleteOutcome, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_sql {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
+        }
+        macro_rules! reject {
+            ($outcome:expr) => {{
+                try_sql!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
+                return Ok($outcome);
+            }};
+        }
+
+        let builtin: Option<bool> = try_sql!(
+            sqlx::query_scalar("SELECT is_builtin FROM tunnel_profiles WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await
+        );
+        match builtin {
+            None => reject!(ProfileDeleteOutcome::NotFound),
+            Some(true) => reject!(ProfileDeleteOutcome::BuiltinReadOnly),
+            Some(false) => {}
+        }
+        let rules: i64 = try_sql!(
+            sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE tunnel_profile_id = ?")
+                .bind(id)
+                .fetch_one(&mut *conn)
+                .await
+        );
+        if rules > 0 {
+            reject!(ProfileDeleteOutcome::InUse { rules });
+        }
+        try_sql!(
+            sqlx::query("DELETE FROM tunnel_profiles WHERE id = ?")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+        );
+        try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
+        Ok(ProfileDeleteOutcome::Deleted)
+    }
 }

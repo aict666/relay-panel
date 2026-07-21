@@ -32,6 +32,10 @@ use serde::Serialize;
 
 use super::error::DbError;
 
+/// PostgreSQL advisory-lock namespace for registration settings + user
+/// provisioning. SQLite uses its single-writer lock for the same invariant.
+pub const REGISTRATION_SETTINGS_LOCK_KEY: i64 = 0x5250_5345_5454;
+
 // ── Resource scoping (v0.4.10 multi-user isolation) ──
 
 /// The ownership scope a resource query is restricted to.
@@ -60,7 +64,50 @@ pub enum GroupDeleteOutcome {
         rule_count: i64,
         tunnel_count: i64,
         fallback_group_count: i64,
+        plan_count: i64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminUserPlanEditOutcome {
+    Updated,
+    NotFound,
+    AdminTarget,
+    PlanChanged,
+    ExpiryNotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanDeleteOutcome {
+    Deleted,
+    NotFound,
+    RegistrationDefault,
+    RegistrationAllowed,
+    InUse { users: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileUpdateOutcome {
+    Updated,
+    NotFound,
+    BuiltinReadOnly,
+    BindingConflict { count: i64, sample: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileDeleteOutcome {
+    Deleted,
+    NotFound,
+    BuiltinReadOnly,
+    InUse { rules: i64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserProvisionOutcome {
+    Created,
+    RegistrationDisabled,
+    PlanNotAllowed,
+    PlanMissing(i64),
 }
 
 /// Complete, already-validated rule update passed from the service layer to a
@@ -92,6 +139,36 @@ pub struct RuleUpdateData {
     pub connection_controls: Option<(i32, i32)>,
     pub tunnel_profile_id: Option<Option<i64>>,
     pub tunnel_id: Option<Option<i64>>,
+}
+
+impl RuleUpdateData {
+    /// Pausing must remain possible even when a legacy rule references a
+    /// topology/profile that no longer passes today's validation.  It is a
+    /// single safe state transition; every resume or route edit still goes
+    /// through the full transactional invariant checks.
+    pub fn is_pause_only(&self) -> bool {
+        self.paused == Some(true)
+            && self.name.is_none()
+            && self.listen_port.is_none()
+            && self.protocol.is_none()
+            && self.public_transport.is_none()
+            && self.node_transport.is_none()
+            && self.entry_transport.is_none()
+            && self.route_mode.is_none()
+            && self.ws_path.is_none()
+            && self.device_group_in.is_none()
+            && self.device_group_out.is_none()
+            && self.forward_mode.is_none()
+            && self.target_addr.is_none()
+            && self.target_port.is_none()
+            && self.targets.is_none()
+            && self.hops.is_none()
+            && self.load_balance_strategy.is_none()
+            && self.rate_limits.is_none()
+            && self.connection_controls.is_none()
+            && self.tunnel_profile_id.is_none()
+            && self.tunnel_id.is_none()
+    }
 }
 
 impl ResourceScope {
@@ -170,19 +247,44 @@ pub trait UserRepository: Send + Sync {
         password_hash: &str,
         plan_id: i64,
     ) -> Result<u64, DbError>;
+    /// Public signup with registration-enabled, default/explicit plan choice,
+    /// allowed-list membership, plan quota copy, and INSERT checked atomically.
+    async fn insert_public_registered_user(
+        &self,
+        username: &str,
+        password_hash: &str,
+        requested_plan_id: Option<i64>,
+    ) -> Result<UserProvisionOutcome, DbError>;
+    /// Administrator provisioning uses the default plan current at commit
+    /// time (or fallback id 1 when settings have not yet been seeded).
+    async fn insert_admin_user_from_default(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<UserProvisionOutcome, DbError>;
     /// Update password.
     async fn update_password(&self, id: i64, new_hash: &str) -> Result<u64, DbError>;
-    /// v0.4.10 PR4: self-service password change. Atomically sets the new hash,
-    /// bumps token_version (revoking all the user's existing sessions including
-    /// the one making this call), and clears must_change_password. Returns rows
-    /// affected (0 = user not found).
-    async fn change_own_password(&self, id: i64, new_hash: &str) -> Result<u64, DbError>;
+    /// v0.4.10 PR4: self-service password change. Atomically compares the hash
+    /// that was verified by the handler, sets the new hash, bumps token_version
+    /// (revoking all sessions), and clears must_change_password. The compare-
+    /// and-swap prevents an in-flight old-password request from overwriting a
+    /// concurrent administrator reset. Returns 0 when the account or verified
+    /// credential changed before the write.
+    async fn change_own_password(
+        &self,
+        id: i64,
+        expected_hash: &str,
+        new_hash: &str,
+    ) -> Result<u64, DbError>;
     /// v0.4.10 PR4: admin password reset. Atomically sets the new hash, bumps
     /// token_version (revoking the target's sessions), and sets
     /// must_change_password to the given value (so a temporary password forces
-    /// a change on first use). Returns rows affected (0 = user not found).
+    /// a change on first use). The write also checks that the target is not a
+    /// different administrator, closing a promotion race after bcrypt work.
+    /// Returns rows affected (0 = missing or protected target).
     async fn admin_reset_password(
         &self,
+        actor_id: i64,
         id: i64,
         new_hash: &str,
         must_change_password: bool,
@@ -201,30 +303,23 @@ pub trait UserRepository: Send + Sync {
         banned: Option<bool>,
         suspended: Option<bool>,
     ) -> Result<u64, DbError>;
-    /// v1.0.7: admin directly sets a user's plan association + expiry WITHOUT
-    /// charging (the "edit user plan" panel uses this for removing a plan — both
-    /// NULL — and for adjusting the expiry). Unconditionally writes both columns;
-    /// the caller composes the pair (e.g. keep plan_id, change expiry). Skips
-    /// admin users (WHERE admin = false). Returns rows affected (0 = not found
-    /// or target is an admin).
-    async fn admin_set_user_plan(
+    /// Edit expiry or remove the current plan without charging. The expected
+    /// plan id is checked while the user row is locked, so a stale admin view
+    /// cannot overwrite/remove a concurrently purchased plan. Clear also
+    /// revokes group authorization and pauses active rules in the same tx.
+    async fn admin_edit_user_plan(
         &self,
-        id: i64,
-        plan_id: Option<i64>,
-        plan_expire_at: Option<String>,
-    ) -> Result<u64, DbError>;
-    /// v1.0.9: remove a user's plan AND revoke device-group authorization AND
-    /// pause their now-unauthorized rules, all in ONE transaction — the clear
-    /// path used to do these as 4 separate calls, which could half-complete.
-    /// Clears plan_id/plan_expire_at, sets all_device_groups=0, deletes the
-    /// user's user_device_groups rows, and system-pauses (auto_paused=1) every
-    /// active rule. No-op for admins. Returns rows affected on the user row
-    /// (0 = not found or admin).
-    async fn clear_user_plan(&self, user_id: i64) -> Result<u64, DbError>;
+        user_id: i64,
+        expected_plan_id: i64,
+        clear: bool,
+        plan_expire_at: Option<&str>,
+    ) -> Result<AdminUserPlanEditOutcome, DbError>;
     /// Increment user traffic_used (called inside traffic batch tx).
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError>;
     /// Reset traffic_used to 0 for user AND their rules (atomic).
-    async fn reset_traffic(&self, id: i64) -> Result<(), DbError>;
+    /// Returns rows affected on the user row (0 = user not found); the rule
+    /// reset is skipped and the transaction rolled back for a missing target.
+    async fn reset_traffic(&self, id: i64) -> Result<u64, DbError>;
     /// Delete user (only if not admin). Returns rows affected (0 = not found or admin).
     async fn delete_non_admin(&self, id: i64) -> Result<u64, DbError>;
     /// Delete a non-admin user AND all their owned resources (rules,
@@ -443,6 +538,8 @@ pub trait RuleRepository: Send + Sync {
             download_limit_mbps,
             tunnel_profile_id,
             None,
+            0,
+            0,
         )
         .await
     }
@@ -471,6 +568,8 @@ pub trait RuleRepository: Send + Sync {
         download_limit_mbps: i32,
         tunnel_profile_id: Option<i64>,
         tunnel_id: Option<i64>,
+        max_connections: i32,
+        auto_restart_minutes: i32,
     ) -> Result<Option<i64>, DbError>;
     /// Find (protocol, public_transport) for effective-combo validation, scoped.
     async fn find_transport_by_id(
@@ -671,6 +770,25 @@ pub trait GroupRepository: Send + Sync {
 // device-group allowlist) with a direct user ↔ device_group link plus a
 // per-user `all_device_groups` flag. Admins are always treated as all-allowed.
 
+/// Complete administrator edit for a user. The scalar user fields and the
+/// authorization fields belong to one logical operation and therefore must be
+/// committed (or rolled back) together.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdminUserUpdate<'a> {
+    pub balance: Option<&'a str>,
+    pub max_rules: Option<i32>,
+    pub traffic_limit: Option<i64>,
+    pub banned: Option<bool>,
+    pub suspended: Option<bool>,
+    pub all_device_groups: Option<bool>,
+    pub device_group_ids: Option<&'a [i64]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminUserUpdateOutcome {
+    pub paused_rules: u64,
+}
+
 #[async_trait]
 pub trait DeviceGroupAuthRepository: Send + Sync {
     /// List the device-group IDs explicitly assigned to this user (the raw
@@ -686,9 +804,18 @@ pub trait DeviceGroupAuthRepository: Send + Sync {
     /// Set the per-user `all_device_groups` flag. Returns rows affected
     /// (0 = user not found).
     async fn set_user_all_device_groups(&self, user_id: i64, all: bool) -> Result<u64, DbError>;
+    /// Atomically update a user's editable scalar fields, authorization flag,
+    /// explicit device-group assignments, and pause rules that fall outside
+    /// the resulting authorization. `None` means the user did not exist.
+    async fn update_user_with_authorization(
+        &self,
+        user_id: i64,
+        update: AdminUserUpdate<'_>,
+    ) -> Result<Option<AdminUserUpdateOutcome>, DbError>;
     /// Effective set of inbound-capable (`in` or `both`) device-group IDs the user may use:
-    /// admins and `all_device_groups` users get ALL inbound-capable groups; everyone else
-    /// gets only their explicit assignments. Empty = cannot forward.
+    /// admins and `all_device_groups` users get ALL administrator-managed,
+    /// inbound-capable groups; everyone else gets only valid explicit
+    /// assignments. Empty = cannot forward.
     async fn authorized_device_group_ids(&self, user_id: i64) -> Result<Vec<i64>, DbError>;
     /// v1.0.4: pause all of `user_id`'s rules whose device_group_in is NOT in
     /// `allowed_group_ids` (the user lost authorization for that group). Rules
@@ -775,6 +902,22 @@ pub trait TunnelProfileRepository: Send + Sync {
         sni: Option<&str>,
     ) -> Result<u64, DbError>;
     async fn delete_profile(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
+    /// Administrator profile edit with builtin protection and bound-rule
+    /// compatibility checked under the same lock/transaction as the update.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_profile_checked(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        transport: Option<&str>,
+        tls_mode: Option<&str>,
+        ws_path: Option<&str>,
+        host_header: Option<&str>,
+        sni: Option<&str>,
+    ) -> Result<ProfileUpdateOutcome, DbError>;
+    /// Administrator deletion with builtin/reference checks serialized with
+    /// the DELETE. Rule writers share-lock the selected profile in their tx.
+    async fn delete_profile_checked(&self, id: i64) -> Result<ProfileDeleteOutcome, DbError>;
 }
 
 // ── Reusable preset tunnels ──
@@ -1039,9 +1182,10 @@ pub trait PlanRepository: Send + Sync {
         grant_all_groups: bool,
         device_group_ids: &[i64],
     ) -> Result<i64, DbError>;
-    /// v1.0.8: update a plan's mutable fields. Returns rows affected (0 = not
-    /// found). speed_limit/ip_limit are intentionally NOT updatable here
-    /// (placeholders, never enforced) to keep the API surface minimal.
+    /// Update a plan's mutable fields and, when supplied, replace its device-group
+    /// grant set in ONE transaction. Returns rows affected (0 = not found).
+    /// speed_limit/ip_limit are intentionally NOT updatable here (placeholders,
+    /// never enforced) to keep the API surface minimal.
     #[allow(clippy::too_many_arguments)]
     async fn update_plan_fields(
         &self,
@@ -1056,9 +1200,13 @@ pub trait PlanRepository: Send + Sync {
         reset_traffic: Option<bool>,
         description: Option<&str>,
         grant_all_groups: Option<bool>,
+        device_group_ids: Option<&[i64]>,
     ) -> Result<u64, DbError>;
     /// v1.0.8: delete a plan. Returns rows affected (0 = not found).
     async fn delete_plan(&self, id: i64) -> Result<u64, DbError>;
+    /// Delete with the settings/default/allowed-list and user-reference checks
+    /// serialized in the same transaction as the DELETE.
+    async fn delete_plan_checked(&self, id: i64) -> Result<PlanDeleteOutcome, DbError>;
     /// v1.0.8: count users whose plan_id points at this plan. Used as a
     /// pre-delete safety check (count > 0 → 409).
     async fn count_users_on_plan(&self, plan_id: i64) -> Result<i64, DbError>;
@@ -1085,11 +1233,12 @@ pub trait PlanRepository: Send + Sync {
     ///     authorization — when `grant_all_groups` set all_device_groups=1 (and
     ///     clear explicit rows); else reset all_device_groups=0 and replace
     ///     user_device_groups with the plan's `device_group_ids`. Rules bound to
-    ///     groups outside `new_authorized_group_ids` are paused in the same tx.
+    ///     groups outside `new_authorized_group_ids` are paused in the same tx;
+    ///     grant-all plans derive their effective set transactionally instead.
     /// All on the same tx handle so a concurrent purchase can't double-spend.
-    /// `price_cents` / `traffic_to_add` / `plan_max_rules` / `duration_days` are
-    /// resolved by the caller from the plan row (and re-checked hidden=0 there),
-    /// so this method trusts them and only owns the atomic money + bookkeeping.
+    /// This lower-level entry point applies the explicit caller snapshot. HTTP
+    /// request handlers use `buy_plan_guarded` below, which additionally locks
+    /// and compares the current plan + grants before charging.
     #[allow(clippy::too_many_arguments)]
     async fn buy_plan(
         &self,
@@ -1105,9 +1254,86 @@ pub trait PlanRepository: Send + Sync {
         device_group_ids: &[i64],
         // v1.0.8: the NEW authorized group set AFTER purchase. Used inside the
         // transaction to pause rules outside this set (replacement semantics).
-        // Computed by the caller: all inbound groups if grant_all_groups, else
-        // device_group_ids (the plan's grants).
+        // Computed by the caller for per-group plans. Ignored when
+        // grant_all_groups=true, whose semantics are derived in-transaction.
         new_authorized_group_ids: &[i64],
+    ) -> Result<(), BuyPlanError> {
+        self.buy_plan_impl(
+            user_id,
+            plan_id,
+            plan_name,
+            price_cents,
+            traffic_to_add,
+            plan_max_rules,
+            duration_days,
+            reset_traffic,
+            grant_all_groups,
+            device_group_ids,
+            new_authorized_group_ids,
+            false,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Purchase with atomic plan-snapshot validation and an optional visibility
+    /// guard. Request handlers must use this method; `buy_plan` retains the
+    /// lower-level explicit-snapshot contract used by repository tests.
+    #[allow(clippy::too_many_arguments)]
+    async fn buy_plan_guarded(
+        &self,
+        user_id: i64,
+        plan_id: i64,
+        plan_name: &str,
+        price_cents: i64,
+        traffic_to_add: i64,
+        plan_max_rules: i32,
+        duration_days: i32,
+        reset_traffic: bool,
+        grant_all_groups: bool,
+        device_group_ids: &[i64],
+        new_authorized_group_ids: &[i64],
+        require_visible: bool,
+        expected_current_plan_id: Option<Option<i64>>,
+    ) -> Result<(), BuyPlanError> {
+        self.buy_plan_impl(
+            user_id,
+            plan_id,
+            plan_name,
+            price_cents,
+            traffic_to_add,
+            plan_max_rules,
+            duration_days,
+            reset_traffic,
+            grant_all_groups,
+            device_group_ids,
+            new_authorized_group_ids,
+            require_visible,
+            true,
+            expected_current_plan_id,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    async fn buy_plan_impl(
+        &self,
+        user_id: i64,
+        plan_id: i64,
+        plan_name: &str,
+        price_cents: i64,
+        traffic_to_add: i64,
+        plan_max_rules: i32,
+        duration_days: i32,
+        reset_traffic: bool,
+        grant_all_groups: bool,
+        device_group_ids: &[i64],
+        new_authorized_group_ids: &[i64],
+        require_visible: bool,
+        check_plan_snapshot: bool,
+        expected_current_plan_id: Option<Option<i64>>,
     ) -> Result<(), BuyPlanError>;
 }
 
@@ -1116,6 +1342,14 @@ pub trait PlanRepository: Send + Sync {
 pub enum BuyPlanError {
     /// User balance < plan price. Caller → 400.
     InsufficientBalance,
+    /// The plan changed after the caller loaded/confirmed it. Caller → 409.
+    PlanChanged,
+    /// The target user's current plan changed after an administrator opened the
+    /// assignment UI. Caller → 409 without charging or changing authorization.
+    UserPlanChanged,
+    /// Renewing would make the cumulative traffic quota exceed i64. Caller →
+    /// 409 and the whole purchase is rolled back before balance/order changes.
+    QuotaOverflow,
     /// DB error. Caller → 500.
     Database(DbError),
 }
@@ -1142,6 +1376,26 @@ pub struct RegistrationSettings {
     pub default_registration_plan_id: i64,
     pub allowed_plan_ids: Vec<i64>,
     pub site_name: String,
+}
+
+#[derive(Debug)]
+pub enum RegistrationSettingsWriteError {
+    AllowedPlansEmpty,
+    DefaultPlanNotInAllowed,
+    PlanNotFound(i64),
+    Database(DbError),
+}
+
+impl From<DbError> for RegistrationSettingsWriteError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<sqlx::Error> for RegistrationSettingsWriteError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(DbError::from(error))
+    }
 }
 
 /// v0.4.10 PR3: registration settings stored in the `app_settings` single-row
@@ -1181,6 +1435,15 @@ pub trait SettingsRepository: Send + Sync {
         allowed_plan_ids: &[i64],
         site_name: &str,
     ) -> Result<(), DbError>;
+    /// Validate every referenced plan while holding locks that serialize with
+    /// checked plan deletion, then write the complete settings row atomically.
+    async fn set_system_settings_checked(
+        &self,
+        enabled: bool,
+        default_plan_id: i64,
+        allowed_plan_ids: &[i64],
+        site_name: &str,
+    ) -> Result<(), RegistrationSettingsWriteError>;
 }
 
 // ── Aggregate ──

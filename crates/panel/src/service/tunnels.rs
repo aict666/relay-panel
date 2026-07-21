@@ -101,18 +101,22 @@ async fn resolve_hops(
             } else {
                 TunnelError::InvalidHop
             })?;
+        let owner_is_admin = db
+            .is_admin(group.uid)
+            .await
+            .map_err(TunnelError::Database)?;
 
         if position == 0 {
             if hop.listen_port.is_some() {
                 return Err(TunnelError::EntryPort);
             }
-            if !group_type_supports_inbound(&group.group_type) {
+            if !group_type_supports_inbound(&group.group_type) || !owner_is_admin {
                 return Err(TunnelError::InvalidEntry);
             }
             resolved.push((group.id, None));
             continue;
         }
-        if group.group_type == "monitor" {
+        if group.group_type == "monitor" || !owner_is_admin {
             return Err(TunnelError::InvalidHop);
         }
         if group.connect_host.trim().is_empty() {

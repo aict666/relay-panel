@@ -79,8 +79,7 @@ impl TrafficRepository for PgRepository {
         struct Resolved {
             rule_id: i64,
             uid: i64,
-            delta_up: u64,
-            delta_down: u64,
+            real_delta: i64,
             /// v1.0.8: billed bytes charged to the USER = round((up+down) * rate).
             /// Separate from delta_up/delta_down (real bytes for the rule).
             billed_delta: i64,
@@ -95,10 +94,10 @@ impl TrafficRepository for PgRepository {
                     return Ok(vec![TrafficEntryResult::Overflow]);
                 }
             };
-            // JOIN users to fetch both the rule's and the user's current totals
-            // in one round trip (same as the SQLite path).
-            let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
-                "SELECT fr.id, fr.uid, fr.traffic_used, u.traffic_used \
+            // Resolve ownership first. Totals are checked again only after all
+            // affected user/rule rows have been locked in deterministic order.
+            let row: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT fr.id, fr.uid \
                  FROM forward_rules fr \
                  JOIN users u ON u.id = fr.uid \
                  WHERE fr.id = $1 AND (fr.device_group_in = $2 OR EXISTS( \
@@ -110,7 +109,7 @@ impl TrafficRepository for PgRepository {
             .bind(group_id)
             .fetch_optional(&mut *tx)
             .await?;
-            let Some((rid, uid, rule_used, user_used)) = row else {
+            let Some((rid, uid)) = row else {
                 tracing::warn!(
                     "traffic_batch: rule {} not available to group {} \
                      (missing or foreign) — rejecting batch",
@@ -120,21 +119,17 @@ impl TrafficRepository for PgRepository {
                 let _ = tx.rollback().await;
                 return Ok(vec![TrafficEntryResult::Unavailable]);
             };
-            // Per-rule cumulative overflow (REAL bytes — rate does not apply).
-            if rule_used.checked_add(rule_delta_sum).is_none() {
-                let _ = tx.rollback().await;
-                return Ok(vec![TrafficEntryResult::Overflow]);
-            }
             // v1.0.8: billed delta charged to the user = round(real * rate).
-            let billed_raw = (rule_delta_sum as f64) * rate;
-            let billed_delta = if billed_raw.is_finite() && billed_raw <= i64::MAX as f64 {
-                billed_raw.round() as i64
+            let billed_delta = if let Some(delta) =
+                crate::service::traffic::billed_traffic_delta(rule_delta_sum, rate)
+            {
+                delta
             } else {
                 let _ = tx.rollback().await;
                 return Ok(vec![TrafficEntryResult::Overflow]);
             };
-            // Per-user cumulative overflow: existing total + running batch delta
-            // (BILLED bytes).
+            // The batch delta itself must fit even before it is added to the
+            // locked current total below.
             let cur_user_delta = *user_delta.get(&uid).unwrap_or(&0);
             let new_user_delta = match cur_user_delta.checked_add(billed_delta) {
                 Some(v) => v,
@@ -143,36 +138,102 @@ impl TrafficRepository for PgRepository {
                     return Ok(vec![TrafficEntryResult::Overflow]);
                 }
             };
-            if user_used.checked_add(new_user_delta).is_none() {
-                let _ = tx.rollback().await;
-                return Ok(vec![TrafficEntryResult::Overflow]);
-            }
             user_delta.insert(uid, new_user_delta);
             resolved.push(Resolved {
                 rule_id: rid,
                 uid,
-                delta_up: *dup,
-                delta_down: *ddown,
+                real_delta: rule_delta_sum,
                 billed_delta,
             });
         }
 
-        // ── Pass 3: apply writes (one UPDATE per distinct rule + its user).
-        // v1.0.8: forward_rules += REAL bytes; users += BILLED bytes. ──
-        for r in &resolved {
-            let up = r.delta_up as i64;
-            let down = r.delta_down as i64;
-            sqlx::query(
-                "UPDATE forward_rules SET traffic_used = traffic_used + $1 + $2 WHERE id = $3",
+        // ── Pass 3: lock + revalidate. Every transaction that changes both
+        // user and rule traffic (including admin reset) uses user -> rule.
+        // Sorting each domain also prevents two multi-user batches from taking
+        // the same rows in opposite HashMap iteration order. ──
+        resolved.sort_unstable_by_key(|row| row.rule_id);
+        let mut user_ids: Vec<i64> = user_delta.keys().copied().collect();
+        user_ids.sort_unstable();
+        for uid in &user_ids {
+            let exists: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                    .bind(uid)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if exists.is_none() {
+                let _ = tx.rollback().await;
+                return Ok(vec![TrafficEntryResult::Unavailable]);
+            }
+        }
+        for row in &resolved {
+            let exists: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM forward_rules WHERE id = $1 FOR UPDATE")
+                    .bind(row.rule_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if exists.is_none() {
+                let _ = tx.rollback().await;
+                return Ok(vec![TrafficEntryResult::Unavailable]);
+            }
+        }
+
+        let mut checked_user_delta: std::collections::HashMap<i64, i64> =
+            std::collections::HashMap::new();
+        for row in &resolved {
+            let current: Option<(i64, i64, i64)> = sqlx::query_as(
+                "SELECT fr.uid, fr.traffic_used, u.traffic_used \
+                 FROM forward_rules fr JOIN users u ON u.id=fr.uid \
+                 WHERE fr.id=$1 AND (fr.device_group_in=$2 OR EXISTS( \
+                   SELECT 1 FROM forward_rule_retired_entries re \
+                   WHERE re.rule_id=fr.id AND re.device_group_id=$2 \
+                     AND re.expires_at>=EXTRACT(EPOCH FROM now())::BIGINT))",
             )
-            .bind(up)
-            .bind(down)
-            .bind(r.rule_id)
-            .execute(&mut *tx)
+            .bind(row.rule_id)
+            .bind(group_id)
+            .fetch_optional(&mut *tx)
             .await?;
+            let Some((current_uid, rule_used, user_used)) = current else {
+                let _ = tx.rollback().await;
+                return Ok(vec![TrafficEntryResult::Unavailable]);
+            };
+            if current_uid != row.uid {
+                let _ = tx.rollback().await;
+                return Ok(vec![TrafficEntryResult::Unavailable]);
+            }
+            if rule_used.checked_add(row.real_delta).is_none() {
+                let _ = tx.rollback().await;
+                return Ok(vec![TrafficEntryResult::Overflow]);
+            }
+            let prior = *checked_user_delta.get(&row.uid).unwrap_or(&0);
+            let next = match prior.checked_add(row.billed_delta) {
+                Some(value) => value,
+                None => {
+                    let _ = tx.rollback().await;
+                    return Ok(vec![TrafficEntryResult::Overflow]);
+                }
+            };
+            if user_used.checked_add(next).is_none() {
+                let _ = tx.rollback().await;
+                return Ok(vec![TrafficEntryResult::Overflow]);
+            }
+            checked_user_delta.insert(row.uid, next);
+        }
+
+        // ── Pass 4: apply real rule bytes, then one aggregated billed update
+        // per user. Rows remain locked from pass 3, so these increments cannot
+        // cross a reset or another report between validation and commit. ──
+        for r in &resolved {
+            sqlx::query("UPDATE forward_rules SET traffic_used = traffic_used + $1 WHERE id = $2")
+                .bind(r.real_delta)
+                .bind(r.rule_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for uid in user_ids {
+            let billed_delta = checked_user_delta.get(&uid).copied().unwrap_or(0);
             sqlx::query("UPDATE users SET traffic_used = traffic_used + $1 WHERE id = $2")
-                .bind(r.billed_delta)
-                .bind(r.uid)
+                .bind(billed_delta)
+                .bind(uid)
                 .execute(&mut *tx)
                 .await?;
         }

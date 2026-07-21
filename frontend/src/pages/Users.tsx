@@ -1,7 +1,7 @@
-import { Table, Button, Tag, Popconfirm, message, Progress, Tooltip, Modal, Form, Input, InputNumber, Switch, Space, Select, DatePicker, Divider, Dropdown } from 'antd';
+import { Table, Button, Tag, Popconfirm, message, Progress, Tooltip, Modal, Form, Input, InputNumber, Switch, Space, Select, DatePicker, Divider, Dropdown, Alert } from 'antd';
 import type { MenuProps } from 'antd';
-import { DeleteOutlined, EditOutlined, ReloadOutlined, UndoOutlined, UserOutlined, PlusOutlined, KeyOutlined, ApiOutlined, ShoppingOutlined, MoreOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useState } from 'react';
+import { DeleteOutlined, EditOutlined, ReloadOutlined, UndoOutlined, UserOutlined, PlusOutlined, KeyOutlined, ApiOutlined, ShoppingOutlined, MoreOutlined, SearchOutlined } from '@ant-design/icons';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import dayjs, { type Dayjs } from 'dayjs';
 import api from '../api/client';
@@ -10,15 +10,11 @@ import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { makePasswordValidator } from '../utils/password';
 import { useAuth } from '../auth/useAuth';
+import { MAX_SAFE_TRAFFIC_GB, bytesToGb, gbToBytes, trafficGbChanged } from '../utils/traffic';
 
 // traffic_limit is stored in BYTES in the database. The edit form works in GB
 // for usability (a raw byte count is meaningless to a human). Convert on the
 // boundary only — the backend and DB stay byte-based.
-const BYTES_PER_GB = 1024 * 1024 * 1024;
-const bytesToGb = (bytes: number): number =>
-  bytes > 0 ? Math.round((bytes / BYTES_PER_GB) * 100) / 100 : 0;
-const gbToBytes = (gb: number): number => Math.round(gb * BYTES_PER_GB);
-
 interface UserFormValues {
   // Stored as a string (not number) so the wire format matches the backend's
   // TEXT-typed `users.balance` column and the strict `parse_balance` rules
@@ -54,7 +50,11 @@ export default function Users() {
   const navigate = useNavigate();
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [actionBusyId, setActionBusyId] = useState<number | null>(null);
+  const [query, setQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'suspended' | 'banned'>('all');
   const [editing, setEditing] = useState<User | null>(null);
   const [creating, setCreating] = useState(false);
   // v0.4.10 PR4: admin password reset state. resetting = the target user row.
@@ -66,9 +66,11 @@ export default function Users() {
   const [planChoice, setPlanChoice] = useState<number | undefined>(undefined);
   const [planExpire, setPlanExpire] = useState<Dayjs | null>(null);
   const [planBusy, setPlanBusy] = useState(false);
+  const userBusy = loading || loadFailed || saving || planBusy || actionBusyId !== null;
   const [form] = Form.useForm<UserFormValues>();
   const [createForm] = Form.useForm<CreateUserFormValues>();
   const [resetForm] = Form.useForm<ResetFormValues>();
+  const loadGenerationRef = useRef(0);
 
   // Only admins can create users / delete regular users. v0.4.10: read from
   // AuthContext (server-verified role) instead of localStorage. The backend
@@ -78,9 +80,13 @@ export default function Users() {
   const { isAdmin } = useAuth();
 
   const load = useCallback(async () => {
+    const requestId = ++loadGenerationRef.current;
+    Modal.destroyAll();
+    setEditing(null);
+    setCreating(false);
+    setResetting(null);
     setLoading(true);
-    setUsers([]);
-    setPlans([]);
+    setLoadFailed(false);
     try {
       // The plan catalog is required by the embedded plan editor. Do not turn
       // a failed catalog request into an empty selector that looks authoritative.
@@ -88,11 +94,19 @@ export default function Users() {
         api.get<unknown, ApiEnvelope<User[]>>('/admin/users'),
         api.get<unknown, ApiEnvelope<Plan[]>>('/admin/plans'),
       ]);
+      if (requestId !== loadGenerationRef.current) return false;
       setUsers(usersRes.data || []);
       setPlans(pRes.data || []);
+      return true;
     } catch {
-      message.error(t('loadFailed'));
-    } finally { setLoading(false); }
+      if (requestId === loadGenerationRef.current) {
+        setLoadFailed(true);
+        message.error(t('loadFailed'));
+      }
+      return false;
+    } finally {
+      if (requestId === loadGenerationRef.current) setLoading(false);
+    }
   }, [t]);
 
   // Resolve a plan id → display name (falls back to #id, or "no plan" for null).
@@ -117,16 +131,27 @@ export default function Users() {
   // expiry (REPLACE semantics), so confirm first. Renew (same plan) / first
   // assignment proceed directly.
   const handleBuyPlanForUser = () => {
-    if (!editing || planChoice == null) return;
+    if (!editing || planChoice == null || userBusy) return;
     const target = editing;
+    const selectedPlan = plans.find(plan => plan.id === planChoice);
+    if (!selectedPlan) return;
     const doBuy = async () => {
       setPlanBusy(true);
       try {
-        const res = await api.post<unknown, ApiEnvelope<null>>(`/admin/users/${target.id}/buy-plan`, { plan_id: planChoice });
-        if (res.code !== 0) { message.error(res.message); return; }
+        const res = await api.post<unknown, ApiEnvelope<null>>(`/admin/users/${target.id}/buy-plan`, {
+          plan_id: selectedPlan.id,
+          expected_current_plan_id: target.plan_id ?? 0,
+          expected_price: selectedPlan.price,
+          expected_revision: selectedPlan.purchase_revision,
+        });
+        if (res.code !== 0) {
+          message.error(res.message);
+          if (res.code === 409) await load();
+          return;
+        }
         message.success(t('planAssigned'));
         setEditing(null);
-        load();
+        await load();
       } catch {
         message.error(t('purchaseFailed'));
       } finally { setPlanBusy(false); }
@@ -149,14 +174,23 @@ export default function Users() {
   // plan (and revokes device-group authorization on the backend); otherwise
   // keep plan_id and set the expiry (null = never expires).
   const handleSetUserPlan = async (clear: boolean, expire: string | null) => {
-    if (!editing) return;
+    if (!editing || editing.plan_id == null || userBusy) return;
+    const target = editing;
     setPlanBusy(true);
     try {
-      const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/users/${editing.id}/plan`, { clear, plan_expire_at: expire });
-      if (res.code !== 0) { message.error(res.message); return; }
+      const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/users/${target.id}/plan`, {
+        expected_plan_id: target.plan_id,
+        clear,
+        plan_expire_at: expire,
+      });
+      if (res.code !== 0) {
+        message.error(res.message);
+        if (res.code === 409) await load();
+        return;
+      }
       message.success(t('userUpdated'));
       setEditing(null);
-      load();
+      await load();
     } catch {
       message.error(t('saveFailed'));
     } finally { setPlanBusy(false); }
@@ -164,14 +198,29 @@ export default function Users() {
 
   useEffect(() => { load(); }, [load]);
 
+  const filteredUsers = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase();
+    return users.filter((u) => {
+      const matchesQuery = !needle
+        || u.username.toLocaleLowerCase().includes(needle)
+        || String(u.id).includes(needle);
+      const status = u.banned ? 'banned' : u.suspended ? 'suspended' : 'active';
+      return matchesQuery && (statusFilter === 'all' || status === statusFilter);
+    });
+  }, [query, statusFilter, users]);
+
   const handleDelete = async (id: number) => {
+    if (userBusy) return;
+    setActionBusyId(id);
     try {
       const res = await api.delete<unknown, ApiEnvelope<null>>(`/admin/users/${id}`);
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('userDeleted'));
-      load();
+      await load();
     } catch {
       message.error(t('deleteFailed'));
+    } finally {
+      setActionBusyId(null);
     }
   };
 
@@ -193,7 +242,7 @@ export default function Users() {
   };
 
   const handleSave = async () => {
-    if (!editing) return;
+    if (!editing || userBusy) return;
     const values = await form.validateFields().catch(() => null);
     if (!values) return;
     // Trim the balance string and convert empty input to undefined so the
@@ -204,9 +253,12 @@ export default function Users() {
       max_rules: values.max_rules,
       banned: values.banned,
       suspended: values.suspended,
-      // Convert GB back to the byte count the backend/DB expect.
-      traffic_limit: gbToBytes(values.traffic_limit_gb),
     };
+    // The form displays only two decimal places. Do not round-trip an exact
+    // byte quota merely because the administrator changed another field.
+    if (trafficGbChanged(editing.traffic_limit, values.traffic_limit_gb)) {
+      payload.traffic_limit = gbToBytes(values.traffic_limit_gb);
+    }
     if (balance !== '') {
       payload.balance = balance;
     }
@@ -220,7 +272,7 @@ export default function Users() {
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('userUpdated'));
       setEditing(null);
-      load();
+      await load();
     } catch {
       message.error(t('saveFailed'));
     } finally { setSaving(false); }
@@ -232,6 +284,7 @@ export default function Users() {
   };
 
   const handleCreate = async () => {
+    if (userBusy) return;
     const values = await createForm.validateFields().catch(() => null);
     if (!values) return;
     setSaving(true);
@@ -243,35 +296,43 @@ export default function Users() {
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('userCreated'));
       setCreating(false);
-      load();
+      await load();
     } catch {
       message.error(t('saveFailed'));
     } finally { setSaving(false); }
   };
 
   const handleResetTraffic = async (id: number) => {
+    if (userBusy) return;
+    setActionBusyId(id);
     try {
       const res = await api.post<unknown, ApiEnvelope<null>>(`/admin/users/${id}/reset-traffic`);
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('trafficReset'));
-      load();
+      await load();
     } catch {
       message.error(t('saveFailed'));
+    } finally {
+      setActionBusyId(null);
     }
   };
 
   // v1.0.8: suspend / unsuspend a user (non-admin only). Stops forwarding via
   // the config gate WITHOUT bumping token_version (the user stays logged in).
   const handleToggleSuspend = async (u: User) => {
+    if (userBusy) return;
+    setActionBusyId(u.id);
     try {
       const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/users/${u.id}`, {
         suspended: !u.suspended,
       });
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(u.suspended ? t('userUnsuspended') : t('userSuspended'));
-      load();
+      await load();
     } catch {
       message.error(t('saveFailed'));
+    } finally {
+      setActionBusyId(null);
     }
   };
 
@@ -284,7 +345,7 @@ export default function Users() {
   };
 
   const handleReset = async () => {
-    if (!resetting) return;
+    if (!resetting || userBusy) return;
     const values = await resetForm.validateFields().catch(() => null);
     if (!values) return;
     setSaving(true);
@@ -306,14 +367,14 @@ export default function Users() {
 
   const userActionMenu = (u: User): MenuProps => ({
     items: [
-      { key: 'rules', icon: <ApiOutlined />, label: t('manageRules') },
-      { key: 'reset-traffic', icon: <UndoOutlined />, label: t('resetTraffic') },
+      { key: 'rules', icon: <ApiOutlined />, label: t('manageRules'), disabled: userBusy },
+      { key: 'reset-traffic', icon: <UndoOutlined />, label: t('resetTraffic'), disabled: userBusy },
       ...(isAdmin && !u.admin ? [
         { type: 'divider' as const },
-        { key: 'password', icon: <KeyOutlined />, label: t('resetPassword') },
-        { key: 'suspend', label: u.suspended ? t('unsuspend') : t('suspend') },
+        { key: 'password', icon: <KeyOutlined />, label: t('resetPassword'), disabled: userBusy },
+        { key: 'suspend', label: u.suspended ? t('unsuspend') : t('suspend'), disabled: userBusy },
         { type: 'divider' as const },
-        { key: 'delete', icon: <DeleteOutlined />, label: t('delete'), danger: true },
+        { key: 'delete', icon: <DeleteOutlined />, label: t('delete'), danger: true, disabled: userBusy },
       ] : []),
     ],
     onClick: ({ key }) => {
@@ -416,12 +477,12 @@ export default function Users() {
     },
     { title: t('joined'), dataIndex: 'created_at', key: 'created_at' },
     {
-      title: t('action'), key: 'action', width: 115,
+      title: t('action'), key: 'action', width: 115, fixed: 'right' as const,
       render: (_: unknown, u: User) => (
         <Space size={0}>
-          <Button icon={<EditOutlined />} size="small" type="text" onClick={() => openEdit(u)}>{t('edit')}</Button>
+          <Button icon={<EditOutlined />} size="small" type="text" disabled={userBusy} onClick={() => openEdit(u)}>{t('edit')}</Button>
           <Dropdown menu={userActionMenu(u)} trigger={['click']} placement="bottomRight">
-            <Button icon={<MoreOutlined />} size="small" type="text" aria-label={t('action')} title={t('action')} />
+            <Button icon={<MoreOutlined />} size="small" type="text" loading={actionBusyId === u.id} disabled={userBusy && actionBusyId !== u.id} aria-label={t('action')} title={t('action')} />
           </Dropdown>
         </Space>
       ),
@@ -434,23 +495,58 @@ export default function Users() {
         <h2 className="rp-page-title"><UserOutlined /> {t('users')}</h2>
         <Space className="rp-page-actions" wrap>
           {isAdmin && (
-            <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>{t('addUser')}</Button>
+            <Button type="primary" icon={<PlusOutlined />} disabled={userBusy} onClick={openCreate}>{t('addUser')}</Button>
           )}
-          <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
+          <Button icon={<ReloadOutlined />} loading={loading} disabled={saving || planBusy || actionBusyId !== null || !!editing || creating || !!resetting} onClick={load}>{t('refresh')}</Button>
         </Space>
       </div>
-      <Table className="rp-responsive-table" dataSource={users} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} scroll={{ x: 'max-content' }} />
+      {loadFailed && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 14 }}
+          title={t('loadFailed')}
+          description={t('loadFailedRetry')}
+        />
+      )}
+      <div className="rp-list-filters">
+        <Input
+          allowClear
+          prefix={<SearchOutlined />}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder={t('searchUsers')}
+          aria-label={t('searchUsers')}
+        />
+        <Select
+          value={statusFilter}
+          onChange={setStatusFilter}
+          aria-label={t('filterUserStatus')}
+          options={[
+            { value: 'all', label: t('allStatuses') },
+            { value: 'active', label: t('active') },
+            { value: 'suspended', label: t('suspended') },
+            { value: 'banned', label: t('banned') },
+          ]}
+        />
+      </div>
+      <Table className="rp-responsive-table" dataSource={filteredUsers} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20, hideOnSinglePage: true }} scroll={{ x: 'max-content' }} />
 
       <Modal
         title={editing ? `${t('editUser')}: ${editing.username}` : t('editUser')}
         open={!!editing}
         confirmLoading={saving}
         onOk={handleSave}
-        onCancel={() => setEditing(null)}
+        onCancel={() => { if (!saving && !planBusy) setEditing(null); }}
+        closable={!saving && !planBusy}
+        mask={{ closable: !saving && !planBusy }}
+        keyboard={!saving && !planBusy}
+        cancelButtonProps={{ disabled: saving || planBusy }}
+        okButtonProps={{ disabled: planBusy }}
         okText={t('save')}
         cancelText={t('cancel')}
       >
-        <Form form={form} layout="vertical">
+        <Form form={form} layout="vertical" disabled={saving || planBusy}>
           <Form.Item
             name="balance"
             label={t('balance')}
@@ -498,15 +594,18 @@ export default function Users() {
             label={t('maxRules')}
             rules={[{ type: 'number', min: 0, max: 100000, message: t('maxRulesRange') }]}
           >
-            <InputNumber min={0} max={100000} style={{ width: 200 }} />
+            <InputNumber min={0} max={100000} precision={0} style={{ width: 200 }} />
           </Form.Item>
           <Form.Item
             name="traffic_limit_gb"
             label={t('trafficLimitGb')}
             tooltip={t('trafficLimitGbHint')}
-            rules={[{ type: 'number', min: 0, message: t('trafficLimitNonNegative') }]}
+            rules={[
+              { type: 'number', min: 0, message: t('trafficLimitNonNegative') },
+              { type: 'number', max: MAX_SAFE_TRAFFIC_GB, message: t('trafficLimitTooLarge') },
+            ]}
           >
-            <InputNumber min={0} step={1} style={{ width: '100%' }} addonAfter="GB" />
+            <InputNumber min={0} max={MAX_SAFE_TRAFFIC_GB} step={1} style={{ width: '100%' }} addonAfter="GB" />
           </Form.Item>
           <Form.Item name="banned" label={t('banned')} valuePropName="checked">
             <Switch disabled={!!editing?.admin} />
@@ -546,12 +645,13 @@ export default function Users() {
                 placeholder={t('selectPlan')}
                 value={planChoice}
                 onChange={setPlanChoice}
+                disabled={userBusy}
                 options={plans.map(p => ({
                   value: p.id,
                   label: `${p.name} · ${p.price} · ${p.plan_type === 'time' ? `${p.duration_days}${t('days')}` : t('planTypeData')}`,
                 }))}
               />
-              <Button type="primary" loading={planBusy} disabled={planChoice == null} onClick={handleBuyPlanForUser}>
+              <Button type="primary" loading={planBusy} disabled={userBusy || planChoice == null} onClick={handleBuyPlanForUser}>
                 {isRenewSamePlan ? t('renewAndCharge') : t('assignAndCharge')}
               </Button>
             </Space.Compact>
@@ -571,11 +671,11 @@ export default function Users() {
               <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>{t('expiryOnlyForTimePlan')}</div>
             )}
             <Space wrap>
-              <DatePicker showTime disabled={!isTimePlan} value={planExpire} onChange={setPlanExpire} placeholder={t('neverExpires')} />
-              <Button loading={planBusy} disabled={!isTimePlan} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
+              <DatePicker showTime disabled={userBusy || !isTimePlan} value={planExpire} onChange={setPlanExpire} placeholder={t('neverExpires')} />
+              <Button loading={planBusy} disabled={userBusy || !isTimePlan} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
                 {t('saveExpiry')}
               </Button>
-              <Button loading={planBusy} disabled={!isTimePlan} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
+              <Button loading={planBusy} disabled={userBusy || !isTimePlan} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
                 {t('setNeverExpires')}
               </Button>
             </Space>
@@ -584,8 +684,8 @@ export default function Users() {
 
             {/* v1.0.8: "remove plan" is only enabled when the user actually has
                 a plan — you can't remove what isn't there. */}
-            <Popconfirm title={t('removePlanConfirm')} disabled={!hasPlan} onConfirm={() => handleSetUserPlan(true, null)}>
-              <Button danger loading={planBusy} disabled={!hasPlan}>{t('removePlan')}</Button>
+            <Popconfirm title={t('removePlanConfirm')} disabled={userBusy || !hasPlan} onConfirm={() => handleSetUserPlan(true, null)}>
+              <Button danger loading={planBusy} disabled={userBusy || !hasPlan}>{t('removePlan')}</Button>
             </Popconfirm>
           </>
         )}
@@ -596,7 +696,11 @@ export default function Users() {
         open={creating}
         confirmLoading={saving}
         onOk={handleCreate}
-        onCancel={() => setCreating(false)}
+        onCancel={() => { if (!saving) setCreating(false); }}
+        closable={!saving}
+        mask={{ closable: !saving }}
+        keyboard={!saving}
+        cancelButtonProps={{ disabled: saving }}
         okText={t('create')}
         cancelText={t('cancel')}
       >
@@ -636,7 +740,11 @@ export default function Users() {
         open={!!resetting}
         confirmLoading={saving}
         onOk={handleReset}
-        onCancel={() => setResetting(null)}
+        onCancel={() => { if (!saving) setResetting(null); }}
+        closable={!saving}
+        mask={{ closable: !saving }}
+        keyboard={!saving}
+        cancelButtonProps={{ disabled: saving }}
         okText={t('confirmReset')}
         cancelText={t('cancel')}
         okButtonProps={{ danger: true }}

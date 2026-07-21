@@ -1,19 +1,22 @@
 import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Tag, Alert, Typography, Dropdown, Switch, Tabs, Spin, Tooltip, Card, Checkbox, Grid, List } from 'antd';
 import type { MenuProps } from 'antd';
-import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, MoreOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, MoreOutlined, SearchOutlined } from '@ant-design/icons';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
 import { canUsePresetForRuleUpdate } from '../utils/tunnels';
+import { ruleFormTabForErrors } from '../utils/ruleForm';
 import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, Tunnel } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { useAuth } from '../auth/useAuth';
+import { mapWithConcurrency } from '../utils/async';
 import { asValidatedEntry, buildExportJSON, parseDest, ruleTargets, validateImportEntry } from '../utils/rulesIO';
 
 const { Text } = Typography;
 const { TextArea } = Input;
+const BATCH_REQUEST_CONCURRENCY = 6;
 
 function targetSummary(rule: ForwardRule): string {
   const targets = ruleTargets(rule).filter(t => t.enabled);
@@ -90,27 +93,62 @@ export default function Rules() {
   const [importResults, setImportResults] = useState<string[]>([]);
   const [editing, setEditing] = useState<ForwardRule | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [busyRuleId, setBusyRuleId] = useState<number | null>(null);
+  const [batchAction, setBatchAction] = useState<'delete' | 'pause' | 'resume' | 'restart' | null>(null);
+  const batchBusy = batchAction !== null;
+  const [query, setQuery] = useState('');
+  const [createTab, setCreateTab] = useState('basic');
+  const [editTab, setEditTab] = useState('basic');
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
   // v0.4.8: rule diagnosis modal state.
   const [diagnosing, setDiagnosing] = useState<ForwardRule | null>(null);
   const [diagnoseLoading, setDiagnoseLoading] = useState(false);
   const [diagnoseResult, setDiagnoseResult] = useState<DiagnoseResponse | null>(null);
+  const diagnoseGenerationRef = useRef(0);
   // v0.4.9: group-name column + filter. selectedGroup === null means "all".
   // (Explicit null, not !selectedGroup, so a future id of 0 wouldn't be falsy.)
   const [selectedGroup, setSelectedGroup] = useState<number | null>(null);
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([]);
   const userId = user?.id;
+  const ownerUid = filterOwnerUid ?? (isAdmin ? (userId ?? null) : null);
+  const loadScope = isAdmin
+    ? `admin:${ownerUid ?? 'self'}`
+    : `user:${userId ?? 'anonymous'}`;
+  const loadGenerationRef = useRef(0);
+  const loadScopeRef = useRef<string | null>(null);
+  const desiredLoadScopeRef = useRef(loadScope);
+  useLayoutEffect(() => {
+    desiredLoadScopeRef.current = loadScope;
+  }, [loadScope]);
 
   const load = useCallback(async () => {
+    if (desiredLoadScopeRef.current !== loadScope) return false;
+    const requestId = ++loadGenerationRef.current;
+    if (loadScopeRef.current !== loadScope) {
+      loadScopeRef.current = loadScope;
+      Modal.destroyAll();
+      setRules([]);
+      setGroups([]);
+      setTunnels([]);
+      setSharedGroups([]);
+      setSharedLoadFailed(false);
+      setUsers([]);
+      setSelfQuota(null);
+      setSelectedRowKeys([]);
+      setEditing(null);
+      setCreateOpen(false);
+      setEditOpen(false);
+      setImportOpen(false);
+      ++diagnoseGenerationRef.current;
+      setDiagnosing(null);
+      setDiagnoseLoading(false);
+      setDiagnoseResult(null);
+    }
     setLoading(true);
-    setRules([]);
-    setGroups([]);
-    setTunnels([]);
-    setUsers([]);
-    setSelfQuota(null);
-    setSharedGroups([]);
-    setSharedLoadFailed(!isAdmin);
+    setLoadFailed(false);
     try {
       // v0.4.10: /admin/users is admin-only and NOT in the main Promise.all —
       // a regular user would 403 and block the whole page load. The owner
@@ -120,34 +158,35 @@ export default function Rules() {
       // v0.4.20: admin can filter rules by owner_uid.
       // Admin on own page → filter to their own rules; admin viewing another
       // user → use filterOwnerUid; regular user → backend filters automatically.
-      const ownerUid = filterOwnerUid ?? (isAdmin ? (userId ?? null) : null);
       const rulesUrl = ownerUid ? `/rules?owner_uid=${ownerUid}` : '/rules';
       const [r, g, tr] = await Promise.all([
         api.get<unknown, ApiEnvelope<ForwardRule[]>>(rulesUrl),
-        api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
+        isAdmin
+          ? api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups')
+          : Promise.resolve({ code: 0, message: 'ok', data: [] as DeviceGroup[] }),
         api.get<unknown, ApiEnvelope<Tunnel[]>>('/tunnels'),
       ]);
-      setRules(r.data || []);
-      setGroups(g.data || []);
-      setTunnels(tr.data || []);
+      const nextRules = r.data || [];
+      let nextUsers: User[] = [];
+      let nextSelfQuota: { used: number; limit: number } | null = null;
+      let nextSharedGroups: SharedGroupSummary[] = [];
+      let nextSharedLoadFailed = false;
       if (isAdmin) {
         try {
           const u = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
-          setUsers(u.data || []);
+          nextUsers = u.data || [];
         } catch {
           // Non-fatal: owner column falls back to "#uid" labels.
-          setUsers([]);
+          nextUsers = [];
         }
-        setSelfQuota(null);
       } else {
-        setUsers([]);
         // v1.0.7: a regular user only ever sees their own rules, so one /user/me
         // read gives the quota needed to flag all of them. Non-fatal on failure.
         try {
           const me = await api.get<unknown, ApiEnvelope<UserSelf>>('/user/me');
-          setSelfQuota(me.data ? { used: me.data.traffic_used, limit: me.data.traffic_limit } : null);
+          nextSelfQuota = me.data ? { used: me.data.traffic_used, limit: me.data.traffic_limit } : null;
         } catch {
-          setSelfQuota(null);
+          nextSelfQuota = null;
         }
       }
       // v0.4.12 PR1: shared inbound groups (admin-owned) for regular users.
@@ -159,26 +198,40 @@ export default function Rules() {
         try {
           const sg = await api.get<unknown, ApiEnvelope<SharedGroupSummary[]>>('/groups/shared');
           if (sg.code !== 0) {
-            setSharedLoadFailed(true);
-            setSharedGroups([]);
+            nextSharedLoadFailed = true;
           } else {
-            setSharedLoadFailed(false);
-            setSharedGroups(sg.data || []);
+            nextSharedGroups = sg.data || [];
           }
         } catch {
-          setSharedLoadFailed(true);
-          setSharedGroups([]);
+          nextSharedLoadFailed = true;
         }
-      } else {
-        setSharedLoadFailed(false);
-        setSharedGroups([]);
       }
+
+      if (requestId !== loadGenerationRef.current || desiredLoadScopeRef.current !== loadScope) return false;
+      setRules(nextRules);
+      setSelectedRowKeys(current => current.filter(id => nextRules.some(rule => rule.id === id)));
+      setGroups(g.data || []);
+      setTunnels(tr.data || []);
+      setUsers(nextUsers);
+      setSelfQuota(nextSelfQuota);
+      setSharedGroups(nextSharedGroups);
+      setSharedLoadFailed(nextSharedLoadFailed);
+      setLoadFailed(false);
+      return true;
     } catch {
-      message.error(t('loadFailed'));
-    } finally { setLoading(false); }
-  }, [filterOwnerUid, isAdmin, t, userId]);
+      if (requestId === loadGenerationRef.current && desiredLoadScopeRef.current === loadScope) {
+        setLoadFailed(true);
+        message.error(t('loadFailed'));
+      }
+      return false;
+    } finally {
+      if (requestId === loadGenerationRef.current && desiredLoadScopeRef.current === loadScope) setLoading(false);
+    }
+  }, [isAdmin, loadScope, ownerUid, t]);
 
   useEffect(() => { load(); }, [load]);
+
+  const mutationsBlocked = loading || loadFailed || saving || batchBusy || busyRuleId !== null;
 
   // User lookup map for the "owner" column.
   const userMap = new Map(users.map(u => [u.id, u.username]));
@@ -195,11 +248,9 @@ export default function Rules() {
   };
   // v0.4.9: group lookup map for the "group name" column + filter. Memoized so
   // the column render + filter options share one derivation.
-  const groupMap = useMemo(() => new Map(groups.map(g => [g.id, g])), [groups]);
   const tunnelMap = useMemo(() => new Map(tunnels.map(tunnel => [tunnel.id, tunnel])), [tunnels]);
   // v1.0.8: group-name + listen-IP lookup for the rule columns. A regular user
-  // does NOT own the (admin-owned) device groups, so GET /groups returns none
-  // for them and the columns rendered "未知分组 / 未配置". Their AUTHORIZED
+  // cannot read the administrator group inventory. Their AUTHORIZED
   // groups come from /groups/shared (SharedGroupSummary, which carries name +
   // connect_host) — merge both so name/IP resolve for admins and users alike.
   const groupInfo = useMemo(() => {
@@ -212,10 +263,29 @@ export default function Rules() {
   }, [groups, sharedGroups]);
   // The rules actually shown: filtered by the selected inbound group, or all
   // when selectedGroup === null. Computed once so the table + count stay in sync.
-  const visibleRules = useMemo(
-    () => rules.filter(r => selectedGroup === null || r.device_group_in === selectedGroup),
-    [rules, selectedGroup],
-  );
+  const visibleRules = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase();
+    return rules.filter((r) => {
+      if (selectedGroup !== null && r.device_group_in !== selectedGroup) return false;
+      if (!needle) return true;
+      const targets = ruleTargets(r).map(target => `${target.host}:${target.port}`).join(' ');
+      const haystack = [
+        r.name,
+        String(r.id),
+        String(r.listen_port),
+        groupInfo.get(r.device_group_in)?.name ?? '',
+        targets,
+      ].join(' ').toLocaleLowerCase();
+      return haystack.includes(needle);
+    });
+  }, [groupInfo, query, rules, selectedGroup]);
+  const visibleRuleIds = useMemo(() => new Set(visibleRules.map(rule => rule.id)), [visibleRules]);
+
+  // A selected rule must remain visible. Otherwise a rename/group change can
+  // hide it behind the active filters while batch actions still target it.
+  useEffect(() => {
+    setSelectedRowKeys(current => current.filter(id => visibleRuleIds.has(id)));
+  }, [visibleRuleIds]);
 
   const handleCreate = async (values: {
     name: string; listen_port: number | null; protocol: string;
@@ -230,13 +300,17 @@ export default function Rules() {
     load_balance_strategy?: string;
     upload_limit_mbps?: number;
     download_limit_mbps?: number;
+    max_connections?: number;
+    auto_restart_minutes?: number;
     tunnel_profile_id?: number | null;
     owner_uid?: number | null;
   }) => {
+    if (loading || loadFailed || saving) return;
     // v0.4.20: WS/TLS tunnel hidden — always raw, no profile.
     // owner determined by entry point (filterOwnerUid from URL).
     const owner_uid = filterOwnerUid ?? undefined;
     if (formTargets(values).length < 1) {
+      setCreateTab('forward');
       message.error(t('targetRequired'));
       return;
     }
@@ -265,18 +339,22 @@ export default function Rules() {
       hops: isChain ? hops : undefined,
       owner_uid,
     });
+    setSaving(true);
     try {
       const res = await api.post<unknown, ApiEnvelope<null>>('/rules', payload);
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('ruleCreated'));
       setCreateOpen(false);
       createForm.resetFields();
-      load();
+      await load();
     } catch { message.error(t('failedCreateRule')); }
+    finally { setSaving(false); }
   };
 
   const handleEdit = (r: ForwardRule) => {
+    if (loading || loadFailed || saving || batchBusy || busyRuleId !== null) return;
     setEditing(r);
+    setEditTab('basic');
     const isChain = r.route_mode === 'chain' || r.forward_mode === 'chain';
     const lineMode = r.tunnel_id ? 'tunnel' : isChain ? 'chain' : 'direct';
     editForm.setFieldsValue({
@@ -302,7 +380,10 @@ export default function Rules() {
   /** Copy: open the create modal pre-filled with the rule's values, but with
    *  a "-copy" name suffix and no listen_port (auto-assign). */
   const handleCopy = (r: ForwardRule) => {
+    if (loading || loadFailed || saving || batchBusy || busyRuleId !== null) return;
     setEditing(null);
+    setCreateTab('basic');
+    createForm.resetFields();
     createForm.setFieldsValue({
       name: `${r.name}-copy`,
       listen_port: null,
@@ -318,9 +399,8 @@ export default function Rules() {
       load_balance_strategy: r.load_balance_strategy ?? 'first',
       upload_limit_mbps: r.upload_limit_mbps ?? 0,
       download_limit_mbps: r.download_limit_mbps ?? 0,
-      // v1.2.0: max_connections / auto_restart_minutes are NOT carried over —
-      // they're edit-only (the create path can't store them), so the copy starts
-      // uncapped and the user sets them via Edit if wanted.
+      max_connections: r.max_connections ?? 0,
+      auto_restart_minutes: r.auto_restart_minutes ?? 0,
     });
     setCreateOpen(true);
   };
@@ -349,6 +429,7 @@ const IMPORT_DEFAULTS = {
   download_limit_mbps: 0,
 };
   const handleImport = async () => {
+    if (loading || loadFailed || saving) return;
     if (!importGroupId) {
       message.error(t('selectInboundGroup'));
       return;
@@ -361,41 +442,46 @@ const IMPORT_DEFAULTS = {
     if (entries.length === 0) {
       message.error(t('importInvalidFormat')); return;
     }
+    setSaving(true);
     const results: string[] = [];
-    for (const e of entries) {
-      const label = (typeof e === 'object' && e !== null && !Array.isArray(e))
-        ? String((e as { name?: unknown })['name'] ?? '?')
-        : '?';
-      const err = validateImportEntry(e);
-      if (err) { results.push(`❌ ${label}: ${err}`); continue; }
-      const entry = asValidatedEntry(e);
-      const targets = entry.dest.map(d => {
-        // validateImportEntry already rejected any unparseable dest above, so
-        // parseDest is non-null here; fall back to a safe default defensively.
-        const p = parseDest(d) ?? { host: '', port: 0 };
-        return { host: p.host, port: p.port, enabled: true, weight: 1 };
-      });
-      const first = targets[0];
-      try {
-        const res = await api.post<unknown, ApiEnvelope<null>>('/rules', {
-          name: entry.name,
-          listen_port: entry.listen_port,
-          ...IMPORT_DEFAULTS,
-          device_group_in: importGroupId,
-          target_addr: first.host,
-          target_port: first.port,
-          targets,
-          // v1.0.6: attribute to the target user when an admin imports via the
-          // user-management entry (/rules?owner_uid=X); else owner = caller.
-          owner_uid: filterOwnerUid ?? undefined,
+    try {
+      for (const e of entries) {
+        const label = (typeof e === 'object' && e !== null && !Array.isArray(e))
+          ? String((e as { name?: unknown })['name'] ?? '?')
+          : '?';
+        const err = validateImportEntry(e);
+        if (err) { results.push(`❌ ${label}: ${err}`); continue; }
+        const entry = asValidatedEntry(e);
+        const targets = entry.dest.map(d => {
+          // validateImportEntry already rejected any unparseable dest above, so
+          // parseDest is non-null here; fall back to a safe default defensively.
+          const p = parseDest(d) ?? { host: '', port: 0 };
+          return { host: p.host, port: p.port, enabled: true, weight: 1 };
         });
-        if (res.code === 0) results.push(`✅ ${entry.name}:${entry.listen_port}`);
-        else results.push(`❌ ${entry.name}: ${res.message}`);
-      } catch { results.push(`❌ ${entry.name}: network error`); }
+        const first = targets[0];
+        try {
+          const res = await api.post<unknown, ApiEnvelope<null>>('/rules', {
+            name: entry.name,
+            listen_port: entry.listen_port,
+            ...IMPORT_DEFAULTS,
+            device_group_in: importGroupId,
+            target_addr: first.host,
+            target_port: first.port,
+            targets,
+            // v1.0.6: attribute to the target user when an admin imports via the
+            // user-management entry (/rules?owner_uid=X); else owner = caller.
+            owner_uid: filterOwnerUid ?? undefined,
+          });
+          if (res.code === 0) results.push(`✅ ${entry.name}:${entry.listen_port}`);
+          else results.push(`❌ ${entry.name}: ${res.message}`);
+        } catch { results.push(`❌ ${entry.name}: network error`); }
+      }
+      if (results.length === 0) { message.error(t('importInvalidFormat')); return; }
+      setImportResults(results);
+      await load();
+    } finally {
+      setSaving(false);
     }
-    if (results.length === 0) { message.error(t('importInvalidFormat')); return; }
-    setImportResults(results);
-    load(); // refresh rules in background
   };
   const handleUpdate = async (values: {
     name?: string; listen_port?: number; protocol?: string;
@@ -412,6 +498,7 @@ const IMPORT_DEFAULTS = {
     auto_restart_minutes?: number;
   }) => {
     if (!editing) return;
+    if (loading || loadFailed || saving) return;
     const payload: Record<string, unknown> = {};
     if (values.name !== undefined && values.name !== editing.name) payload.name = values.name;
     if (values.listen_port !== undefined && values.listen_port !== editing.listen_port) payload.listen_port = values.listen_port;
@@ -462,6 +549,7 @@ const IMPORT_DEFAULTS = {
     const oldTargets = ruleTargets(editing);
     if (JSON.stringify(newTargets) !== JSON.stringify(oldTargets)) {
       if (newTargets.length < 1) {
+        setEditTab('forward');
         message.error(t('targetRequired'));
         return;
       }
@@ -489,16 +577,20 @@ const IMPORT_DEFAULTS = {
       payload.auto_restart_minutes = newAutoRestart;
     }
     if (Object.keys(payload).length === 0) { setEditOpen(false); return; }
+    setSaving(true);
     try {
       const res = await api.put<unknown, ApiEnvelope<null>>(`/rules/${editing.id}`, payload);
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('ruleUpdated'));
       setEditOpen(false);
-      load();
+      await load();
     } catch { message.error(t('failedUpdateRule')); }
+    finally { setSaving(false); }
   };
 
   const handleDelete = async (id: number) => {
+    if (loading || loadFailed || busyRuleId !== null || batchBusy) return;
+    setBusyRuleId(id);
     try {
       const res = await api.delete<unknown, ApiEnvelope<null>>(`/rules/${id}`);
       if (res.code !== 0) {
@@ -506,33 +598,39 @@ const IMPORT_DEFAULTS = {
         return;
       }
       message.success(t('ruleDeleted'));
-      load();
+      await load();
     } catch {
       message.error(t('deleteFailed'));
+    } finally {
+      setBusyRuleId(null);
     }
   };
 
   const handleBatchDelete = async () => {
     const ids = selectedRowKeys as number[];
-    if (ids.length === 0) return;
-    // v1.0.9: tally per-rule success/failure instead of assuming Promise.all
-    // means everything worked — a delete can fail (e.g. 404/permission) and the
-    // old code still reported the full count as deleted.
-    const results = await Promise.all(ids.map(async id => {
-      try {
-        const res = await api.delete<unknown, ApiEnvelope<null>>(`/rules/${id}`);
-        return res.code === 0;
-      } catch { return false; }
-    }));
-    const ok = results.filter(Boolean).length;
-    const fail = results.length - ok;
-    if (fail === 0) {
-      message.success(t('batchDeleteSuccess').replace('{count}', String(ok)));
-    } else {
-      message.warning(t('batchPartial').replace('{ok}', String(ok)).replace('{fail}', String(fail)));
+    if (ids.length === 0 || loading || loadFailed || batchBusy || busyRuleId !== null) return;
+    setBatchAction('delete');
+    // Tally per-rule success/failure and keep request fan-out bounded. A large
+    // selection must not open one browser/server connection per rule at once.
+    try {
+      const results = await mapWithConcurrency(ids, BATCH_REQUEST_CONCURRENCY, async id => {
+        try {
+          const res = await api.delete<unknown, ApiEnvelope<null>>(`/rules/${id}`);
+          return res.code === 0;
+        } catch { return false; }
+      });
+      const ok = results.filter(Boolean).length;
+      const fail = results.length - ok;
+      if (fail === 0) {
+        message.success(t('batchDeleteSuccess').replace('{count}', String(ok)));
+      } else {
+        message.warning(t('batchPartial').replace('{ok}', String(ok)).replace('{fail}', String(fail)));
+      }
+      setSelectedRowKeys([]);
+      await load();
+    } finally {
+      setBatchAction(null);
     }
-    setSelectedRowKeys([]);
-    load();
   };
 
   /** v1.0.7: batch pause/resume. Each rule goes through PUT /rules/{id}
@@ -541,22 +639,27 @@ const IMPORT_DEFAULTS = {
    *  instead of assuming success. */
   const handleBatchSetPaused = async (paused: boolean) => {
     const ids = selectedRowKeys as number[];
-    if (ids.length === 0) return;
-    const results = await Promise.all(ids.map(async id => {
-      try {
-        const res = await api.put<unknown, ApiEnvelope<null>>(`/rules/${id}`, { paused });
-        return res.code === 0;
-      } catch { return false; }
-    }));
-    const ok = results.filter(Boolean).length;
-    const fail = results.length - ok;
-    if (fail === 0) {
-      message.success((paused ? t('batchPauseSuccess') : t('batchResumeSuccess')).replace('{count}', String(ok)));
-    } else {
-      message.warning(t('batchPartial').replace('{ok}', String(ok)).replace('{fail}', String(fail)));
+    if (ids.length === 0 || loading || loadFailed || batchBusy || busyRuleId !== null) return;
+    setBatchAction(paused ? 'pause' : 'resume');
+    try {
+      const results = await mapWithConcurrency(ids, BATCH_REQUEST_CONCURRENCY, async id => {
+        try {
+          const res = await api.put<unknown, ApiEnvelope<null>>(`/rules/${id}`, { paused });
+          return res.code === 0;
+        } catch { return false; }
+      });
+      const ok = results.filter(Boolean).length;
+      const fail = results.length - ok;
+      if (fail === 0) {
+        message.success((paused ? t('batchPauseSuccess') : t('batchResumeSuccess')).replace('{count}', String(ok)));
+      } else {
+        message.warning(t('batchPartial').replace('{ok}', String(ok)).replace('{fail}', String(fail)));
+      }
+      setSelectedRowKeys([]);
+      await load();
+    } finally {
+      setBatchAction(null);
     }
-    setSelectedRowKeys([]);
-    load();
   };
 
   /** v1.2.0: restart one rule — drop its live connections and rebuild its
@@ -568,6 +671,8 @@ const IMPORT_DEFAULTS = {
    *  node is too old to understand the command. Reporting that as success would
    *  hide exactly the case the user needs to act on. */
   const handleRestart = async (r: ForwardRule) => {
+    if (loading || loadFailed || busyRuleId !== null || batchBusy) return;
+    setBusyRuleId(r.id);
     try {
       const res = await api.post<unknown, ApiEnvelope<RestartResponse>>(`/rules/${r.id}/restart`, {});
       if (res.code !== 0) {
@@ -592,6 +697,8 @@ const IMPORT_DEFAULTS = {
       }
     } catch {
       message.error(t('restartFailed'));
+    } finally {
+      setBusyRuleId(null);
     }
   };
 
@@ -600,48 +707,68 @@ const IMPORT_DEFAULTS = {
    *  404), so tally ok/fail rather than assuming Promise.all means success. */
   const handleBatchRestart = async () => {
     const ids = selectedRowKeys as number[];
-    if (ids.length === 0) return;
-    const results = await Promise.all(ids.map(async id => {
-      try {
-        const res = await api.post<unknown, ApiEnvelope<RestartResponse>>(`/rules/${id}/restart`, {});
-        // Reaching zero nodes is not a success worth reporting as one.
-        return res.code === 0 && (res.data?.restarted ?? 0) > 0;
-      } catch { return false; }
-    }));
-    const ok = results.filter(Boolean).length;
-    const fail = results.length - ok;
-    if (fail === 0) {
-      message.success(t('batchRestartSuccess').replace('{count}', String(ok)));
-    } else {
-      // NOT batchPartial: that message blames "unauthorized lines can't be
-      // resumed", which is the batch-resume failure mode and has nothing to do
-      // with a restart. A restart fails when the rule is paused or every node is
-      // old/offline — say that instead of pointing at the wrong cause.
-      message.warning(
-        t('batchRestartPartial').replace('{ok}', String(ok)).replace('{fail}', String(fail))
-      );
+    if (ids.length === 0 || loading || loadFailed || batchBusy || busyRuleId !== null) return;
+    setBatchAction('restart');
+    try {
+      const results = await mapWithConcurrency(ids, BATCH_REQUEST_CONCURRENCY, async id => {
+        try {
+          const res = await api.post<unknown, ApiEnvelope<RestartResponse>>(`/rules/${id}/restart`, {});
+          // Reaching zero nodes is not a success worth reporting as one.
+          return res.code === 0 && (res.data?.restarted ?? 0) > 0;
+        } catch { return false; }
+      });
+      const ok = results.filter(Boolean).length;
+      const fail = results.length - ok;
+      if (fail === 0) {
+        message.success(t('batchRestartSuccess').replace('{count}', String(ok)));
+      } else {
+        // NOT batchPartial: that message blames "unauthorized lines can't be
+        // resumed", which is the batch-resume failure mode and has nothing to do
+        // with a restart. A restart fails when the rule is paused or every node is
+        // old/offline — say that instead of pointing at the wrong cause.
+        message.warning(
+          t('batchRestartPartial').replace('{ok}', String(ok)).replace('{fail}', String(fail))
+        );
+      }
+      setSelectedRowKeys([]);
+    } finally {
+      setBatchAction(null);
     }
-    setSelectedRowKeys([]);
   };
 
   /** v0.4.8: run a diagnosis for a rule. The panel fans the probe out to the
    *  rule's inbound-group nodes over WS and waits up to 8s for results. */
   const handleDiagnose = async (r: ForwardRule) => {
+    if (diagnoseLoading || mutationsBlocked) return;
+    const requestId = ++diagnoseGenerationRef.current;
+    const requestScope = loadScope;
     setDiagnosing(r);
     setDiagnoseResult(null);
     setDiagnoseLoading(true);
     try {
       const res = await api.post<unknown, ApiEnvelope<DiagnoseResponse>>(`/rules/${r.id}/diagnose`);
+      if (requestId !== diagnoseGenerationRef.current || desiredLoadScopeRef.current !== requestScope) return;
       if (res.code === 0 && res.data) {
         setDiagnoseResult(res.data);
       } else {
         message.error(res.message || t('diagnoseFailed'));
       }
     } catch {
-      message.error(t('diagnoseFailed'));
+      if (requestId === diagnoseGenerationRef.current && desiredLoadScopeRef.current === requestScope) {
+        message.error(t('diagnoseFailed'));
+      }
     } finally {
-      setDiagnoseLoading(false);
+      if (requestId === diagnoseGenerationRef.current && desiredLoadScopeRef.current === requestScope) {
+        setDiagnoseLoading(false);
+      }
     }
+  };
+
+  const closeDiagnose = () => {
+    ++diagnoseGenerationRef.current;
+    setDiagnosing(null);
+    setDiagnoseLoading(false);
+    setDiagnoseResult(null);
   };
 
   /** Toggle a rule's paused state via the dedicated paused field on the update
@@ -649,13 +776,16 @@ const IMPORT_DEFAULTS = {
    *  filters WHERE paused = 0). This is the only way to pause a rule — before
    *  v0.3.0 the paused column existed but had no API to flip it. */
   const handleTogglePause = async (r: ForwardRule) => {
+    if (loading || loadFailed || busyRuleId !== null || batchBusy) return;
     const nextPaused = !r.paused;
+    setBusyRuleId(r.id);
     try {
       const res = await api.put<unknown, ApiEnvelope<null>>(`/rules/${r.id}`, { paused: nextPaused });
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(nextPaused ? t('rulePaused') : t('ruleResumed'));
-      load();
+      await load();
     } catch { message.error(t('failedUpdateRule')); }
+    finally { setBusyRuleId(null); }
   };
 
   const protoTags = (p: string) => {
@@ -683,11 +813,11 @@ const IMPORT_DEFAULTS = {
 
   const ruleMoreMenu = (r: ForwardRule): MenuProps => ({
     items: [
-      { key: 'copy', label: t('copy'), icon: <CopyOutlined /> },
-      { key: 'diagnose', label: t('diagnose'), icon: <MedicineBoxOutlined />, disabled: r.protocol === 'udp' },
-      { key: 'restart', label: t('restart'), icon: <ThunderboltOutlined />, disabled: r.paused },
+      { key: 'copy', label: t('copy'), icon: <CopyOutlined />, disabled: mutationsBlocked },
+      { key: 'diagnose', label: t('diagnose'), icon: <MedicineBoxOutlined />, disabled: r.protocol === 'udp' || mutationsBlocked },
+      { key: 'restart', label: t('restart'), icon: <ThunderboltOutlined />, disabled: r.paused || mutationsBlocked },
       { type: 'divider' },
-      { key: 'delete', label: t('delete'), icon: <DeleteOutlined />, danger: true },
+      { key: 'delete', label: t('delete'), icon: <DeleteOutlined />, danger: true, disabled: mutationsBlocked },
     ],
     onClick: ({ key }) => {
       if (key === 'copy') handleCopy(r);
@@ -702,13 +832,15 @@ const IMPORT_DEFAULTS = {
       <Button
         size="small" type="text"
         icon={r.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
+        loading={busyRuleId === r.id}
+        disabled={loading || loadFailed || saving || batchBusy || (busyRuleId !== null && busyRuleId !== r.id)}
         onClick={() => handleTogglePause(r)}
       >
         {r.paused ? t('resume') : t('pause')}
       </Button>
-      <Button size="small" type="text" icon={<EditOutlined />} onClick={() => handleEdit(r)}>{t('edit')}</Button>
+      <Button size="small" type="text" icon={<EditOutlined />} disabled={mutationsBlocked} onClick={() => handleEdit(r)}>{t('edit')}</Button>
       <Dropdown menu={ruleMoreMenu(r)} trigger={['click']}>
-        <Button size="small" type="text" icon={<MoreOutlined />} aria-label={t('action')} />
+        <Button size="small" type="text" icon={<MoreOutlined />} disabled={mutationsBlocked} aria-label={t('action')} />
       </Dropdown>
     </Space>
   );
@@ -959,7 +1091,7 @@ const IMPORT_DEFAULTS = {
         extra={udpOnly ? t('maxConnectionsUdpUnsupported') : t('maxConnectionsHint')}
         initialValue={0}
       >
-        <InputNumber min={0} style={{ width: '100%' }} placeholder="0" disabled={udpOnly} />
+        <InputNumber min={0} precision={0} style={{ width: '100%' }} placeholder="0" disabled={udpOnly} />
       </Form.Item>
       <Form.Item
         name="auto_restart_minutes"
@@ -971,17 +1103,24 @@ const IMPORT_DEFAULTS = {
           // 1 and the floor would drop connections faster than clients reconnect.
           validator: (_, value) => {
             const v = Number(value ?? 0);
-            if (v === 0 || v >= MIN_AUTO_RESTART_MINUTES) return Promise.resolve();
+            if (Number.isInteger(v) && (v === 0 || v >= MIN_AUTO_RESTART_MINUTES)) return Promise.resolve();
             return Promise.reject(new Error(
               t('autoRestartTooSmall').replace('{min}', String(MIN_AUTO_RESTART_MINUTES))
             ));
           },
         }]}
       >
-        <InputNumber min={0} style={{ width: '100%' }} addonAfter={t('minutes')} placeholder="0" />
+        <InputNumber min={0} precision={0} style={{ width: '100%' }} addonAfter={t('minutes')} placeholder="0" />
       </Form.Item>
     </>
     );
+  };
+
+  const closeImport = () => {
+    if (saving) return;
+    setImportOpen(false);
+    setImportText('');
+    setImportResults([]);
   };
 
   const renderTargetsEditor = () => (
@@ -1008,7 +1147,7 @@ const IMPORT_DEFAULTS = {
                 rules={[{ required: true }]}
                 className="rp-target-weight"
               >
-                <InputNumber min={1} max={100} style={{ width: '100%' }} />
+                <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item
                 {...field}
@@ -1018,7 +1157,7 @@ const IMPORT_DEFAULTS = {
                   { required: true, message: t('targetPortInvalid') },
                   {
                     validator: (_, v) => {
-                      if (v == null || v === '' || !Number.isFinite(Number(v)) || Number(v) < 1 || Number(v) > 65535) {
+                      if (v == null || v === '' || !Number.isInteger(Number(v)) || Number(v) < 1 || Number(v) > 65535) {
                         return Promise.reject(new Error(t('targetPortInvalid')));
                       }
                       return Promise.resolve();
@@ -1027,7 +1166,7 @@ const IMPORT_DEFAULTS = {
                 ]}
                 className="rp-target-port"
               >
-                <InputNumber min={1} max={65535} placeholder={t('targetPort')} style={{ width: '100%' }} />
+                <InputNumber min={1} max={65535} precision={0} placeholder={t('targetPort')} style={{ width: '100%' }} />
               </Form.Item>
               <div className="rp-target-actions">
                 <Form.Item
@@ -1077,7 +1216,7 @@ const IMPORT_DEFAULTS = {
 
   const exportMenuItems: MenuProps['items'] = [
     { key: 'export-all', label: t('exportAll'), icon: <DownloadOutlined />, onClick: handleExportAll },
-    { key: 'import', label: t('import'), icon: <UploadOutlined />, onClick: () => setImportOpen(true) },
+    { key: 'import', label: t('import'), icon: <UploadOutlined />, disabled: mutationsBlocked || (!isAdmin && sharedLoadFailed), onClick: () => setImportOpen(true) },
   ];
 
   const confirmBatchRestart = () => {
@@ -1100,11 +1239,11 @@ const IMPORT_DEFAULTS = {
   const batchMenu: MenuProps = {
     items: [
       { key: 'export', label: t('batchExport'), icon: <DownloadOutlined /> },
-      { key: 'resume', label: t('batchResume'), icon: <PlayCircleOutlined /> },
-      { key: 'pause', label: t('batchPause'), icon: <PauseCircleOutlined /> },
-      { key: 'restart', label: t('batchRestart'), icon: <ThunderboltOutlined /> },
+      { key: 'resume', label: t('batchResume'), icon: <PlayCircleOutlined />, disabled: mutationsBlocked },
+      { key: 'pause', label: t('batchPause'), icon: <PauseCircleOutlined />, disabled: mutationsBlocked },
+      { key: 'restart', label: t('batchRestart'), icon: <ThunderboltOutlined />, disabled: mutationsBlocked },
       { type: 'divider' },
-      { key: 'delete', label: t('batchDelete'), icon: <DeleteOutlined />, danger: true },
+      { key: 'delete', label: t('batchDelete'), icon: <DeleteOutlined />, danger: true, disabled: mutationsBlocked },
     ],
     onClick: ({ key }) => {
       if (key === 'export') handleExportSelected();
@@ -1144,6 +1283,15 @@ const IMPORT_DEFAULTS = {
       <div className="rp-page-header">
         <h2 className="rp-page-title"><ApiOutlined /> {t('forwardRules')}</h2>
         <Space className="rp-page-actions rp-rules-toolbar" wrap size={[8, 8]}>
+          <Input
+            className="rp-rules-search"
+            allowClear
+            prefix={<SearchOutlined />}
+            value={query}
+            onChange={(event) => { setQuery(event.target.value); setSelectedRowKeys([]); }}
+            placeholder={t('searchRules')}
+            aria-label={t('searchRules')}
+          />
           {/* v0.4.9: filter by inbound group. Only groups that actually have
               rules are offered, so the list stays short for large fleets. */}
           <Select
@@ -1154,7 +1302,7 @@ const IMPORT_DEFAULTS = {
             onChange={(v: number | undefined) => { setSelectedGroup(v ?? null); setSelectedRowKeys([]); }}
             options={Array.from(new Set(rules.map(r => r.device_group_in)))
               .map(gid => {
-                const g = groupMap.get(gid);
+                const g = groupInfo.get(gid);
                 return { value: gid, label: g ? g.name : `${t('unknownGroup')} (#${gid})` };
               })}
           />
@@ -1164,12 +1312,12 @@ const IMPORT_DEFAULTS = {
             </Button>
           )}
           {!isMobile && selectedRowKeys.length > 0 && (
-            <Button icon={<PlayCircleOutlined />} onClick={() => handleBatchSetPaused(false)}>
+            <Button icon={<PlayCircleOutlined />} loading={batchAction === 'resume'} disabled={mutationsBlocked} onClick={() => handleBatchSetPaused(false)}>
               {t('batchResume')} ({selectedRowKeys.length})
             </Button>
           )}
           {!isMobile && selectedRowKeys.length > 0 && (
-            <Button icon={<PauseCircleOutlined />} onClick={() => handleBatchSetPaused(true)}>
+            <Button icon={<PauseCircleOutlined />} loading={batchAction === 'pause'} disabled={mutationsBlocked} onClick={() => handleBatchSetPaused(true)}>
               {t('batchPause')} ({selectedRowKeys.length})
             </Button>
           )}
@@ -1180,7 +1328,7 @@ const IMPORT_DEFAULTS = {
               onConfirm={handleBatchRestart}
               okButtonProps={{ danger: true }}
             >
-              <Button icon={<ThunderboltOutlined />}>
+              <Button icon={<ThunderboltOutlined />} loading={batchAction === 'restart'} disabled={mutationsBlocked}>
                 {t('batchRestart')} ({selectedRowKeys.length})
               </Button>
             </Popconfirm>
@@ -1191,25 +1339,34 @@ const IMPORT_DEFAULTS = {
               onConfirm={handleBatchDelete}
               okButtonProps={{ danger: true }}
             >
-              <Button danger icon={<DeleteOutlined />}>
+              <Button danger icon={<DeleteOutlined />} loading={batchAction === 'delete'} disabled={mutationsBlocked}>
                 {t('batchDelete')} ({selectedRowKeys.length})
               </Button>
             </Popconfirm>
           )}
           {isMobile && selectedRowKeys.length > 0 && (
             <Dropdown menu={batchMenu} trigger={['click']}>
-              <Button icon={<MoreOutlined />}>
+              <Button icon={<MoreOutlined />} loading={batchBusy} disabled={loading || loadFailed || saving || busyRuleId !== null}>
                 {t('selectedCount').replace('{count}', String(selectedRowKeys.length))}
               </Button>
             </Dropdown>
           )}
-          <Button icon={<ReloadOutlined />} onClick={load}><span className="rp-mobile-hide">{t('refresh')}</span></Button>
-          <Dropdown menu={{ items: exportMenuItems }}>
+          <Button icon={<ReloadOutlined />} loading={loading} disabled={saving || batchBusy || busyRuleId !== null || createOpen || editOpen || importOpen || !!diagnosing} onClick={load}><span className="rp-mobile-hide">{t('refresh')}</span></Button>
+          <Dropdown menu={{ items: exportMenuItems }} trigger={['click']}>
             <Button icon={<DownloadOutlined />}><span className="rp-mobile-hide">{t('exportImport')}</span></Button>
           </Dropdown>
-          <Button type="primary" icon={<PlusOutlined />} disabled={!isAdmin && sharedLoadFailed} onClick={() => { setEditing(null); createForm.resetFields(); setCreateOpen(true); }}>{t('addRule')}</Button>
+          <Button type="primary" icon={<PlusOutlined />} disabled={mutationsBlocked || (!isAdmin && sharedLoadFailed)} onClick={() => { setEditing(null); setCreateTab('basic'); createForm.resetFields(); setCreateOpen(true); }}>{t('addRule')}</Button>
         </Space>
       </div>
+      {loadFailed && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={t('loadFailed')}
+          description={t('loadFailedRetry')}
+        />
+      )}
       {/* v0.4.20: admin viewing another user's rules — show who. */}
       {filterOwnerUid && (
         <Alert type="info" showIcon style={{ marginBottom: 12 }}
@@ -1219,7 +1376,7 @@ const IMPORT_DEFAULTS = {
       {/* v0.4.12 PR1: a regular user whose shared-lines fetch failed sees a
           load-failure notice; rule creation is disabled above so they can't
           submit against an empty/unknown inbound list. */}
-      {!isAdmin && sharedLoadFailed && (
+      {!loadFailed && !isAdmin && sharedLoadFailed && (
         <Alert
           type="error"
           showIcon
@@ -1244,6 +1401,7 @@ const IMPORT_DEFAULTS = {
                   <div className="rp-rule-card-header">
                     <Checkbox
                       checked={selectedRowKeys.includes(r.id)}
+                      disabled={mutationsBlocked}
                       onChange={event => setRuleSelected(r.id, event.target.checked)}
                       aria-label={`${t('select')} #${r.id}`}
                     />
@@ -1294,16 +1452,24 @@ const IMPORT_DEFAULTS = {
       ) : (
         <Table
           className="rp-responsive-table rp-rules-table"
-          rowSelection={{ selectedRowKeys, onChange: (keys) => setSelectedRowKeys(keys as number[]) }}
+          rowSelection={{
+            selectedRowKeys,
+            onChange: (keys) => setSelectedRowKeys(keys as number[]),
+            getCheckboxProps: () => ({ disabled: mutationsBlocked }),
+          }}
           dataSource={visibleRules} columns={columns} rowKey="id" loading={loading}
           pagination={{ pageSize: 20 }} scroll={{ x: 1480 }}
         />
       )}
 
-      <Modal title={t('addRule')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={680}>
+      <Modal title={t('addRule')} open={createOpen} onCancel={() => { if (!saving) setCreateOpen(false); }} onOk={() => createForm.submit()} confirmLoading={saving} okButtonProps={{ disabled: loadFailed || loading }} okText={t('create')} cancelText={t('cancel')} width={680}>
         <Form
           form={createForm}
+          disabled={saving || loadFailed || loading}
           onFinish={handleCreate}
+          onFinishFailed={({ errorFields }) => {
+            setCreateTab(ruleFormTabForErrors(errorFields));
+          }}
           layout="vertical"
           onValuesChange={(changed) => {
             if (changed.route_mode !== undefined) {
@@ -1317,12 +1483,12 @@ const IMPORT_DEFAULTS = {
             }
           }}
         >
-          <Tabs items={[
+          <Tabs activeKey={createTab} onChange={setCreateTab} items={[
             {
               key: 'basic',
               label: t('tabBasic'),
               children: (<>
-                <Form.Item name="name" label={t('name')} rules={[{ required: true }]}><Input placeholder="my-rule" /></Form.Item>
+                <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input placeholder="my-rule" /></Form.Item>
                 {/* v0.4.20: owner is determined by the entry point — admins use
                     /rules?owner_uid=X from the user management page; regular
                     users always own their own rules. */}
@@ -1332,7 +1498,7 @@ const IMPORT_DEFAULTS = {
                   />
                 )}
                 {renderHostHint(createRouteMode === 'tunnel' ? selectedCreateTunnel?.hops[0]?.device_group_id : createGroupId)}
-                <Form.Item name="listen_port" label={t('listenPort')} extra={t('listenPortHint')}><InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder="auto" /></Form.Item>
+                <Form.Item name="listen_port" label={t('listenPort')} extra={t('listenPortHint')}><InputNumber min={1} max={65535} precision={0} style={{ width: '100%' }} placeholder="auto" /></Form.Item>
                 <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp"
                   extra={isUdp(createProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
                   <Select
@@ -1383,6 +1549,7 @@ const IMPORT_DEFAULTS = {
             },
             {
               key: 'forward',
+              forceRender: true,
               label: t('tabForward'),
               children: (<>
                 {renderTargetsEditor()}
@@ -1394,20 +1561,25 @@ const IMPORT_DEFAULTS = {
                   extra={t('rateLimitsHint')}
                 >
                   <Space orientation="vertical" style={{ width: '100%' }}>
-                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
-                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} precision={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} precision={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
                   </Space>
                 </Form.Item>
+                {renderConnectionControls(createProto)}
               </>),
             },
           ]} />
         </Form>
       </Modal>
 
-      <Modal title={t('editRule')} open={editOpen} onCancel={() => setEditOpen(false)} onOk={() => editForm.submit()} okText={t('save')} cancelText={t('cancel')} width={680}>
+      <Modal title={t('editRule')} open={editOpen} onCancel={() => { if (!saving) setEditOpen(false); }} onOk={() => editForm.submit()} confirmLoading={saving} okButtonProps={{ disabled: loadFailed || loading }} okText={t('save')} cancelText={t('cancel')} width={680}>
         <Form
           form={editForm}
+          disabled={saving || loadFailed || loading}
           onFinish={handleUpdate}
+          onFinishFailed={({ errorFields }) => {
+            setEditTab(ruleFormTabForErrors(errorFields));
+          }}
           layout="vertical"
           onValuesChange={(changed) => {
             if (changed.route_mode !== undefined) {
@@ -1421,14 +1593,14 @@ const IMPORT_DEFAULTS = {
             }
           }}
         >
-          <Tabs items={[
+          <Tabs activeKey={editTab} onChange={setEditTab} items={[
             {
               key: 'basic',
               label: t('tabBasic'),
               children: (<>
-                <Form.Item name="name" label={t('name')}><Input /></Form.Item>
+                <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
                 {renderHostHint(editRouteMode === 'tunnel' ? selectedEditTunnel?.hops[0]?.device_group_id : editGroupId)}
-                <Form.Item name="listen_port" label={t('listenPort')}><InputNumber min={1} max={65535} style={{ width: '100%' }} /></Form.Item>
+                <Form.Item name="listen_port" label={t('listenPort')}><InputNumber min={1} max={65535} precision={0} style={{ width: '100%' }} /></Form.Item>
                 <Form.Item name="protocol" label={t('protocol')}
                   extra={isUdp(editProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
                   <Select
@@ -1493,8 +1665,8 @@ const IMPORT_DEFAULTS = {
                   extra={t('rateLimitsHint')}
                 >
                   <Space orientation="vertical" style={{ width: '100%' }}>
-                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
-                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} precision={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} precision={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
                   </Space>
                 </Form.Item>
                 {renderConnectionControls(editProto)}
@@ -1504,23 +1676,26 @@ const IMPORT_DEFAULTS = {
         </Form>
       </Modal>
 
-      <Modal title={t('import')} open={importOpen} onCancel={() => { setImportOpen(false); setImportText(''); setImportResults([]); }}
+      <Modal title={t('import')} open={importOpen} onCancel={closeImport}
         onOk={importResults.length > 0 ? undefined : handleImport}
         okText={importResults.length > 0 ? t('close') : t('import')}
-        cancelText={t('cancel')} width={600}
-        footer={importResults.length > 0 ? <Button onClick={() => { setImportOpen(false); setImportText(''); setImportResults([]); }}>{t('close')}</Button> : undefined}
+        cancelText={t('cancel')} width={600} confirmLoading={saving}
+        closable={!saving} mask={{ closable: !saving }} keyboard={!saving}
+        okButtonProps={{ disabled: loadFailed || loading }}
+        cancelButtonProps={{ disabled: saving }}
+        footer={importResults.length > 0 ? <Button disabled={saving} onClick={closeImport}>{t('close')}</Button> : undefined}
       >
         {importResults.length === 0 ? (
           <>
             <Form.Item label={t('selectInboundGroup')}>
-              <Select value={importGroupId} onChange={setImportGroupId}
+              <Select value={importGroupId} onChange={setImportGroupId} disabled={saving || loading || loadFailed}
                 options={(isAdmin ? groups.filter(isInboundGroup) : sharedGroups.filter(isInboundGroup))
                   .map(g => ({ value: g.id, label: `${g.name} (#${g.id})` }))}
                 placeholder={t('selectDeviceGroups')} style={{ width: '100%' }} />
             </Form.Item>
             <Alert type="info" showIcon style={{ marginBottom: 12 }}
               title={t('importHint')} />
-            <TextArea value={importText} onChange={e => setImportText(e.target.value)}
+            <TextArea value={importText} onChange={e => setImportText(e.target.value)} disabled={saving || loading || loadFailed}
               rows={10} placeholder='[{"dest":["1.2.3.4:8080"],"listen_port":38446,"name":"SK5"}]' />
           </>
         ) : (
@@ -1534,8 +1709,8 @@ const IMPORT_DEFAULTS = {
       <Modal
         title={diagnosing ? `${t('diagnoseTitle')} · ${diagnosing.name} (#${diagnosing.id})` : t('diagnoseTitle')}
         open={!!diagnosing}
-        onCancel={() => { setDiagnosing(null); setDiagnoseResult(null); }}
-        footer={<Button onClick={() => { setDiagnosing(null); setDiagnoseResult(null); }}>{t('close')}</Button>}
+        onCancel={closeDiagnose}
+        footer={<Button onClick={closeDiagnose}>{t('close')}</Button>}
         width={720}
       >
         {diagnoseLoading ? (
