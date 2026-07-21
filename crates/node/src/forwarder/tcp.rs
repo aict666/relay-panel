@@ -948,6 +948,7 @@ mod tests {
             runtime.gate(None),
             true,
             true,
+            false,
             None,
         ));
 
