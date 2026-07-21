@@ -388,7 +388,7 @@ export default function Dashboard() {
         onNavigate={navigate}
       />
 
-      <Card title={t('nodeStatus')} extra={<Text type="secondary" style={{ fontSize: 12 }}>{t('autoRefresh10s')}</Text>}>
+      <Card title={t('nodeStatus')}>
         {nodeGroups.length === 0
           ? <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--rp-text-tertiary)', fontSize: 13 }}>{t('noNodesReporting')}</div>
           : <Table

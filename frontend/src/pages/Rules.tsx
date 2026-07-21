@@ -1011,8 +1011,6 @@ const IMPORT_DEFAULTS = {
     { value: 'least_latency', label: t('lbLeastLatency') },
     { value: 'least_connections', label: t('lbLeastConnections') },
   ];
-  const isUdp = (p?: string) => p === 'udp' || p === 'tcp_udp';
-
   const createGroupId = Form.useWatch('device_group_in', createForm);
   const createRouteMode = Form.useWatch('route_mode', createForm);
   const createTunnelId = Form.useWatch('tunnel_id', createForm);
@@ -1046,47 +1044,29 @@ const IMPORT_DEFAULTS = {
     : undefined;
 
   const renderTunnelPicker = (selected?: Tunnel) => (
-    <>
-      <Form.Item
-        name="tunnel_id"
-        label={t('modePresetTunnel')}
-        rules={[{ required: true, message: t('tunnelSelectHint') }]}
-        extra={t('tunnelSelectHint')}
-      >
-        <Select
-          showSearch
-          optionFilterProp="searchLabel"
-          options={(selected && !tunnelMap.has(selected.id) ? [selected, ...tunnels] : tunnels).map(tunnel => ({
-            value: tunnel.id,
-            searchLabel: `${tunnel.name} · ${tunnelPathText(tunnel)}`,
-            label: (
-              <Space size={4}>
-                <span>{tunnel.name} · {tunnelPathText(tunnel)}</span>
-                {tunnelBlockedProtocols(tunnel).includes('http') && <Tag color="orange">{t('httpBlocked')}</Tag>}
-                {tunnelBlockedProtocols(tunnel).includes('tls') && <Tag color="red">{t('tlsBlocked')}</Tag>}
-              </Space>
-            ),
-            disabled: !tunnelMap.has(tunnel.id) || (!tunnel.enabled && tunnel.id !== selected?.id),
-          }))}
-          placeholder={t('select')}
-        />
-      </Form.Item>
-      {selected && (
-        <Alert
-          type={selected.enabled ? 'success' : 'warning'}
-          showIcon
-          style={{ marginBottom: 16 }}
-          title={selected.enabled ? (
+    <Form.Item
+      name="tunnel_id"
+      label={t('modePresetTunnel')}
+      rules={[{ required: true, message: t('tunnelSelectHint') }]}
+    >
+      <Select
+        showSearch
+        optionFilterProp="searchLabel"
+        options={(selected && !tunnelMap.has(selected.id) ? [selected, ...tunnels] : tunnels).map(tunnel => ({
+          value: tunnel.id,
+          searchLabel: `${tunnel.name} · ${tunnelPathText(tunnel)}`,
+          label: (
             <Space size={4}>
-              <span>{tunnelPathText(selected)}</span>
-              {tunnelBlockedProtocols(selected).includes('http') && <Tag color="orange">{t('httpBlocked')}</Tag>}
-              {tunnelBlockedProtocols(selected).includes('tls') && <Tag color="red">{t('tlsBlocked')}</Tag>}
+              <span>{tunnel.name} · {tunnelPathText(tunnel)}</span>
+              {tunnelBlockedProtocols(tunnel).includes('http') && <Tag color="orange">{t('httpBlocked')}</Tag>}
+              {tunnelBlockedProtocols(tunnel).includes('tls') && <Tag color="red">{t('tlsBlocked')}</Tag>}
             </Space>
-          ) : t('tunnelDisabled')}
-          description={t('tunnelPortsReused')}
-        />
-      )}
-    </>
+          ),
+          disabled: !tunnelMap.has(tunnel.id) || (!tunnel.enabled && tunnel.id !== selected?.id),
+        }))}
+        placeholder={t('select')}
+      />
+    </Form.Item>
   );
 
   const hostForForm = (gid?: number) => {
@@ -1106,19 +1086,8 @@ const IMPORT_DEFAULTS = {
     );
   };
 
-  /** v1.2.0: connection cap + scheduled restart. Shared by the create and edit
-   *  forms so the two can't drift (the rate-limit block above predates this and
-   *  is still duplicated).
-   *
-   *  Both fields are 0 = off. The cap's `extra` says the count is PER NODE,
-   *  because that isn't guessable: a rule on 3 nodes admits 3x the number typed
-   *  here.
-   *
-   *  The cap is disabled for a UDP-ONLY rule. It is enforced at accept(), which
-   *  UDP doesn't have — the panel would happily store the number and ship it to
-   *  the node, where nothing would ever read it. Showing an editable field that
-   *  silently does nothing is worse than showing a disabled one that says why.
-   *  A tcp_udp rule keeps it: the cap governs its TCP half. */
+  /** Connection cap + scheduled restart. Shared by create/edit so the forms
+   *  cannot drift. A UDP-only rule disables the TCP connection cap. */
   const renderConnectionControls = (proto?: string) => {
     const udpOnly = proto === 'udp';
     return (
@@ -1126,7 +1095,6 @@ const IMPORT_DEFAULTS = {
       <Form.Item
         name="max_connections"
         label={t('maxConnections')}
-        extra={udpOnly ? t('maxConnectionsUdpUnsupported') : t('maxConnectionsHint')}
         initialValue={0}
       >
         <InputNumber min={0} precision={0} style={{ width: '100%' }} placeholder="0" disabled={udpOnly} />
@@ -1134,7 +1102,6 @@ const IMPORT_DEFAULTS = {
       <Form.Item
         name="auto_restart_minutes"
         label={t('autoRestart')}
-        extra={t('autoRestartHint').replace('{min}', String(MIN_AUTO_RESTART_MINUTES))}
         initialValue={0}
         rules={[{
           // Mirrors the API's floor. 0 = off is always allowed; anything between
@@ -1405,7 +1372,6 @@ const IMPORT_DEFAULTS = {
           showIcon
           style={{ marginBottom: 12 }}
           title={t('loadFailed')}
-          description={t('loadFailedRetry')}
         />
       )}
       {/* v0.4.20: admin viewing another user's rules — show who. */}
@@ -1423,7 +1389,6 @@ const IMPORT_DEFAULTS = {
           showIcon
           style={{ marginBottom: 12 }}
           title={t('loadFailed')}
-          description={t('loadFailedRetry')}
         />
       )}
       {isMobile ? (
@@ -1539,9 +1504,8 @@ const IMPORT_DEFAULTS = {
                   />
                 )}
                 {renderHostHint(createRouteMode === 'tunnel' ? selectedCreateTunnel?.hops[0]?.device_group_id : createGroupId)}
-                <Form.Item name="listen_port" label={t('listenPort')} extra={t('listenPortHint')}><InputNumber min={1} max={65535} precision={0} style={{ width: '100%' }} placeholder="auto" /></Form.Item>
-                <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp"
-                  extra={isUdp(createProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
+                <Form.Item name="listen_port" label={t('listenPort')}><InputNumber min={1} max={65535} precision={0} style={{ width: '100%' }} placeholder={t('listenPortHint')} /></Form.Item>
+                <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp">
                   <Select
                     options={protocolOptions}
                   />
@@ -1564,7 +1528,7 @@ const IMPORT_DEFAULTS = {
                 {createRouteMode === 'chain' && (
                   <Form.List name="hops" initialValue={[undefined, undefined]}>
                     {(fields, { add, remove }) => (
-                      <Form.Item label={t('chainHops')} extra={t('chainHopsHint')} required>
+                      <Form.Item label={t('chainHops')} required>
                         <Space orientation="vertical" style={{ width: '100%' }}>
                           {fields.map((field, idx) => {
                             const { key, ...fieldProps } = field;
@@ -1602,7 +1566,6 @@ const IMPORT_DEFAULTS = {
                 </Form.Item>
                 <Form.Item
                   label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
-                  extra={t('rateLimitsHint')}
                 >
                   <Space orientation="vertical" style={{ width: '100%' }}>
                     <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} precision={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
@@ -1645,8 +1608,7 @@ const IMPORT_DEFAULTS = {
                 <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
                 {renderHostHint(editRouteMode === 'tunnel' ? selectedEditTunnel?.hops[0]?.device_group_id : editGroupId)}
                 <Form.Item name="listen_port" label={t('listenPort')}><InputNumber min={1} max={65535} precision={0} style={{ width: '100%' }} /></Form.Item>
-                <Form.Item name="protocol" label={t('protocol')}
-                  extra={isUdp(editProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
+                <Form.Item name="protocol" label={t('protocol')}>
                   <Select
                     options={protocolOptions}
                   />
@@ -1666,7 +1628,7 @@ const IMPORT_DEFAULTS = {
                 {editRouteMode === 'chain' && (
                   <Form.List name="hops">
                     {(fields, { add, remove }) => (
-                      <Form.Item label={t('chainHops')} extra={t('chainHopsHint')} required>
+                      <Form.Item label={t('chainHops')} required>
                         <Space orientation="vertical" style={{ width: '100%' }}>
                           {fields.map((field, idx) => {
                             const { key, ...fieldProps } = field;
@@ -1709,7 +1671,6 @@ const IMPORT_DEFAULTS = {
                 </Form.Item>
                 <Form.Item
                   label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
-                  extra={t('rateLimitsHint')}
                 >
                   <Space orientation="vertical" style={{ width: '100%' }}>
                     <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} precision={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
@@ -1739,8 +1700,6 @@ const IMPORT_DEFAULTS = {
                 options={inboundGroupOptions}
                 placeholder={t('selectDeviceGroups')} style={{ width: '100%' }} />
             </Form.Item>
-            <Alert type="info" showIcon style={{ marginBottom: 12 }}
-              title={t('importHint')} />
             <TextArea value={importText} onChange={e => setImportText(e.target.value)} disabled={saving || loading || loadFailed}
               rows={10} placeholder='[{"dest":["1.2.3.4:8080"],"listen_port":38446,"name":"SK5"}]' />
           </>

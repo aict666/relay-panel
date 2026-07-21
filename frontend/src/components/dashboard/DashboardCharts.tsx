@@ -1,6 +1,6 @@
 import { Area, Bar, Line, Pie } from '@ant-design/charts';
 import { QuestionCircleOutlined } from '@ant-design/icons';
-import { Alert, Button, Card, Col, Empty, Row, Segmented, Space, Spin, Tag, Tooltip, Typography } from 'antd';
+import { Alert, Button, Card, Col, Empty, Row, Segmented, Space, Spin, Tag, Tooltip } from 'antd';
 import { useMemo } from 'react';
 import type {
   DashboardHistory,
@@ -18,8 +18,6 @@ import {
   insertHistoryGaps,
   type GroupHealthKey,
 } from './data';
-
-const { Text } = Typography;
 
 interface DashboardChartsProps {
   history: DashboardHistory | null;
@@ -227,9 +225,6 @@ export default function DashboardCharts({
             )}
           >
             {historyContent()}
-            <Text type="secondary" className="rp-dashboard-refresh-note">
-              {t('dashboardHistoryRefresh')}
-            </Text>
           </Card>
         </Col>
         <Col xs={24} xl={8} className="rp-dashboard-chart-col">
@@ -312,9 +307,6 @@ export default function DashboardCharts({
             title={<ChartTitle title={t('dashboardRuleTrafficTop')} hint={t('dashboardRuleTrafficHint')} />}
             extra={<Button type="link" size="small" onClick={() => onNavigate('/rules')}>{t('dashboardViewAll')}</Button>}
           >
-            <Text type="secondary" className="rp-dashboard-chart-subtitle">
-              {t('dashboardRuleTrafficSinceReset')}
-            </Text>
             {ruleBarData.length === 0 ? (
               <div className="rp-dashboard-chart-empty rp-dashboard-chart-empty-short">
                 <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('dashboardNoRuleTraffic')} />

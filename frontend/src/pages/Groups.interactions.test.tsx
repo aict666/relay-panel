@@ -121,8 +121,7 @@ describe('Groups permissions', () => {
     render(<Groups />);
     expect(await screen.findByText('7')).toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: /edit/ }));
-    const enabledSwitches = await screen.findAllByRole('switch', { checked: true });
-    await user.click(enabledSwitches[enabledSwitches.length - 1]);
+    await user.click(await screen.findByRole('checkbox', { name: 'TLS', checked: true }));
     await user.click(screen.getByRole('button', { name: /save/ }));
 
     await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/groups/1', {

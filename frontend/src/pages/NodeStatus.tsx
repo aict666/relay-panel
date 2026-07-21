@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Spin, Result, Empty, Modal, message } from 'antd';
-import { LineChartOutlined } from '@ant-design/icons';
+import { Spin, Result, Empty, Modal, message, Button } from 'antd';
+import { LineChartOutlined, ReloadOutlined } from '@ant-design/icons';
 import api from '../api/client';
 import type { ApiEnvelope, NodeStatus, SharedNodeSummary, NodeDisplayRow } from '../api/types';
 import { useI18n } from '../i18n/context';
@@ -162,7 +162,11 @@ export default function NodeStatus() {
     return (
       <>
         <h2 className="rp-page-title"><LineChartOutlined /> {title}</h2>
-        <Result status="warning" title={t('loadFailed')} subTitle={t('loadFailedRetry')} />
+        <Result
+          status="warning"
+          title={t('loadFailed')}
+          extra={<Button type="primary" icon={<ReloadOutlined />} onClick={refresh}>{t('refresh')}</Button>}
+        />
       </>
     );
   }

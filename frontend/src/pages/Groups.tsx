@@ -1,4 +1,4 @@
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Typography, Tag, Tooltip, Alert, Switch } from 'antd';
+import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Typography, Tag, Tooltip, Alert, Switch, Checkbox } from 'antd';
 import { PlusOutlined, ReloadOutlined, CopyOutlined, EditOutlined, CloudServerOutlined, CodeOutlined, ApiOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import api from '../api/client';
@@ -19,20 +19,15 @@ interface GroupFormValues {
   port_range?: string;
   rate?: number;
   hidden?: boolean;
-  block_http?: boolean;
-  block_tls?: boolean;
+  blocked_protocols?: BlockedProtocol[];
 }
 
 function selectedBlockedProtocols(
   ingressCapable: boolean,
-  blockHttp: boolean | undefined,
-  blockTls: boolean | undefined,
+  blockedProtocols: BlockedProtocol[] | undefined,
 ): BlockedProtocol[] {
   if (!ingressCapable) return [];
-  return [
-    ...(blockHttp ? ['http' as const] : []),
-    ...(blockTls ? ['tls' as const] : []),
-  ];
+  return (['http', 'tls'] as const).filter(protocol => blockedProtocols?.includes(protocol));
 }
 
 function isLocalhost(): boolean {
@@ -142,13 +137,12 @@ export default function Groups() {
     try {
       // v1.0.8: rate defaults to 1.0 on the server when omitted; send it
       // explicitly so the value the admin picked is what gets persisted.
-      const { block_http, block_tls, ...groupValues } = values;
       const ingressCapable = values.group_type === 'in' || values.group_type === 'both';
       const payload = {
-        ...groupValues,
+        ...values,
         rate: values.rate ?? 1.0,
         hidden: values.hidden ?? false,
-        blocked_protocols: selectedBlockedProtocols(ingressCapable, block_http, block_tls),
+        blocked_protocols: selectedBlockedProtocols(ingressCapable, values.blocked_protocols),
       };
       const res = await api.post<unknown, ApiEnvelope<DeviceGroup>>('/groups', payload);
       if (res.code !== 0) { message.error(res.message); return; }
@@ -170,8 +164,7 @@ export default function Groups() {
       port_range: g.port_range,
       rate: g.rate,
       hidden: !!g.hidden,
-      block_http: g.blocked_protocols?.includes('http') ?? false,
-      block_tls: g.blocked_protocols?.includes('tls') ?? false,
+      blocked_protocols: g.blocked_protocols ?? [],
     });
     setEditOpen(true);
   };
@@ -192,8 +185,7 @@ export default function Groups() {
     const effectiveType = values.group_type ?? editing.group_type;
     const nextBlockedProtocols = selectedBlockedProtocols(
       effectiveType === 'in' || effectiveType === 'both',
-      values.block_http,
-      values.block_tls,
+      values.blocked_protocols,
     );
     const previousBlockedProtocols = [...(editing.blocked_protocols ?? [])].sort();
     if (nextBlockedProtocols.join(',') !== previousBlockedProtocols.join(',')) {
@@ -432,7 +424,7 @@ export default function Groups() {
       </div>
 
       {loadFailed && (
-        <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} description={t('loadFailedRetry')} />
+        <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} />
       )}
       <Table
         className="rp-responsive-table"
@@ -454,8 +446,7 @@ export default function Groups() {
           <Form.Item name="group_type" label={t('type')} rules={[{ required: true }]} initialValue="in">
             <Select options={groupTypeOptions} onChange={(value) => {
               if (value !== 'in' && value !== 'both') {
-                createForm.setFieldValue('block_http', false);
-                createForm.setFieldValue('block_tls', false);
+                createForm.setFieldValue('blocked_protocols', []);
               }
             }} />
           </Form.Item>
@@ -463,23 +454,19 @@ export default function Groups() {
           <Form.Item name="port_range" label={t('portRange')} rules={[{ required: true }]} initialValue="10000-65535"><Input placeholder="10000-65535" /></Form.Item>
           {/* v1.0.8: billing rate. Users are charged real bytes × rate; the
               rule/user byte counters keep real bytes. 1.0 = bill as used. */}
-          <Form.Item name="rate" label={t('rate')} initialValue={1.0} extra={t('rateHint')} rules={[{ required: true }]}>
+          <Form.Item name="rate" label={t('rate')} initialValue={1.0} rules={[{ required: true }]}>
             <InputNumber min={0.1} max={100} step={0.1} style={{ width: '100%' }} />
           </Form.Item>
           {/* v1.0.7: hide this group from regular users' node-status / available
               lines. Admins always see it. */}
-          <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" initialValue={false} extra={t('groupHiddenHint')}>
+          <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" initialValue={false}>
             <Switch />
           </Form.Item>
-          <Form.Item label={t('protocolBlocking')} extra={t('blockProtocolHint')}>
-            <Space wrap>
-              <Form.Item name="block_http" valuePropName="checked" initialValue={false} noStyle>
-                <Switch checkedChildren="HTTP" unCheckedChildren="HTTP" disabled={createGroupType !== 'in' && createGroupType !== 'both'} />
-              </Form.Item>
-              <Form.Item name="block_tls" valuePropName="checked" initialValue={false} noStyle>
-                <Switch checkedChildren="TLS" unCheckedChildren="TLS" disabled={createGroupType !== 'in' && createGroupType !== 'both'} />
-              </Form.Item>
-            </Space>
+          <Form.Item name="blocked_protocols" label={t('protocolBlocking')} initialValue={[]}>
+            <Checkbox.Group
+              disabled={createGroupType !== 'in' && createGroupType !== 'both'}
+              options={[{ label: 'HTTP', value: 'http' }, { label: 'TLS', value: 'tls' }]}
+            />
           </Form.Item>
         </Form>
       </Modal>
@@ -489,27 +476,22 @@ export default function Groups() {
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
           <Form.Item name="group_type" label={t('type')}><Select options={groupTypeOptions} onChange={(value) => {
             if (value !== 'in' && value !== 'both') {
-              editForm.setFieldValue('block_http', false);
-              editForm.setFieldValue('block_tls', false);
+              editForm.setFieldValue('blocked_protocols', []);
             }
           }} /></Form.Item>
           <Form.Item name="connect_host" label={t('connectHost')}><Input /></Form.Item>
           <Form.Item name="port_range" label={t('portRange')}><Input /></Form.Item>
-          <Form.Item name="rate" label={t('rate')} extra={t('rateHint')}>
+          <Form.Item name="rate" label={t('rate')}>
             <InputNumber min={0.1} max={100} step={0.1} style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" extra={t('groupHiddenHint')}>
+          <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked">
             <Switch />
           </Form.Item>
-          <Form.Item label={t('protocolBlocking')} extra={t('blockProtocolHint')}>
-            <Space wrap>
-              <Form.Item name="block_http" valuePropName="checked" noStyle>
-                <Switch checkedChildren="HTTP" unCheckedChildren="HTTP" disabled={editGroupType !== 'in' && editGroupType !== 'both'} />
-              </Form.Item>
-              <Form.Item name="block_tls" valuePropName="checked" noStyle>
-                <Switch checkedChildren="TLS" unCheckedChildren="TLS" disabled={editGroupType !== 'in' && editGroupType !== 'both'} />
-              </Form.Item>
-            </Space>
+          <Form.Item name="blocked_protocols" label={t('protocolBlocking')}>
+            <Checkbox.Group
+              disabled={editGroupType !== 'in' && editGroupType !== 'both'}
+              options={[{ label: 'HTTP', value: 'http' }, { label: 'TLS', value: 'tls' }]}
+            />
           </Form.Item>
         </Form>
       </Modal>

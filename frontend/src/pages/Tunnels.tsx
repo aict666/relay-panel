@@ -256,7 +256,7 @@ export default function Tunnels() {
       </div>
 
       {loadFailed && (
-        <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} description={t('loadFailedRetry')} />
+        <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} />
       )}
 
       {mobile ? (

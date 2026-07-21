@@ -268,7 +268,7 @@ export default function Plans() {
         </Space>
       </div>
       {loadFailed && (
-        <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} description={t('loadFailedRetry')} />
+        <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} />
       )}
       <Table className="rp-responsive-table" dataSource={plans} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} scroll={{ x: 'max-content' }} />
 
@@ -282,7 +282,7 @@ export default function Plans() {
             />
           </Form.Item>
           <Space align="start" style={{ display: 'flex' }}>
-            <Form.Item name="traffic_gb" label={t('planTrafficGb')} rules={[{ required: true }]} style={{ flex: 1 }} extra={t('planTrafficGbHint')}>
+            <Form.Item name="traffic_gb" label={t('planTrafficGb')} rules={[{ required: true }]} style={{ flex: 1 }}>
               <InputNumber min={0} max={MAX_SAFE_TRAFFIC_GB} step={1} style={{ width: '100%' }} addonAfter="GB" />
             </Form.Item>
             <Form.Item name="max_rules" label={t('planMaxRules')} rules={[{ required: true }]} initialValue={5} style={{ flex: 1 }}>
@@ -294,16 +294,16 @@ export default function Plans() {
               <Input placeholder="9.99" />
             </Form.Item>
             {createPlanType === 'time' && (
-              <Form.Item name="duration_days" label={t('planDuration')} rules={[{ required: true, type: 'number', min: 1, message: t('planDurationHint') }]} style={{ flex: 1 }} extra={t('planDurationHint')}>
+              <Form.Item name="duration_days" label={t('planDuration')} rules={[{ required: true, type: 'number', min: 1, message: t('planDurationHint') }]} style={{ flex: 1 }}>
                 <InputNumber min={1} precision={0} style={{ width: '100%' }} />
               </Form.Item>
             )}
           </Space>
           {/* v1.0.9: device-group grants. The switch disables the multi-select. */}
-          <Form.Item name="grant_all_groups" label={t('planGrantAll')} valuePropName="checked" extra={t('planGrantAllHint')}>
+          <Form.Item name="grant_all_groups" label={t('planGrantAll')} valuePropName="checked">
             <Switch onChange={setCreateGrantAll} />
           </Form.Item>
-          <Form.Item name="device_group_ids" label={t('planGrantGroups')} extra={t('planGrantGroupsHint')}>
+          <Form.Item name="device_group_ids" label={t('planGrantGroups')}>
             <Select
               mode="multiple"
               allowClear
@@ -319,7 +319,7 @@ export default function Plans() {
             <Form.Item name="hidden" label={t('planHidden')} valuePropName="checked" style={{ flex: 1 }}>
               <Switch />
             </Form.Item>
-            <Form.Item name="reset_traffic" label={t('planResetTraffic')} valuePropName="checked" style={{ flex: 1 }} extra={t('planResetTrafficHint')}>
+            <Form.Item name="reset_traffic" label={t('planResetTraffic')} valuePropName="checked" style={{ flex: 1 }}>
               <Switch />
             </Form.Item>
           </Space>
@@ -337,7 +337,7 @@ export default function Plans() {
             />
           </Form.Item>
           <Space align="start" style={{ display: 'flex' }}>
-            <Form.Item name="traffic_gb" label={t('planTrafficGb')} style={{ flex: 1 }} extra={t('planTrafficGbHint')}>
+            <Form.Item name="traffic_gb" label={t('planTrafficGb')} style={{ flex: 1 }}>
               <InputNumber min={0} max={MAX_SAFE_TRAFFIC_GB} step={1} style={{ width: '100%' }} addonAfter="GB" />
             </Form.Item>
             <Form.Item name="max_rules" label={t('planMaxRules')} style={{ flex: 1 }}>
@@ -347,16 +347,16 @@ export default function Plans() {
           <Space align="start" style={{ display: 'flex' }}>
             <Form.Item name="price" label={t('planPrice')} style={{ flex: 1 }}><Input /></Form.Item>
             {editPlanType === 'time' && (
-              <Form.Item name="duration_days" label={t('planDuration')} rules={[{ required: true, type: 'number', min: 1, message: t('planDurationHint') }]} style={{ flex: 1 }} extra={t('planDurationHint')}>
+              <Form.Item name="duration_days" label={t('planDuration')} rules={[{ required: true, type: 'number', min: 1, message: t('planDurationHint') }]} style={{ flex: 1 }}>
                 <InputNumber min={1} precision={0} style={{ width: '100%' }} />
               </Form.Item>
             )}
           </Space>
           {/* v1.0.9: device-group grants. */}
-          <Form.Item name="grant_all_groups" label={t('planGrantAll')} valuePropName="checked" extra={t('planGrantAllHint')}>
+          <Form.Item name="grant_all_groups" label={t('planGrantAll')} valuePropName="checked">
             <Switch onChange={setEditGrantAll} />
           </Form.Item>
-          <Form.Item name="device_group_ids" label={t('planGrantGroups')} extra={t('planGrantGroupsHint')}>
+          <Form.Item name="device_group_ids" label={t('planGrantGroups')}>
             <Select
               mode="multiple"
               allowClear
