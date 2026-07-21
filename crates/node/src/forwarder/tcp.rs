@@ -8,6 +8,7 @@ use super::gate::RuleGate;
 use super::limiter::RateLimit;
 use super::selector::TargetSelector;
 use crate::reporter::{ConnectionTracker, TrafficCounter};
+use relay_shared::models::BlockedProtocol;
 use relay_shared::protocol::TunnelClientConfig;
 
 /// v1.2.0: how often the "rule is at its connection cap" warning may be logged
@@ -15,13 +16,33 @@ use relay_shared::protocol::TunnelClientConfig;
 /// unthrottled warn! here would itself become the outage (disk + CPU) that the
 /// cap exists to prevent.
 const CAP_WARN_INTERVAL: Duration = Duration::from_secs(60);
-const TLS_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(100);
-const TLS_HEADER_TIMEOUT: Duration = Duration::from_millis(200);
+const PROTOCOL_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(100);
+const PROTOCOL_HEADER_TIMEOUT: Duration = Duration::from_millis(200);
 const TLS_MAX_PLAINTEXT_RECORD_LEN: u16 = 1 << 14;
+const HTTP_MAX_REQUEST_LINE_LEN: usize = 1024;
 
-enum TlsSniffResult {
+#[derive(Clone, Copy, Default)]
+pub struct ProtocolBlockPolicy {
+    http: bool,
+    tls: bool,
+}
+
+impl ProtocolBlockPolicy {
+    pub fn from_protocols(protocols: &[BlockedProtocol]) -> Self {
+        Self {
+            http: protocols.contains(&BlockedProtocol::Http),
+            tls: protocols.contains(&BlockedProtocol::Tls),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        !self.http && !self.tls
+    }
+}
+
+enum ProtocolSniffResult {
     Allow(Vec<u8>),
-    Block,
+    Block(BlockedProtocol),
 }
 
 /// v1.0.4: serve an ALREADY-BOUND TcpListener. Binding happens in the manager
@@ -44,7 +65,7 @@ pub async fn serve_tcp_listener(
     gate: RuleGate,
     count_traffic: bool,
     tcp_fast_open: bool,
-    block_tls: bool,
+    protocol_policy: ProtocolBlockPolicy,
     tunnel: Option<TunnelClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr = listener
@@ -146,7 +167,7 @@ pub async fn serve_tcp_listener(
                             source_ipv4,
                             count_traffic,
                             tcp_fast_open,
-                            block_tls,
+                            protocol_policy,
                             connections,
                             tunnel,
                         ) => {
@@ -209,15 +230,15 @@ async fn handle_tcp_connection(
     source_ipv4: Option<Ipv4Addr>,
     count_traffic: bool,
     tcp_fast_open: bool,
-    block_tls: bool,
+    protocol_policy: ProtocolBlockPolicy,
     connections: Arc<ConnectionTracker>,
     tunnel: Option<TunnelClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let sniffed_prefix = if block_tls {
-        match sniff_tls_client_hello(&mut inbound).await {
-            TlsSniffResult::Allow(prefix) => prefix,
-            TlsSniffResult::Block => {
-                connections.record_blocked_tls(rule_id, client_addr);
+    let sniffed_prefix = if !protocol_policy.is_empty() {
+        match sniff_blocked_protocol(&mut inbound, protocol_policy).await {
+            ProtocolSniffResult::Allow(prefix) => prefix,
+            ProtocolSniffResult::Block(protocol) => {
+                connections.record_blocked_protocol(protocol, rule_id, client_addr);
                 return Ok(());
             }
         }
@@ -312,7 +333,7 @@ async fn handle_tcp_connection(
         super::tunnel::write_header(&mut outbound, tunnel, super::tunnel::TunnelMode::Tcp).await?;
     }
 
-    // Protocol sniffing consumes at most six user bytes. Replay them before
+    // Protocol sniffing consumes at most one bounded request-line prefix. Replay it before
     // entering the regular forwarding loop, and account for them exactly once.
     // The remainder can still use Linux splice(2).
     let prefixed_upload = sniffed_prefix.len() as u64;
@@ -455,48 +476,135 @@ async fn fast_open_has_client_data(
     }
 }
 
-async fn sniff_tls_client_hello(inbound: &mut TcpStream) -> TlsSniffResult {
-    let mut header = [0u8; 6];
-    let first =
-        match tokio::time::timeout(TLS_FIRST_BYTE_TIMEOUT, inbound.read(&mut header[..1])).await {
-            Err(_) => return TlsSniffResult::Allow(Vec::new()),
-            // EOF only closes the client's upload direction. The peer may
-            // still be waiting for a server-first banner, so preserve normal
-            // half-close semantics and let the forwarding path propagate EOF.
-            Ok(Ok(0)) => return TlsSniffResult::Allow(Vec::new()),
-            Ok(Ok(n)) => n,
-            // A read error is not evidence of a blocked protocol. Treat it as
-            // fail-open; the normal forwarding path will surface a terminal socket
-            // error if the connection is no longer usable.
-            Ok(Err(_)) => return TlsSniffResult::Allow(Vec::new()),
-        };
+async fn sniff_blocked_protocol(
+    inbound: &mut TcpStream,
+    policy: ProtocolBlockPolicy,
+) -> ProtocolSniffResult {
+    let mut first_byte = [0u8; 1];
+    let first = match tokio::time::timeout(
+        PROTOCOL_FIRST_BYTE_TIMEOUT,
+        inbound.read(&mut first_byte),
+    )
+    .await
+    {
+        Err(_) => return ProtocolSniffResult::Allow(Vec::new()),
+        // EOF only closes the client's upload direction. The peer may
+        // still be waiting for a server-first banner, so preserve normal
+        // half-close semantics and let the forwarding path propagate EOF.
+        Ok(Ok(0)) => return ProtocolSniffResult::Allow(Vec::new()),
+        Ok(Ok(n)) => n,
+        // A read error is not evidence of a blocked protocol. Treat it as
+        // fail-open; the normal forwarding path will surface a terminal socket
+        // error if the connection is no longer usable.
+        Ok(Err(_)) => return ProtocolSniffResult::Allow(Vec::new()),
+    };
     debug_assert_eq!(first, 1);
-    if header[0] != 0x16 {
-        return TlsSniffResult::Allow(header[..1].to_vec());
-    }
 
+    if policy.tls && first_byte[0] == 0x16 {
+        return sniff_tls_client_hello(inbound, first_byte[0]).await;
+    }
+    if policy.http && is_http_method_initial(first_byte[0]) {
+        return sniff_http_request(inbound, first_byte[0]).await;
+    }
+    ProtocolSniffResult::Allow(first_byte.to_vec())
+}
+
+async fn sniff_tls_client_hello(inbound: &mut TcpStream, first_byte: u8) -> ProtocolSniffResult {
+    let mut header = [0u8; 6];
+    header[0] = first_byte;
     let mut filled = 1usize;
-    let deadline = tokio::time::sleep(TLS_HEADER_TIMEOUT);
+    let deadline = tokio::time::sleep(PROTOCOL_HEADER_TIMEOUT);
     tokio::pin!(deadline);
     while filled < header.len() {
         tokio::select! {
-            _ = &mut deadline => return TlsSniffResult::Allow(header[..filled].to_vec()),
+            _ = &mut deadline => return ProtocolSniffResult::Allow(header[..filled].to_vec()),
             result = inbound.read(&mut header[filled..]) => match result {
                 // A half-closed client may legitimately send a short request
                 // and wait for the server response. Preserve those bytes and
                 // forward the EOF through the normal copy path.
-                Ok(0) => return TlsSniffResult::Allow(header[..filled].to_vec()),
+                Ok(0) => return ProtocolSniffResult::Allow(header[..filled].to_vec()),
                 Ok(n) => filled += n,
-                Err(_) => return TlsSniffResult::Allow(header[..filled].to_vec()),
+                Err(_) => return ProtocolSniffResult::Allow(header[..filled].to_vec()),
             }
         }
     }
 
     if is_tls_client_hello_header(&header) {
-        TlsSniffResult::Block
+        ProtocolSniffResult::Block(BlockedProtocol::Tls)
     } else {
-        TlsSniffResult::Allow(header.to_vec())
+        ProtocolSniffResult::Allow(header.to_vec())
     }
+}
+
+async fn sniff_http_request(inbound: &mut TcpStream, first_byte: u8) -> ProtocolSniffResult {
+    let mut buffered = Vec::with_capacity(256);
+    buffered.push(first_byte);
+    let deadline = tokio::time::sleep(PROTOCOL_HEADER_TIMEOUT);
+    tokio::pin!(deadline);
+
+    while buffered.len() < HTTP_MAX_REQUEST_LINE_LEN {
+        if let Some(line_end) = buffered.windows(2).position(|window| window == b"\r\n") {
+            return if is_http_request_line(&buffered[..line_end]) {
+                ProtocolSniffResult::Block(BlockedProtocol::Http)
+            } else {
+                ProtocolSniffResult::Allow(buffered)
+            };
+        }
+        let mut chunk = [0u8; 256];
+        let remaining = HTTP_MAX_REQUEST_LINE_LEN - buffered.len();
+        let read_len = remaining.min(chunk.len());
+        tokio::select! {
+            _ = &mut deadline => return ProtocolSniffResult::Allow(buffered),
+            result = inbound.read(&mut chunk[..read_len]) => match result {
+                Ok(0) => return ProtocolSniffResult::Allow(buffered),
+                Ok(n) => buffered.extend_from_slice(&chunk[..n]),
+                Err(_) => return ProtocolSniffResult::Allow(buffered),
+            }
+        }
+    }
+
+    ProtocolSniffResult::Allow(buffered)
+}
+
+fn is_http_method_initial(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'C' | b'D' | b'G' | b'H' | b'L' | b'M' | b'O' | b'P' | b'T' | b'U'
+    )
+}
+
+fn is_http_request_line(line: &[u8]) -> bool {
+    let mut parts = line.split(|byte| *byte == b' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if target.is_empty() {
+        return false;
+    }
+    if method == b"PRI" {
+        return target == b"*" && version == b"HTTP/2.0";
+    }
+    const METHODS: &[&[u8]] = &[
+        b"CONNECT",
+        b"COPY",
+        b"DELETE",
+        b"GET",
+        b"HEAD",
+        b"LOCK",
+        b"MKCOL",
+        b"MOVE",
+        b"OPTIONS",
+        b"PATCH",
+        b"POST",
+        b"PROPFIND",
+        b"PROPPATCH",
+        b"PUT",
+        b"TRACE",
+        b"UNLOCK",
+    ];
+    METHODS.contains(&method) && (version == b"HTTP/1.0" || version == b"HTTP/1.1")
 }
 
 fn is_tls_client_hello_header(header: &[u8; 6]) -> bool {
@@ -546,6 +654,28 @@ mod tests {
         assert!(!is_tls_client_hello_header(b"GET / "));
     }
 
+    #[test]
+    fn http_request_line_classifier_accepts_http1_and_h2_preface() {
+        for line in [
+            &b"GET / HTTP/1.1"[..],
+            &b"POST /submit HTTP/1.0"[..],
+            &b"CONNECT example.com:443 HTTP/1.1"[..],
+            &b"PROPFIND /dav HTTP/1.1"[..],
+            &b"PRI * HTTP/2.0"[..],
+        ] {
+            assert!(is_http_request_line(line), "expected HTTP: {line:?}");
+        }
+        for line in [
+            &b"GET /"[..],
+            &b"GET / SSH/2.0"[..],
+            &b"get / HTTP/1.1"[..],
+            &b"PRI / HTTP/2.0"[..],
+            &b"HTTP/1.1 200 OK"[..],
+        ] {
+            assert!(!is_http_request_line(line), "unexpected HTTP: {line:?}");
+        }
+    }
+
     /// v1.0.8: end-to-end raw TCP forwarding still works after the NODELAY /
     /// 64 KiB buffer changes, and the client-facing socket has Nagle disabled.
     /// Topology: client → [serve_tcp_listener] → echo target.
@@ -582,7 +712,7 @@ mod tests {
             runtime.gate(None),
             true,
             false,
-            false,
+            ProtocolBlockPolicy::default(),
             None,
         ));
         // Keep the runtime alive for the duration of the test: dropping it would
@@ -625,7 +755,7 @@ mod tests {
             runtime.gate(None),
             true,
             false,
-            true,
+            ProtocolBlockPolicy::from_protocols(&[BlockedProtocol::Tls]),
             None,
         ));
         let _runtime = runtime;
@@ -663,6 +793,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fragmented_http_request_is_rejected_before_target_dial() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let listener = bind_tcp_listener(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let counter = Arc::new(TrafficCounter::new());
+        let connections = Arc::new(ConnectionTracker::new());
+        let runtime = crate::forwarder::gate::RuleRuntime::new();
+        tokio::spawn(serve_tcp_listener(
+            listener,
+            vec![target_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            RateLimit::Unlimited,
+            counter.clone(),
+            connections.clone(),
+            44,
+            None,
+            runtime.gate(None),
+            true,
+            false,
+            ProtocolBlockPolicy::from_protocols(&[BlockedProtocol::Http]),
+            None,
+        ));
+        let _runtime = runtime;
+
+        let mut client = TcpStream::connect(listen_addr).await.unwrap();
+        client.write_all(b"GE").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client
+            .write_all(b"T /health HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("blocked HTTP client was not closed promptly");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), target.accept())
+                .await
+                .is_err(),
+            "blocked HTTP must not open the target connection"
+        );
+        assert_eq!(
+            connections
+                .blocked_protocol_connections()
+                .get("http")
+                .copied(),
+            Some(1)
+        );
+        assert!(
+            counter.drain().await.is_empty(),
+            "blocked bytes are not billable"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_lookalike_fails_open_and_replays_billable_bytes() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let payload = b"GET / SSH/2.0\r\nnot-http".to_vec();
+        let expected = payload.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut received = vec![0u8; expected.len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            stream.write_all(&received).await.unwrap();
+        });
+
+        let listener = bind_tcp_listener(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let counter = Arc::new(TrafficCounter::new());
+        let runtime = crate::forwarder::gate::RuleRuntime::new();
+        tokio::spawn(serve_tcp_listener(
+            listener,
+            vec![target_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            RateLimit::Unlimited,
+            counter.clone(),
+            Arc::new(ConnectionTracker::new()),
+            45,
+            None,
+            runtime.gate(None),
+            true,
+            false,
+            ProtocolBlockPolicy::from_protocols(&[BlockedProtocol::Http]),
+            None,
+        ));
+        let _runtime = runtime;
+
+        let mut client = TcpStream::connect(listen_addr).await.unwrap();
+        client.write_all(&payload).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload);
+        drop(client);
+
+        let mut observed = None;
+        for _ in 0..20 {
+            let snapshot = counter.snapshot().await;
+            observed = snapshot.entries.first().cloned();
+            if observed.as_ref().is_some_and(|entry| {
+                entry.upload == payload.len() as u64 && entry.download == payload.len() as u64
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let entry = observed.expect("forwarded HTTP lookalike must be counted");
+        assert_eq!(entry.upload, payload.len() as u64);
+        assert_eq!(entry.download, payload.len() as u64);
+    }
+
+    #[tokio::test]
     async fn incomplete_tls_prefix_fails_open_and_replays_billable_bytes() {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target.local_addr().unwrap();
@@ -692,14 +937,14 @@ mod tests {
             runtime.gate(None),
             true,
             false,
-            true,
+            ProtocolBlockPolicy::from_protocols(&[BlockedProtocol::Tls]),
             None,
         ));
         let _runtime = runtime;
 
         let mut client = TcpStream::connect(listen_addr).await.unwrap();
         client.write_all(&payload[..2]).await.unwrap();
-        tokio::time::sleep(TLS_HEADER_TIMEOUT + Duration::from_millis(25)).await;
+        tokio::time::sleep(PROTOCOL_HEADER_TIMEOUT + Duration::from_millis(25)).await;
         client.write_all(&payload[2..]).await.unwrap();
         let mut echoed = vec![0u8; payload.len()];
         client.read_exact(&mut echoed).await.unwrap();
@@ -754,7 +999,7 @@ mod tests {
             runtime.gate(None),
             true,
             false,
-            true,
+            ProtocolBlockPolicy::from_protocols(&[BlockedProtocol::Http, BlockedProtocol::Tls]),
             None,
         ));
         let _runtime = runtime;
@@ -796,7 +1041,7 @@ mod tests {
             runtime.gate(None),
             true,
             true,
-            true,
+            ProtocolBlockPolicy::from_protocols(&[BlockedProtocol::Tls]),
             None,
         ));
         let _runtime = runtime;
@@ -843,7 +1088,7 @@ mod tests {
             runtime.gate(None),
             true,
             true,
-            false,
+            ProtocolBlockPolicy::default(),
             None,
         ));
         let _runtime = runtime;
@@ -948,7 +1193,7 @@ mod tests {
             runtime.gate(None),
             true,
             true,
-            false,
+            ProtocolBlockPolicy::default(),
             None,
         ));
 
@@ -1017,7 +1262,7 @@ mod tests {
             runtime.gate(Some(2)),
             true,
             false,
-            false,
+            ProtocolBlockPolicy::default(),
             None,
         ));
         let _runtime = runtime;

@@ -2875,13 +2875,17 @@ mod tests {
                 owner_uid: None,
                 rate: None,
                 hidden: None,
-                blocked_protocols: vec![BlockedProtocol::Tls, BlockedProtocol::Tls],
+                blocked_protocols: vec![
+                    BlockedProtocol::Tls,
+                    BlockedProtocol::Http,
+                    BlockedProtocol::Tls,
+                ],
             }),
         )
         .await;
         assert_eq!(created.code, 0, "{}", created.message);
         let group = created.data.unwrap();
-        assert_eq!(group.blocked_protocols, "[\"tls\"]");
+        assert_eq!(group.blocked_protocols, "[\"http\",\"tls\"]");
 
         let Json(updated) = update_group(
             AdminOnly { user_id: 1 },

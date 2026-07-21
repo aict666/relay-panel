@@ -187,7 +187,7 @@ export interface Tunnel {
   bound_rule_count: number;
 }
 
-export type BlockedProtocol = 'tls';
+export type BlockedProtocol = 'http' | 'tls';
 
 export interface DeviceGroup {
   id: number;

@@ -434,10 +434,10 @@ async fn handle_node_ws(
     let (mut sender, mut receiver) = socket.split();
 
     // Send an empty, backward-compatible snapshot to a protocol-incompatible
-    // node in a blocked group. Newer pre-v10 nodes use it as a signal to fetch
+    // node in a blocked group. Newer pre-v11 nodes use it as a signal to fetch
     // the serialized HTTP snapshot; older ones apply it directly, and their
     // regular HTTP poll then persists the same empty configuration. Never build
-    // or expose the v10 listener snapshot on this compatibility bridge.
+    // or expose the v11 listener snapshot on this compatibility bridge.
     let initial_config = match initial_snapshot_mode {
         WsInitialSnapshotMode::FailClosed => Some(policy_fail_closed_snapshot()),
         WsInitialSnapshotMode::ControlOnly => None,

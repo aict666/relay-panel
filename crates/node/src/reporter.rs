@@ -1,6 +1,7 @@
 use crate::config::NodeConfig;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use relay_shared::models::BlockedProtocol;
 use relay_shared::protocol::{
     ApiResponse, ListenerError, StatusReport, TrafficEntry, TrafficReport,
 };
@@ -204,7 +205,9 @@ pub const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct ConnectionTracker {
     tcp: Arc<AtomicU64>,
     udp: DashMap<UdpSessionKey, Instant>,
+    blocked_http: AtomicU64,
     blocked_tls: AtomicU64,
+    last_http_block_log_secs: AtomicU64,
     last_tls_block_log_secs: AtomicU64,
 }
 
@@ -221,7 +224,9 @@ impl ConnectionTracker {
         Self {
             tcp: Arc::new(AtomicU64::new(0)),
             udp: DashMap::new(),
+            blocked_http: AtomicU64::new(0),
             blocked_tls: AtomicU64::new(0),
+            last_http_block_log_secs: AtomicU64::new(0),
             last_tls_block_log_secs: AtomicU64::new(0),
         }
     }
@@ -306,36 +311,60 @@ impl ConnectionTracker {
         tcp.saturating_add(udp)
     }
 
-    /// Record one rejected TLS ClientHello. The cumulative count is lock-free
+    /// Record one rejected protocol connection. The cumulative count is lock-free
     /// and survives listener hot reloads for the lifetime of this node process.
     /// Individual rejects are intentionally not logged; one representative
     /// warning per minute is enough for diagnosis without turning scans into a
     /// disk/CPU amplification vector.
-    pub fn record_blocked_tls(&self, rule_id: i64, client_addr: SocketAddr) -> u64 {
-        let total = self.blocked_tls.fetch_add(1, Ordering::Relaxed) + 1;
+    pub fn record_blocked_protocol(
+        &self,
+        protocol: BlockedProtocol,
+        rule_id: i64,
+        client_addr: SocketAddr,
+    ) -> u64 {
+        let (counter, last_log, label) = match protocol {
+            BlockedProtocol::Http => (
+                &self.blocked_http,
+                &self.last_http_block_log_secs,
+                "HTTP request",
+            ),
+            BlockedProtocol::Tls => (
+                &self.blocked_tls,
+                &self.last_tls_block_log_secs,
+                "TLS ClientHello",
+            ),
+        };
+        let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let last = self.last_tls_block_log_secs.load(Ordering::Relaxed);
+        let last = last_log.load(Ordering::Relaxed);
         if now.saturating_sub(last) >= 60
-            && self
-                .last_tls_block_log_secs
+            && last_log
                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
             tracing::warn!(
                 rule_id,
                 %client_addr,
+                protocol = ?protocol,
                 total,
-                "blocked TLS ClientHello at public ingress (log rate-limited to once per 60s)"
+                "blocked {} at public ingress (log rate-limited to once per 60s)",
+                label
             );
         }
         total
     }
 
     pub fn blocked_protocol_connections(&self) -> BTreeMap<String, u64> {
-        BTreeMap::from([("tls".to_string(), self.blocked_tls.load(Ordering::Relaxed))])
+        BTreeMap::from([
+            (
+                "http".to_string(),
+                self.blocked_http.load(Ordering::Relaxed),
+            ),
+            ("tls".to_string(), self.blocked_tls.load(Ordering::Relaxed)),
+        ])
     }
 }
 

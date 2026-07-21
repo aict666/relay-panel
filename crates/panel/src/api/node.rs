@@ -108,7 +108,7 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
         let received = extract_config_protocol_version(&headers);
         // A protocol mismatch normally preserves the old cached config to
         // avoid an outage during rolling upgrades. That is unsafe once an
-        // ingress-blocking policy is active: a pre-v10 node would keep serving
+        // ingress-blocking policy is active: a pre-v11 node would keep serving
         // its old unfiltered listener indefinitely. Return a wire-compatible
         // successful EMPTY snapshot so every historical poller follows its
         // normal save-and-apply path. Protocol v4-v7 treated 401/403 as a

@@ -11,7 +11,7 @@ const CACHE_FILE: &str = "config-cache.json";
 
 /// Cache envelope used only when a protocol-blocking policy is active. Older
 /// nodes expect `listeners` at the JSON root, so they cannot accidentally load
-/// this envelope, ignore the v10 policy fields and resume unfiltered listeners
+/// this envelope, ignore protocol-policy fields and resume unfiltered listeners
 /// after a binary downgrade. Policy-free snapshots retain the historical raw
 /// format so ordinary rollback/offline recovery remains compatible.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -257,7 +257,7 @@ fn load_cache_at(path: &std::path::Path) -> Option<NodeConfigResponse> {
         }
         return Some(bound.config);
     }
-    // Backward compatibility for every policy-free cache written before v10.
+    // Backward compatibility for every policy-free cache written before v11.
     serde_json::from_str::<NodeConfigResponse>(&data).ok()
 }
 
@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_policy_cache_is_bound_to_v10_and_unreadable_as_a_legacy_snapshot() {
+    fn protocol_policy_cache_is_bound_to_v11_and_unreadable_as_a_legacy_snapshot() {
         let path = std::env::temp_dir().join(format!(
             "relaypanel-test-policy-cache-{}-{}",
             std::process::id(),
@@ -503,7 +503,7 @@ mod tests {
         assert!(value.get("listeners").is_none());
         assert!(value["config"]["listeners"].is_array());
 
-        // All pre-v10 NodeConfigResponse versions require a root `listeners`
+        // All pre-v11 NodeConfigResponse versions require a root `listeners`
         // field. This models their serde behavior and proves a downgraded node
         // fails closed instead of ignoring the policy nested in the envelope.
         #[derive(serde::Deserialize)]

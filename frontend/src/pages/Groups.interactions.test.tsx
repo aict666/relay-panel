@@ -45,7 +45,7 @@ const group: DeviceGroup = {
   port_range: '10000-65535',
   fallback_group: null,
   config: '{}',
-  blocked_protocols: ['tls'],
+  blocked_protocols: ['http', 'tls'],
   rate: 1,
   created_at: '2026-01-01',
 };
@@ -66,7 +66,7 @@ beforeEach(() => {
         capabilities: '[]',
         region: null,
         line_type: null,
-        blocked_protocols: ['tls'],
+        blocked_protocols: ['http', 'tls'],
       }]));
     }
     return Promise.reject(new Error(`unexpected ${url}`));
@@ -78,6 +78,7 @@ describe('Groups permissions', () => {
     render(<Groups />);
 
     expect(await screen.findByText('member-group')).toBeInTheDocument();
+    expect(screen.getByText('httpBlocked')).toBeInTheDocument();
     expect(screen.getByText('tlsBlocked')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /addGroup/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /edit/ })).not.toBeInTheDocument();
@@ -88,7 +89,7 @@ describe('Groups permissions', () => {
     expect(mockGet).not.toHaveBeenCalledWith('/nodes/shared');
   });
 
-  it('lets an administrator clear the TLS policy from the edit form', async () => {
+  it('lets an administrator clear TLS while retaining the HTTP policy', async () => {
     authState.isAdmin = true;
     const user = userEvent.setup();
     mockGet.mockImplementation((url: string) => {
@@ -96,7 +97,7 @@ describe('Groups permissions', () => {
       if (url === '/nodes') return Promise.resolve(ok([{
         group_id: group.id,
         online: true,
-        blocked_protocol_connections: { tls: 7 },
+        blocked_protocol_connections: { http: 3, tls: 7 },
       }]));
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -104,12 +105,12 @@ describe('Groups permissions', () => {
     render(<Groups />);
     expect(await screen.findByText('7')).toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: /edit/ }));
-    const tlsSwitch = await screen.findByRole('switch', { checked: true });
-    await user.click(tlsSwitch);
+    const enabledSwitches = await screen.findAllByRole('switch', { checked: true });
+    await user.click(enabledSwitches[enabledSwitches.length - 1]);
     await user.click(screen.getByRole('button', { name: /save/ }));
 
     await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/groups/1', {
-      blocked_protocols: [],
+      blocked_protocols: ['http'],
     }));
   });
 

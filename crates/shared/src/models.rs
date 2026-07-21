@@ -2,10 +2,12 @@ use serde::{Deserialize, Serialize};
 
 /// Protocols that an inbound device group may reject before dialing the
 /// configured target. The wire/storage vocabulary is deliberately extensible;
-/// v1 exposes only TLS ClientHello detection.
+/// Detection is best-effort and currently covers plaintext HTTP request lines
+/// plus TLS ClientHello records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BlockedProtocol {
+    Http,
     Tls,
 }
 
@@ -493,8 +495,12 @@ mod tests {
     #[test]
     fn blocked_protocol_storage_is_canonical_and_api_is_an_array() {
         assert_eq!(
-            encode_blocked_protocols(&[BlockedProtocol::Tls, BlockedProtocol::Tls]),
-            "[\"tls\"]"
+            encode_blocked_protocols(&[
+                BlockedProtocol::Tls,
+                BlockedProtocol::Http,
+                BlockedProtocol::Tls,
+            ]),
+            "[\"http\",\"tls\"]"
         );
         let summary = SharedGroupSummary {
             id: 1,
@@ -504,13 +510,17 @@ mod tests {
             capabilities: "[\"tcp\"]".into(),
             region: None,
             line_type: None,
-            blocked_protocols: "[\"tls\",\"tls\"]".into(),
+            blocked_protocols: "[\"tls\",\"http\",\"tls\"]".into(),
             hidden: false,
         };
         let json = serde_json::to_value(&summary).unwrap();
-        assert_eq!(json["blocked_protocols"], serde_json::json!(["tls"]));
+        assert_eq!(
+            json["blocked_protocols"],
+            serde_json::json!(["http", "tls"])
+        );
 
         let decoded: SharedGroupSummary = serde_json::from_value(json).unwrap();
-        assert_eq!(decoded.blocked_protocols, "[\"tls\"]");
+        assert_eq!(decoded.blocked_protocols, "[\"http\",\"tls\"]");
+        assert!(serde_json::from_str::<Vec<BlockedProtocol>>("[\"smtp\"]").is_err());
     }
 }

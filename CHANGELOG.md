@@ -10,6 +10,17 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.9] - 2026-07-21
+
+### Added
+
+- 入口设备组协议屏蔽新增明文 HTTP：识别标准 HTTP/1 请求行与 HTTP/2 明文前言，
+  并在共享线路、节点状态和拦截计数中单独展示 HTTP 策略与命中数。
+
+### Changed
+
+- 节点配置协议升级到 v11，避免 v10 节点无法识别 `http` 策略时继续沿用未过滤配置。
+
 ## [1.3.8] - 2026-07-21
 
 ### Fixed
