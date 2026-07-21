@@ -25,6 +25,22 @@ vi.mock('../auth/useAuth', () => ({
   useAuth: () => authState,
 }));
 
+// Ant Design's global message API mounts a detached React root. The update
+// interaction only needs to verify the request payload; leaving that root's
+// scheduled render alive can race Vitest's jsdom teardown on slower CI runners
+// and surface as `window is not defined` after every assertion has passed.
+vi.mock('antd', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('antd')>();
+  return {
+    ...actual,
+    message: {
+      ...actual.message,
+      success: vi.fn(),
+      error: vi.fn(),
+    },
+  };
+});
+
 import Groups from './Groups';
 
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
@@ -112,6 +128,9 @@ describe('Groups permissions', () => {
     await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/groups/1', {
       blocked_protocols: ['http'],
     }));
+    await waitFor(() => {
+      expect(mockGet.mock.calls.filter(([url]) => url === '/groups')).toHaveLength(2);
+    });
   });
 
   it('does not reopen an old install command after the authenticated account changes', async () => {
