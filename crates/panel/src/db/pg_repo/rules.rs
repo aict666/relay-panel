@@ -1,4 +1,4 @@
-use super::PgRepository;
+use super::{tunnel_advisory_lock_key, PgRepository};
 use crate::db::error::DbError;
 use crate::db::repo::*;
 use async_trait::async_trait;
@@ -510,6 +510,8 @@ impl RuleRepository for PgRepository {
         download_limit_mbps: i32,
         tunnel_profile_id: Option<i64>,
         tunnel_id: Option<i64>,
+        max_connections: i32,
+        auto_restart_minutes: i32,
     ) -> Result<Option<i64>, DbError> {
         // v1.2: atomic create. Same advisory-xact-lock + user-row FOR UPDATE +
         // conflict pre-check + quota-guarded INSERT shape as
@@ -554,14 +556,111 @@ impl RuleRepository for PgRepository {
                     .await
             );
         }
+        if let Some(tunnel_id) = tunnel_id {
+            try_!(
+                tx,
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(tunnel_advisory_lock_key(tunnel_id))
+                    .execute(&mut *tx)
+                    .await
+            );
+        }
 
-        try_!(
+        let owner: Option<(bool, bool, bool)> = try_!(
             tx,
-            sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+            sqlx::query_as(
+                "SELECT admin,all_device_groups,banned FROM users WHERE id=$1 FOR UPDATE",
+            )
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await
+        );
+        let Some((owner_is_admin, owner_all_groups, owner_banned)) = owner else {
+            let _ = tx.rollback().await;
+            return Err(DbError::RuleGroupAccessDenied);
+        };
+        if owner_banned {
+            let _ = tx.rollback().await;
+            return Err(DbError::RuleGroupAccessDenied);
+        }
+        // The role bit is not mutable through repository/API writes. Locking
+        // the owner row here would invert regular-user deletion's user -> group
+        // row order; the device-group row is the only mutable validation input.
+        let valid_entry: Option<i64> = try_!(
+            tx,
+            sqlx::query_scalar(
+                "SELECT dg.id FROM device_groups dg \
+                 JOIN users group_owner ON group_owner.id=dg.uid \
+                 WHERE dg.id=$1 AND dg.group_type IN ('in','both') \
+                   AND group_owner.admin=TRUE FOR SHARE OF dg",
+            )
+            .bind(device_group_in)
+            .fetch_optional(&mut *tx)
+            .await
+        );
+        if valid_entry.is_none() {
+            let _ = tx.rollback().await;
+            return Err(DbError::RuleGroupUnavailable);
+        }
+        if !owner_is_admin && !owner_all_groups {
+            let authorized: Option<i32> = try_!(
+                tx,
+                sqlx::query_scalar(
+                    "SELECT 1 FROM user_device_groups \
+                     WHERE user_id=$1 AND device_group_id=$2",
+                )
                 .bind(uid)
+                .bind(device_group_in)
                 .fetch_optional(&mut *tx)
                 .await
-        );
+            );
+            if authorized.is_none() {
+                let _ = tx.rollback().await;
+                return Err(DbError::RuleGroupAccessDenied);
+            }
+        }
+        for (position, (group_id, _)) in hops.iter().enumerate().skip(1) {
+            let valid: Option<i64> = try_!(
+                tx,
+                sqlx::query_scalar(
+                    "SELECT dg.id FROM device_groups dg \
+                     JOIN users owner ON owner.id=dg.uid \
+                     WHERE dg.id=$1 AND dg.group_type<>'monitor' \
+                       AND BTRIM(dg.connect_host)<>'' AND owner.admin=TRUE \
+                     FOR SHARE OF dg",
+                )
+                .bind(group_id)
+                .fetch_optional(&mut *tx)
+                .await
+            );
+            if valid.is_none() {
+                tracing::debug!("create_rule_full: invalid downstream hop at {position}");
+                let _ = tx.rollback().await;
+                return Err(DbError::RuleGroupUnavailable);
+            }
+        }
+
+        if let Some(profile_id) = tunnel_profile_id {
+            if protocol != "tcp" {
+                let _ = tx.rollback().await;
+                return Err(DbError::ProfileUnavailable);
+            }
+            let valid: Option<i64> = try_!(
+                tx,
+                sqlx::query_scalar(
+                    "SELECT id FROM tunnel_profiles \
+                     WHERE id = $1 AND transport = $2 FOR SHARE",
+                )
+                .bind(profile_id)
+                .bind(public_transport)
+                .fetch_optional(&mut *tx)
+                .await
+            );
+            if valid.is_none() {
+                let _ = tx.rollback().await;
+                return Err(DbError::ProfileUnavailable);
+            }
+        }
 
         // Close the service-validation race by locking and checking the preset
         // route in the same transaction that inserts the rule.
@@ -578,7 +677,17 @@ impl RuleRepository for PgRepository {
                      JOIN tunnel_hops entry ON entry.tunnel_id=t.id AND entry.position=0 \
                      JOIN tunnel_hops exit ON exit.tunnel_id=t.id \
                        AND exit.position=(SELECT MAX(position) FROM tunnel_hops WHERE tunnel_id=t.id) \
-                     WHERE t.id=$1 FOR SHARE OF t",
+                     WHERE t.id=$1 \
+                       AND (SELECT COUNT(*) FROM tunnel_hops h WHERE h.tunnel_id=t.id) BETWEEN 2 AND 8 \
+                       AND (SELECT COUNT(DISTINCT h.device_group_id) FROM tunnel_hops h WHERE h.tunnel_id=t.id) = \
+                           (SELECT COUNT(*) FROM tunnel_hops h WHERE h.tunnel_id=t.id) \
+                       AND NOT EXISTS (SELECT 1 FROM tunnel_hops checked \
+                         JOIN device_groups dg ON dg.id=checked.device_group_id \
+                         JOIN users owner ON owner.id=dg.uid \
+                         WHERE checked.tunnel_id=t.id AND (owner.admin=FALSE \
+                           OR (checked.position=0 AND (dg.group_type NOT IN ('in','both') OR checked.listen_port IS NOT NULL)) \
+                           OR (checked.position>0 AND (dg.group_type='monitor' OR BTRIM(dg.connect_host)='' OR checked.listen_port IS NULL)))) \
+                     FOR SHARE OF t",
                 )
                 .bind(tunnel_id)
                 .bind(uid)
@@ -763,6 +872,21 @@ impl RuleRepository for PgRepository {
                 )
                 .bind(upload_limit_mbps)
                 .bind(download_limit_mbps)
+                .bind(rule_id)
+                .execute(&mut *tx)
+                .await
+            );
+        }
+
+        if max_connections != 0 || auto_restart_minutes != 0 {
+            try_!(
+                tx,
+                sqlx::query(
+                    "UPDATE forward_rules SET max_connections = $1, auto_restart_minutes = $2 \
+                     WHERE id = $3",
+                )
+                .bind(max_connections)
+                .bind(auto_restart_minutes)
                 .bind(rule_id)
                 .execute(&mut *tx)
                 .await
@@ -972,6 +1096,24 @@ impl RuleRepository for PgRepository {
     }
 
     async fn update_rule_full(&self, update: &RuleUpdateData) -> Result<u64, DbError> {
+        if update.is_pause_only() {
+            let result = if let Some(uid) = update.owner_uid {
+                sqlx::query(
+                    "UPDATE forward_rules SET paused=TRUE,auto_paused=FALSE WHERE id=$1 AND uid=$2",
+                )
+                .bind(update.id)
+                .bind(uid)
+                .execute(&self.pool)
+                .await?
+            } else {
+                sqlx::query("UPDATE forward_rules SET paused=TRUE,auto_paused=FALSE WHERE id=$1")
+                    .bind(update.id)
+                    .execute(&self.pool)
+                    .await?
+            };
+            return Ok(result.rows_affected());
+        }
+
         let mut tx = self.pool.begin().await?;
         macro_rules! try_ {
             ($expr:expr) => {
@@ -984,6 +1126,27 @@ impl RuleRepository for PgRepository {
                 }
             };
         }
+
+        let rule_snapshot: Option<(i64, Option<i64>)> = if let Some(uid) = update.owner_uid {
+            try_!(
+                sqlx::query_as("SELECT uid,tunnel_id FROM forward_rules WHERE id=$1 AND uid=$2",)
+                    .bind(update.id)
+                    .bind(uid)
+                    .fetch_optional(&mut *tx)
+                    .await
+            )
+        } else {
+            try_!(
+                sqlx::query_as("SELECT uid,tunnel_id FROM forward_rules WHERE id=$1")
+                    .bind(update.id)
+                    .fetch_optional(&mut *tx)
+                    .await
+            )
+        };
+        let Some((rule_owner_id, initial_tunnel_id)) = rule_snapshot else {
+            let _ = tx.rollback().await;
+            return Ok(0);
+        };
 
         // Include the current placement as well as the requested placement.
         // Route-transition rows reserve the old ports, so their groups must use
@@ -1014,20 +1177,56 @@ impl RuleRepository for PgRepository {
             .collect();
         locked_groups.sort_unstable();
         locked_groups.dedup();
-        for group_id in locked_groups {
+        for group_id in &locked_groups {
             try_!(
                 sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                    .bind(group_id)
+                    .bind(*group_id)
                     .execute(&mut *tx)
                     .await
             );
         }
 
-        let existing: Option<(String, i32, i64, Option<i64>, Option<i64>, bool, String)> =
-            if let Some(uid) = update.owner_uid {
-                try_!(
+        let mut locked_tunnel_ids: Vec<i64> = initial_tunnel_id
+            .into_iter()
+            .chain(update.tunnel_id.flatten())
+            .collect();
+        locked_tunnel_ids.sort_unstable();
+        locked_tunnel_ids.dedup();
+        for tunnel_id in &locked_tunnel_ids {
+            try_!(
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(tunnel_advisory_lock_key(*tunnel_id))
+                    .execute(&mut *tx)
+                    .await
+            );
+        }
+
+        // User authorization writers lock this row before pausing rules. Take
+        // it before the rule row so revoke-vs-resume has a single lock order
+        // (user -> rule) and cannot commit a stale authorization decision.
+        let owner: Option<(bool, bool, bool)> = try_!(
+            sqlx::query_as(
+                "SELECT admin,all_device_groups,banned FROM users WHERE id=$1 FOR UPDATE",
+            )
+            .bind(rule_owner_id)
+            .fetch_optional(&mut *tx)
+            .await
+        );
+
+        let existing: Option<(
+            String,
+            i32,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            bool,
+            String,
+            String,
+            Option<i64>,
+        )> = if let Some(uid) = update.owner_uid {
+            try_!(
                     sqlx::query_as(
-                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode \
+                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode,public_transport,tunnel_profile_id \
                      FROM forward_rules WHERE id=$1 AND uid=$2 FOR UPDATE",
                     )
                     .bind(update.id)
@@ -1035,17 +1234,17 @@ impl RuleRepository for PgRepository {
                     .fetch_optional(&mut *tx)
                     .await
                 )
-            } else {
-                try_!(
+        } else {
+            try_!(
                     sqlx::query_as(
-                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode \
+                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode,public_transport,tunnel_profile_id \
                      FROM forward_rules WHERE id=$1 FOR UPDATE",
                     )
                     .bind(update.id)
                     .fetch_optional(&mut *tx)
                     .await
                 )
-            };
+        };
         let Some((
             old_protocol,
             old_port,
@@ -1054,11 +1253,40 @@ impl RuleRepository for PgRepository {
             old_tunnel_id,
             old_paused,
             old_route_mode,
+            old_public_transport,
+            old_profile_id,
         )) = existing
         else {
             let _ = tx.rollback().await;
             return Ok(0);
         };
+        // We may have waited for another rule/tunnel edit after taking the
+        // optimistic placement snapshot above. The rule row is locked now, and
+        // tunnel editors share the tunnel advisory lock, so re-read the live
+        // placement and reject a stale request if it contains a group/tunnel
+        // whose lock this transaction did not acquire.
+        if old_tunnel_id.is_some_and(|id| locked_tunnel_ids.binary_search(&id).is_err()) {
+            let _ = tx.rollback().await;
+            return Err(DbError::TunnelUnavailable);
+        }
+        let live_groups: Vec<i64> = try_!(
+            sqlx::query_scalar(
+                "SELECT device_group_in FROM forward_rules WHERE id=$1 \
+                 UNION SELECT h.device_group_id FROM forward_rule_hops h WHERE h.rule_id=$1 \
+                 UNION SELECT th.device_group_id FROM tunnel_hops th \
+                   JOIN forward_rules r ON r.tunnel_id=th.tunnel_id WHERE r.id=$1",
+            )
+            .bind(update.id)
+            .fetch_all(&mut *tx)
+            .await
+        );
+        if live_groups
+            .iter()
+            .any(|group_id| locked_groups.binary_search(group_id).is_err())
+        {
+            let _ = tx.rollback().await;
+            return Err(DbError::PortConflict);
+        }
         let effective_protocol = update.protocol.as_deref().unwrap_or(&old_protocol);
         let effective_port = update.listen_port.unwrap_or(old_port);
         let effective_group = update.device_group_in.unwrap_or(old_group);
@@ -1072,6 +1300,108 @@ impl RuleRepository for PgRepository {
             || update.route_mode.is_some()
             || update.device_group_in.is_some()
             || update.device_group_out.is_some();
+        let authorization_required = route_update_requested || (old_paused && !effective_paused);
+        if authorization_required {
+            let Some((owner_is_admin, owner_all_groups, owner_banned)) = owner else {
+                let _ = tx.rollback().await;
+                return Err(DbError::RuleGroupAccessDenied);
+            };
+            // Keep the mutable group row stable without also locking its owner;
+            // users.admin is immutable and user deletion locks owner then group.
+            let valid_entry: Option<i64> = try_!(
+                sqlx::query_scalar(
+                    "SELECT dg.id FROM device_groups dg \
+                     JOIN users group_owner ON group_owner.id=dg.uid \
+                     WHERE dg.id=$1 AND dg.group_type IN ('in','both') \
+                       AND group_owner.admin=TRUE FOR SHARE OF dg",
+                )
+                .bind(effective_group)
+                .fetch_optional(&mut *tx)
+                .await
+            );
+            if valid_entry.is_none() {
+                let _ = tx.rollback().await;
+                return Err(DbError::RuleGroupUnavailable);
+            }
+            if owner_banned || (!owner_is_admin && !owner_all_groups) {
+                let authorized: Option<i32> = if owner_banned {
+                    None
+                } else {
+                    try_!(
+                        sqlx::query_scalar(
+                            "SELECT 1 FROM user_device_groups \
+                             WHERE user_id=$1 AND device_group_id=$2",
+                        )
+                        .bind(rule_owner_id)
+                        .bind(effective_group)
+                        .fetch_optional(&mut *tx)
+                        .await
+                    )
+                };
+                if authorized.is_none() {
+                    let _ = tx.rollback().await;
+                    return Err(DbError::RuleGroupAccessDenied);
+                }
+            }
+            if effective_tunnel_id.is_none() && effective_route_mode == "chain" {
+                let downstream_groups: Vec<i64> = if let Some(hops) = &update.hops {
+                    hops.iter().skip(1).map(|(group_id, _)| *group_id).collect()
+                } else {
+                    try_!(
+                        sqlx::query_scalar(
+                            "SELECT device_group_id FROM forward_rule_hops \
+                             WHERE rule_id=$1 AND position>0 ORDER BY position",
+                        )
+                        .bind(update.id)
+                        .fetch_all(&mut *tx)
+                        .await
+                    )
+                };
+                for group_id in downstream_groups {
+                    let valid: Option<i64> = try_!(
+                        sqlx::query_scalar(
+                            "SELECT dg.id FROM device_groups dg \
+                             JOIN users owner ON owner.id=dg.uid \
+                             WHERE dg.id=$1 AND dg.group_type<>'monitor' \
+                               AND BTRIM(dg.connect_host)<>'' AND owner.admin=TRUE \
+                             FOR SHARE OF dg",
+                        )
+                        .bind(group_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                    );
+                    if valid.is_none() {
+                        let _ = tx.rollback().await;
+                        return Err(DbError::RuleGroupUnavailable);
+                    }
+                }
+            }
+        }
+        let effective_public_transport = update
+            .public_transport
+            .as_deref()
+            .unwrap_or(&old_public_transport);
+        let effective_profile_id = update.tunnel_profile_id.unwrap_or(old_profile_id);
+        if let Some(profile_id) = effective_profile_id {
+            if effective_protocol != "tcp" {
+                let _ = tx.rollback().await;
+                return Err(DbError::ProfileUnavailable);
+            }
+            let valid: Option<i64> = try_!(
+                sqlx::query_scalar(
+                    "SELECT id FROM tunnel_profiles \
+                     WHERE id = $1 AND transport = $2 FOR SHARE",
+                )
+                .bind(profile_id)
+                .bind(effective_public_transport)
+                .fetch_optional(&mut *tx)
+                .await
+            );
+            if valid.is_none() {
+                let _ = tx.rollback().await;
+                return Err(DbError::ProfileUnavailable);
+            }
+        }
         let mut old_downstream_ports: Vec<(i64, i32, String)> =
             if route_update_requested && !old_paused {
                 if let Some(tunnel_id) = old_tunnel_id {
@@ -1120,7 +1450,17 @@ impl RuleRepository for PgRepository {
                      JOIN tunnel_hops entry ON entry.tunnel_id=t.id AND entry.position=0 \
                      JOIN tunnel_hops exit ON exit.tunnel_id=t.id \
                        AND exit.position=(SELECT MAX(position) FROM tunnel_hops WHERE tunnel_id=t.id) \
-                     WHERE t.id=$1 FOR SHARE OF t",
+                     WHERE t.id=$1 \
+                       AND (SELECT COUNT(*) FROM tunnel_hops h WHERE h.tunnel_id=t.id) BETWEEN 2 AND 8 \
+                       AND (SELECT COUNT(DISTINCT h.device_group_id) FROM tunnel_hops h WHERE h.tunnel_id=t.id) = \
+                           (SELECT COUNT(*) FROM tunnel_hops h WHERE h.tunnel_id=t.id) \
+                       AND NOT EXISTS (SELECT 1 FROM tunnel_hops checked \
+                         JOIN device_groups dg ON dg.id=checked.device_group_id \
+                         JOIN users owner ON owner.id=dg.uid \
+                         WHERE checked.tunnel_id=t.id AND (owner.admin=FALSE \
+                           OR (checked.position=0 AND (dg.group_type NOT IN ('in','both') OR checked.listen_port IS NOT NULL)) \
+                           OR (checked.position>0 AND (dg.group_type='monitor' OR BTRIM(dg.connect_host)='' OR checked.listen_port IS NULL)))) \
+                     FOR SHARE OF t",
                 )
                 .bind(tunnel_id)
                 .bind(update.id)
@@ -1572,7 +1912,9 @@ impl RuleRepository for PgRepository {
     }
 
     async fn list_active_for_config(&self, group_id: i64) -> Result<Vec<ForwardRule>, DbError> {
-        // v0.4.11 PR3: REMOVED cross-owner defense filter. See SQLite impl comment.
+        // Shared entries are administrator-managed. Revalidate their current
+        // type, owner role, and the rule owner's current grant here so legacy
+        // rows or out-of-band edits cannot reach a node config.
         // v1.0.8: FOUR gating conditions (banned, suspended, over-quota,
         // expired). Mirrors the SQLite WHERE clause. PG uses now() for the
         // expiry comparison; plan_expire_at is TEXT UTC 'YYYY-MM-DD HH:MM:SS'.
@@ -1583,7 +1925,12 @@ impl RuleRepository for PgRepository {
              WHERE fr.device_group_in = $1 AND fr.paused = FALSE \
              AND u.banned = FALSE \
              AND u.suspended = FALSE \
-             AND (fr.tunnel_id IS NULL OR u.admin = TRUE OR (t.shared = TRUE AND \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=TRUE) \
+             AND (u.admin = TRUE OR (\
+               (fr.tunnel_id IS NULL OR t.shared = TRUE) AND \
                (u.all_device_groups = TRUE OR EXISTS (SELECT 1 FROM user_device_groups udg \
                  WHERE udg.user_id = u.id AND udg.device_group_id = fr.device_group_in)))) \
              AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) \
@@ -1735,8 +2082,15 @@ impl RuleRepository for PgRepository {
              JOIN forward_rules fr ON fr.id = h.rule_id \
              JOIN users u ON fr.uid = u.id \
              WHERE h.device_group_id = $1 \
-             AND fr.route_mode = 'chain' AND fr.paused = FALSE \
+             AND fr.route_mode = 'chain' AND fr.tunnel_id IS NULL AND fr.paused = FALSE \
              AND u.banned = FALSE AND u.suspended = FALSE \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=TRUE) \
+             AND (u.admin = TRUE OR u.all_device_groups = TRUE OR EXISTS (\
+               SELECT 1 FROM user_device_groups udg WHERE udg.user_id = u.id \
+                 AND udg.device_group_id = fr.device_group_in)) \
              AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at > to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')) \
              ORDER BY h.rule_id, h.position",
@@ -1755,8 +2109,16 @@ impl RuleRepository for PgRepository {
             "SELECT DISTINCT fr.* FROM forward_rules fr \
              JOIN forward_rule_hops h ON h.rule_id=fr.id \
              JOIN users u ON u.id=fr.uid \
-             WHERE h.device_group_id=$1 AND fr.route_mode='chain' AND fr.paused=FALSE \
+             WHERE h.device_group_id=$1 AND fr.route_mode='chain' \
+             AND fr.tunnel_id IS NULL AND fr.paused=FALSE \
              AND u.banned=FALSE AND u.suspended=FALSE \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=TRUE) \
+             AND (u.admin=TRUE OR u.all_device_groups=TRUE OR EXISTS (\
+               SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
+                 AND udg.device_group_id=fr.device_group_in)) \
              AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at>to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
              ORDER BY fr.id",
@@ -1769,8 +2131,16 @@ impl RuleRepository for PgRepository {
              JOIN forward_rules fr ON fr.id=rt.rule_id \
              JOIN forward_rule_hops h ON h.rule_id=fr.id \
              JOIN users u ON u.id=fr.uid \
-             WHERE h.device_group_id=$1 AND fr.route_mode='chain' AND fr.paused=FALSE \
+             WHERE h.device_group_id=$1 AND fr.route_mode='chain' \
+             AND fr.tunnel_id IS NULL AND fr.paused=FALSE \
              AND rt.enabled=TRUE AND u.banned=FALSE AND u.suspended=FALSE \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=TRUE) \
+             AND (u.admin=TRUE OR u.all_device_groups=TRUE OR EXISTS (\
+               SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
+                 AND udg.device_group_id=fr.device_group_in)) \
              AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at>to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
              ORDER BY rt.rule_id,rt.position,rt.id",
@@ -1814,12 +2184,12 @@ impl PgRepository {
     ) -> Result<Vec<relay_shared::models::ForwardRuleHop>, DbError> {
         let mut hops = self.list_rule_hops(rule_id).await?;
         for hop in &mut hops {
-            if let Ok(Some((name, host))) = sqlx::query_as::<_, (String, String)>(
+            if let Some((name, host)) = sqlx::query_as::<_, (String, String)>(
                 "SELECT name, connect_host FROM device_groups WHERE id = $1",
             )
             .bind(hop.device_group_id)
             .fetch_optional(&self.pool)
-            .await
+            .await?
             {
                 hop.group_name = Some(name);
                 hop.connect_host = Some(host);

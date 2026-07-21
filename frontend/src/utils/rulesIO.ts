@@ -111,7 +111,7 @@ export function validateImportEntry(e: unknown): string | null {
   // string like "80" is rejected (the export emits a real number; accepting
   // strings would silently let "80abc" through Number() later).
   const port = e['listen_port'];
-  if (typeof port !== 'number' || !Number.isFinite(port) || port < 1 || port > 65535)
+  if (typeof port !== 'number' || !Number.isFinite(port) || !Number.isInteger(port) || port < 1 || port > 65535)
     return 'listen_port must be 1-65535';
   // dest: required, must be a non-empty array of strings.
   const dest = e['dest'];

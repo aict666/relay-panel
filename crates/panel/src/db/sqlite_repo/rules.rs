@@ -497,6 +497,8 @@ impl RuleRepository for SqliteRepository {
         download_limit_mbps: i32,
         tunnel_profile_id: Option<i64>,
         tunnel_id: Option<i64>,
+        max_connections: i32,
+        auto_restart_minutes: i32,
     ) -> Result<Option<i64>, DbError> {
         // v1.2: atomic create. Same BEGIN IMMEDIATE + conflict pre-check +
         // quota-guarded INSERT shape as insert_quota_guarded, but the INSERT is
@@ -527,6 +529,99 @@ impl RuleRepository for SqliteRepository {
             };
         }
 
+        // The API/service checks these predicates for an early, friendly
+        // rejection. Re-evaluate them after BEGIN IMMEDIATE so revoking the
+        // owner's grant or changing the group between that check and INSERT
+        // cannot leave a newly-active unauthorized rule.
+        let owner: Option<(bool, bool, bool)> = try_!(
+            conn,
+            sqlx::query_as("SELECT admin,all_device_groups,banned FROM users WHERE id=?",)
+                .bind(uid)
+                .fetch_optional(&mut *conn)
+                .await
+        );
+        let Some((owner_is_admin, owner_all_groups, owner_banned)) = owner else {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(DbError::RuleGroupAccessDenied);
+        };
+        if owner_banned {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(DbError::RuleGroupAccessDenied);
+        }
+        let valid_entry: Option<i64> = try_!(
+            conn,
+            sqlx::query_scalar(
+                "SELECT dg.id FROM device_groups dg \
+                 JOIN users group_owner ON group_owner.id=dg.uid \
+                 WHERE dg.id=? AND dg.group_type IN ('in','both') \
+                   AND group_owner.admin=1",
+            )
+            .bind(device_group_in)
+            .fetch_optional(&mut *conn)
+            .await
+        );
+        if valid_entry.is_none() {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(DbError::RuleGroupUnavailable);
+        }
+        if !owner_is_admin && !owner_all_groups {
+            let authorized: Option<i64> = try_!(
+                conn,
+                sqlx::query_scalar(
+                    "SELECT 1 FROM user_device_groups \
+                     WHERE user_id=? AND device_group_id=?",
+                )
+                .bind(uid)
+                .bind(device_group_in)
+                .fetch_optional(&mut *conn)
+                .await
+            );
+            if authorized.is_none() {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(DbError::RuleGroupAccessDenied);
+            }
+        }
+        for (position, (group_id, _)) in hops.iter().enumerate().skip(1) {
+            let valid: Option<i64> = try_!(
+                conn,
+                sqlx::query_scalar(
+                    "SELECT dg.id FROM device_groups dg \
+                     JOIN users owner ON owner.id=dg.uid \
+                     WHERE dg.id=? AND dg.group_type<>'monitor' \
+                       AND TRIM(dg.connect_host)<>'' AND owner.admin=1",
+                )
+                .bind(group_id)
+                .fetch_optional(&mut *conn)
+                .await
+            );
+            if valid.is_none() {
+                tracing::debug!("create_rule_full: invalid downstream hop at {position}");
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(DbError::RuleGroupUnavailable);
+            }
+        }
+
+        if let Some(profile_id) = tunnel_profile_id {
+            if protocol != "tcp" {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(DbError::ProfileUnavailable);
+            }
+            let valid: Option<i64> = try_!(
+                conn,
+                sqlx::query_scalar(
+                    "SELECT id FROM tunnel_profiles WHERE id = ? AND transport = ?",
+                )
+                .bind(profile_id)
+                .bind(public_transport)
+                .fetch_optional(&mut *conn)
+                .await
+            );
+            if valid.is_none() {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(DbError::ProfileUnavailable);
+            }
+        }
+
         // The service resolves preset topology before opening this transaction,
         // but an administrator may edit/disable it concurrently. Re-read the
         // complete derived endpoints while holding SQLite's writer lock.
@@ -543,7 +638,16 @@ impl RuleRepository for SqliteRepository {
                      JOIN tunnel_hops entry ON entry.tunnel_id=t.id AND entry.position=0 \
                      JOIN tunnel_hops exit ON exit.tunnel_id=t.id \
                        AND exit.position=(SELECT MAX(position) FROM tunnel_hops WHERE tunnel_id=t.id) \
-                     WHERE t.id=?",
+                     WHERE t.id=? \
+                       AND (SELECT COUNT(*) FROM tunnel_hops h WHERE h.tunnel_id=t.id) BETWEEN 2 AND 8 \
+                       AND (SELECT COUNT(DISTINCT h.device_group_id) FROM tunnel_hops h WHERE h.tunnel_id=t.id) = \
+                           (SELECT COUNT(*) FROM tunnel_hops h WHERE h.tunnel_id=t.id) \
+                       AND NOT EXISTS (SELECT 1 FROM tunnel_hops checked \
+                         JOIN device_groups dg ON dg.id=checked.device_group_id \
+                         JOIN users owner ON owner.id=dg.uid \
+                         WHERE checked.tunnel_id=t.id AND (owner.admin<>1 \
+                           OR (checked.position=0 AND (dg.group_type NOT IN ('in','both') OR checked.listen_port IS NOT NULL)) \
+                           OR (checked.position>0 AND (dg.group_type='monitor' OR TRIM(dg.connect_host)='' OR checked.listen_port IS NULL))))",
                 )
                 .bind(uid)
                 .bind(tunnel_id)
@@ -763,6 +867,25 @@ impl RuleRepository for SqliteRepository {
             );
         }
 
+        // Connection controls are part of the same atomic create. Keeping the
+        // update in this transaction avoids the old create-then-edit workflow
+        // and guarantees a write failure cannot leave a partially configured
+        // rule behind.
+        if max_connections != 0 || auto_restart_minutes != 0 {
+            try_!(
+                conn,
+                sqlx::query(
+                    "UPDATE forward_rules SET max_connections = ?, auto_restart_minutes = ? \
+                     WHERE id = ?",
+                )
+                .bind(max_connections)
+                .bind(auto_restart_minutes)
+                .bind(rule_id)
+                .execute(&mut *conn)
+                .await
+            );
+        }
+
         // Tunnel profile: only written when Some (Raw transport rules never
         // reach here with a profile — the service rejects that combination
         // earlier).
@@ -951,6 +1074,22 @@ impl RuleRepository for SqliteRepository {
     }
 
     async fn update_rule_full(&self, update: &RuleUpdateData) -> Result<u64, DbError> {
+        if update.is_pause_only() {
+            let result = if let Some(uid) = update.owner_uid {
+                sqlx::query("UPDATE forward_rules SET paused=1,auto_paused=0 WHERE id=? AND uid=?")
+                    .bind(update.id)
+                    .bind(uid)
+                    .execute(&self.pool)
+                    .await?
+            } else {
+                sqlx::query("UPDATE forward_rules SET paused=1,auto_paused=0 WHERE id=?")
+                    .bind(update.id)
+                    .execute(&self.pool)
+                    .await?
+            };
+            return Ok(result.rows_affected());
+        }
+
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         macro_rules! try_ {
@@ -965,11 +1104,21 @@ impl RuleRepository for SqliteRepository {
             };
         }
 
-        let existing: Option<(String, i32, i64, Option<i64>, Option<i64>, bool, String)> =
-            if let Some(uid) = update.owner_uid {
-                try_!(
+        let existing: Option<(
+            i64,
+            String,
+            i32,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            bool,
+            String,
+            String,
+            Option<i64>,
+        )> = if let Some(uid) = update.owner_uid {
+            try_!(
                     sqlx::query_as(
-                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode \
+                        "SELECT uid,protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode,public_transport,tunnel_profile_id \
                      FROM forward_rules WHERE id=? AND uid=?",
                     )
                     .bind(update.id)
@@ -977,18 +1126,19 @@ impl RuleRepository for SqliteRepository {
                     .fetch_optional(&mut *conn)
                     .await
                 )
-            } else {
-                try_!(
+        } else {
+            try_!(
                     sqlx::query_as(
-                        "SELECT protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode \
+                        "SELECT uid,protocol,listen_port,device_group_in,device_group_out,tunnel_id,paused,route_mode,public_transport,tunnel_profile_id \
                      FROM forward_rules WHERE id=?",
                     )
                     .bind(update.id)
                     .fetch_optional(&mut *conn)
                     .await
                 )
-            };
+        };
         let Some((
+            rule_owner_id,
             old_protocol,
             old_port,
             old_group,
@@ -996,6 +1146,8 @@ impl RuleRepository for SqliteRepository {
             old_tunnel_id,
             old_paused,
             old_route_mode,
+            old_public_transport,
+            old_profile_id,
         )) = existing
         else {
             try_!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
@@ -1014,6 +1166,110 @@ impl RuleRepository for SqliteRepository {
             || update.route_mode.is_some()
             || update.device_group_in.is_some()
             || update.device_group_out.is_some();
+        let authorization_required = route_update_requested || (old_paused && !effective_paused);
+        if authorization_required {
+            let owner: Option<(bool, bool, bool)> = try_!(
+                sqlx::query_as("SELECT admin,all_device_groups,banned FROM users WHERE id=?",)
+                    .bind(rule_owner_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+            );
+            let Some((owner_is_admin, owner_all_groups, owner_banned)) = owner else {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(DbError::RuleGroupAccessDenied);
+            };
+            let valid_entry: Option<i64> = try_!(
+                sqlx::query_scalar(
+                    "SELECT dg.id FROM device_groups dg \
+                     JOIN users group_owner ON group_owner.id=dg.uid \
+                     WHERE dg.id=? AND dg.group_type IN ('in','both') \
+                       AND group_owner.admin=1",
+                )
+                .bind(effective_group)
+                .fetch_optional(&mut *conn)
+                .await
+            );
+            if valid_entry.is_none() {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(DbError::RuleGroupUnavailable);
+            }
+            if owner_banned || (!owner_is_admin && !owner_all_groups) {
+                let authorized: Option<i64> = if owner_banned {
+                    None
+                } else {
+                    try_!(
+                        sqlx::query_scalar(
+                            "SELECT 1 FROM user_device_groups \
+                             WHERE user_id=? AND device_group_id=?",
+                        )
+                        .bind(rule_owner_id)
+                        .bind(effective_group)
+                        .fetch_optional(&mut *conn)
+                        .await
+                    )
+                };
+                if authorized.is_none() {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(DbError::RuleGroupAccessDenied);
+                }
+            }
+            if effective_tunnel_id.is_none() && effective_route_mode == "chain" {
+                let downstream_groups: Vec<i64> = if let Some(hops) = &update.hops {
+                    hops.iter().skip(1).map(|(group_id, _)| *group_id).collect()
+                } else {
+                    try_!(
+                        sqlx::query_scalar(
+                            "SELECT device_group_id FROM forward_rule_hops \
+                             WHERE rule_id=? AND position>0 ORDER BY position",
+                        )
+                        .bind(update.id)
+                        .fetch_all(&mut *conn)
+                        .await
+                    )
+                };
+                for group_id in downstream_groups {
+                    let valid: Option<i64> = try_!(
+                        sqlx::query_scalar(
+                            "SELECT dg.id FROM device_groups dg \
+                             JOIN users owner ON owner.id=dg.uid \
+                             WHERE dg.id=? AND dg.group_type<>'monitor' \
+                               AND TRIM(dg.connect_host)<>'' AND owner.admin=1",
+                        )
+                        .bind(group_id)
+                        .fetch_optional(&mut *conn)
+                        .await
+                    );
+                    if valid.is_none() {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::RuleGroupUnavailable);
+                    }
+                }
+            }
+        }
+        let effective_public_transport = update
+            .public_transport
+            .as_deref()
+            .unwrap_or(&old_public_transport);
+        let effective_profile_id = update.tunnel_profile_id.unwrap_or(old_profile_id);
+        if let Some(profile_id) = effective_profile_id {
+            if effective_protocol != "tcp" {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(DbError::ProfileUnavailable);
+            }
+            let valid: Option<i64> = try_!(
+                sqlx::query_scalar(
+                    "SELECT id FROM tunnel_profiles WHERE id = ? AND transport = ?",
+                )
+                .bind(profile_id)
+                .bind(effective_public_transport)
+                .fetch_optional(&mut *conn)
+                .await
+            );
+            if valid.is_none() {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(DbError::ProfileUnavailable);
+            }
+        }
         let mut old_downstream_ports: Vec<(i64, i32, String)> =
             if route_update_requested && !old_paused {
                 if let Some(tunnel_id) = old_tunnel_id {
@@ -1063,7 +1319,16 @@ impl RuleRepository for SqliteRepository {
                      JOIN tunnel_hops entry ON entry.tunnel_id=t.id AND entry.position=0 \
                      JOIN tunnel_hops exit ON exit.tunnel_id=t.id \
                        AND exit.position=(SELECT MAX(position) FROM tunnel_hops WHERE tunnel_id=t.id) \
-                     WHERE t.id=?",
+                     WHERE t.id=? \
+                       AND (SELECT COUNT(*) FROM tunnel_hops h WHERE h.tunnel_id=t.id) BETWEEN 2 AND 8 \
+                       AND (SELECT COUNT(DISTINCT h.device_group_id) FROM tunnel_hops h WHERE h.tunnel_id=t.id) = \
+                           (SELECT COUNT(*) FROM tunnel_hops h WHERE h.tunnel_id=t.id) \
+                       AND NOT EXISTS (SELECT 1 FROM tunnel_hops checked \
+                         JOIN device_groups dg ON dg.id=checked.device_group_id \
+                         JOIN users owner ON owner.id=dg.uid \
+                         WHERE checked.tunnel_id=t.id AND (owner.admin<>1 \
+                           OR (checked.position=0 AND (dg.group_type NOT IN ('in','both') OR checked.listen_port IS NOT NULL)) \
+                           OR (checked.position>0 AND (dg.group_type='monitor' OR TRIM(dg.connect_host)='' OR checked.listen_port IS NULL))))",
                 )
                 .bind(update.id)
                 .bind(tunnel_id)
@@ -1560,12 +1825,9 @@ impl RuleRepository for SqliteRepository {
         // user's rules must be filtered from the node's config. The service
         // layer (config.rs) just iterates the result and resolves targets.
         //
-        // v0.4.11 PR3 change: REMOVED the cross-owner defense filter. Previously
-        // this enforced forward_rules.uid == device_groups(in).uid, which blocked
-        // cross-user rules needed for shared inbound/outbound groups. Migration 24
-        // (warnings mode) ensures new rules satisfy the invariant at creation time;
-        // the defense filter is no longer needed here and would incorrectly reject
-        // valid shared-inbound rules.
+        // Shared entries are administrator-managed. Revalidate their current
+        // type, owner role, and the rule owner's current grant here so legacy
+        // rows or out-of-band edits cannot reach a node config.
         // v1.0.8: FOUR gating conditions (banned, suspended, over-quota,
         // expired). suspended stops forwarding WITHOUT bumping token_version
         // (the user stays logged in). plan_expire_at is a TEXT UTC timestamp
@@ -1577,7 +1839,12 @@ impl RuleRepository for SqliteRepository {
              WHERE fr.device_group_in = ? AND fr.paused = 0 \
              AND u.banned = 0 \
              AND u.suspended = 0 \
-             AND (fr.tunnel_id IS NULL OR u.admin = 1 OR (t.shared = 1 AND \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=1) \
+             AND (u.admin = 1 OR (\
+               (fr.tunnel_id IS NULL OR t.shared = 1) AND \
                (u.all_device_groups = 1 OR EXISTS (SELECT 1 FROM user_device_groups udg \
                  WHERE udg.user_id = u.id AND udg.device_group_id = fr.device_group_in)))) \
              AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) \
@@ -1610,7 +1877,9 @@ impl RuleRepository for SqliteRepository {
     }
 
     async fn replace_rule_hops(&self, rule_id: i64, hops: &[(i64, i32)]) -> Result<(), DbError> {
-        let mut tx = self.pool.begin().await?;
+        // Preserve allocated tunnel ports from one coherent snapshot and
+        // serialize competing replacements before the initial read.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let old_tunnel_ports: std::collections::HashMap<i64, Option<i32>> =
             sqlx::query_as::<_, (i64, Option<i32>)>(
                 "SELECT device_group_id, tunnel_port FROM forward_rule_hops WHERE rule_id = ?",
@@ -1719,8 +1988,15 @@ impl RuleRepository for SqliteRepository {
              JOIN forward_rules fr ON fr.id = h.rule_id \
              JOIN users u ON fr.uid = u.id \
              WHERE h.device_group_id = ? \
-             AND fr.route_mode = 'chain' AND fr.paused = 0 \
+             AND fr.route_mode = 'chain' AND fr.tunnel_id IS NULL AND fr.paused = 0 \
              AND u.banned = 0 AND u.suspended = 0 \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=1) \
+             AND (u.admin = 1 OR u.all_device_groups = 1 OR EXISTS (\
+               SELECT 1 FROM user_device_groups udg WHERE udg.user_id = u.id \
+                 AND udg.device_group_id = fr.device_group_in)) \
              AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at > datetime('now')) \
              ORDER BY h.rule_id, h.position",
@@ -1739,8 +2015,16 @@ impl RuleRepository for SqliteRepository {
             "SELECT DISTINCT fr.* FROM forward_rules fr \
              JOIN forward_rule_hops h ON h.rule_id=fr.id \
              JOIN users u ON u.id=fr.uid \
-             WHERE h.device_group_id=? AND fr.route_mode='chain' AND fr.paused=0 \
+             WHERE h.device_group_id=? AND fr.route_mode='chain' \
+             AND fr.tunnel_id IS NULL AND fr.paused=0 \
              AND u.banned=0 AND u.suspended=0 \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=1) \
+             AND (u.admin=1 OR u.all_device_groups=1 OR EXISTS (\
+               SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
+                 AND udg.device_group_id=fr.device_group_in)) \
              AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at>datetime('now')) \
              ORDER BY fr.id",
@@ -1753,8 +2037,16 @@ impl RuleRepository for SqliteRepository {
              JOIN forward_rules fr ON fr.id=rt.rule_id \
              JOIN forward_rule_hops h ON h.rule_id=fr.id \
              JOIN users u ON u.id=fr.uid \
-             WHERE h.device_group_id=? AND fr.route_mode='chain' AND fr.paused=0 \
+             WHERE h.device_group_id=? AND fr.route_mode='chain' \
+             AND fr.tunnel_id IS NULL AND fr.paused=0 \
              AND rt.enabled=1 AND u.banned=0 AND u.suspended=0 \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=1) \
+             AND (u.admin=1 OR u.all_device_groups=1 OR EXISTS (\
+               SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
+                 AND udg.device_group_id=fr.device_group_in)) \
              AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at>datetime('now')) \
              ORDER BY rt.rule_id,rt.position,rt.id",
@@ -1799,12 +2091,12 @@ impl SqliteRepository {
     ) -> Result<Vec<relay_shared::models::ForwardRuleHop>, DbError> {
         let mut hops = self.list_rule_hops(rule_id).await?;
         for hop in &mut hops {
-            if let Ok(Some((name, host))) = sqlx::query_as::<_, (String, String)>(
+            if let Some((name, host)) = sqlx::query_as::<_, (String, String)>(
                 "SELECT name, connect_host FROM device_groups WHERE id = ?",
             )
             .bind(hop.device_group_id)
             .fetch_optional(&self.pool)
-            .await
+            .await?
             {
                 hop.group_name = Some(name);
                 hop.connect_host = Some(host);

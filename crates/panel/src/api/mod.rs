@@ -107,12 +107,19 @@ pub fn routes() -> Router<AppState> {
             "/groups",
             axum::routing::get(admin::list_groups).post(admin::create_group),
         )
+        // Compatibility view for regular users that still own groups created
+        // before groups became admin-managed. This intentionally returns only
+        // a safe summary (never the node token or internal config).
+        .route(
+            "/groups/owned",
+            axum::routing::get(admin::list_owned_group_summaries),
+        )
         .route(
             "/groups/{id}",
             axum::routing::put(admin::update_group).delete(admin::delete_group),
         )
         // Rotate a group's node token (revokes the old one; broadcasts
-        // config_changed so nodes re-authenticate). Owner-scoped.
+        // config_changed so nodes re-authenticate). Administrator-only.
         .route(
             "/groups/{id}/rotate-token",
             axum::routing::post(admin::rotate_group_token),
@@ -202,11 +209,10 @@ pub fn routes() -> Router<AppState> {
             "/dashboard/history",
             axum::routing::get(stats::get_dashboard_history),
         )
-        // v0.4.10: node status is owner-scoped (a user sees only nodes for
-        // groups they own). Renamed /node_status → /nodes.
+        // Full node diagnostics are administrator-only. Regular users use the
+        // typed, field-filtered /nodes/shared availability endpoint.
         .route("/nodes", axum::routing::get(stats::get_node_status))
-        // v0.4.10: manually delete a node status record (owner-scoped — the
-        // caller must own the group). Renamed /node_status/{id} → /nodes/{id}.
+        // Manually delete an administrator-managed node status record.
         .route(
             "/nodes/{group_id}",
             axum::routing::delete(stats::delete_node_status),

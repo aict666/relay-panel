@@ -52,20 +52,26 @@ impl GroupRepository for SqliteRepository {
     }
 
     async fn find_by_token(&self, token: &str) -> Result<Option<DeviceGroup>, DbError> {
-        let group: Option<DeviceGroup> =
-            sqlx::query_as("SELECT * FROM device_groups WHERE token = ?")
-                .bind(token)
-                .fetch_optional(&self.pool)
-                .await?;
+        // Historical regular-user-owned groups remain visible through the safe
+        // compatibility catalog, but their old tokens must not authenticate a
+        // data-plane node or receive/report runtime state.
+        let group: Option<DeviceGroup> = sqlx::query_as(
+            "SELECT g.* FROM device_groups g JOIN users owner ON owner.id=g.uid \
+             WHERE g.token = ? AND owner.admin = 1",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(group)
     }
 
     async fn list_group_credential_revisions(&self) -> Result<Vec<(i64, i64)>, DbError> {
-        Ok(
-            sqlx::query_as("SELECT id, credential_revision FROM device_groups ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?,
+        Ok(sqlx::query_as(
+            "SELECT g.id, g.credential_revision FROM device_groups g \
+             JOIN users owner ON owner.id=g.uid WHERE owner.admin=1 ORDER BY g.id",
         )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     async fn find_by_id(
@@ -220,6 +226,52 @@ impl GroupRepository for SqliteRepository {
 
         let effective_type = group_type.unwrap_or(&current_type);
         let effective_host = connect_host.unwrap_or(&current_host);
+        let entry_rules: i64 = rollback_on_err!(
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM (\
+                   SELECT id AS rule_id FROM forward_rules WHERE device_group_in = ? \
+                   UNION \
+                   SELECT rule_id FROM forward_rule_hops \
+                    WHERE device_group_id = ? AND position = 0 \
+                   UNION \
+                   SELECT rule_id FROM forward_rule_retired_entries \
+                    WHERE device_group_id = ? AND expires_at >= unixepoch()\
+                 )",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        let downstream_rules: i64 = rollback_on_err!(
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM (\
+                   SELECT id AS rule_id FROM forward_rules WHERE device_group_out = ? \
+                   UNION \
+                   SELECT rule_id FROM forward_rule_hops \
+                    WHERE device_group_id = ? AND position > 0 \
+                   UNION \
+                   SELECT rule_id FROM forward_rule_route_transitions \
+                    WHERE device_group_id = ? AND expires_at >= unixepoch()\
+                 )",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        let invalid_rule_entry = entry_rules > 0 && !matches!(effective_type, "in" | "both");
+        let invalid_rule_downstream = downstream_rules > 0
+            && (effective_type == "monitor" || effective_host.trim().is_empty());
+        if invalid_rule_entry || invalid_rule_downstream {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Err(DbError::RuleGroupInvariant {
+                entry_rules,
+                downstream_rules,
+            });
+        }
         let (entry_tunnels, downstream_tunnels): (i64, i64) = rollback_on_err!(
             sqlx::query_as(
                 "SELECT COUNT(DISTINCT CASE WHEN position = 0 THEN tunnel_id END), \
@@ -239,6 +291,18 @@ impl GroupRepository for SqliteRepository {
                 entry_tunnels,
                 downstream_tunnels,
             });
+        }
+        let plan_count: i64 = rollback_on_err!(
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM plan_device_groups WHERE device_group_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        if plan_count > 0 && !matches!(effective_type, "in" | "both") {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Err(DbError::GroupPlanInvariant { plans: plan_count });
         }
 
         let sql = match scope.owner_id() {
@@ -315,8 +379,7 @@ impl GroupRepository for SqliteRepository {
             sqlx::query_as("SELECT COUNT(*) FROM forward_rule_hops WHERE device_group_id = ?")
                 .bind(id)
                 .fetch_one(&self.pool)
-                .await
-                .unwrap_or((0,));
+                .await?;
         Ok(row.0 + hop_count.0)
     }
 
@@ -363,8 +426,16 @@ impl GroupRepository for SqliteRepository {
                 WHERE device_group_in = ? OR device_group_out = ? \
                UNION \
                SELECT rule_id FROM forward_rule_hops WHERE device_group_id = ? \
+               UNION \
+               SELECT rule_id FROM forward_rule_retired_entries \
+                WHERE device_group_id = ? AND expires_at >= unixepoch() \
+               UNION \
+               SELECT rule_id FROM forward_rule_route_transitions \
+                WHERE device_group_id = ? AND expires_at >= unixepoch() \
              ) refs",
             )
+            .bind(id)
+            .bind(id)
             .bind(id)
             .bind(id)
             .bind(id)
@@ -385,12 +456,21 @@ impl GroupRepository for SqliteRepository {
                 .fetch_one(&mut *conn)
                 .await
         );
-        if rule_count > 0 || tunnel_count > 0 || fallback_group_count > 0 {
+        let plan_count: i64 = try_!(
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM plan_device_groups WHERE device_group_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        if rule_count > 0 || tunnel_count > 0 || fallback_group_count > 0 || plan_count > 0 {
             sqlx::query("ROLLBACK").execute(&mut *conn).await?;
             return Ok(GroupDeleteOutcome::InUse {
                 rule_count,
                 tunnel_count,
                 fallback_group_count,
+                plan_count,
             });
         }
         try_!(
@@ -413,7 +493,8 @@ impl GroupRepository for SqliteRepository {
 
     async fn list_all_inbound_group_ids(&self) -> Result<Vec<i64>, DbError> {
         let rows: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM device_groups WHERE group_type IN ('in', 'both') ORDER BY id",
+            "SELECT dg.id FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+             WHERE dg.group_type IN ('in', 'both') AND owner.admin=1 ORDER BY dg.id",
         )
         .fetch_all(&self.pool)
         .await?;

@@ -1,4 +1,4 @@
-use super::PgRepository;
+use super::{tunnel_advisory_lock_key, PgRepository};
 use crate::db::error::DbError;
 use crate::db::repo::{
     TunnelDeleteOutcome, TunnelRepository, ENTRY_DRAIN_LEASE_TTL_SECS,
@@ -131,21 +131,28 @@ impl TunnelRepository for PgRepository {
         // Re-read every hop under the same lock domain as group updates so an
         // entry cannot become outbound-only, and a new downstream hop cannot
         // lose its connect_host or become a monitor between validation and write.
+        // `users.admin` is immutable at runtime, so lock only `dg`; locking the
+        // owner too would invert delete_user_cascade's user -> group row order.
         for (position, (group_id, port)) in hops.iter().enumerate() {
-            let group: Option<(String, String)> = sqlx::query_as(
-                "SELECT group_type, connect_host FROM device_groups WHERE id=$1 FOR SHARE",
+            let group: Option<(String, String, bool)> = sqlx::query_as(
+                "SELECT dg.group_type, dg.connect_host, owner.admin \
+                 FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+                 WHERE dg.id=$1 FOR SHARE OF dg",
             )
             .bind(group_id)
             .fetch_optional(&mut *tx)
             .await?;
-            let Some((group_type, connect_host)) = group else {
+            let Some((group_type, connect_host, owner_is_admin)) = group else {
                 tx.rollback().await?;
                 return Err(DbError::TunnelUnavailable);
             };
             let valid = if position == 0 {
-                port.is_none() && matches!(group_type.as_str(), "in" | "both")
+                port.is_none() && matches!(group_type.as_str(), "in" | "both") && owner_is_admin
             } else {
-                port.is_some() && group_type != "monitor" && !connect_host.trim().is_empty()
+                port.is_some()
+                    && group_type != "monitor"
+                    && !connect_host.trim().is_empty()
+                    && owner_is_admin
             };
             if !valid {
                 tx.rollback().await?;
@@ -200,21 +207,12 @@ impl TunnelRepository for PgRepository {
         expected_hops: Option<&[(i64, Option<i32>)]>,
     ) -> Result<u64, DbError> {
         let mut tx = self.pool.begin().await?;
-        // Path replacement needs a serializable snapshot for the authorization
-        // predicate and topology rewrite. Scalar-only partial updates stay at
-        // READ COMMITTED: the row lock plus COALESCE lets disjoint fields merge
-        // instead of either losing state or raising an avoidable serialization
-        // failure.
-        if hops.is_some() {
-            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-                .execute(&mut *tx)
-                .await?;
-        }
         // The caller's exact snapshot gives us the old groups without reading
-        // mutable rows first. Lock those groups before taking the current path
-        // snapshot so two administrators replacing the same route serialize
-        // and the loser receives TunnelUnavailable (409), not a late
-        // PostgreSQL serialization failure (500).
+        // mutable rows first. Lock those groups, then the tunnel namespace,
+        // before taking the current path snapshot. READ COMMITTED is deliberate:
+        // after waiting for an earlier editor, this transaction must see that
+        // editor's committed topology and return a deterministic 409 instead of
+        // failing at commit with a serialization error.
         let mut groups: Vec<i64> = hops
             .into_iter()
             .flatten()
@@ -229,6 +227,10 @@ impl TunnelRepository for PgRepository {
                 .execute(&mut *tx)
                 .await?;
         }
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(tunnel_advisory_lock_key(id))
+            .execute(&mut *tx)
+            .await?;
         let current_hops: Vec<(i64, Option<i32>)> = if hops.is_some() {
             sqlx::query_as(
                 "SELECT device_group_id, listen_port FROM tunnel_hops \
@@ -241,8 +243,8 @@ impl TunnelRepository for PgRepository {
             Vec::new()
         };
         if hops.is_some() {
-            // Lock bound rules before the tunnel row. Rule updates use the same
-            // group -> rule -> tunnel order, avoiding a deadlock cycle.
+            // Rule bind/unbind uses group -> tunnel advisory -> rule as well,
+            // so this snapshot cannot miss a concurrently attached rule.
             sqlx::query("SELECT id FROM forward_rules WHERE tunnel_id=$1 ORDER BY id FOR UPDATE")
                 .bind(id)
                 .fetch_all(&mut *tx)
@@ -266,21 +268,28 @@ impl TunnelRepository for PgRepository {
                 tx.rollback().await?;
                 return Err(DbError::TunnelUnavailable);
             }
+            // See create_tunnel_full: owner.admin is immutable, while the group
+            // fields must stay stable until the path replacement commits.
             for (position, (group_id, port)) in hops.iter().enumerate() {
-                let group: Option<(String, String)> = sqlx::query_as(
-                    "SELECT group_type, connect_host FROM device_groups WHERE id=$1 FOR SHARE",
+                let group: Option<(String, String, bool)> = sqlx::query_as(
+                    "SELECT dg.group_type, dg.connect_host, owner.admin \
+                     FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+                     WHERE dg.id=$1 FOR SHARE OF dg",
                 )
                 .bind(group_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-                let Some((group_type, connect_host)) = group else {
+                let Some((group_type, connect_host, owner_is_admin)) = group else {
                     tx.rollback().await?;
                     return Err(DbError::TunnelUnavailable);
                 };
                 let valid = if position == 0 {
-                    port.is_none() && matches!(group_type.as_str(), "in" | "both")
+                    port.is_none() && matches!(group_type.as_str(), "in" | "both") && owner_is_admin
                 } else {
-                    port.is_some() && group_type != "monitor" && !connect_host.trim().is_empty()
+                    port.is_some()
+                        && group_type != "monitor"
+                        && !connect_host.trim().is_empty()
+                        && owner_is_admin
                 };
                 if !valid {
                     tx.rollback().await?;
@@ -479,6 +488,10 @@ impl TunnelRepository for PgRepository {
 
     async fn delete_tunnel(&self, id: i64) -> Result<TunnelDeleteOutcome, DbError> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(tunnel_advisory_lock_key(id))
+            .execute(&mut *tx)
+            .await?;
         let exists: Option<(i64,)> =
             sqlx::query_as("SELECT id FROM tunnels WHERE id=$1 FOR UPDATE")
                 .bind(id)
@@ -515,6 +528,10 @@ impl TunnelRepository for PgRepository {
                (u.all_device_groups=TRUE OR EXISTS (SELECT 1 FROM user_device_groups udg \
                  WHERE udg.user_id=u.id AND udg.device_group_id=fr.device_group_in)))) \
              AND fr.paused=FALSE AND u.banned=FALSE AND u.suspended=FALSE \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=TRUE) \
              AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at>to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) ORDER BY fr.id"
         ).bind(tunnel_id).fetch_all(&self.pool).await?;
@@ -554,6 +571,10 @@ impl TunnelRepository for PgRepository {
                (SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
                 AND udg.device_group_id=fr.device_group_in)))) \
              AND fr.paused=FALSE AND u.banned=FALSE AND u.suspended=FALSE \
+             AND EXISTS(SELECT 1 FROM device_groups entry \
+               JOIN users entry_owner ON entry_owner.id=entry.uid \
+               WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                 AND entry_owner.admin=TRUE) \
              AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
              AND (u.plan_expire_at IS NULL OR u.plan_expire_at>to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
              ORDER BY fr.id",
@@ -572,6 +593,10 @@ impl TunnelRepository for PgRepository {
                  (SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
                   AND udg.device_group_id=fr.device_group_in)))) \
                AND fr.paused=FALSE AND u.banned=FALSE AND u.suspended=FALSE \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=TRUE) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at>to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS'))) \
              ORDER BY rt.rule_id,rt.position,rt.id",
@@ -661,6 +686,10 @@ impl TunnelRepository for PgRepository {
                AND fr.tunnel_id=re.tunnel_id \
                AND source_tunnel.enabled=TRUE AND fr.paused=FALSE \
                AND u.banned=FALSE AND u.suspended=FALSE \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=re.device_group_id AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=TRUE) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at> \
                  to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
@@ -686,13 +715,18 @@ impl TunnelRepository for PgRepository {
              WHERE rt.device_group_id=$1 \
                AND rt.expires_at>=EXTRACT(EPOCH FROM now())::BIGINT \
                AND fr.paused=FALSE AND u.banned=FALSE AND u.suspended=FALSE \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=TRUE) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at> \
                  to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
-               AND (fr.tunnel_id IS NULL OR (t.enabled=TRUE AND \
-                 (u.admin=TRUE OR (t.shared=TRUE AND (u.all_device_groups=TRUE OR EXISTS( \
+               AND (fr.tunnel_id IS NULL OR t.enabled=TRUE) \
+               AND (u.admin=TRUE OR ((fr.tunnel_id IS NULL OR t.shared=TRUE) AND \
+                 (u.all_device_groups=TRUE OR EXISTS( \
                    SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
-                     AND udg.device_group_id=fr.device_group_in)))))) \
+                     AND udg.device_group_id=fr.device_group_in)))) \
              ORDER BY fr.id",
         )
         .bind(group_id)
@@ -716,13 +750,18 @@ impl TunnelRepository for PgRepository {
                    AND re.device_group_id=$1 \
                    AND re.expires_at>=EXTRACT(EPOCH FROM now())::BIGINT)) \
                AND fr.paused=FALSE AND u.banned=FALSE AND u.suspended=FALSE \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=TRUE) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at> \
                  to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
-               AND (fr.tunnel_id IS NULL OR (t.enabled=TRUE AND \
-                 (u.admin=TRUE OR (t.shared=TRUE AND (u.all_device_groups=TRUE OR EXISTS( \
+               AND (fr.tunnel_id IS NULL OR t.enabled=TRUE) \
+               AND (u.admin=TRUE OR ((fr.tunnel_id IS NULL OR t.shared=TRUE) AND \
+                 (u.all_device_groups=TRUE OR EXISTS( \
                    SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
-                     AND udg.device_group_id=$1)))))) \
+                     AND udg.device_group_id=fr.device_group_in)))) \
              ORDER BY fr.id",
         )
         .bind(group_id)
@@ -742,13 +781,18 @@ impl TunnelRepository for PgRepository {
              WHERE rt.device_group_id=$1 \
                AND rt.expires_at<EXTRACT(EPOCH FROM now())::BIGINT \
                AND fr.paused=FALSE AND u.banned=FALSE AND u.suspended=FALSE \
+               AND EXISTS(SELECT 1 FROM device_groups entry \
+                 JOIN users entry_owner ON entry_owner.id=entry.uid \
+                 WHERE entry.id=fr.device_group_in AND entry.group_type IN ('in','both') \
+                   AND entry_owner.admin=TRUE) \
                AND (u.traffic_limit=0 OR u.traffic_used<u.traffic_limit) \
                AND (u.plan_expire_at IS NULL OR u.plan_expire_at> \
                  to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) \
-               AND (fr.tunnel_id IS NULL OR (t.enabled=TRUE AND \
-                 (u.admin=TRUE OR (t.shared=TRUE AND (u.all_device_groups=TRUE OR EXISTS( \
+               AND (fr.tunnel_id IS NULL OR t.enabled=TRUE) \
+               AND (u.admin=TRUE OR ((fr.tunnel_id IS NULL OR t.shared=TRUE) AND \
+                 (u.all_device_groups=TRUE OR EXISTS( \
                    SELECT 1 FROM user_device_groups udg WHERE udg.user_id=u.id \
-                     AND udg.device_group_id=fr.device_group_in)))))) \
+                     AND udg.device_group_id=fr.device_group_in)))) \
              ORDER BY fr.id",
         )
         .bind(group_id)

@@ -118,9 +118,7 @@ async fn dispatch_restart_group(
         group_id,
         &ResourceScope::All,
     )
-    .await
-    .ok()
-    .flatten()
+    .await?
     .map(|g| g.name)
     .unwrap_or_else(|| format!("#{group_id}"));
 
@@ -133,7 +131,7 @@ async fn dispatch_restart_group(
             rule_id,
             request_id.to_string(),
         ))
-        .unwrap_or_default()
+        .expect("restart-rule message is serializable")
     };
 
     let mut out = Vec::with_capacity(nodes.len());

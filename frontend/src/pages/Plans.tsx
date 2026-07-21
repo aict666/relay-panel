@@ -1,20 +1,17 @@
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Switch, Space, message, Popconfirm, Typography, Tag } from 'antd';
+import { Alert, Table, Button, Modal, Form, Input, InputNumber, Select, Switch, Space, message, Popconfirm, Typography, Tag } from 'antd';
 import { PlusOutlined, ReloadOutlined, EditOutlined, ShoppingOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, Plan, DeviceGroup, Tunnel } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
+import { MAX_SAFE_TRAFFIC_GB, bytesToGb, gbToBytes, trafficGbChanged } from '../utils/traffic';
 
 const { Text } = Typography;
 
 // Traffic is stored in BYTES, but the admin form works in GB (a raw byte count
 // is unfriendly to type). Convert only at the form boundary — storage stays
 // byte-based. 0 GB = unlimited.
-const BYTES_PER_GB = 1024 * 1024 * 1024;
-const bytesToGb = (b: number): number => (b > 0 ? Math.round((b / BYTES_PER_GB) * 100) / 100 : 0);
-const gbToBytes = (gb: number): number => Math.round((gb || 0) * BYTES_PER_GB);
-
 /**
  * v1.0.8: admin plan management (CRUD). GET /admin/plans lists ALL plans
  * (including hidden). Create/Update validate name, traffic≥0, price (decimal),
@@ -27,6 +24,8 @@ export default function Plans() {
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
   const [tunnels, setTunnels] = useState<Tunnel[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [editing, setEditing] = useState<Plan | null>(null);
@@ -43,29 +42,39 @@ export default function Plans() {
   const editPlanType = Form.useWatch('plan_type', editForm);
   const createGroupIds = Form.useWatch('device_group_ids', createForm) as number[] | undefined;
   const editGroupIds = Form.useWatch('device_group_ids', editForm) as number[] | undefined;
+  const loadGenerationRef = useRef(0);
 
   const load = useCallback(async () => {
+    const requestId = ++loadGenerationRef.current;
     setLoading(true);
-    setPlans([]);
-    setGroups([]);
-    setTunnels([]);
+    setLoadFailed(false);
     try {
       const [plansRes, groupsRes, tunnelsRes] = await Promise.all([
         api.get<unknown, ApiEnvelope<Plan[]>>('/admin/plans'),
         api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
         api.get<unknown, ApiEnvelope<Tunnel[]>>('/admin/tunnels'),
       ]);
+      if (requestId !== loadGenerationRef.current) return false;
       setPlans(plansRes.data || []);
       // Only inbound-capable groups are meaningful as plan grants. A `both`
       // group can be a rule entry and therefore belongs in this list too.
       setGroups((groupsRes.data || []).filter((g) => g.group_type === 'in' || g.group_type === 'both'));
       setTunnels(tunnelsRes.data || []);
+      setLoadFailed(false);
+      return true;
     } catch {
-      message.error(t('loadFailed'));
-    } finally { setLoading(false); }
+      if (requestId === loadGenerationRef.current) {
+        setLoadFailed(true);
+        message.error(t('loadFailed'));
+      }
+      return false;
+    } finally {
+      if (requestId === loadGenerationRef.current) setLoading(false);
+    }
   }, [t]);
 
   useEffect(() => { load(); }, [load]);
+  const mutationsBlocked = loading || loadFailed || saving;
 
   // Map device-group ids → a readable label for the table summary.
   const groupName = useCallback(
@@ -104,6 +113,8 @@ export default function Plans() {
     reset_traffic: boolean; description: string;
     grant_all_groups?: boolean; device_group_ids?: number[];
   }) => {
+    if (loading || loadFailed || saving) return;
+    setSaving(true);
     try {
       const { traffic_gb, ...rest } = values;
       const res = await api.post<unknown, ApiEnvelope<number>>('/admin/plans', {
@@ -117,11 +128,13 @@ export default function Plans() {
       message.success(t('planCreated'));
       setCreateOpen(false);
       createForm.resetFields();
-      load();
+      await load();
     } catch { message.error(t('failedCreatePlan')); }
+    finally { setSaving(false); }
   };
 
   const handleEdit = (p: Plan) => {
+    if (loading || loadFailed || saving) return;
     setEditing(p);
     setEditGrantAll(!!p.grant_all_groups);
     editForm.setFieldsValue({
@@ -140,10 +153,11 @@ export default function Plans() {
     grant_all_groups?: boolean; device_group_ids?: number[];
   }) => {
     if (!editing) return;
+    if (loading || loadFailed || saving) return;
     const payload: Record<string, unknown> = {};
     if (values.name !== undefined && values.name !== editing.name) payload.name = values.name;
     if (values.max_rules !== undefined && values.max_rules !== editing.max_rules) payload.max_rules = values.max_rules;
-    if (values.traffic_gb !== undefined && gbToBytes(values.traffic_gb) !== editing.traffic) payload.traffic = gbToBytes(values.traffic_gb);
+    if (values.traffic_gb !== undefined && trafficGbChanged(editing.traffic, values.traffic_gb)) payload.traffic = gbToBytes(values.traffic_gb);
     if (values.price !== undefined && values.price !== editing.price) payload.price = values.price;
     if (values.plan_type !== undefined && values.plan_type !== (editing.plan_type || 'data')) payload.plan_type = values.plan_type;
     if (values.duration_days !== undefined && values.duration_days !== (editing.duration_days || 0)) payload.duration_days = values.duration_days;
@@ -158,16 +172,20 @@ export default function Plans() {
     const sortedNew = [...newIds].sort((a, b) => a - b);
     if (JSON.stringify(oldIds) !== JSON.stringify(sortedNew)) payload.device_group_ids = newIds;
     if (Object.keys(payload).length === 0) { setEditOpen(false); return; }
+    setSaving(true);
     try {
       const res = await api.put<unknown, ApiEnvelope<null>>(`/admin/plans/${editing.id}`, payload);
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('planUpdated'));
       setEditOpen(false);
-      load();
+      await load();
     } catch { message.error(t('failedUpdatePlan')); }
+    finally { setSaving(false); }
   };
 
   const handleDelete = async (id: number) => {
+    if (loading || loadFailed || saving) return;
+    setSaving(true);
     try {
       const res = await api.delete<unknown, ApiEnvelope<null>>(`/admin/plans/${id}`);
       if (res.code !== 0) {
@@ -175,13 +193,16 @@ export default function Plans() {
         return;
       }
       message.success(t('planDeleted'));
-      load();
+      await load();
     } catch {
       message.error(t('failedDeletePlan'));
+    } finally {
+      setSaving(false);
     }
   };
 
   const openCreate = () => {
+    if (loading || loadFailed || saving) return;
     createForm.resetFields();
     setCreateGrantAll(false);
     setCreateOpen(true);
@@ -225,12 +246,12 @@ export default function Plans() {
       render: (h: boolean) => h ? <Tag>{t('yes')}</Tag> : <Text type="secondary">{t('no')}</Text>,
     },
     {
-      title: t('action'), key: 'action', width: 120,
+      title: t('action'), key: 'action', width: 120, fixed: 'right' as const,
       render: (_: unknown, p: Plan) => (
         <Space>
-          <Button size="small" type="text" icon={<EditOutlined />} onClick={() => handleEdit(p)}>{t('edit')}</Button>
+          <Button size="small" type="text" icon={<EditOutlined />} disabled={mutationsBlocked} onClick={() => handleEdit(p)}>{t('edit')}</Button>
           <Popconfirm title={t('deletePlanConfirm')} onConfirm={() => handleDelete(p.id)}>
-            <Button danger size="small" type="text">{t('delete')}</Button>
+            <Button danger size="small" type="text" disabled={mutationsBlocked}>{t('delete')}</Button>
           </Popconfirm>
         </Space>
       ),
@@ -242,15 +263,18 @@ export default function Plans() {
       <div className="rp-page-header">
         <h2 className="rp-page-title"><ShoppingOutlined /> {t('planManagement')}</h2>
         <Space className="rp-page-actions" wrap>
-          <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>{t('addPlan')}</Button>
+          <Button icon={<ReloadOutlined />} loading={loading} disabled={saving || createOpen || editOpen} onClick={load}>{t('refresh')}</Button>
+          <Button type="primary" icon={<PlusOutlined />} disabled={mutationsBlocked} onClick={openCreate}>{t('addPlan')}</Button>
         </Space>
       </div>
+      {loadFailed && (
+        <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} description={t('loadFailedRetry')} />
+      )}
       <Table className="rp-responsive-table" dataSource={plans} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} scroll={{ x: 'max-content' }} />
 
-      <Modal title={t('addPlan')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={520}>
-        <Form form={createForm} onFinish={handleCreate} layout="vertical" initialValues={{ plan_type: 'data', duration_days: 0, hidden: false, reset_traffic: false, description: '', grant_all_groups: false, device_group_ids: [] }}>
-          <Form.Item name="name" label={t('name')} rules={[{ required: true }]}><Input placeholder="Pro 100GB" /></Form.Item>
+      <Modal title={t('addPlan')} open={createOpen} onCancel={() => { if (!saving) setCreateOpen(false); }} onOk={() => createForm.submit()} confirmLoading={saving} okButtonProps={{ disabled: loading || loadFailed }} okText={t('create')} cancelText={t('cancel')} width={520}>
+        <Form form={createForm} onFinish={handleCreate} layout="vertical" disabled={saving || loading || loadFailed} initialValues={{ plan_type: 'data', duration_days: 0, hidden: false, reset_traffic: false, description: '', grant_all_groups: false, device_group_ids: [] }}>
+          <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input placeholder="Pro 100GB" /></Form.Item>
           <Form.Item name="plan_type" label={t('type')} rules={[{ required: true }]}>
             <Select
               options={[{ value: 'data', label: t('planTypeData') }, { value: 'time', label: t('planTypeTime') }]}
@@ -259,10 +283,10 @@ export default function Plans() {
           </Form.Item>
           <Space align="start" style={{ display: 'flex' }}>
             <Form.Item name="traffic_gb" label={t('planTrafficGb')} rules={[{ required: true }]} style={{ flex: 1 }} extra={t('planTrafficGbHint')}>
-              <InputNumber min={0} step={1} style={{ width: '100%' }} addonAfter="GB" />
+              <InputNumber min={0} max={MAX_SAFE_TRAFFIC_GB} step={1} style={{ width: '100%' }} addonAfter="GB" />
             </Form.Item>
             <Form.Item name="max_rules" label={t('planMaxRules')} rules={[{ required: true }]} initialValue={5} style={{ flex: 1 }}>
-              <InputNumber min={0} max={100000} style={{ width: '100%' }} />
+              <InputNumber min={0} max={100000} precision={0} style={{ width: '100%' }} />
             </Form.Item>
           </Space>
           <Space align="start" style={{ display: 'flex' }}>
@@ -271,7 +295,7 @@ export default function Plans() {
             </Form.Item>
             {createPlanType === 'time' && (
               <Form.Item name="duration_days" label={t('planDuration')} rules={[{ required: true, type: 'number', min: 1, message: t('planDurationHint') }]} style={{ flex: 1 }} extra={t('planDurationHint')}>
-                <InputNumber min={1} style={{ width: '100%' }} />
+                <InputNumber min={1} precision={0} style={{ width: '100%' }} />
               </Form.Item>
             )}
           </Space>
@@ -303,9 +327,9 @@ export default function Plans() {
         </Form>
       </Modal>
 
-      <Modal title={t('editPlan')} open={editOpen} onCancel={() => setEditOpen(false)} onOk={() => editForm.submit()} okText={t('save')} cancelText={t('cancel')} width={520}>
-        <Form form={editForm} onFinish={handleUpdate} layout="vertical">
-          <Form.Item name="name" label={t('name')}><Input /></Form.Item>
+      <Modal title={t('editPlan')} open={editOpen} onCancel={() => { if (!saving) setEditOpen(false); }} onOk={() => editForm.submit()} confirmLoading={saving} okButtonProps={{ disabled: loading || loadFailed }} okText={t('save')} cancelText={t('cancel')} width={520}>
+        <Form form={editForm} onFinish={handleUpdate} layout="vertical" disabled={saving || loading || loadFailed}>
+          <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
           <Form.Item name="plan_type" label={t('type')}>
             <Select
               options={[{ value: 'data', label: t('planTypeData') }, { value: 'time', label: t('planTypeTime') }]}
@@ -314,17 +338,17 @@ export default function Plans() {
           </Form.Item>
           <Space align="start" style={{ display: 'flex' }}>
             <Form.Item name="traffic_gb" label={t('planTrafficGb')} style={{ flex: 1 }} extra={t('planTrafficGbHint')}>
-              <InputNumber min={0} step={1} style={{ width: '100%' }} addonAfter="GB" />
+              <InputNumber min={0} max={MAX_SAFE_TRAFFIC_GB} step={1} style={{ width: '100%' }} addonAfter="GB" />
             </Form.Item>
             <Form.Item name="max_rules" label={t('planMaxRules')} style={{ flex: 1 }}>
-              <InputNumber min={0} max={100000} style={{ width: '100%' }} />
+              <InputNumber min={0} max={100000} precision={0} style={{ width: '100%' }} />
             </Form.Item>
           </Space>
           <Space align="start" style={{ display: 'flex' }}>
             <Form.Item name="price" label={t('planPrice')} style={{ flex: 1 }}><Input /></Form.Item>
             {editPlanType === 'time' && (
               <Form.Item name="duration_days" label={t('planDuration')} rules={[{ required: true, type: 'number', min: 1, message: t('planDurationHint') }]} style={{ flex: 1 }} extra={t('planDurationHint')}>
-                <InputNumber min={1} style={{ width: '100%' }} />
+                <InputNumber min={1} precision={0} style={{ width: '100%' }} />
               </Form.Item>
             )}
           </Space>

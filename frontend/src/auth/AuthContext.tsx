@@ -74,8 +74,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Idempotency guard: once logout has run, subsequent concurrent 401s must
   // not re-run it (no-op clears are fine, but we avoid redundant state churn).
   const loggedOutRef = useRef(false);
+  // Invalidates in-flight /user/me responses across logout/account changes so
+  // an older session can never overwrite the role of a newer one.
+  const authGenerationRef = useRef(0);
 
   const clearAuth = useCallback(() => {
+    authGenerationRef.current += 1;
     localStorage.removeItem('token');
     localStorage.removeItem('admin');
     setToken(null);
@@ -90,37 +94,80 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearAuth();
   }, [clearAuth]);
 
+  const fetchCurrentUser = useCallback(async (): Promise<UserSelf> => {
+    const res = await api.get<unknown, ApiEnvelope<UserSelf>>('/user/me');
+    if (!res.data) throw new Error('current-user response did not contain a user');
+    return res.data;
+  }, []);
+
+  const applyCurrentUser = useCallback((me: UserSelf) => {
+    setUser(me);
+    setIsAdmin(me.admin);
+    setMustChangePassword(me.must_change_password === true);
+    localStorage.setItem('admin', String(me.admin));
+  }, []);
+
   const refreshCurrentUser = useCallback(async () => {
     // No token → nothing to refresh. (login sets the token before calling this.)
-    if (!localStorage.getItem('token')) return;
+    const requestToken = localStorage.getItem('token');
+    if (!requestToken) return;
+    const generation = authGenerationRef.current;
     try {
-      const res = await api.get<unknown, ApiEnvelope<UserSelf>>('/user/me');
-      const me = res.data;
-      if (me) {
-        setUser(me);
-        // The server is the source of truth for the role — never trust
-        // localStorage.admin long-term (a user can edit it).
-        setIsAdmin(me.admin);
-        setMustChangePassword(me.must_change_password === true);
-        localStorage.setItem('admin', String(me.admin));
-      }
+      const me = await fetchCurrentUser();
+      if (
+        generation !== authGenerationRef.current
+        || localStorage.getItem('token') !== requestToken
+      ) return;
+      // The server is the source of truth for the role — never trust
+      // localStorage.admin long-term (a user can edit it).
+      applyCurrentUser(me);
     } catch {
       // /user/me failed. If it was a 401, the axios interceptor already
-      // invoked logout via the unauthorized handler. Any other error (network,
-      // 500) leaves the existing state; the account page will retry. We do NOT
-      // log out on non-401 errors.
+      // invoked logout via the unauthorized handler. On a non-401 outage keep
+      // the token for retry, but fail the cached role closed: a stale/tampered
+      // localStorage admin flag must never become authoritative.
+      if (
+        generation === authGenerationRef.current
+        && localStorage.getItem('token') === requestToken
+      ) {
+        setUser(null);
+        setIsAdmin(false);
+        localStorage.removeItem('admin');
+      }
     }
-  }, []);
+  }, [applyCurrentUser, fetchCurrentUser]);
 
   const login = useCallback(
     async (newToken: string) => {
       // Reset the idempotency guard for the new session.
       loggedOutRef.current = false;
+      const generation = ++authGenerationRef.current;
       localStorage.setItem('token', newToken);
+      localStorage.removeItem('admin');
       setToken(newToken);
-      await refreshCurrentUser();
+      setUser(null);
+      setIsAdmin(false);
+      setMustChangePassword(false);
+      try {
+        const me = await fetchCurrentUser();
+        if (
+          generation !== authGenerationRef.current
+          || localStorage.getItem('token') !== newToken
+        ) {
+          throw new Error('login session was superseded');
+        }
+        applyCurrentUser(me);
+      } catch (error) {
+        if (
+          generation === authGenerationRef.current
+          && localStorage.getItem('token') === newToken
+        ) {
+          clearAuth();
+        }
+        throw error;
+      }
     },
-    [refreshCurrentUser]
+    [applyCurrentUser, clearAuth, fetchCurrentUser]
   );
 
   // Boot: if a token exists in localStorage, resolve the real user + role

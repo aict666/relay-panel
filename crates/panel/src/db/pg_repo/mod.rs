@@ -50,6 +50,14 @@ impl PgRepository {
     }
 }
 
+/// Keep tunnel-level advisory locks in a namespace disjoint from positive
+/// device-group ids. Rule bind/unbind operations and tunnel mutations use this
+/// key after their ordered group locks, closing the gap where a topology edit
+/// could miss a concurrently attached rule.
+fn tunnel_advisory_lock_key(tunnel_id: i64) -> i64 {
+    tunnel_id | i64::MIN
+}
+
 // Helper: build a PG placeholder list `$1, $2, ..., $n` for n binds. Used by
 // the dynamic SET builders (update_user_fields, update_rule_fields,
 // update_group_fields, update_profile_fields) which construct SQL from the

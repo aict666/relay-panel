@@ -352,7 +352,16 @@ export default function Dashboard() {
             <Card
               className="rp-stat-card rp-stat-card-link"
               style={{ cursor: 'pointer' }}
+              role="link"
+              tabIndex={0}
+              aria-label={`${k.label}: ${k.value}`}
               onClick={() => navigate(k.to)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  navigate(k.to);
+                }
+              }}
             >
               <div className="rp-stat">
                 <div className="rp-stat-text">

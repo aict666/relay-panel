@@ -74,6 +74,12 @@ export const enUS: Dict = {
   refresh: 'Refresh',
   select: 'Select',
   search: 'Search',
+  searchUsers: 'Search username or user ID',
+  filterUserStatus: 'Filter user status',
+  allStatuses: 'All statuses',
+  searchRules: 'Search rule name, port, or target',
+  backToLogin: 'Back to sign in',
+  insufficientBalance: 'Insufficient balance. Contact an administrator to top up before purchasing.',
 
   // Common fields
   id: 'ID',
@@ -302,6 +308,7 @@ export const enUS: Dict = {
   trafficLimitGb: 'Traffic Limit (GB)',
   trafficLimitGbHint: '0 means unlimited; entered in GB, converted to bytes on save.',
   trafficLimitNonNegative: 'Traffic limit cannot be negative',
+  trafficLimitTooLarge: 'Traffic limit exceeds the maximum safely handled by this browser',
   balanceHint: 'Non-negative decimal, up to 2 fraction digits, max 9999999999.99. The server re-validates.',
   balanceRequired: 'Please enter a balance',
   balanceInvalid: 'Balance must be a non-negative decimal (e.g. 0, 12, 12.34), up to 2 fraction digits',

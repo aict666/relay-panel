@@ -255,4 +255,145 @@ impl TunnelProfileRepository for PgRepository {
         .await?;
         Ok(result.rows_affected())
     }
+
+    async fn update_profile_checked(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        transport: Option<&str>,
+        tls_mode: Option<&str>,
+        ws_path: Option<&str>,
+        host_header: Option<&str>,
+        sni: Option<&str>,
+    ) -> Result<ProfileUpdateOutcome, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let builtin: Option<bool> =
+            sqlx::query_scalar("SELECT is_builtin FROM tunnel_profiles WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match builtin {
+            None => {
+                tx.rollback().await?;
+                return Ok(ProfileUpdateOutcome::NotFound);
+            }
+            Some(true) => {
+                tx.rollback().await?;
+                return Ok(ProfileUpdateOutcome::BuiltinReadOnly);
+            }
+            Some(false) => {}
+        }
+
+        if let Some(new_transport) = transport {
+            let (count, sample): (i64, Option<String>) = sqlx::query_as(
+                "SELECT COUNT(*), MIN(protocol || '/' || public_transport) \
+                 FROM forward_rules WHERE tunnel_profile_id = $1 \
+                   AND (protocol <> 'tcp' OR public_transport <> $2)",
+            )
+            .bind(id)
+            .bind(new_transport)
+            .fetch_one(&mut *tx)
+            .await?;
+            if count > 0 {
+                tx.rollback().await?;
+                return Ok(ProfileUpdateOutcome::BindingConflict {
+                    count,
+                    sample: sample.unwrap_or_else(|| "unknown".into()),
+                });
+            }
+        }
+
+        let mut sets: Vec<&str> = Vec::new();
+        if name.is_some() {
+            sets.push("name = ");
+        }
+        if transport.is_some() {
+            sets.push("transport = ");
+        }
+        if tls_mode.is_some() {
+            sets.push("tls_mode = ");
+        }
+        if ws_path.is_some() {
+            sets.push("ws_path = ");
+        }
+        if host_header.is_some() {
+            sets.push("host_header = ");
+        }
+        if sni.is_some() {
+            sets.push("sni = ");
+        }
+        if !sets.is_empty() {
+            let mut placeholder = 1;
+            let assignments: Vec<String> = sets
+                .iter()
+                .map(|prefix| {
+                    let assignment = format!("{prefix}${placeholder}");
+                    placeholder += 1;
+                    assignment
+                })
+                .collect();
+            let sql = format!(
+                "UPDATE tunnel_profiles SET {} WHERE id = ${placeholder}",
+                assignments.join(", ")
+            );
+            let mut query = sqlx::query(&sql);
+            if let Some(value) = name {
+                query = query.bind(value);
+            }
+            if let Some(value) = transport {
+                query = query.bind(value);
+            }
+            if let Some(value) = tls_mode {
+                query = query.bind(value);
+            }
+            if let Some(value) = ws_path {
+                query = query.bind(value);
+            }
+            if let Some(value) = host_header {
+                query = query.bind(value);
+            }
+            if let Some(value) = sni {
+                query = query.bind(value);
+            }
+            query.bind(id).execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(ProfileUpdateOutcome::Updated)
+    }
+
+    async fn delete_profile_checked(&self, id: i64) -> Result<ProfileDeleteOutcome, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let builtin: Option<bool> =
+            sqlx::query_scalar("SELECT is_builtin FROM tunnel_profiles WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match builtin {
+            None => {
+                tx.rollback().await?;
+                return Ok(ProfileDeleteOutcome::NotFound);
+            }
+            Some(true) => {
+                tx.rollback().await?;
+                return Ok(ProfileDeleteOutcome::BuiltinReadOnly);
+            }
+            Some(false) => {}
+        }
+        let rules: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE tunnel_profile_id = $1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if rules > 0 {
+            tx.rollback().await?;
+            return Ok(ProfileDeleteOutcome::InUse { rules });
+        }
+        sqlx::query("DELETE FROM tunnel_profiles WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(ProfileDeleteOutcome::Deleted)
+    }
 }

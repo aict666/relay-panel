@@ -235,6 +235,8 @@ export interface Plan {
    *  these directly — it can't resolve ids for groups the buyer isn't
    *  authorized for yet (the shared-group list only returns visible groups). */
   device_group_names?: string[];
+  /** Opaque purchase snapshot token returned by the plan catalog. */
+  purchase_revision?: string;
   created_at: string;
 }
 

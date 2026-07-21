@@ -113,6 +113,135 @@ impl UserRepository for SqliteRepository {
         Ok(result.rows_affected())
     }
 
+    async fn insert_public_registered_user(
+        &self,
+        username: &str,
+        password_hash: &str,
+        requested_plan_id: Option<i64>,
+    ) -> Result<UserProvisionOutcome, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_sql {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
+        }
+        macro_rules! reject {
+            ($outcome:expr) => {{
+                try_sql!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
+                return Ok($outcome);
+            }};
+        }
+
+        let settings: Option<(bool, i64, String)> = try_sql!(
+            sqlx::query_as(
+                "SELECT registration_enabled, default_registration_plan_id, \
+                 registration_allowed_plan_ids FROM app_settings WHERE id = 1",
+            )
+            .fetch_optional(&mut *conn)
+            .await
+        );
+        let Some((enabled, default_plan_id, raw_allowed)) = settings else {
+            reject!(UserProvisionOutcome::RegistrationDisabled);
+        };
+        if !enabled {
+            reject!(UserProvisionOutcome::RegistrationDisabled);
+        }
+        let plan_id = requested_plan_id.unwrap_or(default_plan_id);
+        let allowed = match serde_json::from_str::<Vec<i64>>(&raw_allowed) {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                tracing::error!(
+                    "insert_public_registered_user: malformed allowed plan ids: {}",
+                    error
+                );
+                try_sql!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
+                return Err(DbError::InvalidData(
+                    "registration_allowed_plan_ids is not a JSON integer array",
+                ));
+            }
+        };
+        if !allowed.contains(&plan_id) {
+            reject!(UserProvisionOutcome::PlanNotAllowed);
+        }
+
+        let inserted = try_sql!(
+            sqlx::query(
+                "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit) \
+                 SELECT ?, ?, ?, max_rules, traffic, speed_limit, ip_limit \
+                 FROM plans WHERE id = ?",
+            )
+            .bind(username)
+            .bind(password_hash)
+            .bind(plan_id)
+            .bind(plan_id)
+            .execute(&mut *conn)
+            .await
+        );
+        if inserted.rows_affected() == 0 {
+            reject!(UserProvisionOutcome::PlanMissing(plan_id));
+        }
+        try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
+        Ok(UserProvisionOutcome::Created)
+    }
+
+    async fn insert_admin_user_from_default(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<UserProvisionOutcome, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_sql {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
+        }
+        macro_rules! reject {
+            ($outcome:expr) => {{
+                try_sql!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
+                return Ok($outcome);
+            }};
+        }
+
+        let plan_id: i64 = try_sql!(
+            sqlx::query_scalar("SELECT default_registration_plan_id FROM app_settings WHERE id=1")
+                .fetch_optional(&mut *conn)
+                .await
+        )
+        .unwrap_or(1);
+        let inserted = try_sql!(
+            sqlx::query(
+                "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit) \
+                 SELECT ?, ?, ?, max_rules, traffic, speed_limit, ip_limit \
+                 FROM plans WHERE id = ?",
+            )
+            .bind(username)
+            .bind(password_hash)
+            .bind(plan_id)
+            .bind(plan_id)
+            .execute(&mut *conn)
+            .await
+        );
+        if inserted.rows_affected() == 0 {
+            reject!(UserProvisionOutcome::PlanMissing(plan_id));
+        }
+        try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
+        Ok(UserProvisionOutcome::Created)
+    }
+
     async fn update_password(&self, id: i64, new_hash: &str) -> Result<u64, DbError> {
         let result = sqlx::query("UPDATE users SET password = ? WHERE id = ?")
             .bind(new_hash)
@@ -122,15 +251,21 @@ impl UserRepository for SqliteRepository {
         Ok(result.rows_affected())
     }
 
-    async fn change_own_password(&self, id: i64, new_hash: &str) -> Result<u64, DbError> {
+    async fn change_own_password(
+        &self,
+        id: i64,
+        expected_hash: &str,
+        new_hash: &str,
+    ) -> Result<u64, DbError> {
         // Atomic: new hash + bump token_version (revoke all sessions) + clear
         // must_change_password, in one UPDATE.
         let result = sqlx::query(
             "UPDATE users SET password = ?, token_version = token_version + 1, \
-             must_change_password = 0 WHERE id = ?",
+             must_change_password = 0 WHERE id = ? AND password = ?",
         )
         .bind(new_hash)
         .bind(id)
+        .bind(expected_hash)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -138,17 +273,19 @@ impl UserRepository for SqliteRepository {
 
     async fn admin_reset_password(
         &self,
+        actor_id: i64,
         id: i64,
         new_hash: &str,
         must_change_password: bool,
     ) -> Result<u64, DbError> {
         let result = sqlx::query(
             "UPDATE users SET password = ?, token_version = token_version + 1, \
-             must_change_password = ? WHERE id = ?",
+             must_change_password = ? WHERE id = ? AND (admin = 0 OR id = ?)",
         )
         .bind(new_hash)
         .bind(must_change_password)
         .bind(id)
+        .bind(actor_id)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -215,53 +352,95 @@ impl UserRepository for SqliteRepository {
         Ok(result.rows_affected())
     }
 
-    async fn admin_set_user_plan(
+    async fn admin_edit_user_plan(
         &self,
-        id: i64,
-        plan_id: Option<i64>,
-        plan_expire_at: Option<String>,
-    ) -> Result<u64, DbError> {
-        let result = sqlx::query(
-            "UPDATE users SET plan_id = ?, plan_expire_at = ? WHERE id = ? AND admin = 0",
-        )
-        .bind(plan_id)
-        .bind(plan_expire_at)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
-    async fn clear_user_plan(&self, user_id: i64) -> Result<u64, DbError> {
-        let mut tx = self.pool.begin().await?;
-        // Clear plan association + revoke the all-groups flag in one UPDATE.
-        let r = sqlx::query(
-            "UPDATE users SET plan_id = NULL, plan_expire_at = NULL, all_device_groups = 0 \
-             WHERE id = ? AND admin = 0",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-        let affected = r.rows_affected();
-        if affected == 0 {
-            // Missing user or an admin target — nothing to clear.
-            let _ = tx.rollback().await;
-            return Ok(0);
+        user_id: i64,
+        expected_plan_id: i64,
+        clear: bool,
+        plan_expire_at: Option<&str>,
+    ) -> Result<AdminUserPlanEditOutcome, DbError> {
+        // Acquire SQLite's writer lock before reading plan_id. This serializes
+        // the optimistic check with purchases and prevents a read-then-write
+        // promotion from observing a stale association.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_sql {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
         }
-        // Drop explicit group grants, then system-pause every active rule
-        // (auto_paused=1) since the user now has no authorized groups.
-        sqlx::query("DELETE FROM user_device_groups WHERE user_id = ?")
+        macro_rules! reject {
+            ($outcome:expr) => {{
+                try_sql!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
+                return Ok($outcome);
+            }};
+        }
+
+        let target: Option<(bool, Option<i64>, Option<String>)> = try_sql!(
+            sqlx::query_as(
+                "SELECT u.admin, u.plan_id, p.plan_type FROM users u \
+                 LEFT JOIN plans p ON p.id = u.plan_id WHERE u.id = ?",
+            )
             .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "UPDATE forward_rules SET paused = 1, auto_paused = 1 WHERE uid = ? AND paused = 0",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(affected)
+            .fetch_optional(&mut *conn)
+            .await
+        );
+        let Some((is_admin, current_plan_id, plan_type)) = target else {
+            reject!(AdminUserPlanEditOutcome::NotFound);
+        };
+        if is_admin {
+            reject!(AdminUserPlanEditOutcome::AdminTarget);
+        }
+        if current_plan_id != Some(expected_plan_id) {
+            reject!(AdminUserPlanEditOutcome::PlanChanged);
+        }
+        if !clear && plan_type.as_deref() != Some("time") {
+            reject!(AdminUserPlanEditOutcome::ExpiryNotApplicable);
+        }
+
+        if clear {
+            try_sql!(
+                sqlx::query(
+                    "UPDATE users SET plan_id = NULL, plan_expire_at = NULL, \
+                     all_device_groups = 0 WHERE id = ?",
+                )
+                .bind(user_id)
+                .execute(&mut *conn)
+                .await
+            );
+            try_sql!(
+                sqlx::query("DELETE FROM user_device_groups WHERE user_id = ?")
+                    .bind(user_id)
+                    .execute(&mut *conn)
+                    .await
+            );
+            try_sql!(
+                sqlx::query(
+                    "UPDATE forward_rules SET paused = 1, auto_paused = 1 \
+                     WHERE uid = ? AND paused = 0",
+                )
+                .bind(user_id)
+                .execute(&mut *conn)
+                .await
+            );
+        } else {
+            try_sql!(
+                sqlx::query("UPDATE users SET plan_expire_at = ? WHERE id = ?")
+                    .bind(plan_expire_at)
+                    .bind(user_id)
+                    .execute(&mut *conn)
+                    .await
+            );
+        }
+
+        try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
+        Ok(AdminUserPlanEditOutcome::Updated)
     }
 
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError> {
@@ -273,18 +452,22 @@ impl UserRepository for SqliteRepository {
         Ok(())
     }
 
-    async fn reset_traffic(&self, id: i64) -> Result<(), DbError> {
+    async fn reset_traffic(&self, id: i64) -> Result<u64, DbError> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE users SET traffic_used = 0 WHERE id = ?")
+        let user = sqlx::query("UPDATE users SET traffic_used = 0 WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        if user.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(0);
+        }
         sqlx::query("UPDATE forward_rules SET traffic_used = 0 WHERE uid = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(user.rows_affected())
     }
 
     async fn delete_non_admin(&self, id: i64) -> Result<u64, DbError> {
@@ -337,9 +520,11 @@ impl UserRepository for SqliteRepository {
         let conflict: (i64, i64) = try_sql!(
             sqlx::query_as(
                 "SELECT COUNT(DISTINCT g.id),COUNT(DISTINCT h.tunnel_id) \
-             FROM device_groups g JOIN tunnel_hops h ON h.device_group_id=g.id \
-             WHERE g.uid=?",
+                 FROM device_groups g JOIN tunnel_hops h ON h.device_group_id=g.id \
+                 JOIN tunnels t ON t.id=h.tunnel_id \
+                 WHERE g.uid=? AND t.uid<>?",
             )
+            .bind(uid)
             .bind(uid)
             .fetch_one(&mut *conn)
             .await
@@ -351,6 +536,87 @@ impl UserRepository for SqliteRepository {
                 tunnels: conflict.1,
             });
         }
+        let cross_owner_rules: i64 = try_sql!(
+            sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT refs.rule_id) FROM ( \
+                   SELECT id AS rule_id, device_group_in AS group_id FROM forward_rules WHERE uid<>? \
+                   UNION SELECT id, device_group_out FROM forward_rules WHERE uid<>? AND device_group_out IS NOT NULL \
+                   UNION SELECT h.rule_id, h.device_group_id FROM forward_rule_hops h \
+                     JOIN forward_rules r ON r.id=h.rule_id WHERE r.uid<>? \
+                   UNION SELECT retired.rule_id, retired.device_group_id \
+                     FROM forward_rule_retired_entries retired \
+                     JOIN forward_rules r ON r.id=retired.rule_id \
+                     WHERE r.uid<>? AND retired.expires_at >= unixepoch() \
+                   UNION SELECT transition.rule_id, transition.device_group_id \
+                     FROM forward_rule_route_transitions transition \
+                     JOIN forward_rules r ON r.id=transition.rule_id \
+                     WHERE r.uid<>? AND transition.expires_at >= unixepoch() \
+                 ) refs JOIN device_groups owned ON owned.id=refs.group_id WHERE owned.uid=?",
+            )
+            .bind(uid)
+            .bind(uid)
+            .bind(uid)
+            .bind(uid)
+            .bind(uid)
+            .bind(uid)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        let fallback_groups: i64 = try_sql!(
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM device_groups dependent \
+                 JOIN device_groups owned ON owned.id=dependent.fallback_group \
+                 WHERE owned.uid=? AND dependent.uid<>?",
+            )
+            .bind(uid)
+            .bind(uid)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        let plans: i64 = try_sql!(
+            sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT pdg.plan_id) FROM plan_device_groups pdg \
+                 JOIN device_groups owned ON owned.id=pdg.device_group_id WHERE owned.uid=?",
+            )
+            .bind(uid)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        if cross_owner_rules > 0 || fallback_groups > 0 || plans > 0 {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Err(DbError::UserGroupReferenceConflict {
+                rules: cross_owner_rules,
+                fallback_groups,
+                plans,
+            });
+        }
+        let owned_tunnel_conflict: (i64, i64) = try_sql!(
+            sqlx::query_as(
+                "SELECT COUNT(DISTINCT t.id),COUNT(DISTINCT refs.rule_id) FROM tunnels t \
+                 JOIN ( \
+                   SELECT id AS rule_id,tunnel_id FROM forward_rules \
+                    WHERE uid<>? AND tunnel_id IS NOT NULL \
+                   UNION \
+                   SELECT retired.rule_id,retired.tunnel_id \
+                    FROM forward_rule_retired_entries retired \
+                    JOIN forward_rules r ON r.id=retired.rule_id \
+                    WHERE r.uid<>? AND retired.expires_at >= unixepoch() \
+                 ) refs ON refs.tunnel_id=t.id \
+                 WHERE t.uid=?",
+            )
+            .bind(uid)
+            .bind(uid)
+            .bind(uid)
+            .fetch_one(&mut *conn)
+            .await
+        );
+        if owned_tunnel_conflict.1 > 0 {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Err(DbError::UserOwnedTunnelConflict {
+                tunnels: owned_tunnel_conflict.0,
+                rules: owned_tunnel_conflict.1,
+            });
+        }
         try_sql!(
             sqlx::query("DELETE FROM forward_rules WHERE uid = ?")
                 .bind(uid)
@@ -359,6 +625,12 @@ impl UserRepository for SqliteRepository {
         );
         try_sql!(
             sqlx::query("DELETE FROM tunnel_profiles WHERE uid = ?")
+                .bind(uid)
+                .execute(&mut *conn)
+                .await
+        );
+        try_sql!(
+            sqlx::query("DELETE FROM tunnels WHERE uid = ?")
                 .bind(uid)
                 .execute(&mut *conn)
                 .await

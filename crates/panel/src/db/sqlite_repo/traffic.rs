@@ -7,7 +7,9 @@ use relay_shared::protocol::TrafficEntry;
 // ── TrafficRepository ──
 //
 // Atomicity + security contract (v0.4.9 hardened):
-//   - whole batch is one transaction (deferred BEGIN; SQLite serialises writers)
+//   - whole batch is one BEGIN IMMEDIATE transaction; the writer reservation
+//     is acquired before validation reads so concurrent reports wait rather
+//     than failing while upgrading a stale WAL snapshot
 //   - rule NOT available to this node (missing OR foreign-group): ABORT +
 //     rollback the entire batch, return Ok(vec![Unavailable]). The caller maps
 //     that to a uniform 403 with a generic message. There is deliberately NO
@@ -30,7 +32,7 @@ impl TrafficRepository for SqliteRepository {
         group_id: i64,
         entries: &[TrafficEntry],
     ) -> Result<Vec<TrafficEntryResult>, DbError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // ── v1.0.8: read this group's billing rate once for the whole batch
         // (every entry in a batch is for the SAME group_id — the node reports
@@ -154,9 +156,10 @@ impl TrafficRepository for SqliteRepository {
             // v1.0.8: billed delta charged to the user = round(real * rate).
             // f64 mul can't overflow (rule_delta_sum ≤ i64::MAX, rate ≤ 100),
             // but the rounded result must fit in i64 — guard it.
-            let billed_raw = (rule_delta_sum as f64) * rate;
-            let billed_delta = if billed_raw.is_finite() && billed_raw <= i64::MAX as f64 {
-                billed_raw.round() as i64
+            let billed_delta = if let Some(delta) =
+                crate::service::traffic::billed_traffic_delta(rule_delta_sum, rate)
+            {
+                delta
             } else {
                 let _ = tx.rollback().await;
                 return Ok(vec![TrafficEntryResult::Overflow]);

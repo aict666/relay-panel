@@ -50,20 +50,23 @@ impl GroupRepository for PgRepository {
     }
 
     async fn find_by_token(&self, token: &str) -> Result<Option<DeviceGroup>, DbError> {
-        let group: Option<DeviceGroup> =
-            sqlx::query_as("SELECT * FROM device_groups WHERE token = $1")
-                .bind(token)
-                .fetch_optional(&self.pool)
-                .await?;
+        let group: Option<DeviceGroup> = sqlx::query_as(
+            "SELECT g.* FROM device_groups g JOIN users owner ON owner.id=g.uid \
+             WHERE g.token = $1 AND owner.admin = TRUE",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(group)
     }
 
     async fn list_group_credential_revisions(&self) -> Result<Vec<(i64, i64)>, DbError> {
-        Ok(
-            sqlx::query_as("SELECT id, credential_revision FROM device_groups ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?,
+        Ok(sqlx::query_as(
+            "SELECT g.id, g.credential_revision FROM device_groups g \
+             JOIN users owner ON owner.id=g.uid WHERE owner.admin=TRUE ORDER BY g.id",
         )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     async fn find_by_id(
@@ -204,6 +207,46 @@ impl GroupRepository for PgRepository {
         };
         let effective_type = group_type.unwrap_or(&current_type);
         let effective_host = connect_host.unwrap_or(&current_host);
+        let entry_rules: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (\
+               SELECT id AS rule_id FROM forward_rules WHERE device_group_in = $1 \
+               UNION \
+               SELECT rule_id FROM forward_rule_hops \
+                WHERE device_group_id = $1 AND position = 0 \
+               UNION \
+               SELECT rule_id FROM forward_rule_retired_entries \
+                WHERE device_group_id = $1 \
+                  AND expires_at >= EXTRACT(EPOCH FROM now())::BIGINT\
+             ) referenced_rules",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let downstream_rules: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (\
+               SELECT id AS rule_id FROM forward_rules WHERE device_group_out = $1 \
+               UNION \
+               SELECT rule_id FROM forward_rule_hops \
+                WHERE device_group_id = $1 AND position > 0 \
+               UNION \
+               SELECT rule_id FROM forward_rule_route_transitions \
+                WHERE device_group_id = $1 \
+                  AND expires_at >= EXTRACT(EPOCH FROM now())::BIGINT\
+             ) referenced_rules",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let invalid_rule_entry = entry_rules > 0 && !matches!(effective_type, "in" | "both");
+        let invalid_rule_downstream = downstream_rules > 0
+            && (effective_type == "monitor" || effective_host.trim().is_empty());
+        if invalid_rule_entry || invalid_rule_downstream {
+            tx.rollback().await?;
+            return Err(DbError::RuleGroupInvariant {
+                entry_rules,
+                downstream_rules,
+            });
+        }
         let (entry_tunnels, downstream_tunnels): (i64, i64) = sqlx::query_as(
             "SELECT COUNT(DISTINCT CASE WHEN position = 0 THEN tunnel_id END), \
                     COUNT(DISTINCT CASE WHEN position > 0 THEN tunnel_id END) \
@@ -221,6 +264,16 @@ impl GroupRepository for PgRepository {
                 entry_tunnels,
                 downstream_tunnels,
             });
+        }
+        let plan_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM plan_device_groups WHERE device_group_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if plan_count > 0 && !matches!(effective_type, "in" | "both") {
+            tx.rollback().await?;
+            return Err(DbError::GroupPlanInvariant { plans: plan_count });
         }
 
         let mut ph = 1;
@@ -315,8 +368,7 @@ impl GroupRepository for PgRepository {
             sqlx::query_as("SELECT COUNT(*) FROM forward_rule_hops WHERE device_group_id = $1")
                 .bind(id)
                 .fetch_one(&self.pool)
-                .await
-                .unwrap_or((0,));
+                .await?;
         Ok(row.0 + hop_count.0)
     }
 
@@ -356,6 +408,14 @@ impl GroupRepository for PgRepository {
                 WHERE device_group_in=$1 OR device_group_out=$1 \
                UNION \
                SELECT rule_id FROM forward_rule_hops WHERE device_group_id=$1 \
+               UNION \
+               SELECT rule_id FROM forward_rule_retired_entries \
+                WHERE device_group_id=$1 \
+                  AND expires_at >= EXTRACT(EPOCH FROM now())::BIGINT \
+               UNION \
+               SELECT rule_id FROM forward_rule_route_transitions \
+                WHERE device_group_id=$1 \
+                  AND expires_at >= EXTRACT(EPOCH FROM now())::BIGINT \
              ) refs",
         )
         .bind(id)
@@ -372,12 +432,18 @@ impl GroupRepository for PgRepository {
                 .bind(id)
                 .fetch_one(&mut *tx)
                 .await?;
-        if rule_count > 0 || tunnel_count > 0 || fallback_group_count > 0 {
+        let plan_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plan_device_groups WHERE device_group_id=$1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if rule_count > 0 || tunnel_count > 0 || fallback_group_count > 0 || plan_count > 0 {
             tx.rollback().await?;
             return Ok(GroupDeleteOutcome::InUse {
                 rule_count,
                 tunnel_count,
                 fallback_group_count,
+                plan_count,
             });
         }
         sqlx::query("DELETE FROM device_groups WHERE id=$1")
@@ -398,7 +464,8 @@ impl GroupRepository for PgRepository {
 
     async fn list_all_inbound_group_ids(&self) -> Result<Vec<i64>, DbError> {
         let rows: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM device_groups WHERE group_type IN ('in', 'both') ORDER BY id",
+            "SELECT dg.id FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+             WHERE dg.group_type IN ('in', 'both') AND owner.admin=TRUE ORDER BY dg.id",
         )
         .fetch_all(&self.pool)
         .await?;

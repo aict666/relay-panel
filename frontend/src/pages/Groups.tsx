@@ -1,19 +1,16 @@
 import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Typography, Tag, Tooltip, Alert, Switch } from 'antd';
 import { PlusOutlined, ReloadOutlined, CopyOutlined, EditOutlined, CloudServerOutlined, CodeOutlined, ApiOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, User, NodeStatus } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedGroupSummary } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { copyText } from '../utils/clipboard';
 import { useAuth } from '../auth/useAuth';
+import { buildInstallCommand } from '../utils/installCommand';
 
 const { Text } = Typography;
 
 const INSTALL_SCRIPT_URL = 'https://raw.githubusercontent.com/aict666/relay-panel/main/scripts/relay-node-install.sh';
-
-function buildInstallCommand(token: string, panelUrl: string): string {
-  return `bash <(curl -fsSL ${INSTALL_SCRIPT_URL}) -t ${token} -u ${panelUrl}`;
-}
 
 function isLocalhost(): boolean {
   const h = window.location.hostname;
@@ -22,11 +19,13 @@ function isLocalhost(): boolean {
 
 export default function Groups() {
   const { t } = useI18n();
-  const { isAdmin } = useAuth();
-  const [groups, setGroups] = useState<DeviceGroup[]>([]);
-  const [users, setUsers] = useState<User[]>([]);
+  const { isAdmin, user } = useAuth();
+  const authScope = `${isAdmin ? 'admin' : 'user'}:${user?.id ?? 'anonymous'}`;
+  const [groups, setGroups] = useState<Array<DeviceGroup | SharedGroupSummary>>([]);
   const [nodes, setNodes] = useState<NodeStatus[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [cmdModalOpen, setCmdModalOpen] = useState(false);
@@ -34,40 +33,69 @@ export default function Groups() {
   const [editing, setEditing] = useState<DeviceGroup | null>(null);
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
+  const loadGenerationRef = useRef(0);
+  const loadScopeRef = useRef<string | null>(null);
+  const desiredScopeRef = useRef(authScope);
+  const commandGenerationRef = useRef(0);
+  useLayoutEffect(() => {
+    desiredScopeRef.current = authScope;
+  }, [authScope]);
 
   const load = useCallback(async () => {
+    if (desiredScopeRef.current !== authScope) return false;
+    const requestId = ++loadGenerationRef.current;
+    ++commandGenerationRef.current;
+    setCmdModalOpen(false);
+    setCmdModalContent({ title: null, body: null });
+    if (loadScopeRef.current !== authScope) {
+      loadScopeRef.current = authScope;
+      Modal.destroyAll();
+      setGroups([]);
+      setNodes([]);
+      setCreateOpen(false);
+      setEditOpen(false);
+      setEditing(null);
+    }
     setLoading(true);
-    setGroups([]);
-    setUsers([]);
-    setNodes([]);
+    setLoadFailed(false);
     try {
       if (isAdmin) {
-        // The user and node catalogs drive owner labels and expandable node
-        // rows. Treat failures as load failures instead of presenting false
-        // empty lists that could mislead an administrator.
-        const [g, u, n] = await Promise.all([
-          api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
-          api.get<unknown, ApiEnvelope<User[]>>('/admin/users'),
-          api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes'),
-        ]);
-        setGroups(g.data || []);
-        setUsers(u.data || []);
-        setNodes(n.data || []);
-      } else {
+        // The node catalog drives expandable rows. Treat failures as load
+        // failures instead of presenting false empty lists that could mislead
+        // an administrator.
         const [g, n] = await Promise.all([
           api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
-          api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes/shared'),
+          api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes'),
         ]);
+        if (requestId !== loadGenerationRef.current || desiredScopeRef.current !== authScope) return false;
         setGroups(g.data || []);
-        setUsers([]);
         setNodes(n.data || []);
+      } else {
+        // This route is kept only as a read-only view of the user's own legacy
+        // groups. `/nodes/shared` describes admin-owned plan-authorized groups,
+        // so joining it to these rows is both meaningless and made an unrelated
+        // shared-node outage fail this page. Regular users use /nodes for the
+        // separate shared-node view instead.
+        const g = await api.get<unknown, ApiEnvelope<SharedGroupSummary[]>>('/groups/owned');
+        if (requestId !== loadGenerationRef.current || desiredScopeRef.current !== authScope) return false;
+        setGroups(g.data || []);
+        setNodes([]);
       }
+      setLoadFailed(false);
+      return true;
     } catch {
-      message.error(t('loadFailed'));
-    } finally { setLoading(false); }
-  }, [isAdmin, t]);
+      if (requestId === loadGenerationRef.current && desiredScopeRef.current === authScope) {
+        setLoadFailed(true);
+        message.error(t('loadFailed'));
+      }
+      return false;
+    } finally {
+      if (requestId === loadGenerationRef.current && desiredScopeRef.current === authScope) setLoading(false);
+    }
+  }, [authScope, isAdmin, t]);
 
   useEffect(() => { load(); }, [load]);
+  const mutationsBlocked = loading || loadFailed || saving;
 
   // ── Node helpers ──
   const nodesByGroup = useCallback((groupId: number): NodeStatus[] => {
@@ -77,28 +105,33 @@ export default function Groups() {
   const nodeCount = useCallback((groupId: number) => nodesByGroup(groupId).length, [nodesByGroup]);
   const onlineCount = useCallback((groupId: number) => nodesByGroup(groupId).filter(n => n.online).length, [nodesByGroup]);
 
-  const handleCreate = async (values: { name: string; group_type: string; connect_host: string; port_range: string; rate?: number; hidden?: boolean; owner_uid?: number | null }) => {
+  const handleCreate = async (values: { name: string; group_type: string; connect_host: string; port_range: string; rate?: number; hidden?: boolean }) => {
+    if (!isAdmin || loading || loadFailed || saving) return;
+    setSaving(true);
     try {
       // v1.0.8: rate defaults to 1.0 on the server when omitted; send it
       // explicitly so the value the admin picked is what gets persisted.
-      const payload = { ...values, rate: values.rate ?? 1.0, hidden: values.hidden ?? false, owner_uid: values.owner_uid || undefined };
+      const payload = { ...values, rate: values.rate ?? 1.0, hidden: values.hidden ?? false };
       const res = await api.post<unknown, ApiEnvelope<DeviceGroup>>('/groups', payload);
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('groupCreated'));
       setCreateOpen(false);
       createForm.resetFields();
-      load();
+      await load();
     } catch { message.error(t('failedCreateGroup')); }
+    finally { setSaving(false); }
   };
 
   const handleEdit = (g: DeviceGroup) => {
+    if (!isAdmin || loading || loadFailed || saving) return;
     setEditing(g);
     editForm.setFieldsValue({ name: g.name, group_type: g.group_type, connect_host: g.connect_host, port_range: g.port_range, rate: g.rate, hidden: !!g.hidden });
     setEditOpen(true);
   };
 
   const handleUpdate = async (values: { name?: string; group_type?: string; connect_host?: string; port_range?: string; rate?: number; hidden?: boolean }) => {
-    if (!editing) return;
+    if (!isAdmin || !editing) return;
+    if (loading || loadFailed || saving) return;
     const payload: Record<string, unknown> = {};
     if (values.name !== undefined && values.name !== editing.name) payload.name = values.name;
     if (values.group_type !== undefined && values.group_type !== editing.group_type) payload.group_type = values.group_type;
@@ -110,16 +143,20 @@ export default function Groups() {
     // v1.0.7: only send hidden when it actually changed.
     if (values.hidden !== undefined && values.hidden !== !!editing.hidden) payload.hidden = values.hidden;
     if (Object.keys(payload).length === 0) { setEditOpen(false); return; }
+    setSaving(true);
     try {
       const res = await api.put<unknown, ApiEnvelope<null>>(`/groups/${editing.id}`, payload);
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('groupUpdated'));
       setEditOpen(false);
-      load();
+      await load();
     } catch { message.error(t('failedUpdateGroup')); }
+    finally { setSaving(false); }
   };
 
   const handleDelete = async (id: number) => {
+    if (!isAdmin || loading || loadFailed || saving) return;
+    setSaving(true);
     try {
       const res = await api.delete<unknown, ApiEnvelope<null>>(`/groups/${id}`);
       if (res.code !== 0) {
@@ -127,9 +164,11 @@ export default function Groups() {
         return;
       }
       message.success(t('groupDeleted'));
-      load();
+      await load();
     } catch {
       message.error(t('failedDeleteGroup'));
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -152,8 +191,12 @@ export default function Groups() {
   };
 
   const showInstallCommand = async (g: DeviceGroup) => {
+    if (loading || loadFailed) return;
+    const requestId = ++commandGenerationRef.current;
+    const requestScope = authScope;
     const panelUrl = await panelUrlRef();
-    const cmd = buildInstallCommand(g.token, panelUrl);
+    if (requestId !== commandGenerationRef.current || desiredScopeRef.current !== requestScope) return;
+    const cmd = buildInstallCommand(INSTALL_SCRIPT_URL, g.token, panelUrl);
     setCmdModalContent({
       title: <span>{t('installCommandTitle')}</span>,
       body: (
@@ -171,6 +214,12 @@ export default function Groups() {
       ),
     });
     setCmdModalOpen(true);
+  };
+
+  const closeCommand = () => {
+    ++commandGenerationRef.current;
+    setCmdModalOpen(false);
+    setCmdModalContent({ title: null, body: null });
   };
 
   const typeColor = (gt: string) => {
@@ -200,7 +249,7 @@ export default function Groups() {
     },
     {
       title: t('nodes'), key: 'nodes', width: 100,
-      render: (_: unknown, g: DeviceGroup) => {
+      render: (_: unknown, g: DeviceGroup | SharedGroupSummary) => {
         const total = nodeCount(g.id);
         const online = onlineCount(g.id);
         return <span>{total > 0 ? `${online}/${total}` : '-'}</span>;
@@ -212,7 +261,7 @@ export default function Groups() {
         <Space>
           <Text code style={{ maxWidth: 180 }} ellipsis>{tk}</Text>
           <Tooltip title={t('copyInstallCommand')}>
-            <Button size="small" type="text" icon={<CodeOutlined />} aria-label={t('copyInstallCommand')} onClick={() => showInstallCommand(g)} />
+            <Button size="small" type="text" icon={<CodeOutlined />} aria-label={t('copyInstallCommand')} disabled={loading || loadFailed} onClick={() => showInstallCommand(g)} />
           </Tooltip>
         </Space>
       ),
@@ -227,9 +276,7 @@ export default function Groups() {
       render: (rate: number) => {
         const r = typeof rate === 'number' ? rate : 1.0;
         if (Math.abs(r - 1.0) < 1e-9) return <span style={{ color: 'var(--rp-text-tertiary)' }}>1x</span>;
-        // Trim trailing zeros: 2.0 → "2x", 1.5 → "1.5x".
-        const label = Number.isInteger(r) ? `${r}x` : `${r}x`;
-        return <Tag color="gold">{label}</Tag>;
+        return <Tag color="gold">{r}x</Tag>;
       },
     },
     {
@@ -239,25 +286,28 @@ export default function Groups() {
         hidden ? <Tag>{t('yes')}</Tag> : <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>,
     },
     {
-      title: t('action'), key: 'action', width: 120,
-      render: (_: unknown, g: DeviceGroup) => (
+      title: t('action'), key: 'action', width: 120, fixed: 'right' as const,
+      render: (_: unknown, g: DeviceGroup | SharedGroupSummary) => isAdmin && 'token' in g ? (
         <Space>
-          <Button size="small" type="text" icon={<EditOutlined />} onClick={() => handleEdit(g)}>{t('edit')}</Button>
+          <Button size="small" type="text" icon={<EditOutlined />} disabled={mutationsBlocked} onClick={() => handleEdit(g)}>{t('edit')}</Button>
           <Popconfirm title={t('deleteGroupConfirm')} onConfirm={() => handleDelete(g.id)}>
-            <Button danger size="small" type="text">{t('delete')}</Button>
+            <Button danger size="small" type="text" disabled={mutationsBlocked}>{t('delete')}</Button>
           </Popconfirm>
         </Space>
-      ),
+      ) : null,
     },
   ];
+  const regularColumnKeys = new Set(['id', 'name', 'group_type', 'connect_host']);
+  const visibleColumns = isAdmin ? columns : columns.filter(column => regularColumnKeys.has(column.key));
 
-  const expandedRowRender = (g: DeviceGroup) => {
+  const expandedRowRender = (g: DeviceGroup | SharedGroupSummary) => {
+    if (!('token' in g)) return null;
     const groupNodes = nodesByGroup(g.id);
     if (groupNodes.length === 0) {
       return (
         <div style={{ padding: '8px 0', color: 'var(--rp-text-tertiary)', fontSize: 13 }}>
           {t('noNodesInGroup')}
-          <Button size="small" type="link" icon={<ApiOutlined />} style={{ marginLeft: 12 }} onClick={() => showInstallCommand(g)}>
+          <Button size="small" type="link" icon={<ApiOutlined />} disabled={loading || loadFailed} style={{ marginLeft: 12 }} onClick={() => showInstallCommand(g)}>
             {t('addNode')}
           </Button>
         </div>
@@ -267,7 +317,7 @@ export default function Groups() {
       <div style={{ padding: 4 }}>
         <div style={{ marginBottom: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text type="secondary" style={{ fontSize: 12 }}>{t('nodesInGroup')} ({groupNodes.length})</Text>
-          <Button size="small" icon={<ApiOutlined />} onClick={() => showInstallCommand(g)}>{t('addNode')}</Button>
+          <Button size="small" icon={<ApiOutlined />} disabled={loading || loadFailed} onClick={() => showInstallCommand(g)}>{t('addNode')}</Button>
         </div>
         <Table
           className="rp-responsive-table"
@@ -292,32 +342,31 @@ export default function Groups() {
       <div className="rp-page-header">
         <h2 className="rp-page-title"><CloudServerOutlined /> {t('deviceGroups')}</h2>
         <Space className="rp-page-actions" wrap>
-          <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>{t('addGroup')}</Button>
+          <Button icon={<ReloadOutlined />} loading={loading} disabled={saving || createOpen || editOpen || cmdModalOpen} onClick={load}>{t('refresh')}</Button>
+          {isAdmin && <Button type="primary" icon={<PlusOutlined />} disabled={mutationsBlocked} onClick={() => setCreateOpen(true)}>{t('addGroup')}</Button>}
         </Space>
       </div>
+
+      {loadFailed && (
+        <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} description={t('loadFailedRetry')} />
+      )}
       <Table
         className="rp-responsive-table"
         dataSource={groups}
-        columns={columns}
+        columns={visibleColumns}
         rowKey="id"
         loading={loading}
         pagination={{ pageSize: 20 }}
         scroll={{ x: 'max-content' }}
-        expandable={{
+        expandable={isAdmin ? {
           expandedRowRender,
-          rowExpandable: () => true,
-        }}
+          rowExpandable: (group) => 'token' in group,
+        } : undefined}
       />
 
-      <Modal title={t('addGroup')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')}>
-        <Form form={createForm} onFinish={handleCreate} layout="vertical">
-          <Form.Item name="name" label={t('name')} rules={[{ required: true }]}><Input placeholder="tokyo-node-1" /></Form.Item>
-          {isAdmin && (
-            <Form.Item name="owner_uid" label={t('owner')} extra={t('ownerHint')}>
-              <Select allowClear placeholder={t('ownerSelf')} options={users.map(u => ({ value: u.id, label: u.username }))} />
-            </Form.Item>
-          )}
+      <Modal title={t('addGroup')} open={createOpen} onCancel={() => { if (!saving) setCreateOpen(false); }} onOk={() => createForm.submit()} confirmLoading={saving} okButtonProps={{ disabled: loading || loadFailed }} okText={t('create')} cancelText={t('cancel')}>
+        <Form form={createForm} onFinish={handleCreate} layout="vertical" disabled={saving || loading || loadFailed}>
+          <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input placeholder="tokyo-node-1" /></Form.Item>
           <Form.Item name="group_type" label={t('type')} rules={[{ required: true }]} initialValue="in">
             <Select options={groupTypeOptions} />
           </Form.Item>
@@ -336,9 +385,9 @@ export default function Groups() {
         </Form>
       </Modal>
 
-      <Modal title={t('editGroup')} open={editOpen} onCancel={() => setEditOpen(false)} onOk={() => editForm.submit()} okText={t('save')} cancelText={t('cancel')}>
-        <Form form={editForm} onFinish={handleUpdate} layout="vertical">
-          <Form.Item name="name" label={t('name')}><Input /></Form.Item>
+      <Modal title={t('editGroup')} open={editOpen} onCancel={() => { if (!saving) setEditOpen(false); }} onOk={() => editForm.submit()} confirmLoading={saving} okButtonProps={{ disabled: loading || loadFailed }} okText={t('save')} cancelText={t('cancel')}>
+        <Form form={editForm} onFinish={handleUpdate} layout="vertical" disabled={saving || loading || loadFailed}>
+          <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
           <Form.Item name="group_type" label={t('type')}><Select options={groupTypeOptions} /></Form.Item>
           <Form.Item name="connect_host" label={t('connectHost')}><Input /></Form.Item>
           <Form.Item name="port_range" label={t('portRange')}><Input /></Form.Item>
@@ -351,7 +400,7 @@ export default function Groups() {
         </Form>
       </Modal>
 
-      <Modal title={cmdModalContent.title} open={cmdModalOpen} onCancel={() => setCmdModalOpen(false)} footer={null} width={580}>
+      <Modal title={cmdModalContent.title} open={cmdModalOpen} onCancel={closeCommand} footer={null} width={580}>
         {cmdModalContent.body}
       </Modal>
     </>

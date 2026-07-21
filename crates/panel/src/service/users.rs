@@ -1,9 +1,8 @@
 use crate::db::error::DbError;
-use crate::db::repo::Repository;
+use crate::db::repo::{Repository, UserProvisionOutcome};
 use crate::service::password::{
     hash_password_async, validate_password, PasswordValidationError, PasswordWorkError,
 };
-use crate::service::settings::get_registration_settings;
 
 #[derive(Debug)]
 pub enum CreateUserError {
@@ -54,22 +53,22 @@ pub async fn create_user(
     }
     validate_password(password).map_err(CreateUserError::Password)?;
 
-    // Admin-created users inherit the configured registration default plan.
-    // The registration-enabled switch only controls the public signup route;
-    // it must not prevent an administrator from provisioning an account.
-    let plan_id = get_registration_settings(db)
-        .await
-        .map_err(CreateUserError::Database)?
-        .default_registration_plan_id;
-
     let hashed = hash_password_async(password).await.map_err(|e| match e {
         PasswordWorkError::Busy => CreateUserError::Hash("password service is busy".into()),
         error => CreateUserError::Hash(error.to_string()),
     })?;
 
-    match db.insert_user_from_plan(username, &hashed, plan_id).await {
-        Ok(1) => Ok(()),
-        Ok(_) => Err(CreateUserError::DefaultPlanMissing(plan_id)),
+    // Resolve and lock the current default only after bcrypt completes, in the
+    // same transaction that copies its quota and inserts the user. Registration
+    // enabled/disabled does not apply to administrator provisioning.
+    match db.insert_admin_user_from_default(username, &hashed).await {
+        Ok(UserProvisionOutcome::Created) => Ok(()),
+        Ok(UserProvisionOutcome::PlanMissing(plan_id)) => {
+            Err(CreateUserError::DefaultPlanMissing(plan_id))
+        }
+        Ok(UserProvisionOutcome::RegistrationDisabled | UserProvisionOutcome::PlanNotAllowed) => {
+            Err(CreateUserError::Database(DbError::NotFound))
+        }
         Err(DbError::UniqueViolation) => Err(CreateUserError::DuplicateUsername),
         Err(e) => Err(CreateUserError::Database(e)),
     }

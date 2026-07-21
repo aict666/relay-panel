@@ -1160,6 +1160,16 @@ pub struct CreateRuleRequest {
     /// config). None/omitted = legacy behavior (use public_transport/ws_path).
     #[serde(default)]
     pub tunnel_profile_id: Option<i64>,
+    /// v1.3.6: cap concurrent TCP connections PER NODE at creation time
+    /// (0 / omitted = unlimited). Previously this could only be configured by
+    /// creating the rule and immediately editing it.
+    #[serde(default)]
+    pub max_connections: Option<i32>,
+    /// v1.3.6: scheduled restart interval in minutes at creation time
+    /// (0 / omitted = off). A non-zero value below MIN_AUTO_RESTART_MINUTES is
+    /// rejected by the service, matching the update path.
+    #[serde(default)]
+    pub auto_restart_minutes: Option<i32>,
 }
 
 fn default_forward_mode() -> String {
@@ -1334,6 +1344,15 @@ pub struct UpdatePlanRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BuyPlanRequest {
     pub plan_id: i64,
+    /// Price displayed in the confirmation dialog. The server canonicalizes
+    /// and compares it before charging so a stale catalog cannot authorize a
+    /// newly-priced purchase. Optional for compatibility with older clients.
+    #[serde(default)]
+    pub expected_price: Option<String>,
+    /// Opaque revision returned by the plan catalog. Detects changes to quota,
+    /// duration, visibility, or device-group grants even when price is stable.
+    #[serde(default)]
+    pub expected_revision: Option<String>,
 }
 
 /// v1.0.7: admin assigns a plan to a user, charging the user's balance (same
@@ -1341,6 +1360,15 @@ pub struct BuyPlanRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdminBuyPlanRequest {
     pub plan_id: i64,
+    /// User plan association displayed when the assignment was confirmed.
+    /// Zero means the user had no plan. Required to prevent stale admin views
+    /// from charging for and overwriting a newer assignment.
+    pub expected_current_plan_id: i64,
+    /// Price displayed to the administrator before assigning the plan.
+    #[serde(default)]
+    pub expected_price: Option<String>,
+    #[serde(default)]
+    pub expected_revision: Option<String>,
 }
 
 /// v1.0.7: admin edits a user's plan association + expiry WITHOUT charging.
@@ -1349,6 +1377,9 @@ pub struct AdminBuyPlanRequest {
 /// `plan_expire_at = None` means "never expires".
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdminSetUserPlanRequest {
+    /// Plan association displayed when the administrator opened the editor.
+    /// The server rejects the edit if another operation switched/removed it.
+    pub expected_plan_id: i64,
     #[serde(default)]
     pub clear: bool,
     #[serde(default)]

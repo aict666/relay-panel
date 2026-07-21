@@ -114,15 +114,21 @@ pub async fn reset_user_password(
     let new_hash = match hash_password_async(&req.new_password).await {
         Ok(h) => h,
         Err(PasswordWorkError::Busy) => return Json(err(429, "密码服务繁忙，请稍后重试")),
-        Err(e) => return Json(err(500, format!("Failed to hash password: {}", e))),
+        Err(e) => {
+            tracing::error!("reset_user_password {}: password hashing failed: {}", id, e);
+            return Json(err(500, "密码服务失败，请稍后重试"));
+        }
     };
 
     match state
         .db
-        .admin_reset_password(id, &new_hash, req.must_change_password)
+        .admin_reset_password(admin.user_id, id, &new_hash, req.must_change_password)
         .await
     {
-        Ok(0) => Json(err(404, "用户不存在")),
+        // The target existed and was non-admin before hashing. Zero here means
+        // it was deleted or promoted while bcrypt was running; never overwrite
+        // a newly promoted administrator based on the stale pre-check.
+        Ok(0) => Json(err(409, "用户状态已变更，请刷新后重试")),
         Ok(_) => {
             // Audit: actor + target + must_change flag. NEVER log the password
             // or its hash.
@@ -155,23 +161,12 @@ pub async fn reset_user_traffic(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
-    // Verify the user exists first (404, not silent success).
-    let exists = match state.db.exists_by_id(id).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("reset_user_traffic {}: exists lookup failed: {}", id, e);
-            return Json(err(500, "数据库错误"));
-        }
-    };
-    if !exists {
-        return Json(err(404, "用户不存在"));
-    }
-
     // Atomic: both updates in one transaction inside the repository. If either
     // fails, neither lands — prevents the "user total zeroed but rules still
     // show old traffic" split.
     match state.db.reset_traffic(id).await {
-        Ok(()) => {
+        Ok(0) => Json(err(404, "用户不存在")),
+        Ok(_) => {
             tracing::warn!(
                 action = "reset_user_traffic",
                 target_user_id = id,
@@ -387,13 +382,25 @@ pub async fn change_password(
     let new_hash = match hash_password_async(&req.new_password).await {
         Ok(h) => h,
         Err(PasswordWorkError::Busy) => return Json(err(429, "密码服务繁忙，请稍后重试")),
-        Err(e) => return Json(err(500, format!("Failed to hash password: {}", e))),
+        Err(e) => {
+            tracing::error!(
+                "change_password {}: password hashing failed: {}",
+                user.user_id,
+                e
+            );
+            return Json(err(500, "密码服务失败，请稍后重试"));
+        }
     };
 
     // v0.4.10 PR4: change_own_password atomically bumps token_version (revoking
     // ALL of this user's sessions, including the current one — the frontend
     // then re-logs in) and clears must_change_password.
-    match state.db.change_own_password(user.user_id, &new_hash).await {
+    match state
+        .db
+        .change_own_password(user.user_id, &current_hash, &new_hash)
+        .await
+    {
+        Ok(0) => Json(err(409, "密码已被其他操作修改，请重新登录后再试")),
         Ok(_) => {
             tracing::info!(
                 "user {} changed their password (sessions revoked)",

@@ -59,13 +59,69 @@ pub async fn list_available_tunnels(
     match state.db.list_tunnels().await {
         Ok(mut tunnels) => {
             if let Some(allowed) = allowed {
-                tunnels.retain(|tunnel| {
-                    tunnel.shared
-                        && tunnel
+                let mut visible = Vec::new();
+                for tunnel in tunnels {
+                    if !tunnel.shared
+                        || !tunnel
                             .hops
                             .first()
                             .is_some_and(|hop| allowed.contains(&hop.device_group_id))
-                });
+                    {
+                        continue;
+                    }
+                    // Historical rows may predate the administrator-managed
+                    // group invariant. Do not advertise a preset that rule
+                    // writes and runtime config will reject as unusable.
+                    let mut valid = (2..=8).contains(&tunnel.hops.len());
+                    for (position, hop) in tunnel.hops.iter().enumerate() {
+                        let group = match crate::db::repo::GroupRepository::find_by_id(
+                            state.db.as_ref(),
+                            hop.device_group_id,
+                            &crate::db::repo::ResourceScope::All,
+                        )
+                        .await
+                        {
+                            Ok(Some(group)) => group,
+                            Ok(None) => {
+                                valid = false;
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    "list_available_tunnels group lookup failed: {}",
+                                    error
+                                );
+                                return Json(err(500, "数据库错误"));
+                            }
+                        };
+                        let owner_is_admin = match state.db.is_admin(group.uid).await {
+                            Ok(value) => value,
+                            Err(error) => {
+                                tracing::error!(
+                                    "list_available_tunnels owner lookup failed: {}",
+                                    error
+                                );
+                                return Json(err(500, "数据库错误"));
+                            }
+                        };
+                        valid &= owner_is_admin
+                            && if position == 0 {
+                                matches!(group.group_type.as_str(), "in" | "both")
+                                    && hop.listen_port.is_none()
+                            } else {
+                                group.group_type != "monitor"
+                                    && !group.connect_host.trim().is_empty()
+                                    && hop.listen_port.is_some()
+                            };
+                        if !valid {
+                            break;
+                        }
+                    }
+                    if valid {
+                        visible.push(tunnel);
+                    }
+                }
+                tunnels = visible;
             }
             for tunnel in &mut tunnels {
                 if !user.admin {
@@ -76,6 +132,11 @@ pub async fn list_available_tunnels(
                 }
                 for hop in &mut tunnel.hops {
                     hop.connect_host = None;
+                    if !user.admin {
+                        // Internal relay ports are operational infrastructure,
+                        // not required to select a preset route.
+                        hop.listen_port = None;
+                    }
                 }
             }
             Json(ApiResponse::success(tunnels))

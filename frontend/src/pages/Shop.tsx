@@ -1,6 +1,6 @@
 import { Card, Row, Col, Button, Spin, Tag, Modal, Table, Typography, message, Result, Alert, Space } from 'antd';
 import { ShoppingOutlined, ReloadOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, Plan, Order, UserSelf } from '../api/types';
 import { useI18n } from '../i18n/context';
@@ -24,8 +24,10 @@ export default function Shop() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [buying, setBuying] = useState<Plan | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const loadGenerationRef = useRef(0);
 
   const load = useCallback(async () => {
+    const requestId = ++loadGenerationRef.current;
     setLoading(true);
     setLoadFailed(false);
     try {
@@ -34,27 +36,52 @@ export default function Shop() {
         api.get<unknown, ApiEnvelope<Order[]>>('/user/orders'),
         api.get<unknown, ApiEnvelope<UserSelf>>('/user/me'),
       ]);
-      setPlans(plansRes.data || []);
+      if (requestId !== loadGenerationRef.current) return false;
+      const nextPlans = plansRes.data || [];
+      setPlans(nextPlans);
       setOrders(ordersRes.data || []);
       setMe(meRes.data || null);
+      // A refresh may change or remove the plan while its confirmation dialog
+      // is open. Reconcile the dialog to the authoritative catalog so it never
+      // displays an old price for a purchase that the server will charge at the
+      // new price.
+      setBuying(current => current
+        ? (nextPlans.find(plan => plan.id === current.id) ?? null)
+        : null);
+      return true;
     } catch {
-      setLoadFailed(true);
+      if (requestId === loadGenerationRef.current) {
+        setBuying(null);
+        setLoadFailed(true);
+      }
+      return false;
     } finally {
-      setLoading(false);
+      if (requestId === loadGenerationRef.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => { load(); }, [load]);
 
   const handleBuy = async () => {
-    if (!buying) return;
+    if (!buying || loading || loadFailed || submitting) return;
     setSubmitting(true);
     try {
-      const res = await api.post<unknown, ApiEnvelope<null>>('/user/buy-plan', { plan_id: buying.id });
-      if (res.code !== 0) { message.error(res.message); return; }
+      const res = await api.post<unknown, ApiEnvelope<null>>('/user/buy-plan', {
+        plan_id: buying.id,
+        expected_price: buying.price,
+        expected_revision: buying.purchase_revision,
+      });
+      if (res.code !== 0) {
+        message.error(res.message);
+        if (res.code === 409) await load();
+        return;
+      }
       message.success(t('purchaseSuccess'));
       setBuying(null);
-      load();
+      // Keep purchase controls locked until the new balance and order history
+      // arrive. Otherwise the retained card data exposes a second purchase
+      // window that still uses the pre-purchase balance.
+      await load();
     } catch {
       message.error(t('purchaseFailed'));
     } finally {
@@ -62,7 +89,7 @@ export default function Shop() {
     }
   };
 
-  if (loading) {
+  if (loading && !me && plans.length === 0 && orders.length === 0) {
     return <div style={{ textAlign: 'center', padding: 48 }}><Spin /></div>;
   }
 
@@ -83,11 +110,18 @@ export default function Shop() {
     { title: t('purchaseTime'), dataIndex: 'created_at', key: 'created_at', render: (v: string) => <span className="rp-mono">{v}</span> },
   ];
 
+  const canAfford = (plan: Plan): boolean => {
+    if (!me) return false;
+    const balance = Number(me.balance);
+    const price = Number(plan.price);
+    return Number.isFinite(balance) && Number.isFinite(price) && balance >= price;
+  };
+
   return (
     <>
       <div className="rp-page-header">
         <h2 className="rp-page-title"><ShoppingOutlined /> {t('shop')}</h2>
-        <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
+        <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>{t('refresh')}</Button>
       </div>
 
       {/* v1.0.8: suspended banner — buying is still allowed (does not auto-clear). */}
@@ -147,9 +181,10 @@ export default function Shop() {
                 )}
                 {p.reset_traffic && <div><Tag color="green">{t('planResetTraffic')}</Tag></div>}
               </div>
-              <Button type="primary" block style={{ marginTop: 16 }} onClick={() => setBuying(p)}>
+              <Button type="primary" block disabled={loading || submitting || !canAfford(p)} title={!canAfford(p) ? t('insufficientBalance') : undefined} style={{ marginTop: 16 }} onClick={() => setBuying(p)}>
                 {t('buyNow')}
               </Button>
+              {!canAfford(p) && <Text type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>{t('insufficientBalance')}</Text>}
             </Card>
           </Col>
         ))}
@@ -172,11 +207,12 @@ export default function Shop() {
       {/* Purchase confirm. */}
       <Modal
         open={!!buying}
-        onCancel={() => setBuying(null)}
+        onCancel={() => { if (!submitting) setBuying(null); }}
         onOk={handleBuy}
         okText={t('confirmPurchase')}
         cancelText={t('cancel')}
         confirmLoading={submitting}
+        okButtonProps={{ disabled: loading || loadFailed || (!!buying && !canAfford(buying)) }}
         title={t('purchaseConfirmTitle')}
       >
         {buying && (
@@ -184,6 +220,9 @@ export default function Shop() {
             <p>{t('planName')}: <Text strong>{buying.name}</Text></p>
             <p>{t('planPrice')}: <span className="rp-mono">{buying.price}</span></p>
             {me && <p>{t('accountBalance')}: <span className="rp-mono">{me.balance}</span></p>}
+            {!canAfford(buying) && (
+              <Alert type="error" showIcon style={{ marginTop: 8 }} title={t('insufficientBalance')} />
+            )}
             {/* v1.0.9: buying a DIFFERENT plan is a switch — the current plan's
                 remaining traffic and expiry are wiped. Warn explicitly. Buying
                 the SAME plan (or having none) just renews/stacks. */}

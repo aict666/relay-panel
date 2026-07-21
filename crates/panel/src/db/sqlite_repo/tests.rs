@@ -31,6 +31,31 @@ async fn repo() -> SqliteRepository {
     SqliteRepository::new(pool)
 }
 
+/// Build a production-shaped multi-connection SQLite pool for concurrency
+/// regressions. In-memory pools in the ordinary contract tests intentionally
+/// use one connection and therefore cannot expose WAL snapshot upgrades.
+async fn concurrent_repo(suffix: &str) -> (SqliteRepository, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!(
+        "relay-panel-{suffix}-{}-{}.db",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let url = format!("sqlite://{}", path.display());
+    let pool = crate::db::init::init_db(&url).await.unwrap();
+    (SqliteRepository::new(pool), path)
+}
+
+async fn cleanup_concurrent_repo(db: SqliteRepository, path: &std::path::Path) {
+    db.pool.close().await;
+    for candidate in [
+        path.to_path_buf(),
+        std::path::PathBuf::from(format!("{}-wal", path.display())),
+        std::path::PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        let _ = std::fs::remove_file(candidate);
+    }
+}
+
 /// Seed an inbound device_group with the given id (rules reference
 /// device_group_in via FK, so the group must exist before any rule).
 async fn seed_group(db: &SqliteRepository, gid: i64) {
@@ -111,6 +136,8 @@ async fn both_groups_are_shared_and_authorized_as_inbound() {
     seed_group_typed(&db, 10, 1, "in").await;
     seed_group_typed(&db, 11, 1, "both").await;
     seed_group_typed(&db, 12, 1, "out").await;
+    seed_user(&db, 3, false).await;
+    seed_group_typed(&db, 13, 3, "in").await;
 
     let shared = db.list_shared_groups(2, false).await.unwrap();
     assert_eq!(
@@ -123,12 +150,28 @@ async fn both_groups_are_shared_and_authorized_as_inbound() {
         vec![10, 11],
         "grant-all plans must include dual-role groups"
     );
+    assert!(matches!(
+        db.set_user_device_groups(999_999, &[11]).await,
+        Err(DbError::NotFound)
+    ));
 
-    db.set_user_device_groups(2, &[11, 12]).await.unwrap();
+    assert!(matches!(
+        db.set_user_device_groups(2, &[11, 12, 13]).await,
+        Err(DbError::UserDeviceGroupInvalid)
+    ));
+    db.set_user_device_groups(2, &[11]).await.unwrap();
+    // Simulate legacy/corrupt rows written before repository validation; the
+    // runtime selector must remain fail-closed even for dirty data.
+    sqlx::query(
+        "INSERT INTO user_device_groups (user_id, device_group_id) VALUES (2, 12), (2, 13)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
     assert_eq!(
         db.authorized_device_group_ids(2).await.unwrap(),
         vec![11],
-        "explicit authorization must keep dual-role entries and reject out-only groups"
+        "explicit authorization must reject out-only and legacy regular-owned groups"
     );
 
     sqlx::query("UPDATE users SET all_device_groups = 1 WHERE id = 2")
@@ -138,7 +181,7 @@ async fn both_groups_are_shared_and_authorized_as_inbound() {
     assert_eq!(
         db.authorized_device_group_ids(2).await.unwrap(),
         vec![10, 11],
-        "all-device-groups users must be authorized for dual-role entries"
+        "all-device-groups users must only receive administrator-managed entries"
     );
 }
 
@@ -480,6 +523,11 @@ async fn user_delete_cascade_clears_rules_groups_profiles_and_user() {
     .execute(&db.pool)
     .await
     .unwrap();
+    sqlx::query("INSERT INTO tunnels(name,enabled,shared,uid) VALUES('alice-preset',1,0,?)")
+        .bind(uid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
     let affected = db.delete_user_cascade(uid).await.unwrap();
     assert_eq!(affected, 1, "the user row must be deleted");
@@ -499,6 +547,11 @@ async fn user_delete_cascade_clears_rules_groups_profiles_and_user() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
+    let tunnels: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tunnels WHERE uid = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
     let user: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?")
         .bind(uid)
         .fetch_one(&db.pool)
@@ -507,6 +560,7 @@ async fn user_delete_cascade_clears_rules_groups_profiles_and_user() {
     assert_eq!(rules.0, 0);
     assert_eq!(groups.0, 0);
     assert_eq!(profiles.0, 0, "custom tunnel profile must be deleted too");
+    assert_eq!(tunnels.0, 0, "owned preset tunnel must be deleted too");
     assert_eq!(user.0, 0, "user row must be gone");
 }
 
@@ -529,13 +583,23 @@ async fn user_delete_cascade_reports_legacy_group_used_by_tunnel() {
     .execute(&db.pool)
     .await
     .unwrap();
-    db.create_tunnel_full(
-        "legacy-owner-path",
-        true,
-        false,
-        1,
-        &[(810, None), (811, Some(38_110))],
+    // Reproduce a row created by an older release. Current write paths reject
+    // regular-user-owned entries, but deletion must still report this legacy
+    // reference instead of partially deleting the owner.
+    let tunnel_id = sqlx::query(
+        "INSERT INTO tunnels(name,enabled,shared,uid) VALUES('legacy-owner-path',1,0,1)",
     )
+    .execute(&db.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO tunnel_hops(tunnel_id,position,device_group_id,listen_port) \
+         VALUES(?,0,810,NULL),(?,1,811,38110)",
+    )
+    .bind(tunnel_id)
+    .bind(tunnel_id)
+    .execute(&db.pool)
     .await
     .unwrap();
 
@@ -554,6 +618,305 @@ async fn user_delete_cascade_reports_legacy_group_used_by_tunnel() {
     assert_eq!(
         group_count, 1,
         "the failed cascade must roll back completely"
+    );
+}
+
+#[tokio::test]
+async fn user_delete_cascade_reports_other_legacy_group_references() {
+    let db = repo().await;
+    db.insert_user("legacy_reference_owner", "h", 1)
+        .await
+        .unwrap();
+    let uid = db
+        .find_by_username("legacy_reference_owner")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,connect_host,token,uid,fallback_group) VALUES \
+         (820,'legacy-owned','in','legacy.example','legacy-owned-token',?,NULL), \
+         (821,'admin-dependent','in','admin.example','admin-dependent-token',1,820)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id,name,uid,listen_port,device_group_in,device_group_out,target_addr,target_port) \
+         VALUES(820,'cross-owner-legacy-route',1,38200,821,820,'127.0.0.1',80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO plan_device_groups(plan_id,device_group_id) VALUES(1,820)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        db.delete_user_cascade(uid).await,
+        Err(DbError::UserGroupReferenceConflict {
+            rules: 1,
+            fallback_groups: 1,
+            plans: 1,
+        })
+    ));
+    assert!(db.exists_by_id(uid).await.unwrap());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_groups WHERE id=820")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn user_delete_cascade_reports_active_cross_owner_rule_leases() {
+    let db = repo().await;
+    db.insert_user("lease_group_owner", "h", 1).await.unwrap();
+    let uid = db
+        .find_by_username("lease_group_owner")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,connect_host,token,uid) VALUES \
+         (822,'retired-entry','in','old-entry.example','retired-entry-token',?), \
+         (823,'route-transition','out','old-exit.example','route-transition-token',?), \
+         (824,'current-entry','in','current.example','current-entry-token',1)",
+    )
+    .bind(uid)
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let tunnel_id =
+        sqlx::query("INSERT INTO tunnels(name,enabled,shared,uid) VALUES('lease-carrier',1,0,1)")
+            .execute(&db.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id,name,uid,listen_port,device_group_in,target_addr,target_port) \
+         VALUES(822,'foreign-lease-owner',1,38222,824,'127.0.0.1',80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rule_retired_entries(rule_id,tunnel_id,device_group_id,expires_at) \
+         VALUES(822,?,822,unixepoch()+600)",
+    )
+    .bind(tunnel_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rule_route_transitions \
+         (rule_id,device_group_id,listen_port,protocol,expires_at) \
+         VALUES(822,823,38223,'tcp',unixepoch()+600)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        db.delete_user_cascade(uid).await,
+        Err(DbError::UserGroupReferenceConflict {
+            rules: 1,
+            fallback_groups: 0,
+            plans: 0,
+        })
+    ));
+    assert!(db.exists_by_id(uid).await.unwrap());
+}
+
+#[tokio::test]
+async fn user_delete_cascade_reports_owned_tunnel_retired_by_other_user() {
+    let db = repo().await;
+    db.insert_user("legacy_tunnel_creator", "h", 1)
+        .await
+        .unwrap();
+    let uid = db
+        .find_by_username("legacy_tunnel_creator")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid) \
+         VALUES(830,'admin-entry','in','admin-entry-830',1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let tunnel_id = sqlx::query(
+        "INSERT INTO tunnels(name,enabled,shared,uid) VALUES('legacy-user-preset',1,1,?)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id,name,uid,listen_port,device_group_in,target_addr,target_port) \
+         VALUES(830,'foreign-retired-rule',1,38300,830,'127.0.0.1',80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rule_retired_entries(rule_id,tunnel_id,device_group_id,expires_at) \
+         VALUES(830,?,830,unixepoch()+600)",
+    )
+    .bind(tunnel_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        db.delete_user_cascade(uid).await,
+        Err(DbError::UserOwnedTunnelConflict {
+            tunnels: 1,
+            rules: 1,
+        })
+    ));
+    assert!(db.exists_by_id(uid).await.unwrap());
+}
+
+#[tokio::test]
+async fn active_rule_leases_protect_group_mutation_until_expiry() {
+    let db = repo().await;
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,connect_host,token,uid) VALUES \
+         (840,'old-entry','in','old-entry.example','old-entry-token',1), \
+         (841,'old-downstream','out','old-downstream.example','old-downstream-token',1), \
+         (842,'current-entry','in','current-entry.example','current-entry-token',1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let tunnel_id = sqlx::query(
+        "INSERT INTO tunnels(name,enabled,shared,uid) VALUES('old-entry-carrier',1,0,1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id,name,uid,listen_port,device_group_in,target_addr,target_port) \
+         VALUES(840,'lease-protected-rule',1,38400,842,'127.0.0.1',80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rule_retired_entries(rule_id,tunnel_id,device_group_id,expires_at) \
+         VALUES(840,?,840,unixepoch()+600)",
+    )
+    .bind(tunnel_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rule_route_transitions \
+         (rule_id,device_group_id,listen_port,protocol,expires_at) \
+         VALUES(840,841,38401,'tcp',unixepoch()+600)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        db.update_group_fields(
+            840,
+            &ResourceScope::All,
+            None,
+            Some("out"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await,
+        Err(DbError::RuleGroupInvariant { entry_rules: 1, .. })
+    ));
+    assert!(matches!(
+        db.update_group_fields(
+            841,
+            &ResourceScope::All,
+            None,
+            None,
+            Some(" "),
+            None,
+            None,
+            None,
+        )
+        .await,
+        Err(DbError::RuleGroupInvariant {
+            downstream_rules: 1,
+            ..
+        })
+    ));
+    for id in [840, 841] {
+        assert!(matches!(
+            db.delete_group_checked(id).await.unwrap(),
+            GroupDeleteOutcome::InUse { rule_count: 1, .. }
+        ));
+    }
+
+    sqlx::query("UPDATE forward_rule_retired_entries SET expires_at=unixepoch()-1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE forward_rule_route_transitions SET expires_at=unixepoch()-1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.update_group_fields(
+            840,
+            &ResourceScope::All,
+            None,
+            Some("out"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.update_group_fields(
+            841,
+            &ResourceScope::All,
+            None,
+            None,
+            Some(" "),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.delete_group_checked(840).await.unwrap(),
+        GroupDeleteOutcome::Deleted
+    );
+    assert_eq!(
+        db.delete_group_checked(841).await.unwrap(),
+        GroupDeleteOutcome::Deleted
     );
 }
 
@@ -1549,11 +1912,15 @@ async fn rule_list_active_for_config_filters_banned_paused_overquota() {
     // Seed a second user (non-admin) with a group + rule.
     db.insert_user("alice", "h", 1).await.unwrap();
     let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query("UPDATE users SET all_device_groups = 1 WHERE id = ?")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO device_groups (id, name, group_type, token, uid) \
-         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+         VALUES (50, 'gin', 'in', 'tok-50', 1)",
     )
-    .bind(alice)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -1660,6 +2027,19 @@ async fn group_insert_then_find_by_token_round_trip() {
     // Unknown token → None.
     assert!(db.find_by_token("nope").await.unwrap().is_none());
 
+    seed_user(&db, 2, false).await;
+    seed_group_typed(&db, 999, 2, "out").await;
+    assert!(
+        db.find_by_token("tok-999").await.unwrap().is_none(),
+        "historical regular-owned node credentials must fail closed"
+    );
+    assert!(!db
+        .list_group_credential_revisions()
+        .await
+        .unwrap()
+        .iter()
+        .any(|(group_id, _)| *group_id == 999));
+
     // find_name_by_id returns the name.
     assert_eq!(
         db.find_name_by_id(g.id, &ResourceScope::All)
@@ -1707,9 +2087,8 @@ async fn traffic_batch_applies_to_rule_and_user() {
     let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
     sqlx::query(
         "INSERT INTO device_groups (id, name, group_type, token, uid) \
-         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+         VALUES (50, 'gin', 'in', 'tok-50', 1)",
     )
-    .bind(alice)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -1747,6 +2126,57 @@ async fn traffic_batch_applies_to_rule_and_user() {
         .unwrap();
     assert_eq!(rule_t.0, 3000);
     assert_eq!(user_t.0, 3000);
+}
+
+#[tokio::test]
+async fn concurrent_traffic_batches_serialize_and_preserve_both_deltas() {
+    let (db, path) = concurrent_repo("traffic").await;
+    seed_group(&db, 50).await;
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id,name,uid,listen_port,device_group_in,target_addr,target_port) \
+         VALUES(100,'concurrent-traffic',1,20000,50,'127.0.0.1',80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let db_a = SqliteRepository::new(db.pool.clone());
+    let db_b = SqliteRepository::new(db.pool.clone());
+
+    let (first, second) = tokio::join!(
+        db_a.apply_traffic_batch(
+            50,
+            &[TrafficEntry {
+                rule_id: 100,
+                upload: 10,
+                download: 5,
+            }],
+        ),
+        db_b.apply_traffic_batch(
+            50,
+            &[TrafficEntry {
+                rule_id: 100,
+                upload: 20,
+                download: 10,
+            }],
+        ),
+    );
+    for result in [first, second] {
+        assert!(matches!(result.as_deref(), Ok([TrafficEntryResult::Ok])));
+    }
+    let rule_traffic: i64 =
+        sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id=100")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let user_traffic: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_traffic, 45);
+    assert_eq!(user_traffic, 45);
+
+    cleanup_concurrent_repo(db, &path).await;
 }
 
 #[tokio::test]
@@ -2280,6 +2710,16 @@ async fn find_profile_by_id_builtin_only_excludes_custom() {
         .await
         .unwrap();
     assert!(r.is_some(), "All must return custom profile");
+    assert_eq!(
+        db.update_profile_checked(custom_id, None, Some("tls_simple"), None, None, None, None,)
+            .await
+            .unwrap(),
+        ProfileUpdateOutcome::Updated
+    );
+    assert_eq!(
+        db.delete_profile_checked(custom_id).await.unwrap(),
+        ProfileDeleteOutcome::Deleted
+    );
 }
 
 /// v0.4.11 PR3: Migration 24 NO LONGER pauses cross-owner rules.
@@ -2412,31 +2852,163 @@ async fn migration_does_not_pause_valid_rules() {
     assert_eq!(paused.0, 0, "valid rule must NOT be paused");
 }
 
-/// v0.4.11 PR3: list_active_for_config INCLUDES cross-owner rules (shared inbound).
+/// Runtime configuration must fail closed when an ordinary rule owner no
+/// longer has access to its entry group, including chain and transition data.
 #[tokio::test]
-async fn list_active_for_config_excludes_cross_owner_rule() {
+async fn runtime_config_requires_current_entry_group_authorization() {
     let db = repo().await;
-    // user 2 owns the rule; group 20 is owned by user 1 (admin, seeded).
-    // v0.4.11 PR3: this cross-owner rule IS returned by list_active_for_config
-    // (shared inbound group scenario). The invariant is now enforced at
-    // create_rule time via Migration 24, not filtered here.
     sqlx::query("INSERT INTO users (id, username, password, admin) VALUES (2, 'u2', 'x', 0)")
         .execute(&db.pool)
         .await
         .unwrap();
     sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (20, 'g', 'in', 't', 1)")
         .execute(&db.pool).await.unwrap();
-    sqlx::query("INSERT INTO forward_rules (name, uid, listen_port, device_group_in, target_addr, target_port) \
-                 VALUES ('r', 2, 15003, 20, '127.0.0.1', 80)")
-        .execute(&db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, connect_host, uid) \
+                 VALUES (21, 'out', 'out', 't-out', '192.0.2.21', 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let rule_id = sqlx::query(
+        "INSERT INTO forward_rules \
+        (name, uid, listen_port, route_mode, device_group_in, device_group_out, \
+         forward_mode, target_addr, target_port) \
+        VALUES ('r', 2, 15003, 'chain', 20, 21, 'chain', '127.0.0.1', 80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO forward_rule_hops \
+        (rule_id, position, device_group_id, listen_port) \
+        VALUES (?, 0, 20, 15003), (?, 1, 21, 15004)",
+    )
+    .bind(rule_id)
+    .bind(rule_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rule_route_transitions \
+        (rule_id, device_group_id, listen_port, protocol, activate_at, expires_at) \
+        VALUES (?, 21, 15004, 'tcp', unixepoch() + 60, unixepoch() + 120), \
+               (?, 21, 15005, 'udp', 0, 0)",
+    )
+    .bind(rule_id)
+    .bind(rule_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
 
-    let rules = db.list_active_for_config(20).await.unwrap();
-    // v0.4.11 PR3: cross-owner rule is now included (shared inbound).
+    assert!(db.list_active_for_config(20).await.unwrap().is_empty());
+    assert!(db
+        .list_active_chain_hops_for_group(21)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .list_active_chain_rules_for_group(21)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .list_route_transition_rule_ids_for_group(21)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .list_route_staging_rule_ids_for_group(20)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .list_route_drain_rule_ids_for_group(21)
+        .await
+        .unwrap()
+        .is_empty());
+
+    sqlx::query("INSERT INTO user_device_groups (user_id, device_group_id) VALUES (2, 20)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db.list_active_for_config(20).await.unwrap().len(), 1);
     assert_eq!(
-        rules.len(),
-        1,
-        "shared inbound rule must be returned for config"
+        db.list_active_chain_hops_for_group(21).await.unwrap().len(),
+        1
     );
+    assert_eq!(
+        db.list_active_chain_rules_for_group(21)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.list_route_transition_rule_ids_for_group(21)
+            .await
+            .unwrap(),
+        vec![rule_id]
+    );
+    assert_eq!(
+        db.list_route_staging_rule_ids_for_group(20).await.unwrap(),
+        vec![rule_id]
+    );
+    assert_eq!(
+        db.list_route_drain_rule_ids_for_group(21).await.unwrap(),
+        vec![rule_id]
+    );
+
+    // A malformed historical row must not be emitted by both the reusable
+    // tunnel path and the legacy custom-hop path.
+    sqlx::query(
+        "INSERT INTO tunnels(id,name,enabled,shared,uid) \
+         VALUES(30,'preset',1,1,1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE forward_rules SET tunnel_id=30 WHERE id=?")
+        .bind(rule_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(db
+        .list_active_chain_hops_for_group(21)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .list_active_chain_rules_for_group(21)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Even grant-all cannot revive a legacy entry owned by a regular user.
+    sqlx::query("INSERT INTO users(id,username,password,admin) VALUES(3,'legacy-owner','x',0)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid) \
+         VALUES(22,'legacy-entry','in','legacy-token',3)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE users SET all_device_groups=1 WHERE id=2")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules(name,uid,listen_port,device_group_in,target_addr,target_port) \
+         VALUES('legacy-entry-rule',2,15006,22,'127.0.0.1',80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(db.list_active_for_config(22).await.unwrap().is_empty());
 }
 
 // ── v0.4.10 PR3: app_settings + insert_user_from_plan ──
@@ -2528,7 +3100,7 @@ async fn settings_allowed_plan_ids_round_trip() {
     .unwrap();
 
     // Multi-plan settings round-trip.
-    db.set_system_settings(true, 1, &[1, 2], "My Relay")
+    db.set_system_settings_checked(true, 1, &[1, 2], "My Relay")
         .await
         .unwrap();
     let s = db.get_registration_settings().await.unwrap().unwrap();
@@ -2540,6 +3112,15 @@ async fn settings_allowed_plan_ids_round_trip() {
         "SQLite multi-plan round-trip"
     );
     assert_eq!(s.site_name, "My Relay", "SQLite site-name round-trip");
+
+    let missing = db
+        .set_system_settings_checked(true, 1, &[1, 999_999], "Invalid")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing,
+        RegistrationSettingsWriteError::PlanNotFound(999_999)
+    ));
 
     // Unseeded row insert must also carry allowed_plan_ids.
     sqlx::query("DELETE FROM app_settings WHERE id = 1")
@@ -2587,6 +3168,71 @@ async fn insert_user_from_plan_inherits_quota_and_handles_missing_plan() {
         db.find_by_username("bob").await.unwrap().is_none(),
         "no user should be created for a missing plan"
     );
+}
+
+#[tokio::test]
+async fn checked_user_provisioning_uses_current_registration_settings() {
+    let db = repo().await;
+    let plan2 = db
+        .insert_plan("p2", 12, 2048, "0", "data", 0, false, false, "", false)
+        .await
+        .unwrap();
+    db.set_system_settings_checked(true, 1, &[1], "RelayPanel")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.insert_public_registered_user("blocked", "hash", Some(plan2))
+            .await
+            .unwrap(),
+        UserProvisionOutcome::PlanNotAllowed
+    );
+    assert!(db.find_by_username("blocked").await.unwrap().is_none());
+
+    sqlx::query("UPDATE app_settings SET registration_allowed_plan_ids='not-json' WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.insert_public_registered_user("malformed-settings", "hash", None)
+            .await,
+        Err(DbError::InvalidData(_))
+    ));
+    assert!(db
+        .find_by_username("malformed-settings")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        db.get_registration_settings().await,
+        Err(DbError::InvalidData(_))
+    ));
+    assert!(matches!(
+        db.delete_plan_checked(plan2).await,
+        Err(DbError::InvalidData(_))
+    ));
+    assert!(
+        db.find_plan_by_id(plan2).await.unwrap().is_some(),
+        "a malformed allow-list must block checked deletion instead of guessing"
+    );
+
+    db.set_system_settings_checked(false, plan2, &[plan2], "RelayPanel")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.insert_public_registered_user("disabled", "hash", None)
+            .await
+            .unwrap(),
+        UserProvisionOutcome::RegistrationDisabled
+    );
+    assert_eq!(
+        db.insert_admin_user_from_default("admin-created", "hash")
+            .await
+            .unwrap(),
+        UserProvisionOutcome::Created
+    );
+    let created = db.find_by_username("admin-created").await.unwrap().unwrap();
+    assert_eq!(created.plan_id, Some(plan2));
+    assert_eq!((created.max_rules, created.traffic_limit), (12, 2048));
 }
 
 /// v1.2 regression: a freshly-registered user has NO usable device groups by
@@ -2689,13 +3335,20 @@ async fn change_own_password_bumps_version_and_clears_must_change() {
     .execute(&db.pool)
     .await
     .unwrap();
-    let n = db.change_own_password(2, "newhash").await.unwrap();
+    let n = db.change_own_password(2, "old", "newhash").await.unwrap();
     assert_eq!(n, 1);
     let s = db.find_auth_state_by_id(2).await.unwrap().unwrap();
     assert_eq!(s.1, 4, "token_version must increment");
     assert!(!s.2, "must_change_password must be cleared");
     let pw = db.find_password_by_id(2).await.unwrap().unwrap();
     assert_eq!(pw, "newhash");
+    assert_eq!(
+        db.change_own_password(2, "old", "stale-write")
+            .await
+            .unwrap(),
+        0,
+        "a request that verified the previous hash must not overwrite the new password"
+    );
 }
 
 /// admin_reset_password bumps token_version and sets must_change_password
@@ -2710,11 +3363,28 @@ async fn admin_reset_password_bumps_version_and_sets_must_change() {
     .execute(&db.pool)
     .await
     .unwrap();
-    let n = db.admin_reset_password(2, "temphash", true).await.unwrap();
+    let n = db
+        .admin_reset_password(1, 2, "temphash", true)
+        .await
+        .unwrap();
     assert_eq!(n, 1);
     let s = db.find_auth_state_by_id(2).await.unwrap().unwrap();
     assert_eq!(s.1, 1, "token_version must increment");
     assert!(s.2, "must_change_password must be set true");
+
+    sqlx::query("UPDATE users SET admin = 1 WHERE id = 2")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let n = db
+        .admin_reset_password(1, 2, "must-not-land", false)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "a different administrator is protected in the UPDATE");
+    assert_eq!(
+        db.find_password_by_id(2).await.unwrap().as_deref(),
+        Some("temphash")
+    );
 }
 
 /// Banning a user (update_user_fields banned=true) bumps token_version so
@@ -3164,8 +3834,8 @@ async fn shared_groups_admin_inbound_only() {
     assert_eq!(shared[0].id, 10);
     assert_eq!(
         db.list_all_inbound_group_ids().await.unwrap(),
-        vec![10, 20],
-        "grant-all includes every inbound-capable group, regardless of owner"
+        vec![10],
+        "grant-all must exclude historical regular-user-owned groups"
     );
 
     // admin caller gets empty list.
@@ -3372,11 +4042,15 @@ async fn traffic_batch_rate_1_5_rounds_correctly() {
 async fn seed_active_rule(db: &SqliteRepository) -> i64 {
     db.insert_user("alice", "h", 1).await.unwrap();
     let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query("UPDATE users SET all_device_groups = 1 WHERE id = ?")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO device_groups (id, name, group_type, token, uid) \
-         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+         VALUES (50, 'gin', 'in', 'tok-50', 1)",
     )
-    .bind(alice)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -3504,6 +4178,43 @@ async fn seed_buyer_and_plan(
 }
 
 #[tokio::test]
+async fn concurrent_plan_purchases_serialize_without_busy_snapshot_errors() {
+    let (db, path) = concurrent_repo("buy-plan").await;
+    let (alice, pid) = seed_buyer_and_plan(&db, "10.00", 1_000, "6.00", 0, false).await;
+    let db_a = SqliteRepository::new(db.pool.clone());
+    let db_b = SqliteRepository::new(db.pool.clone());
+
+    let (first, second) = tokio::join!(
+        db_a.buy_plan(alice, pid, "p1", 600, 1_000, 10, 0, false, false, &[], &[],),
+        db_b.buy_plan(alice, pid, "p1", 600, 1_000, 10, 0, false, false, &[], &[],),
+    );
+    let outcomes = [first, second];
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(result, Err(BuyPlanError::InsufficientBalance)))
+            .count(),
+        1,
+        "the second writer must observe the committed deduction"
+    );
+    let balance: String = sqlx::query_scalar("SELECT balance FROM users WHERE id=?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE user_id=?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(relay_shared::money::balance_to_cents(&balance), Some(400));
+    assert_eq!(orders, 1);
+
+    cleanup_concurrent_repo(db, &path).await;
+}
+
+#[tokio::test]
 async fn buy_plan_stacks_traffic_and_charges_balance() {
     let db = repo().await;
     // alice has 100.00 balance, 500 existing traffic_limit; plan costs 30.00,
@@ -3591,6 +4302,52 @@ async fn buy_plan_reset_traffic_zeros_usage() {
 }
 
 #[tokio::test]
+async fn buy_plan_quota_overflow_rolls_back_without_sqlite_numeric_promotion() {
+    let db = repo().await;
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", i64::MAX, "10.00", 0, false).await;
+    sqlx::query("UPDATE users SET plan_id = ?, traffic_limit = 1 WHERE id = ?")
+        .bind(pid)
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let result = db
+        .buy_plan(
+            alice,
+            pid,
+            "p1",
+            1000,
+            i64::MAX,
+            10,
+            0,
+            false,
+            false,
+            &[],
+            &[],
+        )
+        .await;
+    assert!(matches!(result, Err(BuyPlanError::QuotaOverflow)));
+
+    let (balance, traffic_limit): (String, i64) =
+        sqlx::query_as("SELECT balance, traffic_limit FROM users WHERE id = ?")
+            .bind(alice)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(balance, "100.00");
+    assert_eq!(traffic_limit, 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM orders WHERE user_id = ?")
+            .bind(alice)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn buy_plan_insufficient_balance_is_rejected_and_rolls_back() {
     let db = repo().await;
     // alice has 5.00; plan costs 30.00 → must refuse and leave state untouched.
@@ -3631,6 +4388,135 @@ async fn buy_plan_insufficient_balance_is_rejected_and_rolls_back() {
     assert_eq!(plan_id, None);
     let orders: Vec<relay_shared::models::Order> = db.list_orders_by_user(alice).await.unwrap();
     assert_eq!(orders.len(), 0, "no order row on insufficient balance");
+}
+
+#[tokio::test]
+async fn guarded_buy_rejects_a_plan_changed_after_the_caller_snapshot() {
+    let db = repo().await;
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1_000_000, "30.00", 0, false).await;
+    sqlx::query("UPDATE plans SET price = '40.00' WHERE id = ?")
+        .bind(pid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let err = db
+        .buy_plan_guarded(
+            alice,
+            pid,
+            "p1",
+            3000,
+            1_000_000,
+            10,
+            0,
+            false,
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BuyPlanError::PlanChanged));
+
+    let balance: String = sqlx::query_scalar("SELECT balance FROM users WHERE id = ?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(balance, "100.00");
+    assert!(db.list_orders_by_user(alice).await.unwrap().is_empty());
+
+    // The plan catalog can be fresh while the target user's association is
+    // stale. An admin assignment must reject that independently and not charge.
+    sqlx::query("UPDATE plans SET price = '30.00' WHERE id = ?")
+        .bind(pid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET plan_id = ? WHERE id = ?")
+        .bind(pid)
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let err = db
+        .buy_plan_guarded(
+            alice,
+            pid,
+            "p1",
+            3000,
+            1_000_000,
+            10,
+            0,
+            false,
+            false,
+            &[],
+            &[],
+            false,
+            Some(None),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BuyPlanError::UserPlanChanged));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT balance FROM users WHERE id = ?")
+            .bind(alice)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        "100.00"
+    );
+    assert!(db.list_orders_by_user(alice).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn guarded_buy_rejects_historical_unusable_plan_grants_before_charging() {
+    let db = repo().await;
+    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1_000_000, "30.00", 0, false).await;
+    sqlx::query(
+        "INSERT INTO device_groups(id,name,group_type,token,uid) \
+         VALUES(9901,'legacy-plan-group','in','legacy-plan-token',?)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO plan_device_groups(plan_id,device_group_id) VALUES(?,9901)")
+        .bind(pid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let err = db
+        .buy_plan_guarded(
+            alice,
+            pid,
+            "p1",
+            3000,
+            1_000_000,
+            10,
+            0,
+            false,
+            false,
+            &[9901],
+            &[9901],
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BuyPlanError::PlanChanged));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT balance FROM users WHERE id=?")
+            .bind(alice)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        "100.00"
+    );
+    assert!(db.list_orders_by_user(alice).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -3886,6 +4772,7 @@ async fn plan_crud_round_trip_and_delete_blocked_when_in_use() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap(),
@@ -3910,6 +4797,7 @@ async fn plan_crud_round_trip_and_delete_blocked_when_in_use() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -3922,7 +4810,10 @@ async fn plan_crud_round_trip_and_delete_blocked_when_in_use() {
 
     // count_users_on_plan = 0 → delete succeeds.
     assert_eq!(db.count_users_on_plan(pid).await.unwrap(), 0);
-    assert_eq!(db.delete_plan(pid).await.unwrap(), 1);
+    assert_eq!(
+        db.delete_plan_checked(pid).await.unwrap(),
+        PlanDeleteOutcome::Deleted
+    );
     assert!(db.find_plan_by_id(pid).await.unwrap().is_none());
 
     // Recreate + assign a user → delete still 0 rows would be wrong; instead
@@ -3940,6 +4831,10 @@ async fn plan_crud_round_trip_and_delete_blocked_when_in_use() {
         .await
         .unwrap();
     assert_eq!(db.count_users_on_plan(pid2).await.unwrap(), 1);
+    assert_eq!(
+        db.delete_plan_checked(pid2).await.unwrap(),
+        PlanDeleteOutcome::InUse { users: 1 }
+    );
 }
 
 // ── v1.0.9: plan ↔ device-group grants + purchase authorization ──
@@ -3986,6 +4881,118 @@ async fn create_plan_with_groups_persists_plan_and_grants() {
     assert_eq!(db.list_plan_device_groups(id).await.unwrap(), vec![60, 61]);
 }
 
+#[tokio::test]
+async fn update_plan_fields_rolls_back_scalars_when_grant_replacement_fails() {
+    let db = repo().await;
+    seed_device_group(&db, 62, 1).await;
+    let id = db
+        .create_plan_with_groups(
+            "atomic-update",
+            5,
+            1000,
+            "5.00",
+            "data",
+            0,
+            false,
+            false,
+            "d",
+            false,
+            &[62],
+        )
+        .await
+        .unwrap();
+
+    let result = db
+        .update_plan_fields(
+            id,
+            Some("must-roll-back"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[999_999]),
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        db.find_plan_by_id(id).await.unwrap().unwrap().name,
+        "atomic-update"
+    );
+    assert_eq!(db.list_plan_device_groups(id).await.unwrap(), vec![62]);
+}
+
+#[tokio::test]
+async fn update_plan_fields_enforces_type_duration_invariant_atomically() {
+    let db = repo().await;
+    let data_id = db
+        .insert_plan(
+            "data-zero",
+            5,
+            1000,
+            "5.00",
+            "data",
+            0,
+            false,
+            false,
+            "",
+            false,
+        )
+        .await
+        .unwrap();
+    let to_time = db
+        .update_plan_fields(
+            data_id,
+            None,
+            None,
+            None,
+            None,
+            Some("time"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(to_time, Err(DbError::PlanInvariant)));
+
+    let time_id = db
+        .insert_plan(
+            "time-ten", 5, 1000, "5.00", "time", 10, false, false, "", false,
+        )
+        .await
+        .unwrap();
+    let zero_duration = db
+        .update_plan_fields(
+            time_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(zero_duration, Err(DbError::PlanInvariant)));
+    let stored = db.find_plan_by_id(time_id).await.unwrap().unwrap();
+    assert_eq!(
+        (stored.plan_type.as_str(), stored.duration_days),
+        ("time", 10)
+    );
+}
+
 /// v1.0.9: clear_user_plan nulls the plan, revokes device-group authorization
 /// (flag + explicit rows) and system-pauses the user's active rules — all in
 /// one transaction. Admin targets are a no-op.
@@ -3993,7 +5000,7 @@ async fn create_plan_with_groups_persists_plan_and_grants() {
 async fn clear_user_plan_revokes_groups_and_pauses_rules() {
     let db = repo().await;
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
-    seed_device_group(&db, 70, alice).await;
+    seed_device_group(&db, 70, 1).await;
     sqlx::query("UPDATE users SET plan_id = ?, all_device_groups = 1 WHERE id = ?")
         .bind(pid)
         .bind(alice)
@@ -4010,8 +5017,11 @@ async fn clear_user_plan_revokes_groups_and_pauses_rules() {
     .await
     .unwrap();
 
-    let affected = db.clear_user_plan(alice).await.unwrap();
-    assert_eq!(affected, 1);
+    let outcome = db
+        .admin_edit_user_plan(alice, pid, true, None)
+        .await
+        .unwrap();
+    assert_eq!(outcome, AdminUserPlanEditOutcome::Updated);
 
     let (plan_id, all): (Option<i64>, bool) =
         sqlx::query_as("SELECT plan_id, all_device_groups FROM users WHERE id = ?")
@@ -4030,16 +5040,19 @@ async fn clear_user_plan_revokes_groups_and_pauses_rules() {
     assert!(paused && auto, "rule must be system-paused after clear");
 
     // Admin target (id 1) is a no-op.
-    assert_eq!(db.clear_user_plan(1).await.unwrap(), 0);
+    assert_eq!(
+        db.admin_edit_user_plan(1, pid, true, None).await.unwrap(),
+        AdminUserPlanEditOutcome::AdminTarget
+    );
 }
 
 #[tokio::test]
 async fn plan_device_groups_round_trip_and_replace() {
     let db = repo().await;
-    let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
-    seed_device_group(&db, 50, alice).await;
-    seed_device_group(&db, 51, alice).await;
-    seed_device_group(&db, 52, alice).await;
+    let (_alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
+    seed_device_group(&db, 50, 1).await;
+    seed_device_group(&db, 51, 1).await;
+    seed_device_group(&db, 52, 1).await;
 
     db.set_plan_device_groups(pid, &[50, 51]).await.unwrap();
     assert_eq!(db.list_plan_device_groups(pid).await.unwrap(), vec![50, 51]);
@@ -4051,6 +5064,10 @@ async fn plan_device_groups_round_trip_and_replace() {
     // Duplicate ids in the input are deduped by the PK.
     db.set_plan_device_groups(pid, &[50, 50, 51]).await.unwrap();
     assert_eq!(db.list_plan_device_groups(pid).await.unwrap(), vec![50, 51]);
+    assert!(matches!(
+        db.set_plan_device_groups(999_999, &[50]).await,
+        Err(DbError::NotFound)
+    ));
 }
 
 /// v1.0.8: purchase REPLACES authorization, so a group the user already had
@@ -4061,8 +5078,8 @@ async fn plan_device_groups_round_trip_and_replace() {
 async fn buy_plan_new_authorized_set_has_no_duplicate_groups() {
     let db = repo().await;
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
-    seed_device_group(&db, 50, alice).await;
-    seed_device_group(&db, 51, alice).await;
+    seed_device_group(&db, 50, 1).await;
+    seed_device_group(&db, 51, 1).await;
     // Alice already has group 50 from a prior purchase.
     db.set_user_device_groups(alice, &[50]).await.unwrap();
     // Plan grants 50 (overlaps the existing grant) + 51 (new).
@@ -4107,9 +5124,9 @@ async fn buy_plan_new_authorized_set_has_no_duplicate_groups() {
 async fn buy_plan_replaces_authorization_clears_old_groups() {
     let db = repo().await;
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
-    seed_device_group(&db, 50, alice).await;
-    seed_device_group(&db, 51, alice).await;
-    seed_device_group(&db, 52, alice).await;
+    seed_device_group(&db, 50, 1).await;
+    seed_device_group(&db, 51, 1).await;
+    seed_device_group(&db, 52, 1).await;
     // Alice previously had groups 50 and 51.
     db.set_user_device_groups(alice, &[50, 51]).await.unwrap();
     // Plan grants only group 52.
@@ -4160,8 +5177,8 @@ async fn buy_plan_replaces_authorization_clears_old_groups() {
 async fn buy_plan_grant_all_then_per_group_resets_all_flag() {
     let db = repo().await;
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
-    seed_device_group(&db, 50, alice).await;
-    seed_device_group(&db, 52, alice).await;
+    seed_device_group(&db, 50, 1).await;
+    seed_device_group(&db, 52, 1).await;
 
     // 1) Buy a grant-all plan → all_device_groups = 1.
     db.buy_plan(alice, pid, "all", 100, 1000, 10, 0, false, true, &[], &[])
@@ -4212,8 +5229,8 @@ async fn buy_plan_grant_all_then_per_group_resets_all_flag() {
 async fn buy_plan_resumes_auto_paused_rules_when_group_reauthorized() {
     let db = repo().await;
     let (alice, pid_a) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
-    seed_device_group(&db, 50, alice).await;
-    seed_device_group(&db, 51, alice).await;
+    seed_device_group(&db, 50, 1).await;
+    seed_device_group(&db, 51, 1).await;
     let pid_b = db
         .insert_plan("pB", 10, 1000, "5.00", "data", 0, false, false, "", false)
         .await
@@ -4305,8 +5322,8 @@ async fn buy_plan_resumes_auto_paused_rules_when_group_reauthorized() {
 async fn buy_plan_does_not_resume_manually_paused_rules() {
     let db = repo().await;
     let (alice, pid_a) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
-    seed_device_group(&db, 50, alice).await;
-    seed_device_group(&db, 51, alice).await;
+    seed_device_group(&db, 50, 1).await;
+    seed_device_group(&db, 51, 1).await;
     let pid_b = db
         .insert_plan("pB", 10, 1000, "5.00", "data", 0, false, false, "", false)
         .await
@@ -4420,10 +5437,21 @@ async fn buy_plan_does_not_resume_manually_paused_rules() {
 async fn buy_plan_grant_all_sets_flag() {
     let db = repo().await;
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
+    seed_device_group(&db, 50, 1).await;
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id,name,uid,listen_port,device_group_in,target_addr,target_port,paused,auto_paused) VALUES \
+         (210,'active',?,20210,50,'127.0.0.1',80,0,0), \
+         (211,'system-paused',?,20211,50,'127.0.0.1',80,1,1)",
+    )
+    .bind(alice)
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
 
-    // grant_all_groups=true → set all_device_groups, ignore the explicit list.
-    // new_authorized = all inbound groups (in this test, the only inbound group
-    // is the one created by seed_buyer_and_plan).
+    // grant_all_groups=true must ignore the empty explicit list: active rules
+    // stay active and rules previously system-paused for authorization resume.
     db.buy_plan(alice, pid, "p1", 500, 1000, 10, 0, false, true, &[], &[])
         .await
         .unwrap();
@@ -4437,6 +5465,13 @@ async fn buy_plan_grant_all_sets_flag() {
         all.0,
         "grant_all_groups must set the all_device_groups flag"
     );
+    let rule_states: Vec<(i64, bool, bool)> = sqlx::query_as(
+        "SELECT id,paused,auto_paused FROM forward_rules WHERE id IN (210,211) ORDER BY id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rule_states, vec![(210, false, false), (211, false, false)]);
 }
 
 /// v1.0.8: REPLACE semantics — buying a second (different) plan replaces the
@@ -4446,8 +5481,8 @@ async fn buy_plan_grant_all_sets_flag() {
 async fn second_plan_purchase_replaces_first_plan_groups() {
     let db = repo().await;
     let (alice, pid_a) = seed_buyer_and_plan(&db, "100.00", 1000, "5.00", 0, false).await;
-    seed_device_group(&db, 50, alice).await;
-    seed_device_group(&db, 51, alice).await;
+    seed_device_group(&db, 50, 1).await;
+    seed_device_group(&db, 51, 1).await;
     // Second plan.
     let pid_b = db
         .insert_plan("pB", 10, 1000, "5.00", "data", 0, false, false, "", false)
@@ -4517,7 +5552,7 @@ async fn delete_plan_cascades_grant_rows() {
 async fn expiry_does_not_revoke_granted_groups() {
     let db = repo().await;
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 0, "5.00", 30, false).await;
-    seed_device_group(&db, 50, alice).await;
+    seed_device_group(&db, 50, 1).await;
     db.set_plan_device_groups(pid, &[50]).await.unwrap();
 
     // Buy a 30-day time plan that grants group 50.
@@ -4543,7 +5578,7 @@ async fn expiry_does_not_revoke_granted_groups() {
 // ── v1.0.7: admin directly edits a user's plan association + expiry ──
 
 #[tokio::test]
-async fn admin_set_user_plan_clears_and_adjusts_expiry() {
+async fn admin_edit_user_plan_adjusts_expiry_without_rewriting_plan_id() {
     let db = repo().await;
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", 0, "5.00", 30, false).await;
     // Start with a plan + expiry on alice.
@@ -4558,10 +5593,10 @@ async fn admin_set_user_plan_clears_and_adjusts_expiry() {
 
     // Adjust expiry, keep the plan_id.
     assert_eq!(
-        db.admin_set_user_plan(alice, Some(pid), Some("2099-12-31 00:00:00".into()))
+        db.admin_edit_user_plan(alice, pid, false, Some("2099-12-31 00:00:00"))
             .await
             .unwrap(),
-        1
+        AdminUserPlanEditOutcome::Updated
     );
     let (plan_id, expire): (Option<i64>, Option<String>) =
         sqlx::query_as("SELECT plan_id, plan_expire_at FROM users WHERE id = ?")
@@ -4572,27 +5607,37 @@ async fn admin_set_user_plan_clears_and_adjusts_expiry() {
     assert_eq!(plan_id, Some(pid));
     assert_eq!(expire.as_deref(), Some("2099-12-31 00:00:00"));
 
-    // Clear: both columns go NULL.
-    db.admin_set_user_plan(alice, None, None).await.unwrap();
+    // None means no expiry, but must not clear or rewrite the association.
+    db.admin_edit_user_plan(alice, pid, false, None)
+        .await
+        .unwrap();
     let (plan_id2, expire2): (Option<i64>, Option<String>) =
         sqlx::query_as("SELECT plan_id, plan_expire_at FROM users WHERE id = ?")
             .bind(alice)
             .fetch_one(&db.pool)
             .await
             .unwrap();
-    assert_eq!(plan_id2, None);
+    assert_eq!(plan_id2, Some(pid));
     assert_eq!(expire2, None);
+
+    // A stale editor cannot apply an expiry to a different plan.
+    assert_eq!(
+        db.admin_edit_user_plan(alice, pid + 1, false, Some("2099-01-01 00:00:00"))
+            .await
+            .unwrap(),
+        AdminUserPlanEditOutcome::PlanChanged
+    );
 }
 
 #[tokio::test]
-async fn admin_set_user_plan_skips_admin_users() {
+async fn admin_edit_user_plan_skips_admin_users() {
     let db = repo().await;
     // The baseline seeds admin user id 1. Editing an admin's plan must be a no-op.
     let affected = db
-        .admin_set_user_plan(1, None, Some("2099-12-31 00:00:00".into()))
+        .admin_edit_user_plan(1, 1, false, Some("2099-12-31 00:00:00"))
         .await
         .unwrap();
-    assert_eq!(affected, 0, "admin users must be skipped (WHERE admin = 0)");
+    assert_eq!(affected, AdminUserPlanEditOutcome::AdminTarget);
 }
 
 /// v1.2.0: the auto-restart scheduler's query. It must return ONLY rules that
@@ -4848,6 +5893,80 @@ async fn reusable_tunnel_repository_contract() {
         db.delete_tunnel(tunnel_id).await.unwrap(),
         TunnelDeleteOutcome::Deleted
     );
+
+    for (id, name, group_type, host) in [
+        (801, "entry-guard", "in", ""),
+        (802, "exit-guard", "out", "2001:db8::2"),
+    ] {
+        sqlx::query(
+            "INSERT INTO device_groups(id,name,group_type,token,uid,connect_host) \
+             VALUES(?,?,?,?,1,?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(group_type)
+        .bind(format!("guard-token-{id}"))
+        .bind(host)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let rule_id = sqlx::query(
+        "INSERT INTO forward_rules \
+         (name,uid,listen_port,protocol,route_mode,forward_mode,device_group_in,device_group_out,target_addr,target_port) \
+         VALUES ('guarded-rule',1,36102,'tcp','chain','chain',801,802,'203.0.113.8',443)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO forward_rule_hops(rule_id,position,device_group_id,listen_port,tunnel_port) \
+         VALUES(?,0,801,36102,NULL),(?,1,802,36103,36104)",
+    )
+    .bind(rule_id)
+    .bind(rule_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        db.update_group_fields(
+            801,
+            &ResourceScope::All,
+            None,
+            Some("out"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await,
+        Err(DbError::RuleGroupInvariant { entry_rules: 1, .. })
+    ));
+    assert!(matches!(
+        db.update_group_fields(
+            802,
+            &ResourceScope::All,
+            None,
+            None,
+            Some("  "),
+            None,
+            None,
+            None,
+        )
+        .await,
+        Err(DbError::RuleGroupInvariant {
+            downstream_rules: 1,
+            ..
+        })
+    ));
+    let row: (String, String) =
+        sqlx::query_as("SELECT group_type,connect_host FROM device_groups WHERE id=802")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row, ("out".into(), "2001:db8::2".into()));
 }
 
 #[tokio::test]
@@ -5491,11 +6610,14 @@ async fn tunnel_entry_move_uses_previous_state_for_tail_billing_lease() {
 #[tokio::test]
 async fn reusable_tunnel_repository_revalidates_group_roles_inside_write() {
     let db = repo().await;
+    seed_user(&db, 2, false).await;
     sqlx::query(
         "INSERT INTO device_groups (id,name,group_type,token,uid,connect_host) VALUES \
          (711,'invalid-entry','out','invalid-entry-token',1,'192.0.2.11'), \
          (712,'valid-entry','in','valid-entry-token',1,''), \
-         (713,'invalid-exit','out','invalid-exit-token',1,'')",
+         (713,'invalid-exit','out','invalid-exit-token',1,''), \
+         (714,'legacy-user-entry','in','legacy-entry-token',2,''), \
+         (715,'legacy-user-exit','out','legacy-exit-token',2,'192.0.2.15')",
     )
     .execute(&db.pool)
     .await
@@ -5514,11 +6636,56 @@ async fn reusable_tunnel_repository_revalidates_group_roles_inside_write() {
     ));
     assert!(matches!(
         db.create_tunnel_full(
+            "regular-owned-downstream-validation",
+            true,
+            false,
+            1,
+            &[(712, None), (715, Some(36_015))],
+        )
+        .await,
+        Err(DbError::TunnelUnavailable)
+    ));
+    assert!(matches!(
+        db.create_tunnel_full(
             "stale-exit-validation",
             true,
             false,
             1,
             &[(712, None), (713, Some(36_012))],
+        )
+        .await,
+        Err(DbError::TunnelUnavailable)
+    ));
+    assert!(matches!(
+        db.create_tunnel_full(
+            "regular-owned-entry-validation",
+            true,
+            false,
+            1,
+            &[(714, None), (711, Some(36_013))],
+        )
+        .await,
+        Err(DbError::TunnelUnavailable)
+    ));
+
+    let tunnel_id = db
+        .create_tunnel_full(
+            "valid-route",
+            true,
+            false,
+            1,
+            &[(712, None), (711, Some(36_014))],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.update_tunnel_full(
+            tunnel_id,
+            None,
+            None,
+            None,
+            Some(&[(714, None), (711, Some(36_014))]),
+            Some(&[(712, None), (711, Some(36_014))]),
         )
         .await,
         Err(DbError::TunnelUnavailable)

@@ -142,6 +142,10 @@ export default function MainLayout() {
       message.success(t('passwordChanged'));
       setChangePwOpen(false);
       pwForm.resetFields();
+      // The backend bumps token_version on a successful password change, so
+      // this session is already revoked. Leave immediately instead of waiting
+      // for an unrelated next request to discover the 401.
+      logout();
     } catch {
       message.error(t('passwordChangeFailed'));
     } finally {
@@ -210,7 +214,7 @@ export default function MainLayout() {
             />
             <span className="rp-header-divider" />
             <Dropdown menu={{ items: userMenu }} trigger={['click']} placement="bottomRight">
-              <div className="rp-user-chip" role="button" tabIndex={0}>
+              <button type="button" className="rp-user-chip" aria-label={user?.username || t('user')}>
                 <Avatar
                   size={30}
                   style={{
@@ -226,7 +230,7 @@ export default function MainLayout() {
                   <span className="rp-user-chip-name">{user?.username || t('user')}</span>
                   <span className="rp-user-chip-role">{isAdmin ? t('admin') : t('user')}</span>
                 </span>
-              </div>
+              </button>
             </Dropdown>
           </div>
         </Header>
@@ -245,13 +249,17 @@ export default function MainLayout() {
       <Modal
         title={t('changePassword')}
         open={changePwOpen}
-        onCancel={() => { setChangePwOpen(false); pwForm.resetFields(); }}
+        onCancel={() => { if (!pwSubmitting) { setChangePwOpen(false); pwForm.resetFields(); } }}
         onOk={() => pwForm.submit()}
         okText={t('save')}
         cancelText={t('cancel')}
         confirmLoading={pwSubmitting}
+        closable={!pwSubmitting}
+        mask={{ closable: !pwSubmitting }}
+        keyboard={!pwSubmitting}
+        cancelButtonProps={{ disabled: pwSubmitting }}
       >
-        <Form form={pwForm} onFinish={handleChangePassword} layout="vertical">
+        <Form form={pwForm} onFinish={handleChangePassword} layout="vertical" disabled={pwSubmitting}>
           <Form.Item
             name="current_password"
             label={t('currentPassword')}

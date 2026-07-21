@@ -73,6 +73,12 @@ export const zhCN = {
   refresh: '刷新',
   select: '请选择',
   search: '搜索',
+  searchUsers: '搜索用户名或用户 ID',
+  filterUserStatus: '筛选用户状态',
+  allStatuses: '全部状态',
+  searchRules: '搜索规则名称、端口或目标地址',
+  backToLogin: '返回登录',
+  insufficientBalance: '余额不足，请联系管理员充值后再购买',
 
   // Common fields
   id: 'ID',
@@ -301,6 +307,7 @@ export const zhCN = {
   trafficLimitGb: '流量额度（GB）',
   trafficLimitGbHint: '0 表示不限量；按 GB 录入，保存时换算为字节。',
   trafficLimitNonNegative: '流量额度不能为负数',
+  trafficLimitTooLarge: '流量额度超过浏览器可安全处理的最大值',
   balanceHint: '非负十进制金额，最多两位小数，最大 9999999999.99。后端会再次校验。',
   balanceRequired: '请输入余额',
   balanceInvalid: '余额必须是非负十进制数字（例如 0、12、12.34），最多两位小数',

@@ -109,6 +109,18 @@ impl PlanRepository for SqliteRepository {
         .await?;
         let id = result.last_insert_rowid();
         for dg in device_group_ids {
+            let valid: Option<i64> = sqlx::query_scalar(
+                "SELECT dg.id FROM device_groups dg \
+                 JOIN users u ON u.id = dg.uid \
+                 WHERE dg.id = ? AND dg.group_type IN ('in', 'both') AND u.admin = 1",
+            )
+            .bind(dg)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if valid.is_none() {
+                tx.rollback().await?;
+                return Err(DbError::PlanDeviceGroupInvalid);
+            }
             sqlx::query(
                 "INSERT OR IGNORE INTO plan_device_groups (plan_id, device_group_id) \
                  VALUES (?, ?)",
@@ -136,7 +148,16 @@ impl PlanRepository for SqliteRepository {
         reset_traffic: Option<bool>,
         description: Option<&str>,
         grant_all_groups: Option<bool>,
+        device_group_ids: Option<&[i64]>,
     ) -> Result<u64, DbError> {
+        if duration_days.is_some_and(|days| days < 0)
+            || (plan_type == Some("time") && duration_days.is_some_and(|days| days == 0))
+        {
+            return Err(DbError::PlanInvariant);
+        }
+        let require_positive_duration = plan_type == Some("time") && duration_days.is_none();
+        let require_non_time_plan = plan_type.is_none() && duration_days == Some(0);
+        let has_invariant_guard = require_positive_duration || require_non_time_plan;
         let mut sets: Vec<&str> = Vec::new();
         if name.is_some() {
             sets.push("name = ?");
@@ -169,46 +190,113 @@ impl PlanRepository for SqliteRepository {
             sets.push("grant_all_groups = ?");
         }
 
-        if sets.is_empty() {
+        // A group-only edit reads the plan before replacing child rows. Acquire
+        // SQLite's writer reservation up front so it cannot fail while
+        // upgrading a stale read snapshot under a concurrent purchase/edit.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rows_affected = if sets.is_empty() {
+            let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM plans WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if exists.is_some() {
+                1
+            } else {
+                0
+            }
+        } else {
+            let invariant_sql = if require_positive_duration {
+                " AND duration_days > 0"
+            } else if require_non_time_plan {
+                " AND plan_type <> 'time'"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "UPDATE plans SET {} WHERE id = ?{}",
+                sets.join(", "),
+                invariant_sql
+            );
+            let mut q = sqlx::query(&sql);
+            if let Some(v) = name {
+                q = q.bind(v);
+            }
+            if let Some(v) = max_rules {
+                q = q.bind(v);
+            }
+            if let Some(v) = traffic {
+                q = q.bind(v);
+            }
+            if let Some(v) = price {
+                q = q.bind(v);
+            }
+            if let Some(v) = plan_type {
+                q = q.bind(v);
+            }
+            if let Some(v) = duration_days {
+                q = q.bind(v);
+            }
+            if let Some(v) = hidden {
+                q = q.bind(v);
+            }
+            if let Some(v) = reset_traffic {
+                q = q.bind(v);
+            }
+            if let Some(v) = description {
+                q = q.bind(v);
+            }
+            if let Some(v) = grant_all_groups {
+                q = q.bind(v);
+            }
+            q.bind(id).execute(&mut *tx).await?.rows_affected()
+        };
+
+        if rows_affected == 0 {
+            if has_invariant_guard {
+                let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM plans WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                if exists.is_some() {
+                    tx.rollback().await?;
+                    return Err(DbError::PlanInvariant);
+                }
+            }
+            tx.rollback().await?;
             return Ok(0);
         }
 
-        let sql = format!("UPDATE plans SET {} WHERE id = ?", sets.join(", "));
-        let mut q = sqlx::query(&sql);
-        if let Some(v) = name {
-            q = q.bind(v);
+        if let Some(group_ids) = device_group_ids {
+            sqlx::query("DELETE FROM plan_device_groups WHERE plan_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            for group_id in group_ids {
+                let valid: Option<i64> = sqlx::query_scalar(
+                    "SELECT dg.id FROM device_groups dg \
+                     JOIN users u ON u.id = dg.uid \
+                     WHERE dg.id = ? AND dg.group_type IN ('in', 'both') AND u.admin = 1",
+                )
+                .bind(group_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if valid.is_none() {
+                    tx.rollback().await?;
+                    return Err(DbError::PlanDeviceGroupInvalid);
+                }
+                sqlx::query(
+                    "INSERT OR IGNORE INTO plan_device_groups (plan_id, device_group_id) \
+                     VALUES (?, ?)",
+                )
+                .bind(id)
+                .bind(group_id)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
-        if let Some(v) = max_rules {
-            q = q.bind(v);
-        }
-        if let Some(v) = traffic {
-            q = q.bind(v);
-        }
-        if let Some(v) = price {
-            q = q.bind(v);
-        }
-        if let Some(v) = plan_type {
-            q = q.bind(v);
-        }
-        if let Some(v) = duration_days {
-            q = q.bind(v);
-        }
-        if let Some(v) = hidden {
-            q = q.bind(v);
-        }
-        if let Some(v) = reset_traffic {
-            q = q.bind(v);
-        }
-        if let Some(v) = description {
-            q = q.bind(v);
-        }
-        if let Some(v) = grant_all_groups {
-            q = q.bind(v);
-        }
-        q = q.bind(id);
 
-        let result = q.execute(&self.pool).await?;
-        Ok(result.rows_affected())
+        tx.commit().await?;
+        Ok(rows_affected)
     }
 
     async fn delete_plan(&self, id: i64) -> Result<u64, DbError> {
@@ -219,6 +307,81 @@ impl PlanRepository for SqliteRepository {
         Ok(result.rows_affected())
     }
 
+    async fn delete_plan_checked(&self, id: i64) -> Result<PlanDeleteOutcome, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        macro_rules! try_sql {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(DbError::from(error));
+                    }
+                }
+            };
+        }
+        macro_rules! reject {
+            ($outcome:expr) => {{
+                try_sql!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
+                return Ok($outcome);
+            }};
+        }
+
+        let exists: Option<i64> = try_sql!(
+            sqlx::query_scalar("SELECT id FROM plans WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await
+        );
+        if exists.is_none() {
+            reject!(PlanDeleteOutcome::NotFound);
+        }
+
+        let settings: Option<(i64, String)> = try_sql!(
+            sqlx::query_as(
+                "SELECT default_registration_plan_id, registration_allowed_plan_ids \
+                 FROM app_settings WHERE id = 1",
+            )
+            .fetch_optional(&mut *conn)
+            .await
+        );
+        if let Some((default_plan_id, raw_allowed)) = settings {
+            if default_plan_id == id {
+                reject!(PlanDeleteOutcome::RegistrationDefault);
+            }
+            let allowed_plan_ids = match parse_allowed_plan_ids(&raw_allowed) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    try_sql!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
+                    return Err(error);
+                }
+            };
+            if allowed_plan_ids.contains(&id) {
+                reject!(PlanDeleteOutcome::RegistrationAllowed);
+            }
+        }
+
+        let users: i64 = try_sql!(
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE plan_id = ?")
+                .bind(id)
+                .fetch_one(&mut *conn)
+                .await
+        );
+        if users > 0 {
+            reject!(PlanDeleteOutcome::InUse { users });
+        }
+
+        try_sql!(
+            sqlx::query("DELETE FROM plans WHERE id = ?")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+        );
+        try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
+        Ok(PlanDeleteOutcome::Deleted)
+    }
+
     async fn count_users_on_plan(&self, plan_id: i64) -> Result<i64, DbError> {
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE plan_id = ?")
             .bind(plan_id)
@@ -227,15 +390,12 @@ impl PlanRepository for SqliteRepository {
         Ok(row.0)
     }
 
-    // v1.0.8: atomic plan purchase. This opens a DEFERRED transaction
-    // (pool.begin()); the write lock is acquired lazily on the first write
-    // (the UPDATE below), not at BEGIN. SQLite serializes writers, so under
-    // concurrent purchases the second writer either blocks briefly or fails
-    // with SQLITE_BUSY (the caller retries) — never a double-deduction,
-    // because the balance read + deduct + write all run inside this one tx
-    // against a consistent snapshot. (PG uses an explicit SELECT ... FOR
-    // UPDATE row lock instead; see the PG impl.)
-    async fn buy_plan(
+    // Atomic plan purchase. BEGIN IMMEDIATE reserves the single SQLite writer
+    // before any plan/balance reads. A concurrent purchase waits, then reads
+    // the committed balance instead of trying to upgrade a stale WAL snapshot
+    // and surfacing SQLITE_BUSY_SNAPSHOT as an HTTP 500. (PG uses an explicit
+    // SELECT ... FOR UPDATE row lock instead; see the PG impl.)
+    async fn buy_plan_impl(
         &self,
         user_id: i64,
         plan_id: i64,
@@ -249,25 +409,123 @@ impl PlanRepository for SqliteRepository {
         device_group_ids: &[i64],
         // v1.0.8: the NEW authorized group set AFTER purchase. Used inside the
         // transaction to pause rules outside this set (replacement semantics).
-        // Computed by the caller: all inbound groups if grant_all_groups, else
-        // device_group_ids (the plan's grants).
+        // Explicit authorization snapshot for per-group plans. Grant-all is
+        // derived from current group state inside this transaction.
         new_authorized_group_ids: &[i64],
+        require_visible: bool,
+        check_plan_snapshot: bool,
+        expected_current_plan_id: Option<Option<i64>>,
     ) -> Result<(), BuyPlanError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        // Lock the purchase to one coherent plan snapshot. The handler resolves
+        // display/validation fields before entering this transaction; compare
+        // them again here so an intervening admin edit cannot mix a new plan id
+        // with an old price, quota, duration, or grant set.
+        if check_plan_snapshot {
+            let current_plan: Option<(String, String, i64, i32, String, i32, bool, bool, bool)> =
+                sqlx::query_as(
+                    "SELECT name, price, traffic, max_rules, plan_type, duration_days, \
+                        reset_traffic, grant_all_groups, hidden \
+                 FROM plans WHERE id = ?",
+                )
+                .bind(plan_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some((
+                current_name,
+                current_price,
+                current_traffic,
+                current_max_rules,
+                current_type,
+                current_duration_days,
+                current_reset_traffic,
+                current_grant_all,
+                current_hidden,
+            )) = current_plan
+            else {
+                let _ = tx.rollback().await;
+                return Err(BuyPlanError::PlanChanged);
+            };
+            let current_price_cents = relay_shared::money::balance_to_cents(&current_price)
+                .ok_or_else(|| {
+                    tracing::error!(
+                        "buy_plan: plan {} has non-canonical price {:?}",
+                        plan_id,
+                        current_price
+                    );
+                    BuyPlanError::Database(DbError::NotFound)
+                })?;
+            let effective_current_duration = if current_type == "time" {
+                current_duration_days
+            } else {
+                0
+            };
+            let mut expected_group_ids = device_group_ids.to_vec();
+            expected_group_ids.sort_unstable();
+            expected_group_ids.dedup();
+            let current_group_ids: Vec<i64> = if current_grant_all {
+                Vec::new()
+            } else {
+                sqlx::query_scalar(
+                    "SELECT device_group_id FROM plan_device_groups \
+                 WHERE plan_id = ? ORDER BY device_group_id",
+                )
+                .bind(plan_id)
+                .fetch_all(&mut *tx)
+                .await?
+            };
+            if !current_grant_all {
+                for group_id in &current_group_ids {
+                    let valid: Option<i64> = sqlx::query_scalar(
+                        "SELECT dg.id FROM device_groups dg \
+                         JOIN users owner ON owner.id=dg.uid \
+                         WHERE dg.id=? AND dg.group_type IN ('in','both') \
+                           AND owner.admin=1",
+                    )
+                    .bind(group_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if valid.is_none() {
+                        let _ = tx.rollback().await;
+                        return Err(BuyPlanError::PlanChanged);
+                    }
+                }
+            }
+            let snapshot_changed = (require_visible && current_hidden)
+                || current_name != plan_name
+                || current_price_cents != price_cents
+                || current_traffic != traffic_to_add
+                || current_max_rules != plan_max_rules
+                || effective_current_duration != duration_days
+                || current_reset_traffic != reset_traffic
+                || current_grant_all != grant_all_groups
+                || (!current_grant_all && current_group_ids != expected_group_ids);
+            if snapshot_changed {
+                let _ = tx.rollback().await;
+                return Err(BuyPlanError::PlanChanged);
+            }
+        }
 
         // Read the user's current balance (canonical TEXT) + expiry + plan_id.
         // plan_id decides renew-vs-switch below.
-        let row: Option<(String, Option<String>, Option<i64>)> =
-            sqlx::query_as("SELECT balance, plan_expire_at, plan_id FROM users WHERE id = ?")
-                .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((balance_str, current_expire, current_plan_id)) = row else {
+        let row: Option<(String, Option<String>, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT balance, plan_expire_at, plan_id, traffic_limit FROM users WHERE id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((balance_str, current_expire, current_plan_id, current_traffic_limit)) = row
+        else {
             let _ = tx.rollback().await;
             // A missing user mid-purchase is a DB integrity issue, not a
             // balance issue — surface as a 500.
             return Err(BuyPlanError::Database(DbError::NotFound));
         };
+        if expected_current_plan_id.is_some_and(|expected| expected != current_plan_id) {
+            let _ = tx.rollback().await;
+            return Err(BuyPlanError::UserPlanChanged);
+        }
 
         // Decimal math in integer cents (no floats). balance_to_cents returns
         // None on a non-canonical string — treat that as a data-integrity fault
@@ -296,6 +554,21 @@ impl PlanRepository for SqliteRepository {
         //     the expiry extends from max(now, current) — 加流量/延期.
         // A missing current plan (None) is treated as a switch (fresh start).
         let is_switch = current_plan_id != Some(plan_id);
+        let new_traffic_limit = if is_switch {
+            if traffic_to_add < 0 {
+                let _ = tx.rollback().await;
+                return Err(BuyPlanError::QuotaOverflow);
+            }
+            traffic_to_add
+        } else {
+            match current_traffic_limit.checked_add(traffic_to_add) {
+                Some(value) if value >= 0 => value,
+                _ => {
+                    let _ = tx.rollback().await;
+                    return Err(BuyPlanError::QuotaOverflow);
+                }
+            }
+        };
 
         // Compute the new expiry. duration_days=0 → NULL (no expiry). Stored as
         // 'YYYY-MM-DD HH:MM:SS' UTC (lexically comparable, same as created_at).
@@ -331,7 +604,7 @@ impl PlanRepository for SqliteRepository {
                  WHERE id = ?",
             )
             .bind(&new_balance)
-            .bind(traffic_to_add)
+            .bind(new_traffic_limit)
             .bind(plan_max_rules)
             .bind(plan_id)
             .bind(&new_expire)
@@ -342,12 +615,12 @@ impl PlanRepository for SqliteRepository {
             // Renew + the plan's reset_traffic flag: stack quota, zero usage.
             sqlx::query(
                 "UPDATE users SET \
-                 balance = ?, traffic_limit = traffic_limit + ?, traffic_used = 0, \
+                 balance = ?, traffic_limit = ?, traffic_used = 0, \
                  max_rules = ?, plan_id = ?, plan_expire_at = ? \
                  WHERE id = ?",
             )
             .bind(&new_balance)
-            .bind(traffic_to_add)
+            .bind(new_traffic_limit)
             .bind(plan_max_rules)
             .bind(plan_id)
             .bind(&new_expire)
@@ -358,12 +631,12 @@ impl PlanRepository for SqliteRepository {
             // Renew: stack quota, keep usage.
             sqlx::query(
                 "UPDATE users SET \
-                 balance = ?, traffic_limit = traffic_limit + ?, max_rules = ?, \
+                 balance = ?, traffic_limit = ?, max_rules = ?, \
                  plan_id = ?, plan_expire_at = ? \
                  WHERE id = ?",
             )
             .bind(&new_balance)
-            .bind(traffic_to_add)
+            .bind(new_traffic_limit)
             .bind(plan_max_rules)
             .bind(plan_id)
             .bind(&new_expire)
@@ -392,7 +665,7 @@ impl PlanRepository for SqliteRepository {
         //     with the plan's set. Resetting the flag is the fix for the
         //     grant-all → per-group downgrade case: without it the user kept
         //     all_device_groups=1 and stayed effectively unrestricted.
-        // The caller's new_authorized_group_ids drives the rule-pause below.
+        // The caller's new_authorized_group_ids drives per-group rule pauses.
         if grant_all_groups {
             sqlx::query("UPDATE users SET all_device_groups = 1 WHERE id = ? AND admin = 0")
                 .bind(user_id)
@@ -428,14 +701,16 @@ impl PlanRepository for SqliteRepository {
         // Pause rules outside the new authorization. This is the key change from
         // the old append-only behavior: a new purchase can revoke access to
         // groups the user previously had, and those rules stop forwarding.
-        // When grant_all_groups=true, new_authorized = all inbound groups, so
-        // no rules are paused (the user still has full access).
+        // A grant-all plan must never interpret an empty explicit set as
+        // "authorize nothing"; it skips this pause path entirely.
         // Inline the pause logic inside the transaction (using &mut *tx) to
         // avoid acquiring a separate pool connection while the transaction is
         // still open — that would risk a pool-exhaustion deadlock.
         // v1.0.8: auto_paused=1 marks these as SYSTEM pauses (see the resume
         // step below and the column doc on forward_rules.auto_paused).
-        let n = if new_authorized_group_ids.is_empty() {
+        let n = if grant_all_groups {
+            0
+        } else if new_authorized_group_ids.is_empty() {
             let r = sqlx::query(
                 "UPDATE forward_rules SET paused = 1, auto_paused = 1 \
                  WHERE uid = ? AND paused = 0",
@@ -471,7 +746,28 @@ impl PlanRepository for SqliteRepository {
         // e.g. via the on/off switch) is deliberately left alone even if its
         // group is authorized again — buying a plan must never silently revive
         // a rule the user turned off on purpose.
-        if !new_authorized_group_ids.is_empty() {
+        if grant_all_groups {
+            let resumed = sqlx::query(
+                "UPDATE forward_rules SET paused = 0, auto_paused = 0 \
+                 WHERE uid = ? AND paused = 1 AND auto_paused = 1 \
+                   AND device_group_in IN (\
+                     SELECT dg.id FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+                     WHERE dg.group_type IN ('in', 'both') AND owner.admin=1\
+                   )",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if resumed > 0 {
+                tracing::info!(
+                    "buy_plan: user {} purchased grant-all plan {}, {} previously auto-paused rule(s) resumed",
+                    user_id,
+                    plan_id,
+                    resumed
+                );
+            }
+        } else if !new_authorized_group_ids.is_empty() {
             let placeholders = vec!["?"; new_authorized_group_ids.len()].join(", ");
             let sql = format!(
                 "UPDATE forward_rules SET paused = 0, auto_paused = 0 \
@@ -513,12 +809,37 @@ impl PlanRepository for SqliteRepository {
         device_group_ids: &[i64],
     ) -> Result<(), DbError> {
         // REPLACE the grant set (delete-then-insert, deduped via the PK).
-        let mut tx = self.pool.begin().await?;
+        let mut group_ids = device_group_ids.to_vec();
+        group_ids.sort_unstable();
+        group_ids.dedup();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let plan_exists: Option<i64> = sqlx::query_scalar("SELECT id FROM plans WHERE id = ?")
+            .bind(plan_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if plan_exists.is_none() {
+            tx.rollback().await?;
+            return Err(DbError::NotFound);
+        }
+        for dg_id in &group_ids {
+            let valid: Option<i64> = sqlx::query_scalar(
+                "SELECT dg.id FROM device_groups dg \
+                 JOIN users u ON u.id = dg.uid \
+                 WHERE dg.id = ? AND dg.group_type IN ('in', 'both') AND u.admin = 1",
+            )
+            .bind(dg_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if valid.is_none() {
+                tx.rollback().await?;
+                return Err(DbError::PlanDeviceGroupInvalid);
+            }
+        }
         sqlx::query("DELETE FROM plan_device_groups WHERE plan_id = ?")
             .bind(plan_id)
             .execute(&mut *tx)
             .await?;
-        for dg_id in device_group_ids {
+        for dg_id in &group_ids {
             sqlx::query(
                 "INSERT OR IGNORE INTO plan_device_groups (plan_id, device_group_id) \
                  VALUES (?, ?)",
@@ -535,15 +856,18 @@ impl PlanRepository for SqliteRepository {
 
 // ── Helpers ──
 
-/// Parse the `registration_allowed_plan_ids` TEXT column as a JSON `Vec<i64>`.
-/// Falls back to `[default_plan_id]` on parse failure (dirty data).
-fn parse_allowed_plan_ids(raw: &str, fallback: i64) -> Vec<i64> {
-    serde_json::from_str::<Vec<i64>>(raw).unwrap_or_else(|_| vec![fallback])
+/// Parse the persisted allow-list without inventing a replacement snapshot.
+/// A malformed row is an integrity fault: registration, settings reads, and
+/// checked plan deletion must all fail closed until an administrator repairs it.
+fn parse_allowed_plan_ids(raw: &str) -> Result<Vec<i64>, DbError> {
+    serde_json::from_str::<Vec<i64>>(raw).map_err(|_| {
+        DbError::InvalidData("registration_allowed_plan_ids is not a JSON integer array")
+    })
 }
 
 /// Serialize a `Vec<i64>` to a JSON string.
 fn serialize_allowed_plan_ids(ids: &[i64]) -> String {
-    serde_json::to_string(ids).unwrap_or_else(|_| "[1]".to_string())
+    serde_json::to_string(ids).expect("integer allow-list is JSON-serializable")
 }
 
 #[async_trait]
@@ -555,15 +879,18 @@ impl SettingsRepository for SqliteRepository {
         )
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(enabled, plan_id, raw_allowed, site_name)| {
-            let allowed = parse_allowed_plan_ids(&raw_allowed, plan_id);
-            RegistrationSettings {
-                registration_enabled: enabled,
-                default_registration_plan_id: plan_id,
-                allowed_plan_ids: allowed,
-                site_name,
+        match row {
+            Some((enabled, plan_id, raw_allowed, site_name)) => {
+                let allowed = parse_allowed_plan_ids(&raw_allowed)?;
+                Ok(Some(RegistrationSettings {
+                    registration_enabled: enabled,
+                    default_registration_plan_id: plan_id,
+                    allowed_plan_ids: allowed,
+                    site_name,
+                }))
             }
-        }))
+            None => Ok(None),
+        }
     }
 
     async fn insert_settings_if_absent(
@@ -634,6 +961,75 @@ impl SettingsRepository for SqliteRepository {
         .bind(site_name)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn set_system_settings_checked(
+        &self,
+        enabled: bool,
+        default_plan_id: i64,
+        allowed_plan_ids: &[i64],
+        site_name: &str,
+    ) -> Result<(), RegistrationSettingsWriteError> {
+        let mut allowed = allowed_plan_ids.to_vec();
+        allowed.sort_unstable();
+        allowed.dedup();
+        if allowed.is_empty() {
+            return Err(RegistrationSettingsWriteError::AllowedPlansEmpty);
+        }
+        if !allowed.contains(&default_plan_id) {
+            return Err(RegistrationSettingsWriteError::DefaultPlanNotInAllowed);
+        }
+
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(RegistrationSettingsWriteError::from)?;
+        macro_rules! try_sql {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(RegistrationSettingsWriteError::from(error));
+                    }
+                }
+            };
+        }
+        for plan_id in &allowed {
+            let exists: Option<i64> = try_sql!(
+                sqlx::query_scalar("SELECT id FROM plans WHERE id = ?")
+                    .bind(plan_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+            );
+            if exists.is_none() {
+                try_sql!(sqlx::query("ROLLBACK").execute(&mut *conn).await);
+                return Err(RegistrationSettingsWriteError::PlanNotFound(*plan_id));
+            }
+        }
+
+        let allowed_json = serialize_allowed_plan_ids(&allowed);
+        try_sql!(
+            sqlx::query(
+                "INSERT INTO app_settings (id, registration_enabled, \
+                 default_registration_plan_id, registration_allowed_plan_ids, site_name) \
+                 VALUES (1, ?, ?, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                     registration_enabled = excluded.registration_enabled, \
+                     default_registration_plan_id = excluded.default_registration_plan_id, \
+                     registration_allowed_plan_ids = excluded.registration_allowed_plan_ids, \
+                     site_name = excluded.site_name",
+            )
+            .bind(enabled)
+            .bind(default_plan_id)
+            .bind(&allowed_json)
+            .bind(site_name)
+            .execute(&mut *conn)
+            .await
+        );
+        try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
         Ok(())
     }
 }

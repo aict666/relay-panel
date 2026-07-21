@@ -15,6 +15,7 @@ use relay_shared::protocol::GroupType;
 
 #[derive(Debug)]
 pub enum CreateGroupError {
+    InvalidName,
     /// INSERT succeeded but the follow-up SELECT-by-token found nothing.
     FetchFailed,
     Database(DbError),
@@ -22,11 +23,19 @@ pub enum CreateGroupError {
 
 #[derive(Debug)]
 pub enum UpdateGroupError {
+    InvalidName,
     NotFound,
     NoFields,
     TunnelInvariant {
         entry_tunnels: i64,
         downstream_tunnels: i64,
+    },
+    RuleInvariant {
+        entry_rules: i64,
+        downstream_rules: i64,
+    },
+    PlanInvariant {
+        plans: i64,
     },
     Database(DbError),
 }
@@ -64,6 +73,10 @@ pub async fn create_group(
     rate: f64,
     hidden: bool,
 ) -> Result<DeviceGroup, CreateGroupError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CreateGroupError::InvalidName);
+    }
     let token = uuid::Uuid::new_v4().to_string();
     let group_type = group_type_to_str(group_type);
     db.insert_group(
@@ -126,6 +139,17 @@ pub async fn update_group(
         return Err(UpdateGroupError::NoFields);
     }
 
+    let name = match name {
+        Some(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(UpdateGroupError::InvalidName);
+            }
+            Some(name)
+        }
+        None => None,
+    };
+
     match db
         .update_group_fields(
             id,
@@ -146,6 +170,14 @@ pub async fn update_group(
                 entry_tunnels,
                 downstream_tunnels,
             },
+            DbError::RuleGroupInvariant {
+                entry_rules,
+                downstream_rules,
+            } => UpdateGroupError::RuleInvariant {
+                entry_rules,
+                downstream_rules,
+            },
+            DbError::GroupPlanInvariant { plans } => UpdateGroupError::PlanInvariant { plans },
             other => UpdateGroupError::Database(other),
         })? {
         0 => Err(UpdateGroupError::NotFound),
@@ -161,14 +193,19 @@ pub struct GroupInUseError {
     pub rule_count: i64,
     pub tunnel_count: i64,
     pub fallback_group_count: i64,
+    pub plan_count: i64,
 }
 
 impl std::fmt::Display for GroupInUseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "group {} still referenced by {} rule(s), {} tunnel(s), and {} fallback group(s)",
-            self.group_id, self.rule_count, self.tunnel_count, self.fallback_group_count
+            "group {} still referenced by {} rule(s), {} tunnel(s), {} fallback group(s), and {} plan(s)",
+            self.group_id,
+            self.rule_count,
+            self.tunnel_count,
+            self.fallback_group_count,
+            self.plan_count
         )
     }
 }
@@ -188,11 +225,13 @@ pub async fn delete_group(
             rule_count,
             tunnel_count,
             fallback_group_count,
+            plan_count,
         } => Err(Box::new(GroupInUseError {
             group_id: id,
             rule_count,
             tunnel_count,
             fallback_group_count,
+            plan_count,
         })),
     }
 }
