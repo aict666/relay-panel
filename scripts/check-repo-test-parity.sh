@@ -32,7 +32,7 @@ extract_tests() {
   # grep -P is unavailable in the macOS system grep and previously got hidden
   # by `|| true`, turning a parser failure into a false "0 tests" success.
   sed -nE 's/^[[:space:]]*async fn[[:space:]]+([a-z_][a-z0-9_]*)[[:space:]]*\(.*/\1/p' "$file" \
-    | grep -vE '^(repo|cleanup|seed_group|seed_group_typed|seed_user|pg_url|replace_db_in_url|placeholders|_placeholders_unused)$'
+    | grep -vE '^(repo|concurrent_repo|cleanup|cleanup_concurrent_repo|seed_group|seed_group_typed|seed_user|pg_url|replace_db_in_url|placeholders|_placeholders_unused)$'
 }
 
 # ── Load allowlist ──

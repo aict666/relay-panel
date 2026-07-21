@@ -4302,7 +4302,7 @@ async fn buy_plan_reset_traffic_zeros_usage() {
 }
 
 #[tokio::test]
-async fn buy_plan_quota_overflow_rolls_back_without_sqlite_numeric_promotion() {
+async fn buy_plan_quota_overflow_rolls_back() {
     let db = repo().await;
     let (alice, pid) = seed_buyer_and_plan(&db, "100.00", i64::MAX, "10.00", 0, false).await;
     sqlx::query("UPDATE users SET plan_id = ?, traffic_limit = 1 WHERE id = ?")

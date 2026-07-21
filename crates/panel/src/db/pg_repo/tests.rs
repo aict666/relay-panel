@@ -2045,6 +2045,69 @@ async fn pg_traffic_batch_applies_to_rule_and_user() {
 }
 
 #[tokio::test]
+async fn pg_concurrent_traffic_batches_serialize_and_preserve_both_deltas() {
+    let Some(db) = repo("traffic_concurrent").await else {
+        return;
+    };
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', $1)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id,name,uid,listen_port,device_group_in,target_addr,target_port) \
+         VALUES(100,'concurrent-traffic',$1,20000,50,'127.0.0.1',80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let db_a = PgRepository::new(db.pool.clone());
+    let db_b = PgRepository::new(db.pool.clone());
+
+    let (first, second) = tokio::join!(
+        db_a.apply_traffic_batch(
+            50,
+            &[TrafficEntry {
+                rule_id: 100,
+                upload: 10,
+                download: 5,
+            }],
+        ),
+        db_b.apply_traffic_batch(
+            50,
+            &[TrafficEntry {
+                rule_id: 100,
+                upload: 20,
+                download: 10,
+            }],
+        ),
+    );
+    for result in [first, second] {
+        assert!(matches!(result.as_deref(), Ok([TrafficEntryResult::Ok])));
+    }
+    let rule_traffic: i64 =
+        sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id = 100")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let user_traffic: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_traffic, 45);
+    assert_eq!(user_traffic, 45);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
 async fn pg_traffic_batch_other_group_rule_yields_othergrouprule_and_rolls_back() {
     let Some(db) = repo("traffic_og").await else {
         return;
@@ -4270,6 +4333,44 @@ async fn seed_buyer_and_plan(
         .await
         .unwrap();
     (alice, pid)
+}
+
+#[tokio::test]
+async fn pg_concurrent_plan_purchases_serialize_without_busy_snapshot_errors() {
+    let Some(db) = repo("buy_plan_concurrent").await else {
+        return;
+    };
+    let (alice, pid) = seed_buyer_and_plan(&db, "10.00", 1_000, "6.00", 0, false).await;
+    let db_a = PgRepository::new(db.pool.clone());
+    let db_b = PgRepository::new(db.pool.clone());
+
+    let (first, second) = tokio::join!(
+        db_a.buy_plan(alice, pid, "p1", 600, 1_000, 10, 0, false, false, &[], &[],),
+        db_b.buy_plan(alice, pid, "p1", 600, 1_000, 10, 0, false, false, &[], &[],),
+    );
+    let outcomes = [first, second];
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(result, Err(BuyPlanError::InsufficientBalance)))
+            .count(),
+        1,
+        "the second writer must observe the committed deduction"
+    );
+    let balance: String = sqlx::query_scalar("SELECT balance FROM users WHERE id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE user_id = $1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(relay_shared::money::balance_to_cents(&balance), Some(400));
+    assert_eq!(orders, 1);
+    cleanup(&db).await;
 }
 
 #[tokio::test]

@@ -13,6 +13,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-07-21
+
+### Changed
+
+- **Maintenance rebuild against the current shared protocol models.** The node
+  package is refreshed alongside RelayPanel 1.3.6 so operators can roll every
+  deployed component to a single reviewed release baseline.
+
+### Compatibility
+
+- The forwarding configuration protocol remains version 9. RelayPanel 1.3.6
+  and relay-node 1.3.4 are mutually compatible; no route migration is required.
+
+### Tests
+
+- Revalidated the complete workspace, node command-line contract, configuration
+  manager, TCP/UDP forwarding, staged transitions, and release installer gates.
+
 ## [1.3.3] - 2026-07-20
 
 ### Changed
