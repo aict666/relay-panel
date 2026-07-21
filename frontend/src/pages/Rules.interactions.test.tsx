@@ -323,6 +323,37 @@ describe('Rules import interaction', () => {
     expect(mockGet.mock.calls.filter(([url]) => url === '/rules')).toHaveLength(2);
   });
 
+  it('shows the preset tunnel name in rule diagnosis results', async () => {
+    const user = userEvent.setup();
+    rules = [makeRule({ tunnel_id: 77, tunnel_name: 'named-tunnel' })];
+    mockPost.mockResolvedValue(ok<DiagnoseResponse>({
+      request_id: 'diagnosis',
+      rule_id: 1,
+      tunnel_id: 77,
+      tunnel_name: 'named-tunnel',
+      nodes: [{
+        status: 'result',
+        type: 'diagnose_result',
+        request_id: 'diagnosis',
+        rule_id: 1,
+        node_id: 'node-1',
+        group_name: 'group-one',
+        listener_running: true,
+        listen_port: 30001,
+        protocol: 'tcp',
+        transport: 'raw',
+        results: [{ address: 'tunnel:77 / rule:1', outcome: { reachable: { elapsed_ms: 14 } } }],
+      }],
+    }));
+
+    render(<MemoryRouter><Rules /></MemoryRouter>);
+    await user.click(await screen.findByRole('button', { name: 'action' }));
+    await user.click(await screen.findByRole('menuitem', { name: /diagnose/ }));
+
+    expect(await screen.findByText('tunnel:named-tunnel / rule:1')).toBeInTheDocument();
+    expect(screen.queryByText('tunnel:77 / rule:1')).not.toBeInTheDocument();
+  });
+
   it('does not show a completed diagnosis from the previous owner scope', async () => {
     const user = userEvent.setup();
     const oldDiagnosis = deferred<{ code: number; message: string; data: DiagnoseResponse }>();

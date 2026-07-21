@@ -227,6 +227,13 @@ pub enum NodeDiagnoseStatus {
 pub struct DiagnoseResponse {
     pub request_id: String,
     pub rule_id: i64,
+    /// Display metadata resolved by the panel. The relay-node intentionally
+    /// keeps reporting the stable numeric tunnel id on the wire; API clients
+    /// use these fields to present the administrator-defined tunnel name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_name: Option<String>,
     pub nodes: Vec<NodeDiagnoseStatus>,
 }
 
@@ -454,6 +461,8 @@ pub async fn diagnose_rule(
         return Json(ApiResponse::success(DiagnoseResponse {
             request_id: String::new(),
             rule_id,
+            tunnel_id: rule.tunnel_id,
+            tunnel_name: rule.tunnel_name.clone(),
             nodes: statuses,
         }));
     }
@@ -519,6 +528,8 @@ pub async fn diagnose_rule(
         return Json(ApiResponse::success(DiagnoseResponse {
             request_id: String::new(),
             rule_id,
+            tunnel_id: rule.tunnel_id,
+            tunnel_name: rule.tunnel_name.clone(),
             nodes: statuses,
         }));
     }
@@ -586,6 +597,8 @@ pub async fn diagnose_rule(
     Json(ApiResponse::success(DiagnoseResponse {
         request_id,
         rule_id,
+        tunnel_id: rule.tunnel_id,
+        tunnel_name: rule.tunnel_name,
         nodes: statuses,
     }))
 }

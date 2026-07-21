@@ -3,12 +3,16 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Tunnel } from '../api/types';
 
-const { mockGet, mockPut } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPut: vi.fn() }));
+const { mockGet, mockPost, mockPut } = vi.hoisted(() => ({
+  mockGet: vi.fn(),
+  mockPost: vi.fn(),
+  mockPut: vi.fn(),
+}));
 
 vi.mock('../api/client', () => ({
   default: {
     get: mockGet,
-    post: vi.fn(),
+    post: mockPost,
     put: mockPut,
     delete: vi.fn(),
   },
@@ -18,6 +22,7 @@ import Tunnels from './Tunnels';
 
 beforeEach(() => {
   mockGet.mockReset();
+  mockPost.mockReset();
   mockPut.mockReset();
 });
 
@@ -90,5 +95,40 @@ describe('Tunnels loading interaction', () => {
     expect(screen.getByRole('button', { name: /createTunnel/ })).toBeDisabled();
     expect(screen.getByRole('button', { name: /edit/ })).toBeDisabled();
     expect(screen.getByRole('switch')).toBeDisabled();
+  });
+
+  it('diagnoses a tunnel and displays its name instead of the wire id', async () => {
+    const user = userEvent.setup();
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/admin/tunnels') return Promise.resolve(ok([{ ...tunnel, bound_rule_count: 1 }]));
+      if (url === '/groups') return Promise.resolve(ok([]));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    mockPost.mockResolvedValue(ok({
+      request_id: 'diagnosis-1',
+      rule_id: 9,
+      tunnel_id: 1,
+      tunnel_name: 'primary-tunnel',
+      nodes: [{
+        status: 'result',
+        type: 'diagnose_result',
+        request_id: 'diagnosis-1',
+        rule_id: 9,
+        node_id: 'node-1',
+        group_name: 'entry',
+        listener_running: true,
+        listen_port: 30000,
+        protocol: 'tcp',
+        transport: 'raw',
+        results: [{ address: 'tunnel:1 / rule:9', outcome: { reachable: { elapsed_ms: 12 } } }],
+      }],
+    }));
+    render(<Tunnels />);
+
+    await user.click(await screen.findByRole('button', { name: /diagnose/ }));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/tunnels/1/diagnose'));
+    expect(await screen.findByText('tunnel:primary-tunnel / rule:9')).toBeInTheDocument();
+    expect(screen.queryByText('tunnel:1 / rule:9')).not.toBeInTheDocument();
   });
 });

@@ -1,4 +1,5 @@
 use super::err;
+use crate::api::diagnose::DiagnoseResponse;
 use crate::api::middleware::{AdminOnly, AuthUser};
 use crate::api::AppState;
 use crate::service::tunnels::TunnelError;
@@ -174,6 +175,65 @@ pub async fn get_admin_tunnel(
             Json(err(500, "数据库错误"))
         }
     }
+}
+
+/// Diagnose one preset tunnel through a representative active TCP rule.
+///
+/// Shared tunnel routing is authenticated by both tunnel_id and rule_id, and
+/// the exit target belongs to the rule rather than the tunnel. Reusing a live
+/// bound rule therefore exercises the real end-to-end data path without
+/// accepting a caller-supplied probe address (which would weaken the existing
+/// SSRF boundary). Pure UDP rules cannot provide a TCP liveness probe.
+pub async fn diagnose_tunnel(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<ApiResponse<DiagnoseResponse>> {
+    let tunnel = match state.db.find_tunnel_by_id(id).await {
+        Ok(Some(tunnel)) => tunnel,
+        Ok(None) => return Json(err(404, "隧道不存在")),
+        Err(error) => {
+            tracing::error!("diagnose_tunnel {id} lookup failed: {error}");
+            return Json(err(500, "数据库错误"));
+        }
+    };
+    if !tunnel.enabled {
+        return Json(err(409, "隧道已停用，无法诊断"));
+    }
+
+    let rules = match state.db.list_active_rules_for_tunnel(id).await {
+        Ok(rules) => rules,
+        Err(error) => {
+            tracing::error!("diagnose_tunnel {id} rule lookup failed: {error}");
+            return Json(err(500, "数据库错误"));
+        }
+    };
+    let Some(rule) = rules.into_iter().find(|rule| rule.protocol != "udp") else {
+        let message = if tunnel.bound_rule_count == 0 {
+            "隧道尚未绑定规则，无法诊断"
+        } else {
+            "隧道没有正在运行的 TCP 规则，无法诊断"
+        };
+        return Json(err(409, message));
+    };
+
+    tracing::info!(
+        action = "diagnose_tunnel",
+        tunnel_id = id,
+        tunnel_name = %tunnel.name,
+        probe_rule_id = rule.id,
+        actor_id = admin.user_id,
+        "tunnel diagnosis requested"
+    );
+    crate::api::diagnose::diagnose_rule(
+        AuthUser {
+            user_id: admin.user_id,
+            admin: true,
+        },
+        State(state),
+        Path(rule.id),
+    )
+    .await
 }
 
 pub async fn create_tunnel(

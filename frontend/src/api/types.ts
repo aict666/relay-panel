@@ -464,6 +464,9 @@ export type NodeDiagnoseStatus =
 export interface DiagnoseResponse {
   request_id: string;
   rule_id: number;
+  /** Panel-resolved display metadata for preset-tunnel rules. */
+  tunnel_id?: number | null;
+  tunnel_name?: string | null;
   nodes: NodeDiagnoseStatus[];
 }
 

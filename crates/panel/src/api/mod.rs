@@ -190,6 +190,10 @@ pub fn routes() -> Router<AppState> {
                 .delete(admin::delete_tunnel),
         )
         .route(
+            "/admin/tunnels/{id}/diagnose",
+            axum::routing::post(admin::diagnose_tunnel),
+        )
+        .route(
             "/admin/plans",
             axum::routing::get(admin::list_plans).post(admin::create_plan),
         )
