@@ -23,6 +23,7 @@ export const zhCN = {
   navGroupWorkspace: '工作台',
   navGroupAdmin: '管理',
   toggleMenu: '菜单',
+  projectAddress: '项目地址',
   dashboard: '仪表盘',
   forwardRules: '转发规则',
   deviceGroups: '设备分组',
