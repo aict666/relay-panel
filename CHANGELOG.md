@@ -17,6 +17,10 @@ independent `v*` / `node-v*` tracks since this release).
 - 导航侧栏底部新增 RelayPanel 项目地址，可直接打开 GitHub 仓库；桌面展开状态完整
   展示地址，折叠状态保留带提示的 GitHub 入口，移动端抽屉同步可用。
 
+### Tests
+
+- 放宽复杂规则表单交互回归测试的单项超时预算，避免繁忙 CI 执行器产生偶发误报。
+
 ## [1.3.10] - 2026-07-21
 
 ### Changed

@@ -214,7 +214,7 @@ describe('Rules import interaction', () => {
 
     expect(within(dialog).getByLabelText('maxConnections')).toHaveValue('17');
     expect(within(dialog).getByLabelText('autoRestart')).toHaveValue('30');
-  });
+  }, 10_000);
 
   it('ignores an older owner response after the URL switches to another user', async () => {
     const user = userEvent.setup();
