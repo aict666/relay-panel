@@ -68,6 +68,15 @@ pub enum GroupDeleteOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupUpdateResult {
+    pub rows_affected: u64,
+    /// Exact values observed and committed while the repository held its
+    /// per-group write lock. None means the scoped row did not exist.
+    pub blocked_protocols_before: Option<String>,
+    pub blocked_protocols_after: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminUserPlanEditOutcome {
     Updated,
@@ -720,6 +729,7 @@ pub trait GroupRepository: Send + Sync {
         port_range: &str,
         rate: f64,
         hidden: bool,
+        blocked_protocols: &str,
     ) -> Result<(), DbError>;
     async fn find_by_token_after_insert(&self, token: &str)
         -> Result<Option<DeviceGroup>, DbError>;
@@ -734,7 +744,8 @@ pub trait GroupRepository: Send + Sync {
         port_range: Option<&str>,
         rate: Option<f64>,
         hidden: Option<bool>,
-    ) -> Result<u64, DbError>;
+        blocked_protocols: Option<&str>,
+    ) -> Result<GroupUpdateResult, DbError>;
     async fn update_group_token(
         &self,
         id: i64,

@@ -15,6 +15,14 @@ use relay_shared::protocol::TunnelClientConfig;
 /// unthrottled warn! here would itself become the outage (disk + CPU) that the
 /// cap exists to prevent.
 const CAP_WARN_INTERVAL: Duration = Duration::from_secs(60);
+const TLS_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(100);
+const TLS_HEADER_TIMEOUT: Duration = Duration::from_millis(200);
+const TLS_MAX_PLAINTEXT_RECORD_LEN: u16 = 1 << 14;
+
+enum TlsSniffResult {
+    Allow(Vec<u8>),
+    Block,
+}
 
 /// v1.0.4: serve an ALREADY-BOUND TcpListener. Binding happens in the manager
 /// (synchronously, so errors surface immediately and per-family success is
@@ -36,6 +44,7 @@ pub async fn serve_tcp_listener(
     gate: RuleGate,
     count_traffic: bool,
     tcp_fast_open: bool,
+    block_tls: bool,
     tunnel: Option<TunnelClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr = listener
@@ -137,6 +146,8 @@ pub async fn serve_tcp_listener(
                             source_ipv4,
                             count_traffic,
                             tcp_fast_open,
+                            block_tls,
+                            connections,
                             tunnel,
                         ) => {
                             if let Err(e) = r {
@@ -188,7 +199,7 @@ fn is_transient_accept_error(e: &std::io::Error) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
-    inbound: TcpStream,
+    mut inbound: TcpStream,
     client_addr: SocketAddr,
     targets: Vec<String>,
     selector: Arc<TargetSelector>,
@@ -198,8 +209,22 @@ async fn handle_tcp_connection(
     source_ipv4: Option<Ipv4Addr>,
     count_traffic: bool,
     tcp_fast_open: bool,
+    block_tls: bool,
+    connections: Arc<ConnectionTracker>,
     tunnel: Option<TunnelClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sniffed_prefix = if block_tls {
+        match sniff_tls_client_hello(&mut inbound).await {
+            TlsSniffResult::Allow(prefix) => prefix,
+            TlsSniffResult::Block => {
+                connections.record_blocked_tls(rule_id, client_addr);
+                return Ok(());
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // TCP_FASTOPEN_CONNECT defers the SYN until the first write when a cookie
     // exists. That is ideal for client-first traffic, but blindly using it for
     // server-first protocols (SSH/SMTP banners) would deadlock: the relay waits
@@ -211,8 +236,12 @@ async fn handle_tcp_connection(
     // cannot safely participate in this attempt's fallback loop. Preserve
     // deterministic multi-target failover by using TFO only when the selector
     // has exactly one candidate.
-    let tcp_fast_open =
-        fast_open_has_client_data(&inbound, tcp_fast_open && target_order.len() == 1).await;
+    let tcp_fast_open = fast_open_has_client_data(
+        &inbound,
+        tcp_fast_open && target_order.len() == 1,
+        !sniffed_prefix.is_empty(),
+    )
+    .await;
 
     // v0.4.6: pick targets per the rule's load-balancing strategy. The selector
     // returns the ordered indices to attempt; we connect to the first reachable.
@@ -283,6 +312,15 @@ async fn handle_tcp_connection(
         super::tunnel::write_header(&mut outbound, tunnel, super::tunnel::TunnelMode::Tcp).await?;
     }
 
+    // Protocol sniffing consumes at most six user bytes. Replay them before
+    // entering the regular forwarding loop, and account for them exactly once.
+    // The remainder can still use Linux splice(2).
+    let prefixed_upload = sniffed_prefix.len() as u64;
+    if !sniffed_prefix.is_empty() {
+        rate_limit.acquire_upload(prefixed_upload).await;
+        outbound.write_all(&sniffed_prefix).await?;
+    }
+
     // getpeername may transiently report ENOTCONN on a cookie-hit TFO socket
     // before the first payload triggers SYN. Logging must never turn that
     // harmless deferred state into a failed forwarded connection.
@@ -310,7 +348,9 @@ async fn handle_tcp_connection(
             // the userspace path's counter.add(rule_id, up, down).
             Ok((up, down)) => {
                 if count_traffic {
-                    counter.add(rule_id, up, down).await;
+                    counter
+                        .add(rule_id, up.saturating_add(prefixed_upload), down)
+                        .await;
                 }
             }
             Err(e) => {
@@ -338,7 +378,7 @@ async fn handle_tcp_connection(
     let rl_down = rate_limit;
 
     let upload = Box::pin(async move {
-        let mut total = 0u64;
+        let mut total = prefixed_upload;
         // v1.0.8: 32 KiB copy buffer (this userspace path is only used by
         // rate-limited rules, which are capped anyway; the unlimited fast path
         // uses splice above). Heap-allocated as part of this Box::pin'd future,
@@ -389,12 +429,19 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
-async fn fast_open_has_client_data(inbound: &TcpStream, requested: bool) -> bool {
+async fn fast_open_has_client_data(
+    inbound: &TcpStream,
+    requested: bool,
+    buffered_client_data: bool,
+) -> bool {
     if !requested {
         return false;
     }
     #[cfg(target_os = "linux")]
     {
+        if buffered_client_data {
+            return true;
+        }
         let mut first_byte = [0u8; 1];
         matches!(
             tokio::time::timeout(Duration::from_millis(5), inbound.peek(&mut first_byte)).await,
@@ -403,9 +450,66 @@ async fn fast_open_has_client_data(inbound: &TcpStream, requested: bool) -> bool
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = inbound;
+        let _ = (inbound, buffered_client_data);
         false
     }
+}
+
+async fn sniff_tls_client_hello(inbound: &mut TcpStream) -> TlsSniffResult {
+    let mut header = [0u8; 6];
+    let first =
+        match tokio::time::timeout(TLS_FIRST_BYTE_TIMEOUT, inbound.read(&mut header[..1])).await {
+            Err(_) => return TlsSniffResult::Allow(Vec::new()),
+            // EOF only closes the client's upload direction. The peer may
+            // still be waiting for a server-first banner, so preserve normal
+            // half-close semantics and let the forwarding path propagate EOF.
+            Ok(Ok(0)) => return TlsSniffResult::Allow(Vec::new()),
+            Ok(Ok(n)) => n,
+            // A read error is not evidence of a blocked protocol. Treat it as
+            // fail-open; the normal forwarding path will surface a terminal socket
+            // error if the connection is no longer usable.
+            Ok(Err(_)) => return TlsSniffResult::Allow(Vec::new()),
+        };
+    debug_assert_eq!(first, 1);
+    if header[0] != 0x16 {
+        return TlsSniffResult::Allow(header[..1].to_vec());
+    }
+
+    let mut filled = 1usize;
+    let deadline = tokio::time::sleep(TLS_HEADER_TIMEOUT);
+    tokio::pin!(deadline);
+    while filled < header.len() {
+        tokio::select! {
+            _ = &mut deadline => return TlsSniffResult::Allow(header[..filled].to_vec()),
+            result = inbound.read(&mut header[filled..]) => match result {
+                // A half-closed client may legitimately send a short request
+                // and wait for the server response. Preserve those bytes and
+                // forward the EOF through the normal copy path.
+                Ok(0) => return TlsSniffResult::Allow(header[..filled].to_vec()),
+                Ok(n) => filled += n,
+                Err(_) => return TlsSniffResult::Allow(header[..filled].to_vec()),
+            }
+        }
+    }
+
+    if is_tls_client_hello_header(&header) {
+        TlsSniffResult::Block
+    } else {
+        TlsSniffResult::Allow(header.to_vec())
+    }
+}
+
+fn is_tls_client_hello_header(header: &[u8; 6]) -> bool {
+    let record_len = u16::from_be_bytes([header[3], header[4]]);
+    header[0] == 0x16
+        && header[1] == 0x03
+        && header[2] <= 0x04
+        // A handshake message may be fragmented across TLS records, so a
+        // one-byte record containing only the ClientHello type is valid. The
+        // first ClientHello is plaintext and must stay within TLSPlaintext's
+        // 2^14-byte record limit; out-of-range data is not evidence of TLS.
+        && (1..=TLS_MAX_PLAINTEXT_RECORD_LEN).contains(&record_len)
+        && header[5] == 0x01
 }
 
 #[cfg(test)]
@@ -416,6 +520,31 @@ mod tests {
     use std::net::IpAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn tls_header_classifier_accepts_legacy_through_tls13_record_versions() {
+        for minor in 0x00..=0x04 {
+            assert!(is_tls_client_hello_header(&[
+                0x16, 0x03, minor, 0x00, 0x04, 0x01
+            ]));
+        }
+        assert!(!is_tls_client_hello_header(&[
+            0x16, 0x03, 0x03, 0x00, 0x00, 0x01
+        ]));
+        assert!(is_tls_client_hello_header(&[
+            0x16, 0x03, 0x03, 0x00, 0x01, 0x01
+        ]));
+        assert!(is_tls_client_hello_header(&[
+            0x16, 0x03, 0x03, 0x40, 0x00, 0x01
+        ]));
+        assert!(!is_tls_client_hello_header(&[
+            0x16, 0x03, 0x03, 0x40, 0x01, 0x01
+        ]));
+        assert!(!is_tls_client_hello_header(&[
+            0x16, 0x03, 0x03, 0x00, 0x04, 0x02
+        ]));
+        assert!(!is_tls_client_hello_header(b"GET / "));
+    }
 
     /// v1.0.8: end-to-end raw TCP forwarding still works after the NODELAY /
     /// 64 KiB buffer changes, and the client-facing socket has Nagle disabled.
@@ -453,6 +582,7 @@ mod tests {
             runtime.gate(None),
             true,
             false,
+            false,
             None,
         ));
         // Keep the runtime alive for the duration of the test: dropping it would
@@ -472,6 +602,171 @@ mod tests {
             b"ping-through-relay",
             "relay must echo the target"
         );
+    }
+
+    #[tokio::test]
+    async fn tls_client_hello_is_rejected_before_target_dial() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let listener = bind_tcp_listener(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let counter = Arc::new(TrafficCounter::new());
+        let connections = Arc::new(ConnectionTracker::new());
+        let runtime = crate::forwarder::gate::RuleRuntime::new();
+        tokio::spawn(serve_tcp_listener(
+            listener,
+            vec![target_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            RateLimit::Unlimited,
+            counter.clone(),
+            connections.clone(),
+            41,
+            None,
+            runtime.gate(None),
+            true,
+            false,
+            true,
+            None,
+        ));
+        let _runtime = runtime;
+
+        let mut client = TcpStream::connect(listen_addr).await.unwrap();
+        // TLS handshake record, TLS 1.2 legacy version, record length 4,
+        // handshake type ClientHello. The detector intentionally needs only
+        // this stable six-byte prefix.
+        client
+            .write_all(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x01])
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("blocked client was not closed promptly");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), target.accept())
+                .await
+                .is_err(),
+            "blocked TLS must not open the target connection"
+        );
+        assert_eq!(
+            connections
+                .blocked_protocol_connections()
+                .get("tls")
+                .copied(),
+            Some(1)
+        );
+        assert!(
+            counter.drain().await.is_empty(),
+            "blocked bytes are not billable"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_tls_prefix_fails_open_and_replays_billable_bytes() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let payload = vec![0x16, 0x03, 0xff, b'n', b'o', b't', b'-', b't', b'l', b's'];
+        let expected = payload.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut received = vec![0u8; expected.len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            stream.write_all(&received).await.unwrap();
+        });
+
+        let listener = bind_tcp_listener(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let counter = Arc::new(TrafficCounter::new());
+        let runtime = crate::forwarder::gate::RuleRuntime::new();
+        tokio::spawn(serve_tcp_listener(
+            listener,
+            vec![target_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            RateLimit::Unlimited,
+            counter.clone(),
+            Arc::new(ConnectionTracker::new()),
+            42,
+            None,
+            runtime.gate(None),
+            true,
+            false,
+            true,
+            None,
+        ));
+        let _runtime = runtime;
+
+        let mut client = TcpStream::connect(listen_addr).await.unwrap();
+        client.write_all(&payload[..2]).await.unwrap();
+        tokio::time::sleep(TLS_HEADER_TIMEOUT + Duration::from_millis(25)).await;
+        client.write_all(&payload[2..]).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload);
+        drop(client);
+
+        let mut observed = None;
+        for _ in 0..20 {
+            let snapshot = counter.snapshot().await;
+            observed = snapshot.entries.first().cloned();
+            if observed.as_ref().is_some_and(|entry| {
+                entry.upload == payload.len() as u64 && entry.download == payload.len() as u64
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let entry = observed.expect("forwarded traffic must be counted");
+        assert_eq!(entry.upload, payload.len() as u64);
+        assert_eq!(entry.download, payload.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn zero_byte_upload_half_close_still_receives_server_first_data() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let banner = b"SSH-2.0-relay-test\r\n".to_vec();
+        let expected = banner.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut byte = [0u8; 1];
+            assert_eq!(
+                stream.read(&mut byte).await.unwrap(),
+                0,
+                "client upload half-close must reach the target"
+            );
+            stream.write_all(&banner).await.unwrap();
+        });
+
+        let listener = bind_tcp_listener(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let runtime = crate::forwarder::gate::RuleRuntime::new();
+        tokio::spawn(serve_tcp_listener(
+            listener,
+            vec![target_addr.to_string()],
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
+            RateLimit::Unlimited,
+            Arc::new(TrafficCounter::new()),
+            Arc::new(ConnectionTracker::new()),
+            43,
+            None,
+            runtime.gate(None),
+            true,
+            false,
+            true,
+            None,
+        ));
+        let _runtime = runtime;
+
+        let mut client = TcpStream::connect(listen_addr).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut received = vec![0u8; expected.len()];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut received))
+            .await
+            .expect("server-first response timed out")
+            .unwrap();
+        assert_eq!(received, expected);
     }
 
     /// TFO must never deadlock server-first protocols. With no client payload
@@ -499,6 +794,7 @@ mod tests {
             2,
             None,
             runtime.gate(None),
+            true,
             true,
             true,
             None,
@@ -547,6 +843,7 @@ mod tests {
             runtime.gate(None),
             true,
             true,
+            false,
             None,
         ));
         let _runtime = runtime;
@@ -718,6 +1015,7 @@ mod tests {
             None,
             runtime.gate(Some(2)),
             true,
+            false,
             false,
             None,
         ));

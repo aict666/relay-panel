@@ -58,6 +58,14 @@ describe('NodeGroupSection mobile vs desktop', () => {
     );
     expect(screen.getByText('noNodeReportingInGroup')).toBeInTheDocument();
   });
+
+  it('shows the TLS policy warning in the shared group header', () => {
+    const tlsBlocked = [row({ node_id: 'n1', online: true, blocked_protocols: ['tls'] })];
+    render(
+      <NodeGroupSection rows={tlsBlocked} panelProtocol={0} latestNodeVersion="1.1.0" nodeVersionCheckFailed={false} isMobile={false} t={t} openDetail={vi.fn()} />,
+    );
+    expect(screen.getByText('tlsBlocked')).toBeInTheDocument();
+  });
 });
 
 // ── v1.2: node version is compared against the latest NODE release, not the

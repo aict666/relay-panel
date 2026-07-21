@@ -2,7 +2,7 @@ use super::SqliteRepository;
 use crate::db::error::DbError;
 use crate::db::repo::*;
 use async_trait::async_trait;
-use relay_shared::models::{DeviceGroup, SharedGroupSummary};
+use relay_shared::models::{decode_blocked_protocols, DeviceGroup, SharedGroupSummary};
 
 // ── GroupRepository ──
 
@@ -39,7 +39,7 @@ impl GroupRepository for SqliteRepository {
         // it; the rule dropdown / shop still list hidden groups so existing and
         // new rules keep working. Admins get [] above and are unaffected.
         let groups: Vec<SharedGroupSummary> = sqlx::query_as(
-            "SELECT g.id, g.name, g.group_type, g.connect_host, g.capabilities, g.region, g.line_type, g.hidden \
+            "SELECT g.id, g.name, g.group_type, g.connect_host, g.capabilities, g.region, g.line_type, g.blocked_protocols, g.hidden \
              FROM device_groups g \
              JOIN users u ON u.id = g.uid \
              WHERE g.uid != ? AND u.admin = 1 AND g.group_type IN ('in', 'both') \
@@ -116,10 +116,11 @@ impl GroupRepository for SqliteRepository {
         port_range: &str,
         rate: f64,
         hidden: bool,
+        blocked_protocols: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO device_groups (name, group_type, token, uid, connect_host, port_range, rate, hidden) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO device_groups (name, group_type, token, uid, connect_host, port_range, rate, hidden, blocked_protocols) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(name)
         .bind(group_type)
@@ -129,6 +130,7 @@ impl GroupRepository for SqliteRepository {
         .bind(port_range)
         .bind(rate)
         .bind(hidden)
+        .bind(blocked_protocols)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -158,7 +160,8 @@ impl GroupRepository for SqliteRepository {
         port_range: Option<&str>,
         rate: Option<f64>,
         hidden: Option<bool>,
-    ) -> Result<u64, DbError> {
+        blocked_protocols: Option<&str>,
+    ) -> Result<GroupUpdateResult, DbError> {
         // Token is NOT updatable here (rotation is a separate endpoint). Build
         // the SET clause from the present fields; binding order matches below.
         let mut sets: Vec<&str> = Vec::new();
@@ -180,9 +183,16 @@ impl GroupRepository for SqliteRepository {
         if hidden.is_some() {
             sets.push("hidden = ?");
         }
+        if blocked_protocols.is_some() {
+            sets.push("blocked_protocols = ?");
+        }
 
         if sets.is_empty() {
-            return Ok(0);
+            return Ok(GroupUpdateResult {
+                rows_affected: 0,
+                blocked_protocols_before: None,
+                blocked_protocols_after: None,
+            });
         }
 
         // BEGIN IMMEDIATE serializes this invariant check with tunnel path
@@ -202,16 +212,18 @@ impl GroupRepository for SqliteRepository {
             };
         }
 
-        let current: Option<(String, String)> = match scope.owner_id() {
+        let current: Option<(String, String, String)> = match scope.owner_id() {
             None => rollback_on_err!(
-                sqlx::query_as("SELECT group_type, connect_host FROM device_groups WHERE id = ?",)
+                sqlx::query_as(
+                    "SELECT group_type, connect_host, blocked_protocols FROM device_groups WHERE id = ?",
+                )
                     .bind(id)
                     .fetch_optional(&mut *conn)
                     .await
             ),
             Some(uid) => rollback_on_err!(
                 sqlx::query_as(
-                    "SELECT group_type, connect_host FROM device_groups WHERE id = ? AND uid = ?",
+                    "SELECT group_type, connect_host, blocked_protocols FROM device_groups WHERE id = ? AND uid = ?",
                 )
                 .bind(id)
                 .bind(uid)
@@ -219,13 +231,36 @@ impl GroupRepository for SqliteRepository {
                 .await
             ),
         };
-        let Some((current_type, current_host)) = current else {
+        let Some((current_type, current_host, current_blocked_protocols)) = current else {
             sqlx::query("ROLLBACK").execute(&mut *conn).await?;
-            return Ok(0);
+            return Ok(GroupUpdateResult {
+                rows_affected: 0,
+                blocked_protocols_before: None,
+                blocked_protocols_after: None,
+            });
         };
 
         let effective_type = group_type.unwrap_or(&current_type);
         let effective_host = connect_host.unwrap_or(&current_host);
+        let ingress_capable = matches!(effective_type, "in" | "both");
+        if !ingress_capable
+            && blocked_protocols.is_some_and(|value| !decode_blocked_protocols(value).is_empty())
+        {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Err(DbError::GroupProtocolPolicyInvariant);
+        }
+        let blocked_protocols_to_write = if ingress_capable {
+            blocked_protocols.map(str::to_owned)
+        } else if blocked_protocols.is_some() || current_blocked_protocols.trim() != "[]" {
+            // Changing away from ingress must atomically clear any retained
+            // policy, including malformed/non-canonical historical storage.
+            Some("[]".to_string())
+        } else {
+            None
+        };
+        if blocked_protocols_to_write.is_some() && blocked_protocols.is_none() {
+            sets.push("blocked_protocols = ?");
+        }
         let entry_rules: i64 = rollback_on_err!(
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM (\
@@ -331,6 +366,9 @@ impl GroupRepository for SqliteRepository {
         if let Some(v) = hidden {
             q = q.bind(v);
         }
+        if let Some(v) = blocked_protocols_to_write.as_deref() {
+            q = q.bind(v);
+        }
         q = q.bind(id);
         if let Some(uid) = scope.owner_id() {
             q = q.bind(uid);
@@ -338,7 +376,13 @@ impl GroupRepository for SqliteRepository {
 
         let result = rollback_on_err!(q.execute(&mut *conn).await);
         sqlx::query("COMMIT").execute(&mut *conn).await?;
-        Ok(result.rows_affected())
+        Ok(GroupUpdateResult {
+            rows_affected: result.rows_affected(),
+            blocked_protocols_before: Some(current_blocked_protocols.clone()),
+            blocked_protocols_after: Some(
+                blocked_protocols_to_write.unwrap_or(current_blocked_protocols),
+            ),
+        })
     }
 
     async fn update_group_token(

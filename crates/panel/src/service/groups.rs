@@ -10,12 +10,13 @@ use crate::db::error::DbError;
 use crate::db::repo::ResourceScope;
 use crate::db::Repository;
 use crate::service::rules::group_type_to_str;
-use relay_shared::models::DeviceGroup;
+use relay_shared::models::{encode_blocked_protocols, BlockedProtocol, DeviceGroup};
 use relay_shared::protocol::GroupType;
 
 #[derive(Debug)]
 pub enum CreateGroupError {
     InvalidName,
+    InvalidBlockedProtocolsForGroupType,
     /// INSERT succeeded but the follow-up SELECT-by-token found nothing.
     FetchFailed,
     Database(DbError),
@@ -24,6 +25,7 @@ pub enum CreateGroupError {
 #[derive(Debug)]
 pub enum UpdateGroupError {
     InvalidName,
+    InvalidBlockedProtocolsForGroupType,
     NotFound,
     NoFields,
     TunnelInvariant {
@@ -38,6 +40,12 @@ pub enum UpdateGroupError {
         plans: i64,
     },
     Database(DbError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct GroupUpdateOutcome {
+    pub blocked_protocols_before: String,
+    pub blocked_protocols_after: String,
 }
 
 /// v1.0.8: billing rate bounds. `rate` lives on device_groups; users are
@@ -72,6 +80,7 @@ pub async fn create_group(
     port_range: &str,
     rate: f64,
     hidden: bool,
+    blocked_protocols: &[BlockedProtocol],
 ) -> Result<DeviceGroup, CreateGroupError> {
     let name = name.trim();
     if name.is_empty() {
@@ -79,6 +88,10 @@ pub async fn create_group(
     }
     let token = uuid::Uuid::new_v4().to_string();
     let group_type = group_type_to_str(group_type);
+    if !blocked_protocols.is_empty() && !matches!(group_type, "in" | "both") {
+        return Err(CreateGroupError::InvalidBlockedProtocolsForGroupType);
+    }
+    let blocked_protocols = encode_blocked_protocols(blocked_protocols);
     db.insert_group(
         name,
         group_type,
@@ -88,6 +101,7 @@ pub async fn create_group(
         port_range,
         rate,
         hidden,
+        &blocked_protocols,
     )
     .await
     .map_err(CreateGroupError::Database)?;
@@ -128,13 +142,15 @@ pub async fn update_group(
     port_range: Option<&str>,
     rate: Option<f64>,
     hidden: Option<bool>,
-) -> Result<(), UpdateGroupError> {
+    blocked_protocols: Option<&[BlockedProtocol]>,
+) -> Result<GroupUpdateOutcome, UpdateGroupError> {
     if name.is_none()
         && group_type.is_none()
         && connect_host.is_none()
         && port_range.is_none()
         && rate.is_none()
         && hidden.is_none()
+        && blocked_protocols.is_none()
     {
         return Err(UpdateGroupError::NoFields);
     }
@@ -150,6 +166,10 @@ pub async fn update_group(
         None => None,
     };
 
+    // Canonicalize here; compatibility with the effective group type and
+    // automatic clearing are enforced under the repository write lock.
+    let blocked_protocols = blocked_protocols.map(encode_blocked_protocols);
+
     match db
         .update_group_fields(
             id,
@@ -160,6 +180,7 @@ pub async fn update_group(
             port_range,
             rate,
             hidden,
+            blocked_protocols.as_deref(),
         )
         .await
         .map_err(|error| match error {
@@ -178,10 +199,20 @@ pub async fn update_group(
                 downstream_rules,
             },
             DbError::GroupPlanInvariant { plans } => UpdateGroupError::PlanInvariant { plans },
+            DbError::GroupProtocolPolicyInvariant => {
+                UpdateGroupError::InvalidBlockedProtocolsForGroupType
+            }
             other => UpdateGroupError::Database(other),
         })? {
-        0 => Err(UpdateGroupError::NotFound),
-        _ => Ok(()),
+        result if result.rows_affected == 0 => Err(UpdateGroupError::NotFound),
+        result => Ok(GroupUpdateOutcome {
+            blocked_protocols_before: result
+                .blocked_protocols_before
+                .expect("updated group has a locked before-policy value"),
+            blocked_protocols_after: result
+                .blocked_protocols_after
+                .expect("updated group has a committed after-policy value"),
+        }),
     }
 }
 

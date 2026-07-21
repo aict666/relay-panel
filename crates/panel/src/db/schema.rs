@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS device_groups (
     port_range TEXT NOT NULL DEFAULT '1-65535',
     fallback_group INTEGER REFERENCES device_groups(id),
     config TEXT NOT NULL DEFAULT '{}',
+    -- Best-effort public-ingress protocol policy (canonical JSON array).
+    blocked_protocols TEXT NOT NULL DEFAULT '[]',
     -- v0.3.0: protocol capability declaration (JSON array, e.g.
     -- ["tcp","udp","tcp_udp","ws","wss","tls"]). Used for pre-create validation
     -- only; rules carry their own entry_transport. Older rows default to
@@ -1754,6 +1756,16 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 49: downstream route-transition leases present");
 
+    // ── Migration 50: public-ingress protocol blocking ──
+    add_column_if_missing(
+        pool,
+        "device_groups",
+        "blocked_protocols",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    tracing::info!("Migration 50: device_groups.blocked_protocols present");
+
     Ok(())
 }
 
@@ -2027,6 +2039,7 @@ mod tests {
             "line_type",
             "remark",
             "credential_revision",
+            "blocked_protocols",
         ] {
             assert_column(&pool, "device_groups", col).await;
         }
@@ -2294,6 +2307,7 @@ mod tests {
             ("device_groups", "line_type"),
             ("device_groups", "remark"),
             ("device_groups", "credential_revision"),
+            ("device_groups", "blocked_protocols"),
             ("forward_rule_hops", "tunnel_port"),
         ] {
             assert_column(&pool, table, col).await;

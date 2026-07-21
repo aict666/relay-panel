@@ -1,4 +1,4 @@
-use crate::models::Plan;
+use crate::models::{BlockedProtocol, Plan};
 use serde::{Deserialize, Serialize};
 
 /// Preserve the distinction between an omitted PATCH field and an explicit
@@ -58,7 +58,10 @@ where
 /// v9 = make live route changes overlap safely. The panel marks old downstream
 /// rule generations with a short route-transition lease; nodes keep those
 /// listeners/routes accepting until the new path has reached every hop.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 9;
+/// v10 = public-ingress protocol blocking. ListenerConfig carries the policy,
+/// and NodeConfigResponse carries a group-level copy for retained old entry
+/// generations; old nodes must not silently ignore it and accept blocked TLS.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 10;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,6 +202,12 @@ pub struct NodeConfigResponse {
     /// already-established ordinary TCP streams finish naturally.
     #[serde(default)]
     pub route_drain_rule_ids: Vec<i64>,
+    /// Protocol policy of this node's device group. Listener-level policy is
+    /// still authoritative for ordinary snapshots; this copy lets a node
+    /// update a previous public-entry generation that is temporarily retained
+    /// during route staging and therefore no longer appears in `listeners`.
+    #[serde(default)]
+    pub public_entry_blocked_protocols: Vec<BlockedProtocol>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +310,10 @@ pub struct ListenerConfig {
     /// Unsupported kernels and cold paths fall back to ordinary TCP.
     #[serde(default)]
     pub tcp_fast_open: bool,
+    /// Best-effort protocol rejection applied only to public raw-TCP ingress
+    /// listeners. Empty means the hot path is unchanged.
+    #[serde(default)]
+    pub blocked_protocols: Vec<BlockedProtocol>,
     // v0.4.7: the placeholder `speed_limit` / `ip_limit` wire fields were
     // removed. They were always None and no node ever read them. The DB columns
     // on users/plans are kept (deprecated) to avoid a pointless migration, but
@@ -490,6 +503,7 @@ pub fn build_listeners_for_rule_with(
             uot_next_token: None,
             zero_rtt: false,
             tcp_fast_open: false,
+            blocked_protocols: vec![],
         })
         .collect()
 }
@@ -813,6 +827,11 @@ pub struct StatusReport {
     /// bounded accounting leases; omission/empty means no renewal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub draining_rule_ids: Vec<i64>,
+    /// Cumulative protocol-policy rejects since this node process started.
+    /// Optional/additive so status reporting remains compatible independently
+    /// of the config-protocol lock-step gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_protocol_connections: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// One listener bind failure reported by a node. Carries enough context for the
@@ -1264,6 +1283,9 @@ pub struct CreateGroupRequest {
     /// v1.0.7: hide this group from regular users' shared views. Default false.
     #[serde(default)]
     pub hidden: Option<bool>,
+    /// Inbound protocol policy. Omitted/empty keeps the safe default: allow.
+    #[serde(default)]
+    pub blocked_protocols: Vec<BlockedProtocol>,
 }
 
 /// Update an existing group. All fields optional. Token is NOT updatable
@@ -1280,6 +1302,9 @@ pub struct UpdateGroupRequest {
     /// v1.0.7: hide from regular users' shared views. None = leave unchanged.
     #[serde(default)]
     pub hidden: Option<bool>,
+    /// None keeps the current policy; Some(empty) clears it.
+    #[serde(default)]
+    pub blocked_protocols: Option<Vec<BlockedProtocol>>,
 }
 
 // === Admin API — Plans (v1.0.8) ===

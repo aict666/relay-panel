@@ -144,6 +144,7 @@ mod tests {
     use crate::db::sqlite_repo::SqliteRepository;
     use axum::extract::{Path, Query, State};
     use axum::Json;
+    use relay_shared::models::BlockedProtocol;
     use relay_shared::protocol::{
         AdminSetUserPlanRequest, CreateGroupRequest, CreatePlanRequest, CreateRuleRequest,
         CreateTunnelProfileRequest, CreateTunnelRequest, GroupType, Protocol, PublicTransport,
@@ -2828,6 +2829,7 @@ mod tests {
                 owner_uid: Some(3),
                 rate: None,
                 hidden: None,
+                blocked_protocols: vec![],
             }),
         )
         .await;
@@ -2840,6 +2842,65 @@ mod tests {
             owner.0, 1,
             "owner_uid must be ignored; group belongs to the creating admin"
         );
+    }
+
+    #[tokio::test]
+    async fn group_protocol_policy_is_normalized_validated_and_cleared_with_type() {
+        let (state, pool) = test_state().await;
+        let Json(invalid) = create_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(CreateGroupRequest {
+                name: "out-with-policy".into(),
+                group_type: GroupType::Out,
+                connect_host: "192.0.2.10".into(),
+                port_range: "20000-30000".into(),
+                owner_uid: None,
+                rate: None,
+                hidden: None,
+                blocked_protocols: vec![BlockedProtocol::Tls],
+            }),
+        )
+        .await;
+        assert_eq!(invalid.code, 400);
+
+        let Json(created) = create_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(CreateGroupRequest {
+                name: "entry-policy".into(),
+                group_type: GroupType::In,
+                connect_host: "192.0.2.11".into(),
+                port_range: "20000-30000".into(),
+                owner_uid: None,
+                rate: None,
+                hidden: None,
+                blocked_protocols: vec![BlockedProtocol::Tls, BlockedProtocol::Tls],
+            }),
+        )
+        .await;
+        assert_eq!(created.code, 0, "{}", created.message);
+        let group = created.data.unwrap();
+        assert_eq!(group.blocked_protocols, "[\"tls\"]");
+
+        let Json(updated) = update_group(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Path(group.id),
+            Json(UpdateGroupRequest {
+                group_type: Some(GroupType::Out),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(updated.code, 0, "{}", updated.message);
+        let stored: String =
+            sqlx::query_scalar("SELECT blocked_protocols FROM device_groups WHERE id=?")
+                .bind(group.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "[]");
     }
 
     #[tokio::test]
@@ -2857,6 +2918,7 @@ mod tests {
                 owner_uid: None,
                 rate: None,
                 hidden: None,
+                blocked_protocols: vec![],
             }),
         )
         .await;
@@ -2873,6 +2935,7 @@ mod tests {
                 owner_uid: None,
                 rate: None,
                 hidden: None,
+                blocked_protocols: vec![],
             }),
         )
         .await;

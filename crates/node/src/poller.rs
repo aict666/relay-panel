@@ -9,6 +9,17 @@ use tokio::sync::Mutex;
 /// Path for the config cache file. Used when the panel is unreachable.
 const CACHE_FILE: &str = "config-cache.json";
 
+/// Cache envelope used only when a protocol-blocking policy is active. Older
+/// nodes expect `listeners` at the JSON root, so they cannot accidentally load
+/// this envelope, ignore the v10 policy fields and resume unfiltered listeners
+/// after a binary downgrade. Policy-free snapshots retain the historical raw
+/// format so ordinary rollback/offline recovery remains compatible.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProtocolBoundCache {
+    config_protocol_version: u32,
+    config: NodeConfigResponse,
+}
+
 /// File holding this node's stable identity. Generated once on first start
 /// (a random hex string) and reused forever after, so the panel can tell
 /// multiple nodes sharing one group token apart (fixes status overwrite:
@@ -211,6 +222,7 @@ fn empty_config() -> NodeConfigResponse {
         route_transition_rule_ids: vec![],
         route_staging_rule_ids: vec![],
         route_drain_rule_ids: vec![],
+        public_entry_blocked_protocols: vec![],
     }
 }
 
@@ -223,14 +235,30 @@ pub fn load_cache() -> Option<NodeConfigResponse> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
-    let data = std::fs::read_to_string(&path).ok()?;
-    let resp: NodeConfigResponse = serde_json::from_str(&data).ok()?;
+    let resp = load_cache_at(&path)?;
     tracing::info!(
         "Loaded cached config from {} ({} listeners)",
         path.display(),
         resp.listeners.len()
     );
     Some(resp)
+}
+
+fn load_cache_at(path: &std::path::Path) -> Option<NodeConfigResponse> {
+    let data = std::fs::read_to_string(path).ok()?;
+    if let Ok(bound) = serde_json::from_str::<ProtocolBoundCache>(&data) {
+        if bound.config_protocol_version != CONFIG_PROTOCOL_VERSION {
+            tracing::warn!(
+                cached = bound.config_protocol_version,
+                current = CONFIG_PROTOCOL_VERSION,
+                "Ignoring protocol-bound config cache from an incompatible node version"
+            );
+            return None;
+        }
+        return Some(bound.config);
+    }
+    // Backward compatibility for every policy-free cache written before v10.
+    serde_json::from_str::<NodeConfigResponse>(&data).ok()
 }
 
 /// Save config to config-cache.json (next to the binary or in working dir).
@@ -258,8 +286,20 @@ fn save_cache_fail_closed(config: &NodeConfigResponse) {
 }
 
 fn save_cache_at(config: &NodeConfigResponse, path: &std::path::Path) -> std::io::Result<()> {
-    let json = serde_json::to_vec_pretty(config)
-        .map_err(|error| std::io::Error::other(format!("serialize config cache: {error}")))?;
+    let policy_active = !config.public_entry_blocked_protocols.is_empty()
+        || config
+            .listeners
+            .iter()
+            .any(|listener| !listener.blocked_protocols.is_empty());
+    let json = if policy_active {
+        serde_json::to_vec_pretty(&ProtocolBoundCache {
+            config_protocol_version: CONFIG_PROTOCOL_VERSION,
+            config: config.clone(),
+        })
+    } else {
+        serde_json::to_vec_pretty(config)
+    }
+    .map_err(|error| std::io::Error::other(format!("serialize config cache: {error}")))?;
     write_private_atomic(path, &json)
 }
 
@@ -437,6 +477,66 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
             .count();
         assert_eq!(leftovers, 0, "atomic cache write left temporary files");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn protocol_policy_cache_is_bound_to_v10_and_unreadable_as_a_legacy_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "relaypanel-test-policy-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = empty_config();
+        config.public_entry_blocked_protocols = vec![relay_shared::models::BlockedProtocol::Tls];
+        save_cache_at(&config, &path).unwrap();
+
+        let encoded = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            value["config_protocol_version"],
+            serde_json::json!(CONFIG_PROTOCOL_VERSION)
+        );
+        assert!(value.get("listeners").is_none());
+        assert!(value["config"]["listeners"].is_array());
+
+        // All pre-v10 NodeConfigResponse versions require a root `listeners`
+        // field. This models their serde behavior and proves a downgraded node
+        // fails closed instead of ignoring the policy nested in the envelope.
+        #[derive(serde::Deserialize)]
+        struct LegacyNodeConfigResponse {
+            #[allow(dead_code)]
+            listeners: Vec<serde_json::Value>,
+        }
+        assert!(serde_json::from_str::<LegacyNodeConfigResponse>(&encoded).is_err());
+
+        let loaded = load_cache_at(&path).expect("current node must load its protected cache");
+        assert_eq!(
+            loaded.public_entry_blocked_protocols,
+            vec![relay_shared::models::BlockedProtocol::Tls]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn policy_free_cache_keeps_the_legacy_root_shape() {
+        let path = std::env::temp_dir().join(format!(
+            "relaypanel-test-plain-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        save_cache_at(&empty_config(), &path).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(value["listeners"].is_array());
+        assert!(value.get("config").is_none());
+        assert!(load_cache_at(&path).is_some());
         let _ = std::fs::remove_file(path);
     }
 

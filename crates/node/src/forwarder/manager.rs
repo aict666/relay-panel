@@ -7,6 +7,7 @@ use super::udp;
 use super::uot;
 use super::ws;
 use crate::reporter::{ConnectionTracker, TrafficCounter};
+use relay_shared::models::BlockedProtocol;
 use relay_shared::protocol::{
     ListenerConfig, ListenerError, LoadBalanceStrategy, NodeConfigResponse, NodeTransport,
     Protocol, TunnelClientConfig, TunnelListenerConfig, UotRole,
@@ -77,11 +78,13 @@ struct ListenerFingerprint {
     /// existing connections keep running and the new cap governs admissions
     /// from that point on. A lowered cap takes effect by attrition.
     max_connections: Option<u32>,
+    count_traffic: bool,
     uot_role: UotRole,
     uot_token: Option<String>,
     uot_next_token: Option<String>,
     zero_rtt: bool,
     tcp_fast_open: bool,
+    blocked_protocols: Vec<BlockedProtocol>,
 }
 
 impl ListenerFingerprint {
@@ -96,12 +99,49 @@ impl ListenerFingerprint {
             upload_limit_bps: l.upload_limit_bps,
             download_limit_bps: l.download_limit_bps,
             max_connections: l.max_connections,
+            count_traffic: l.count_traffic,
             uot_role: l.uot_role,
             uot_token: l.uot_token.clone(),
             uot_next_token: l.uot_next_token.clone(),
             zero_rtt: l.zero_rtt,
             tcp_fast_open: l.tcp_fast_open,
+            blocked_protocols: l.blocked_protocols.clone(),
         }
+    }
+
+    /// Rebuild the listener generation captured by this fingerprint with a
+    /// supplied protocol policy. Route staging deliberately
+    /// keeps the previous route until activation, but a group-wide ingress
+    /// policy must still govern newly accepted connections immediately.
+    fn previous_generation_with_policy(
+        &self,
+        key: ListenerKey,
+        blocked_protocols: Vec<BlockedProtocol>,
+    ) -> ListenerConfig {
+        ListenerConfig {
+            rule_id: self.rule_id,
+            port: key.0,
+            protocol: key.1,
+            node_transport: self.node_transport,
+            ws_path: self.ws_path.clone(),
+            targets: self.targets.clone(),
+            target_weights: self.target_weights.clone(),
+            load_balance_strategy: self.load_balance_strategy,
+            upload_limit_bps: self.upload_limit_bps,
+            download_limit_bps: self.download_limit_bps,
+            max_connections: self.max_connections,
+            count_traffic: self.count_traffic,
+            uot_role: self.uot_role,
+            uot_token: self.uot_token.clone(),
+            uot_next_token: self.uot_next_token.clone(),
+            zero_rtt: self.zero_rtt,
+            tcp_fast_open: self.tcp_fast_open,
+            blocked_protocols,
+        }
+    }
+
+    fn running_listener_config(&self, key: ListenerKey) -> ListenerConfig {
+        self.previous_generation_with_policy(key, self.blocked_protocols.clone())
     }
 }
 
@@ -117,6 +157,10 @@ fn target_probe_uses_tcp(listener: &ListenerConfig) -> bool {
 struct ManagedListener {
     handle: JoinHandle<()>,
     fingerprint: ListenerFingerprint,
+    /// The tunnel client actually captured by this accept loop. During route
+    /// staging it can intentionally differ from `last_config`, which records
+    /// the desired next generation rather than the running one.
+    tunnel_client: Option<TunnelClientConfig>,
 }
 
 type TunnelListenerKey = (i64, u16);
@@ -412,14 +456,6 @@ impl ForwarderManager {
     /// TCP-only and the nondeterministic selection was a latent bug for
     /// tcp_udp rules.)
     pub fn listener_info_for_rule_tcp(&self, rule_id: i64) -> Option<ListenerInfo> {
-        let tunnel = self.last_config.as_ref().and_then(|config| {
-            config
-                .tunnels
-                .iter()
-                .flat_map(|listener| listener.clients.iter())
-                .find(|client| client.rule_id == rule_id)
-                .cloned()
-        });
         for ((port, proto, transport), ml) in &self.listeners {
             if ml.fingerprint.rule_id == rule_id && *proto == Protocol::Tcp {
                 return Some(ListenerInfo {
@@ -428,7 +464,7 @@ impl ForwarderManager {
                     transport: format!("{:?}", transport).to_lowercase(),
                     targets: ml.fingerprint.targets.clone(),
                     running: !ml.handle.is_finished(),
-                    tunnel,
+                    tunnel: ml.tunnel_client.clone(),
                 });
             }
         }
@@ -637,14 +673,6 @@ impl ForwarderManager {
             .collect();
         // Fingerprint-changed listeners that ARE still desired: stop them now so
         // step 4 starts them fresh with the new config.
-        let previous_tunnel_clients: HashMap<i64, TunnelClientConfig> = self
-            .last_config
-            .as_ref()
-            .into_iter()
-            .flat_map(|config| config.tunnels.iter())
-            .flat_map(|tunnel| tunnel.clients.iter().cloned())
-            .map(|client| (client.rule_id, client))
-            .collect();
         let tunnel_clients: HashMap<i64, TunnelClientConfig> = config
             .tunnels
             .iter()
@@ -652,6 +680,19 @@ impl ForwarderManager {
             .map(|client| (client.rule_id, client))
             .collect();
         let mut revoked_rule_ids = HashSet::new();
+        // When an ingress policy changes during route staging, restart the
+        // accept loop with the PREVIOUS route plus the NEW policy. Starting the
+        // full next listener here would prematurely activate a route whose
+        // downstream hop is still being pre-warmed.
+        let configured_listener_keys: HashSet<ListenerKey> = config
+            .listeners
+            .iter()
+            .map(|listener| (listener.port, listener.protocol, listener.node_transport))
+            .collect();
+        let mut staged_policy_listeners: HashMap<
+            ListenerKey,
+            (ListenerConfig, Option<TunnelClientConfig>),
+        > = HashMap::new();
         for listener in &config.listeners {
             let key = (listener.port, listener.protocol, listener.node_transport);
             if let Some(m) = self.listeners.get(&key) {
@@ -661,8 +702,8 @@ impl ForwarderManager {
                     // the same identifies a device-group token rotation. It is
                     // a credential revocation, so unlike ordinary target/path
                     // edits the old authenticated TCP streams must not drain.
-                    if previous_tunnel_clients
-                        .get(&listener.rule_id)
+                    if m.tunnel_client
+                        .as_ref()
                         .zip(tunnel_clients.get(&listener.rule_id))
                         .is_some_and(|(old, new)| {
                             old.link_scope == new.link_scope && old.auth_token != new.auth_token
@@ -670,12 +711,54 @@ impl ForwarderManager {
                     {
                         revoked_rule_ids.insert(listener.rule_id);
                     }
-                    if !route_staging_rule_ids.contains(&listener.rule_id) {
+                    let policy_changed =
+                        m.fingerprint.blocked_protocols != new_fp.blocked_protocols;
+                    if route_staging_rule_ids.contains(&listener.rule_id) && policy_changed {
+                        staged_policy_listeners.insert(
+                            key,
+                            (
+                                m.fingerprint.previous_generation_with_policy(
+                                    key,
+                                    listener.blocked_protocols.clone(),
+                                ),
+                                m.tunnel_client.clone(),
+                            ),
+                        );
+                        to_stop.push(key);
+                    } else if !route_staging_rule_ids.contains(&listener.rule_id) {
                         to_stop.push(key);
                     }
                 }
             }
         }
+        // A moved-away entry has no ListenerConfig in this group's desired
+        // snapshot, but its old public accept loop may still be retained by a
+        // transition/staging lease. Carry the group-level policy separately so
+        // that loop can be hot-restarted without inventing a new route.
+        for (key, managed) in &self.listeners {
+            if configured_listener_keys.contains(key)
+                || !retained_route_rule_ids.contains(&managed.fingerprint.rule_id)
+                || key.1 != Protocol::Tcp
+                || key.2 != NodeTransport::Raw
+                || !managed.fingerprint.count_traffic
+                || managed.fingerprint.blocked_protocols == config.public_entry_blocked_protocols
+            {
+                continue;
+            }
+            staged_policy_listeners.insert(
+                *key,
+                (
+                    managed.fingerprint.previous_generation_with_policy(
+                        *key,
+                        config.public_entry_blocked_protocols.clone(),
+                    ),
+                    managed.tunnel_client.clone(),
+                ),
+            );
+            to_stop.push(*key);
+        }
+        let mut seen_stop_keys = HashSet::new();
+        to_stop.retain(|key| seen_stop_keys.insert(*key));
         for rule_id in revoked_rule_ids {
             if let Some(runtime) = self.rule_runtime.get(&rule_id) {
                 runtime.cancel_all();
@@ -746,14 +829,43 @@ impl ForwarderManager {
         // rule and persist across apply calls. A tcp_udp rule's TCP + UDP halves
         // therefore keep drawing from one bucket even if only one dead listener
         // is recovered during this pass.
-        for listener in &config.listeners {
-            let listener_tunnel = tunnel_clients.get(&listener.rule_id).cloned();
+        // Rebuild every retained old generation before considering the desired
+        // next generation. A policy edit can require stopping the old accept
+        // loop; if the new listener has a different key (port/transport),
+        // starting desired entries first would make the staging guard mistake
+        // the new generation for the retained one and skip the old socket.
+        let mut listeners_to_start: Vec<(ListenerConfig, Option<TunnelClientConfig>, bool)> =
+            staged_policy_listeners
+                .iter()
+                .filter(|(key, _)| !configured_listener_keys.contains(key))
+                .map(|(_, (listener, tunnel))| (listener.clone(), tunnel.clone(), true))
+                .collect();
+        listeners_to_start.extend(config.listeners.iter().map(|configured_listener| {
+            let key = (
+                configured_listener.port,
+                configured_listener.protocol,
+                configured_listener.node_transport,
+            );
+            staged_policy_listeners
+                .get(&key)
+                .map(|(listener, tunnel)| (listener.clone(), tunnel.clone(), true))
+                .unwrap_or_else(|| {
+                    (
+                        configured_listener.clone(),
+                        tunnel_clients.get(&configured_listener.rule_id).cloned(),
+                        false,
+                    )
+                })
+        }));
+
+        for (listener, listener_tunnel, retained_generation) in &listeners_to_start {
             let key = (listener.port, listener.protocol, listener.node_transport);
             // Phase one of a route edit pre-warms downstream listeners while
             // the entry keeps its previous generation. If that generation has
             // already died, fail open to the new one instead of leaving the
             // public protocol unavailable for the whole staging interval.
-            if route_staging_rule_ids.contains(&listener.rule_id)
+            if !*retained_generation
+                && route_staging_rule_ids.contains(&listener.rule_id)
                 && self.listeners.iter().any(|(old_key, old)| {
                     old.fingerprint.rule_id == listener.rule_id && old_key.1 == listener.protocol
                 })
@@ -982,6 +1094,7 @@ impl ForwarderManager {
                     let ipv4_src = src_ipv4;
                     let count_traffic = listener.count_traffic;
                     let tcp_fast_open = listener.tcp_fast_open;
+                    let block_tls = listener.blocked_protocols.contains(&BlockedProtocol::Tls);
                     let tunnel4 = listener_tunnel.clone();
                     let tunnel6 = listener_tunnel.clone();
                     // v1.2.0: both families get a gate cloned from the SAME
@@ -1024,6 +1137,7 @@ impl ForwarderManager {
                                     gate4,
                                     count_traffic,
                                     tcp_fast_open,
+                                    block_tls,
                                     tunnel4,
                                 )
                                 .await
@@ -1045,6 +1159,7 @@ impl ForwarderManager {
                                     gate6,
                                     count_traffic,
                                     tcp_fast_open,
+                                    block_tls,
                                     tunnel6,
                                 )
                                 .await
@@ -1406,6 +1521,7 @@ impl ForwarderManager {
                 ManagedListener {
                     handle,
                     fingerprint: ListenerFingerprint::from_listener(listener),
+                    tunnel_client: listener_tunnel.clone(),
                 },
             );
         }
@@ -1853,12 +1969,19 @@ impl ForwarderManager {
             .sum::<u64>();
         let dropped = dropped.saturating_add(retired_dropped);
 
-        let keys: Vec<ListenerKey> = self
-            .listeners
-            .iter()
-            .filter(|(_, m)| m.fingerprint.rule_id == rule_id)
-            .map(|(k, _)| *k)
-            .collect();
+        let running_generations: Vec<(ListenerKey, ListenerConfig, Option<TunnelClientConfig>)> =
+            self.listeners
+                .iter()
+                .filter(|(_, m)| m.fingerprint.rule_id == rule_id)
+                .map(|(key, managed)| {
+                    (
+                        *key,
+                        managed.fingerprint.running_listener_config(*key),
+                        managed.tunnel_client.clone(),
+                    )
+                })
+                .collect();
+        let keys: Vec<ListenerKey> = running_generations.iter().map(|(key, _, _)| *key).collect();
 
         // Genuinely nothing here — this node doesn't serve the rule (it may
         // legitimately span only some of a group's nodes), or it's paused.
@@ -1880,14 +2003,73 @@ impl ForwarderManager {
 
         let restarted = keys.len();
         if restarted > 0 {
-            // Rebuild from the cached config. apply_config re-creates exactly
-            // the listeners we just removed (every other listener still matches
-            // its fingerprint and is skipped), and it reuses this rule's
-            // existing RuleRuntime, so the live counter stays consistent with
-            // the connections that survive — there are none, we just cancelled
-            // them all.
-            if let Some(cfg) = self.last_config.clone() {
-                self.apply_config(&cfg).await;
+            // Rebuild from the cached desired config, except while a route lease
+            // intentionally keeps an older generation alive. apply_config
+            // re-creates exactly the listeners we just removed (every other
+            // listener still matches its fingerprint and is skipped), and it
+            // reuses this rule's existing RuleRuntime, so the live counter stays
+            // consistent with the connections that survive — there are none, we
+            // just cancelled them all.
+            if let Some(desired_config) = self.last_config.clone() {
+                let preserve_running_generation =
+                    desired_config.route_staging_rule_ids.contains(&rule_id)
+                        || desired_config.route_transition_rule_ids.contains(&rule_id);
+                let mut rebuild_config = desired_config.clone();
+                if preserve_running_generation {
+                    // `last_config` is the desired next generation. During a
+                    // route lease the listener we just removed can intentionally
+                    // be an older generation, including a historical entry that
+                    // no longer appears in `last_config.listeners`. Rebuild the
+                    // captured running generation, then restore desired_config
+                    // below so the next activation snapshot still advances it.
+                    rebuild_config
+                        .listeners
+                        .retain(|listener| listener.rule_id != rule_id);
+                    rebuild_config.listeners.extend(
+                        running_generations
+                            .iter()
+                            .map(|(_, listener, _)| listener.clone()),
+                    );
+
+                    for tunnel in &mut rebuild_config.tunnels {
+                        tunnel.clients.retain(|client| client.rule_id != rule_id);
+                    }
+                    let mut running_clients: Vec<TunnelClientConfig> = Vec::new();
+                    for client in running_generations
+                        .iter()
+                        .filter_map(|(_, _, client)| client.as_ref())
+                    {
+                        if !running_clients.contains(client) {
+                            running_clients.push(client.clone());
+                        }
+                    }
+                    for client in running_clients {
+                        if let Some(carrier) = rebuild_config
+                            .tunnels
+                            .iter_mut()
+                            .find(|tunnel| tunnel.port == 0 && tunnel.tunnel_id == client.tunnel_id)
+                        {
+                            carrier.clients.push(client);
+                        } else {
+                            rebuild_config.tunnels.push(TunnelListenerConfig {
+                                tunnel_id: client.tunnel_id,
+                                port: 0,
+                                hop_position: 0,
+                                auth_token: String::new(),
+                                link_scope: String::new(),
+                                next: None,
+                                routes: Vec::new(),
+                                handshake_timeout_ms: 3_000,
+                                max_unauthenticated: 0,
+                                clients: vec![client],
+                            });
+                        }
+                    }
+                }
+                self.apply_config(&rebuild_config).await;
+                if preserve_running_generation {
+                    self.last_config = Some(desired_config);
+                }
             } else {
                 tracing::warn!(
                     "rule {}: restart tore down {} listener(s) but no cached config exists \
@@ -1950,6 +2132,7 @@ mod tests {
                 uot_next_token: None,
                 zero_rtt: false,
                 tcp_fast_open: false,
+                blocked_protocols: vec![],
                 count_traffic: true,
             }],
             tunnels: vec![],
@@ -1959,6 +2142,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         }
     }
 
@@ -1987,6 +2171,7 @@ mod tests {
                 uot_next_token: None,
                 zero_rtt: false,
                 tcp_fast_open: false,
+                blocked_protocols: vec![],
                 count_traffic: true,
             }],
             tunnels: vec![],
@@ -1996,6 +2181,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         }
     }
 
@@ -2004,6 +2190,87 @@ mod tests {
             Arc::new(TrafficCounter::new()),
             Arc::new(ConnectionTracker::new()),
         )
+    }
+
+    #[test]
+    fn protocol_policy_changes_listener_fingerprint() {
+        let mut config = one_rule(40123, Protocol::Tcp, NodeTransport::Raw);
+        let before = ListenerFingerprint::from_listener(&config.listeners[0]);
+        config.listeners[0].blocked_protocols = vec![BlockedProtocol::Tls];
+        let after = ListenerFingerprint::from_listener(&config.listeners[0]);
+        assert_ne!(
+            before, after,
+            "policy edits must hot-restart the accept loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_policy_hot_reload_preserves_existing_streams_and_blocks_only_new_tls() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = target.accept().await {
+                let _ = accepted_tx.send(());
+                tokio::spawn(async move {
+                    let (mut read, mut write) = stream.into_split();
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                });
+            }
+        });
+
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+        let mut config = one_rule(port, Protocol::Tcp, NodeTransport::Raw);
+        config.listeners[0].targets = vec![target_addr.to_string()];
+        manager.apply_config(&config).await;
+
+        let mut existing = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        existing.write_all(b"before").await.unwrap();
+        let mut echoed = [0u8; 6];
+        existing.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"before");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while accepted_rx.try_recv().is_ok() {}
+
+        config.listeners[0].blocked_protocols = vec![BlockedProtocol::Tls];
+        config.public_entry_blocked_protocols = vec![BlockedProtocol::Tls];
+        manager.apply_config(&config).await;
+        // Listener creation starts an immediate health probe. Drain that
+        // control-plane dial before attributing any later accept to the test
+        // connection itself.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while accepted_rx.try_recv().is_ok() {}
+
+        existing.write_all(b"after").await.unwrap();
+        let mut echoed = [0u8; 5];
+        existing.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"after", "hot reload interrupted an old stream");
+
+        let mut blocked = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        blocked
+            .write_all(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x01])
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(1), blocked.read(&mut byte))
+            .await
+            .expect("new TLS connection was not closed");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), accepted_rx.recv())
+                .await
+                .is_err(),
+            "blocked TLS opened a second target connection"
+        );
     }
 
     #[tokio::test]
@@ -2040,6 +2307,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         manager.apply_config(&config).await;
         let key = (901, port);
@@ -2086,6 +2354,7 @@ mod tests {
             route_transition_rule_ids: vec![1],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         manager.apply_config(&switched).await;
         assert_eq!(manager.listeners[&key].handle.id(), original_task);
@@ -2134,6 +2403,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_staging_applies_new_protocol_policy_without_activating_new_route() {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+        let original = one_rule(port, Protocol::Tcp, NodeTransport::Raw);
+        let original_target = original.listeners[0].targets.clone();
+        manager.apply_config(&original).await;
+        let key = (port, Protocol::Tcp, NodeTransport::Raw);
+        let original_task = manager.listeners[&key].handle.id();
+
+        let mut staged = original.clone();
+        staged.listeners[0].targets = vec!["127.0.0.1:10".into()];
+        staged.listeners[0].blocked_protocols = vec![BlockedProtocol::Tls];
+        staged.public_entry_blocked_protocols = vec![BlockedProtocol::Tls];
+        staged.route_staging_rule_ids = vec![1];
+        staged.route_transition_rule_ids = vec![1];
+        manager.apply_config(&staged).await;
+
+        let staged_listener = &manager.listeners[&key];
+        assert_ne!(
+            staged_listener.handle.id(),
+            original_task,
+            "policy change must restart the accept loop during staging"
+        );
+        assert_eq!(
+            staged_listener.fingerprint.blocked_protocols,
+            vec![BlockedProtocol::Tls]
+        );
+        assert_eq!(
+            staged_listener.fingerprint.targets, original_target,
+            "policy restart must retain the pre-staging route"
+        );
+        let policy_task = staged_listener.handle.id();
+
+        staged.route_staging_rule_ids.clear();
+        manager.apply_config(&staged).await;
+        let activated = &manager.listeners[&key];
+        assert_ne!(activated.handle.id(), policy_task);
+        assert_eq!(activated.fingerprint.targets, vec!["127.0.0.1:10"]);
+        assert_eq!(
+            activated.fingerprint.blocked_protocols,
+            vec![BlockedProtocol::Tls]
+        );
+    }
+
+    #[tokio::test]
+    async fn route_staging_policy_update_keeps_previous_listener_when_key_changes() {
+        let old_reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_port = old_reserved.local_addr().unwrap().port();
+        let new_reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new_port = new_reserved.local_addr().unwrap().port();
+        drop((old_reserved, new_reserved));
+
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+        let original = one_rule(old_port, Protocol::Tcp, NodeTransport::Raw);
+        let original_target = original.listeners[0].targets.clone();
+        manager.apply_config(&original).await;
+        let old_key = (old_port, Protocol::Tcp, NodeTransport::Raw);
+        let new_key = (new_port, Protocol::Tcp, NodeTransport::Raw);
+        let original_task = manager.listeners[&old_key].handle.id();
+
+        let mut staged = original.clone();
+        staged.listeners[0].port = new_port;
+        staged.listeners[0].targets = vec!["127.0.0.1:10".into()];
+        staged.listeners[0].blocked_protocols = vec![BlockedProtocol::Tls];
+        staged.public_entry_blocked_protocols = vec![BlockedProtocol::Tls];
+        staged.route_staging_rule_ids = vec![1];
+        staged.route_transition_rule_ids = vec![1];
+        manager.apply_config(&staged).await;
+
+        let retained = &manager.listeners[&old_key];
+        assert_ne!(retained.handle.id(), original_task);
+        assert_eq!(retained.fingerprint.targets, original_target);
+        assert_eq!(
+            retained.fingerprint.blocked_protocols,
+            vec![BlockedProtocol::Tls]
+        );
+        assert!(
+            !manager.listeners.contains_key(&new_key),
+            "the desired listener key must not activate during staging"
+        );
+
+        staged.route_staging_rule_ids.clear();
+        manager.apply_config(&staged).await;
+        assert!(manager.listeners.contains_key(&old_key));
+        assert_eq!(
+            manager.listeners[&new_key].fingerprint.targets,
+            vec!["127.0.0.1:10"]
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_moved_entry_applies_group_policy_without_listener_in_snapshot() {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+
+        let original = one_rule(port, Protocol::Tcp, NodeTransport::Raw);
+        let original_target = original.listeners[0].targets.clone();
+        manager.apply_config(&original).await;
+        let key = (port, Protocol::Tcp, NodeTransport::Raw);
+        let original_task = manager.listeners[&key].handle.id();
+
+        let mut retained = original.clone();
+        retained.listeners.clear();
+        retained.route_staging_rule_ids = vec![1];
+        retained.route_transition_rule_ids = vec![1];
+        retained.public_entry_blocked_protocols = vec![BlockedProtocol::Tls];
+        manager.apply_config(&retained).await;
+
+        let blocked = &manager.listeners[&key];
+        assert_ne!(blocked.handle.id(), original_task);
+        assert_eq!(
+            blocked.fingerprint.blocked_protocols,
+            vec![BlockedProtocol::Tls]
+        );
+        assert_eq!(blocked.fingerprint.targets, original_target);
+        let blocked_task = blocked.handle.id();
+
+        let (_, restarted) = manager.restart_rule(1).await;
+        assert_eq!(restarted, 1);
+        let restarted_blocked = &manager.listeners[&key];
+        assert_ne!(restarted_blocked.handle.id(), blocked_task);
+        assert_eq!(restarted_blocked.fingerprint.targets, original_target);
+        assert_eq!(
+            restarted_blocked.fingerprint.blocked_protocols,
+            vec![BlockedProtocol::Tls]
+        );
+        let blocked_task = restarted_blocked.handle.id();
+
+        retained.public_entry_blocked_protocols.clear();
+        manager.apply_config(&retained).await;
+        let allowed = &manager.listeners[&key];
+        assert_ne!(allowed.handle.id(), blocked_task);
+        assert!(allowed.fingerprint.blocked_protocols.is_empty());
+        assert_eq!(allowed.fingerprint.targets, original_target);
+    }
+
+    #[tokio::test]
+    async fn repeated_staging_policy_edits_keep_running_tunnel_client_generation() {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let mut manager = fresh_mgr();
+        manager.listen_ipv4 = "127.0.0.1".into();
+        manager.listen_ipv6 = String::new();
+
+        let old_client = TunnelClientConfig {
+            tunnel_id: 77,
+            rule_id: 1,
+            hop_position: 0,
+            address: "127.0.0.1:9".into(),
+            auth_token: "a".repeat(64),
+            link_scope: "77:0:10:20".into(),
+        };
+        let new_client = TunnelClientConfig {
+            tunnel_id: 77,
+            rule_id: 1,
+            hop_position: 0,
+            address: "127.0.0.1:10".into(),
+            auth_token: "b".repeat(64),
+            link_scope: "77:0:30:40".into(),
+        };
+        let entry_tunnel = |client: TunnelClientConfig| TunnelListenerConfig {
+            tunnel_id: 77,
+            port: 0,
+            hop_position: 0,
+            auth_token: String::new(),
+            link_scope: String::new(),
+            next: None,
+            routes: vec![],
+            handshake_timeout_ms: 3_000,
+            max_unauthenticated: 0,
+            clients: vec![client],
+        };
+
+        let mut original = one_rule(port, Protocol::Tcp, NodeTransport::Raw);
+        let original_target = original.listeners[0].targets.clone();
+        original.tunnels = vec![entry_tunnel(old_client.clone())];
+        manager.apply_config(&original).await;
+        let key = (port, Protocol::Tcp, NodeTransport::Raw);
+        assert_eq!(
+            manager.listeners[&key].tunnel_client.as_ref(),
+            Some(&old_client)
+        );
+
+        let mut staged = original.clone();
+        staged.listeners[0].targets = vec!["127.0.0.1:10".into()];
+        staged.listeners[0].blocked_protocols = vec![BlockedProtocol::Tls];
+        staged.tunnels = vec![entry_tunnel(new_client)];
+        staged.route_staging_rule_ids = vec![1];
+        staged.route_transition_rule_ids = vec![1];
+        staged.public_entry_blocked_protocols = vec![BlockedProtocol::Tls];
+        manager.apply_config(&staged).await;
+        assert_eq!(
+            manager.listeners[&key].tunnel_client.as_ref(),
+            Some(&old_client)
+        );
+
+        let (_, restarted) = manager.restart_rule(1).await;
+        assert_eq!(restarted, 1);
+        let restarted_staged = &manager.listeners[&key];
+        assert_eq!(restarted_staged.tunnel_client.as_ref(), Some(&old_client));
+        assert_eq!(restarted_staged.fingerprint.targets, original_target);
+        assert_eq!(
+            manager.last_config.as_ref().unwrap().listeners[0].targets,
+            vec!["127.0.0.1:10"]
+        );
+
+        staged.listeners[0].blocked_protocols.clear();
+        staged.public_entry_blocked_protocols.clear();
+        manager.apply_config(&staged).await;
+        let running = &manager.listeners[&key];
+        assert_eq!(running.tunnel_client.as_ref(), Some(&old_client));
+        assert_eq!(running.fingerprint.targets, original_target);
+        assert!(running.fingerprint.blocked_protocols.is_empty());
+    }
+
+    #[tokio::test]
     async fn route_transition_retains_removed_shared_route_and_socket() {
         let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = reserved.local_addr().unwrap().port();
@@ -2168,6 +2664,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         manager.apply_config(&active).await;
         let key = (902, port);
@@ -2182,6 +2679,7 @@ mod tests {
             route_transition_rule_ids: vec![1],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         manager.apply_config(&switched).await;
         let retained = &manager.shared_tunnel_listeners[&key];
@@ -2227,6 +2725,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         manager.apply_config(&active).await;
         active.tunnels.clear();
@@ -2541,6 +3040,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         })
         .await;
         assert!(
@@ -2593,6 +3093,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         mgr.apply_config(&moved).await;
         assert!(!mgr.rule_runtime.contains_key(&1));
@@ -2669,6 +3170,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         })
         .await;
         assert_eq!(mgr.retired_rule_runtimes.len(), 1);
@@ -2895,6 +3397,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         })
         .await;
         assert!(
@@ -2920,12 +3423,13 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    count_traffic: true,
                     uot_role: UotRole::Disabled,
                     uot_token: None,
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
-                    count_traffic: true,
+                    blocked_protocols: vec![],
                 },
                 ListenerConfig {
                     rule_id: 2,
@@ -2944,6 +3448,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                     count_traffic: true,
                 },
             ],
@@ -2954,6 +3459,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         mgr.apply_config(&c).await;
         let keys = mgr.listener_keys();
@@ -3026,6 +3532,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                     count_traffic: true,
                 },
                 ListenerConfig {
@@ -3045,6 +3552,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                     count_traffic: true,
                 },
             ],
@@ -3055,6 +3563,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         mgr.apply_config(&c).await;
         assert_eq!(mgr.listener_keys().len(), 2);
@@ -3136,6 +3645,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: true,
+                    blocked_protocols: vec![],
                 },
                 ListenerConfig {
                     rule_id: 42,
@@ -3155,6 +3665,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                 },
                 ListenerConfig {
                     rule_id: 42,
@@ -3174,6 +3685,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: true,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                 },
             ],
             tunnels: vec![],
@@ -3183,6 +3695,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
 
         let mut exit = fresh_mgr();
@@ -3210,6 +3723,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: true,
+                    blocked_protocols: vec![],
                 },
                 ListenerConfig {
                     rule_id: 42,
@@ -3229,6 +3743,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: true,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                 },
             ],
             tunnels: vec![],
@@ -3238,6 +3753,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         let mut entry = fresh_mgr();
         entry.listen_ipv6 = String::new();
@@ -3279,6 +3795,7 @@ mod tests {
                 route_transition_rule_ids: vec![],
                 route_staging_rule_ids: vec![],
                 route_drain_rule_ids: vec![],
+                public_entry_blocked_protocols: vec![],
             })
             .await;
         exit.apply_config(&NodeConfigResponse {
@@ -3290,6 +3807,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         })
         .await;
         tcp_echo.abort();
@@ -3471,6 +3989,7 @@ mod tests {
                 uot_next_token: None,
                 zero_rtt: false,
                 tcp_fast_open: false,
+                blocked_protocols: vec![],
                 count_traffic: true,
             }],
             tunnels: vec![],
@@ -3480,6 +3999,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         mgr.apply_config(&mk(LoadBalanceStrategy::First)).await;
         let fp1 = mgr
@@ -3518,6 +4038,7 @@ mod tests {
                 uot_next_token: None,
                 zero_rtt: false,
                 tcp_fast_open: false,
+                blocked_protocols: vec![],
                 count_traffic: true,
             }],
             tunnels: vec![],
@@ -3527,6 +4048,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         mgr.apply_config(&mk(NodeTransport::Raw)).await;
         assert!(mgr
@@ -3574,6 +4096,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         })
         .await;
         assert!(mgr.listener_keys().is_empty(), "removed rule must stop");
@@ -3604,6 +4127,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                     count_traffic: true,
                 },
                 ListenerConfig {
@@ -3623,6 +4147,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                     count_traffic: true,
                 },
             ],
@@ -3633,6 +4158,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         mgr.apply_config(&c1).await;
         let fp70 = mgr
@@ -3658,6 +4184,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                     count_traffic: true,
                 },
                 ListenerConfig {
@@ -3677,6 +4204,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                     count_traffic: true,
                 },
             ],
@@ -3687,6 +4215,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         mgr.apply_config(&c2).await;
         assert_eq!(
@@ -3741,12 +4270,15 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    count_traffic: true,
                     uot_role: UotRole::Disabled,
                     uot_token: None,
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                 },
+                tunnel_client: None,
             },
         );
         assert_eq!(mgr.listener_keys().len(), 1);
@@ -3807,12 +4339,15 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    count_traffic: true,
                     uot_role: UotRole::Disabled,
                     uot_token: None,
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                 },
+                tunnel_client: None,
             },
         );
         mgr.listeners.insert(
@@ -3829,12 +4364,15 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    count_traffic: true,
                     uot_role: UotRole::Disabled,
                     uot_token: None,
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                 },
+                tunnel_client: None,
             },
         );
         // Both listeners are registered under rule 7.
@@ -3874,12 +4412,15 @@ mod tests {
                     upload_limit_bps: None,
                     download_limit_bps: None,
                     max_connections: None,
+                    count_traffic: true,
                     uot_role: UotRole::Disabled,
                     uot_token: None,
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                 },
+                tunnel_client: None,
             },
         );
         assert!(mgr.listener_info_for_rule_tcp(9).is_none());
@@ -3945,6 +4486,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         })
         .await;
 
@@ -3988,6 +4530,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                     count_traffic: true,
                 },
                 ListenerConfig {
@@ -4007,6 +4550,7 @@ mod tests {
                     uot_next_token: None,
                     zero_rtt: false,
                     tcp_fast_open: false,
+                    blocked_protocols: vec![],
                     count_traffic: true,
                 },
             ],
@@ -4017,6 +4561,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         mgr.apply_config(&tcp_udp_cfg).await;
         counter.add(1, 200, 100).await;
@@ -4041,6 +4586,7 @@ mod tests {
                 uot_next_token: None,
                 zero_rtt: false,
                 tcp_fast_open: false,
+                blocked_protocols: vec![],
                 count_traffic: true,
             }],
             tunnels: vec![],
@@ -4050,6 +4596,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         };
         mgr.apply_config(&tcp_cfg).await;
 
@@ -4094,6 +4641,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         })
         .await;
 
@@ -4178,6 +4726,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 901,
                 port: shared_port,
@@ -4234,6 +4783,7 @@ mod tests {
             uot_next_token: None,
             zero_rtt: true,
             tcp_fast_open: false,
+            blocked_protocols: vec![],
         };
         let make_client = |rule_id| TunnelClientConfig {
             tunnel_id: 901,
@@ -4259,6 +4809,7 @@ mod tests {
                 route_transition_rule_ids: vec![],
                 route_staging_rule_ids: vec![],
                 route_drain_rule_ids: vec![],
+                public_entry_blocked_protocols: vec![],
                 tunnels: vec![TunnelListenerConfig {
                     tunnel_id: 901,
                     port: 0,
@@ -4325,6 +4876,7 @@ mod tests {
                 route_transition_rule_ids: vec![],
                 route_staging_rule_ids: vec![],
                 route_drain_rule_ids: vec![],
+                public_entry_blocked_protocols: vec![],
             })
             .await;
         exit.apply_config(&NodeConfigResponse {
@@ -4336,6 +4888,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
         })
         .await;
     }
@@ -4355,6 +4908,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 902,
                 port,
@@ -4420,6 +4974,7 @@ mod tests {
                     route_transition_rule_ids: vec![],
                     route_staging_rule_ids: vec![],
                     route_drain_rule_ids: vec![],
+                    public_entry_blocked_protocols: vec![],
                 },
                 &HashMap::new(),
                 &HashSet::new(),
@@ -4457,6 +5012,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 903,
                 port,
@@ -4534,6 +5090,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 904,
                 port,
@@ -4586,6 +5143,7 @@ mod tests {
                 route_transition_rule_ids: vec![],
                 route_staging_rule_ids: vec![],
                 route_drain_rule_ids: vec![],
+                public_entry_blocked_protocols: vec![],
             })
             .await;
         assert_eq!(manager.retired_tunnel_runtimes.len(), 1);
@@ -4644,6 +5202,7 @@ mod tests {
             route_transition_rule_ids: vec![],
             route_staging_rule_ids: vec![],
             route_drain_rule_ids: vec![],
+            public_entry_blocked_protocols: vec![],
             tunnels: vec![TunnelListenerConfig {
                 tunnel_id: 905,
                 port,
@@ -4699,6 +5258,7 @@ mod tests {
                 route_transition_rule_ids: vec![],
                 route_staging_rule_ids: vec![],
                 route_drain_rule_ids: vec![],
+                public_entry_blocked_protocols: vec![],
             })
             .await;
         let mut byte = [0u8; 1];

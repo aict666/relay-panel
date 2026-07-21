@@ -47,6 +47,7 @@ pub async fn list_owned_group_summaries(
                     capabilities: group.capabilities,
                     region: group.region,
                     line_type: group.line_type,
+                    blocked_protocols: group.blocked_protocols,
                     hidden: group.hidden,
                 })
                 .collect(),
@@ -85,11 +86,24 @@ pub async fn create_group(
         &req.port_range,
         rate,
         req.hidden.unwrap_or(false),
+        &req.blocked_protocols,
     )
     .await
     {
-        Ok(g) => Json(ApiResponse::success(g)),
+        Ok(g) => {
+            tracing::info!(
+                action = "create_group",
+                group_id = g.id,
+                actor_id = admin.user_id,
+                blocked_protocols = %g.blocked_protocols,
+                "administrator created device group"
+            );
+            Json(ApiResponse::success(g))
+        }
         Err(CreateGroupError::InvalidName) => Json(err(400, "分组名称不能为空")),
+        Err(CreateGroupError::InvalidBlockedProtocolsForGroupType) => {
+            Json(err(400, "协议屏蔽仅适用于入口或双向设备组"))
+        }
         Err(CreateGroupError::FetchFailed) => Json(err(500, "Failed to fetch created group")),
         Err(CreateGroupError::Database(e)) => {
             tracing::error!("create_group: db error: {}", e);
@@ -158,7 +172,7 @@ pub async fn rotate_group_token(
 }
 
 pub async fn update_group(
-    _admin: AdminOnly,
+    admin: AdminOnly,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateGroupRequest>,
@@ -180,17 +194,30 @@ pub async fn update_group(
         req.port_range.as_deref(),
         rate,
         req.hidden,
+        req.blocked_protocols.as_deref(),
     )
     .await
     {
-        Ok(()) => {
+        Ok(outcome) => {
             state
                 .node_connections
                 .broadcast_all(r#"{"type":"config_changed"}"#)
                 .await;
+            tracing::info!(
+                action = "update_group",
+                group_id = id,
+                actor_id = admin.user_id,
+                blocked_protocols_before = %outcome.blocked_protocols_before,
+                blocked_protocols_after = %outcome.blocked_protocols_after,
+                blocked_protocols_changed = outcome.blocked_protocols_before != outcome.blocked_protocols_after,
+                "administrator updated device group"
+            );
             Json(ApiResponse::success(()))
         }
         Err(UpdateGroupError::InvalidName) => Json(err(400, "分组名称不能为空")),
+        Err(UpdateGroupError::InvalidBlockedProtocolsForGroupType) => {
+            Json(err(400, "协议屏蔽仅适用于入口或双向设备组"))
+        }
         Err(UpdateGroupError::NoFields) => Json(err(400, "无需要更新的字段")),
         // v0.3.6: 0 rows = group id didn't exist. 404 + no broadcast.
         Err(UpdateGroupError::NotFound) => Json(err(404, "Group not found")),
