@@ -6,13 +6,14 @@ import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
 import { canUsePresetForRuleUpdate } from '../utils/tunnels';
 import { ruleFormTabForErrors } from '../utils/ruleForm';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, Tunnel, BlockedProtocol } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, SharedGroupSummary, RestartResponse, Tunnel, BlockedProtocol } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { useAuth } from '../auth/useAuth';
 import { mapWithConcurrency } from '../utils/async';
 import { asValidatedEntry, buildExportJSON, parseDest, ruleTargets, validateImportEntry } from '../utils/rulesIO';
+import { DiagnoseNodeList } from '../components/DiagnoseResults';
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -1730,11 +1731,12 @@ const IMPORT_DEFAULTS = {
             {diagnoseResult.nodes.length === 0 ? (
               <Text type="secondary">{t('diagnoseNoNodes')}</Text>
             ) : (
-              <Space orientation="vertical" style={{ width: '100%' }}>
-                {diagnoseResult.nodes.map((n, i) => (
-                  <DiagnoseNodeRow key={i} node={n} t={t} isAdmin={isAdmin} />
-                ))}
-              </Space>
+              <DiagnoseNodeList
+                nodes={diagnoseResult.nodes}
+                t={t}
+                isAdmin={isAdmin}
+                tunnelName={diagnoseResult.tunnel_name ?? diagnosing?.tunnel_name}
+              />
             )}
           </>
         ) : (
@@ -1743,60 +1745,4 @@ const IMPORT_DEFAULTS = {
       </Modal>
     </>
   );
-}
-
-/** Render one node's diagnosis row. v0.4.15: the visible label is
- *  "分组名 · 公网IP" (or "分组名 · IP 未上报"), NEVER the raw node_id. node_id is
- *  admin-only (tooltip for troubleshooting); a regular user sees just the
- *  label. Same shape across all four statuses; the status tag + details differ. */
-function DiagnoseNodeRow({ node, t, isAdmin }: { node: NodeDiagnoseStatus; t: (k: string) => string; isAdmin: boolean }) {
-  const label = `${node.group_name || '-'} · ${node.public_ip || t('diagnoseIpMissing')}`;
-  const labelText = <Text strong>{label}</Text>;
-  // node_id is internal — only an admin gets the troubleshooting tooltip.
-  const labelWithId = isAdmin
-    ? <Tooltip title={t('diagnoseNodeIdLabel') + node.node_id}>{labelText}</Tooltip>
-    : labelText;
-  return (
-    <div>
-      <Space wrap align="center">
-        {labelWithId}
-        {node.status === 'result' && (
-          <>
-            <Tag color={node.listener_running ? 'green' : 'red'}>
-              {node.listener_running ? t('diagnoseListenerRunning') : t('diagnoseListenerStopped')}
-            </Tag>
-            {node.listen_port ? <Text type="secondary">:{node.listen_port}</Text> : null}
-            {node.protocol ? <Tag>{node.protocol}</Tag> : null}
-            {node.transport ? <Tag>{node.transport}</Tag> : null}
-          </>
-        )}
-        {node.status === 'unsupported' && (
-          <Text type="warning">{t('diagnoseUnsupportedPrefix')}{node.node_version}{t('diagnoseUnsupportedSuffix')}</Text>
-        )}
-        {node.status === 'control_channel_offline' && (
-          <Text type="secondary">{t('diagnoseOffline')}</Text>
-        )}
-        {node.status === 'timeout' && (
-          <Tag color="orange">{t('diagnoseTimeout')}</Tag>
-        )}
-      </Space>
-      {node.status === 'result' && node.results.length > 0 && (
-        <Table<DiagnoseTargetResult> className="rp-responsive-table" size="small" pagination={false} style={{ marginTop: 8 }} scroll={{ x: 'max-content' }}
-          dataSource={node.results} rowKey="address"
-          columns={[
-            { title: t('diagnoseTarget'), dataIndex: 'address', key: 'address', render: (v: string) => <span className="rp-mono">{v}</span> },
-            { title: t('diagnoseOutcome'), key: 'outcome', render: (_: unknown, r: DiagnoseTargetResult) => <ProbeOutcomeTag o={r.outcome} t={t} /> },
-          ]}
-        />
-      )}
-    </div>
-  );
-}
-
-function ProbeOutcomeTag({ o, t }: { o: DiagnoseTargetResult['outcome']; t: (k: string) => string }) {
-  // v0.4.9: 'route_only' variant removed — diagnosis is TCP-only.
-  if (o === 'timeout') return <Tag color="orange">{t('diagnoseOutcomeTimeout')}</Tag>;
-  if ('reachable' in o) return <Tag color="green">{t('diagnoseOutcomeReachable')} {o.reachable.elapsed_ms}ms</Tag>;
-  if ('failed' in o) return <Tag color="red">{t('diagnoseOutcomeFailed')}: {o.failed.error}</Tag>;
-  return <Tag>?</Tag>;
 }

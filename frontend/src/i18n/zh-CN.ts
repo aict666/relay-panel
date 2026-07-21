@@ -445,6 +445,8 @@ export const zhCN = {
   tunnelCreateFailed: '创建隧道失败',
   tunnelUpdateFailed: '更新隧道失败',
   tunnelDeleteFailed: '删除隧道失败',
+  tunnelDiagnoseTitle: '隧道诊断',
+  tunnelDiagnoseIdle: '请选择一条已启用且绑定了运行中 TCP 规则的隧道进行诊断。',
   deleteTunnelConfirm: '确定删除该隧道？',
   tunnelDeleteInUseHint: '仍有规则绑定时服务端会拒绝删除。',
   tunnelAccess: '使用范围',

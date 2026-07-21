@@ -1,15 +1,16 @@
 import {
   Alert, Button, Card, Form, Input, InputNumber, List, Modal, Popconfirm,
-  Select, Space, Switch, Table, Tag, Tooltip, Typography, message, Grid,
+  Select, Space, Spin, Switch, Table, Tag, Tooltip, Typography, message, Grid,
 } from 'antd';
 import {
-  ApiOutlined, DeleteOutlined, EditOutlined, PlusOutlined, QuestionCircleOutlined, ReloadOutlined,
+  ApiOutlined, DeleteOutlined, EditOutlined, MedicineBoxOutlined, PlusOutlined, QuestionCircleOutlined, ReloadOutlined,
 } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, Tunnel } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, DiagnoseResponse, Tunnel } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { tunnelPathChanged, tunnelPathSnapshot, tunnelScalarChanges } from '../utils/tunnels';
+import { DiagnoseNodeList } from '../components/DiagnoseResults';
 
 const { Text } = Typography;
 
@@ -38,10 +39,14 @@ export default function Tunnels() {
   const [busyTunnelId, setBusyTunnelId] = useState<number | null>(null);
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Tunnel | null>(null);
+  const [diagnosing, setDiagnosing] = useState<Tunnel | null>(null);
+  const [diagnoseLoading, setDiagnoseLoading] = useState(false);
+  const [diagnoseResult, setDiagnoseResult] = useState<DiagnoseResponse | null>(null);
   const [form] = Form.useForm<TunnelFormValue>();
   const watchedHops = Form.useWatch('hops', form) ?? [];
   const watchedShared = Form.useWatch('shared', form) ?? false;
   const loadGenerationRef = useRef(0);
+  const diagnoseGenerationRef = useRef(0);
 
   const load = useCallback(async () => {
     const requestId = ++loadGenerationRef.current;
@@ -69,7 +74,7 @@ export default function Tunnels() {
   }, [t]);
 
   useEffect(() => { load(); }, [load]);
-  const mutationsBlocked = loading || loadFailed || submitting || busyTunnelId !== null;
+  const mutationsBlocked = loading || loadFailed || submitting || busyTunnelId !== null || diagnosing !== null;
 
   const groupMap = useMemo(() => new Map(groups.map(group => [group.id, group])), [groups]);
   const entryGroups = groups.filter(group => group.group_type === 'in' || group.group_type === 'both');
@@ -193,6 +198,34 @@ export default function Tunnels() {
     }
   };
 
+  const handleDiagnose = async (tunnel: Tunnel) => {
+    if (mutationsBlocked) return;
+    const requestId = ++diagnoseGenerationRef.current;
+    setDiagnosing(tunnel);
+    setDiagnoseResult(null);
+    setDiagnoseLoading(true);
+    try {
+      const response = await api.post<unknown, ApiEnvelope<DiagnoseResponse>>(`/admin/tunnels/${tunnel.id}/diagnose`);
+      if (requestId !== diagnoseGenerationRef.current) return;
+      if (response.code === 0 && response.data) {
+        setDiagnoseResult(response.data);
+      } else {
+        message.error(response.message || t('diagnoseFailed'));
+      }
+    } catch {
+      if (requestId === diagnoseGenerationRef.current) message.error(t('diagnoseFailed'));
+    } finally {
+      if (requestId === diagnoseGenerationRef.current) setDiagnoseLoading(false);
+    }
+  };
+
+  const closeDiagnose = () => {
+    ++diagnoseGenerationRef.current;
+    setDiagnosing(null);
+    setDiagnoseLoading(false);
+    setDiagnoseResult(null);
+  };
+
   const pathText = (tunnel: Tunnel) => tunnel.hops
     .map(hop => hop.group_name || groupMap.get(hop.device_group_id)?.name || `#${hop.device_group_id}`)
     .join(' → ');
@@ -203,6 +236,7 @@ export default function Tunnels() {
 
   const actions = (tunnel: Tunnel) => (
     <Space size={4}>
+      <Button type="text" size="small" icon={<MedicineBoxOutlined />} disabled={mutationsBlocked} onClick={() => handleDiagnose(tunnel)}>{t('diagnose')}</Button>
       <Button type="text" size="small" icon={<EditOutlined />} disabled={mutationsBlocked} onClick={() => beginEdit(tunnel)}>{t('edit')}</Button>
       <Popconfirm
         title={t('deleteTunnelConfirm')}
@@ -242,7 +276,7 @@ export default function Tunnels() {
       render: (_: unknown, tunnel: Tunnel) => <Text className="rp-mono" ellipsis={{ tooltip: portText(tunnel) }}>{portText(tunnel)}</Text>,
     },
     { title: t('boundRuleCount'), dataIndex: 'bound_rule_count', key: 'rules', width: 110 },
-    { title: t('action'), key: 'actions', fixed: 'right' as const, width: 150, render: (_: unknown, tunnel: Tunnel) => actions(tunnel) },
+    { title: t('action'), key: 'actions', fixed: 'right' as const, width: 220, render: (_: unknown, tunnel: Tunnel) => actions(tunnel) },
   ];
 
   return (
@@ -250,7 +284,7 @@ export default function Tunnels() {
       <div className="rp-page-header">
         <h2 className="rp-page-title"><ApiOutlined /> {t('tunnelManagement')}</h2>
         <Space className="rp-page-actions">
-          <Button icon={<ReloadOutlined />} loading={loading} disabled={submitting || busyTunnelId !== null || open} onClick={load}>{t('refresh')}</Button>
+          <Button icon={<ReloadOutlined />} loading={loading} disabled={submitting || busyTunnelId !== null || open || diagnosing !== null} onClick={load}>{t('refresh')}</Button>
           <Button type="primary" icon={<PlusOutlined />} disabled={mutationsBlocked} onClick={beginCreate}>{t('createTunnel')}</Button>
         </Space>
       </div>
@@ -418,6 +452,36 @@ export default function Tunnels() {
             )}
           </Form.List>
         </Form>
+      </Modal>
+
+      <Modal
+        title={diagnosing ? `${t('tunnelDiagnoseTitle')} · ${diagnosing.name}` : t('tunnelDiagnoseTitle')}
+        open={diagnosing !== null}
+        onCancel={closeDiagnose}
+        footer={<Button onClick={closeDiagnose}>{t('close')}</Button>}
+        width={720}
+      >
+        {diagnoseLoading ? (
+          <div style={{ textAlign: 'center', padding: 32 }} aria-live="polite" aria-busy="true">
+            <Spin tip={t('diagnoseRunning')} />
+          </div>
+        ) : diagnoseResult ? (
+          <>
+            <Typography.Title level={5}>{t('diagnoseIngress')}</Typography.Title>
+            {diagnoseResult.nodes.length === 0 ? (
+              <Text type="secondary">{t('diagnoseNoNodes')}</Text>
+            ) : (
+              <DiagnoseNodeList
+                nodes={diagnoseResult.nodes}
+                t={t}
+                isAdmin
+                tunnelName={diagnoseResult.tunnel_name ?? diagnosing?.name}
+              />
+            )}
+          </>
+        ) : (
+          <Text type="secondary">{t('tunnelDiagnoseIdle')}</Text>
+        )}
       </Modal>
 
     </>

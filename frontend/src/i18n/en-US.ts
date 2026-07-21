@@ -446,6 +446,8 @@ export const enUS: Dict = {
   tunnelCreateFailed: 'Failed to create tunnel',
   tunnelUpdateFailed: 'Failed to update tunnel',
   tunnelDeleteFailed: 'Failed to delete tunnel',
+  tunnelDiagnoseTitle: 'Tunnel Diagnosis',
+  tunnelDiagnoseIdle: 'Choose an enabled tunnel with a running TCP rule to diagnose.',
   deleteTunnelConfirm: 'Delete this tunnel?',
   tunnelDeleteInUseHint: 'The server rejects deletion while rules are still bound.',
   tunnelAccess: 'Access',

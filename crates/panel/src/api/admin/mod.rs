@@ -4189,6 +4189,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preset_tunnel_diagnosis_requires_and_selects_an_active_tcp_rule() {
+        let (state, pool) = test_state().await;
+        seed_tunnel_groups(&pool).await;
+        let Json(created) = super::tunnels::create_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(tunnel_request("diagnostic-route")),
+        )
+        .await;
+        let tunnel = created.data.unwrap();
+
+        let Json(without_rule) = super::tunnels::diagnose_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+        )
+        .await;
+        assert_eq!(without_rule.code, 409);
+        assert!(without_rule.message.contains("尚未绑定规则"));
+
+        let mut request = rule_req("diagnostic-probe", 34021, 501, None);
+        request.route_mode = relay_shared::protocol::RouteMode::Chain;
+        request.forward_mode = "chain".into();
+        request.device_group_out = Some(502);
+        request.tunnel_id = Some(tunnel.id);
+        let Json(bound) = create_rule(auth(1, true), State(state.clone()), Json(request)).await;
+        assert_eq!(bound.code, 0, "{}", bound.message);
+
+        // No node status rows are seeded, so the shared rule-diagnosis path
+        // returns immediately. The metadata still proves the tunnel endpoint
+        // selected the bound rule and resolved the display name.
+        let Json(diagnosed) = super::tunnels::diagnose_tunnel(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(tunnel.id),
+        )
+        .await;
+        assert_eq!(diagnosed.code, 0, "{}", diagnosed.message);
+        let result = diagnosed.data.unwrap();
+        assert_eq!(result.tunnel_id, Some(tunnel.id));
+        assert_eq!(result.tunnel_name.as_deref(), Some("diagnostic-route"));
+        assert!(result.nodes.is_empty());
+    }
+
+    #[tokio::test]
     async fn preset_tunnel_rejects_zero_internal_port_on_create_and_update() {
         let (state, pool) = test_state().await;
         seed_tunnel_groups(&pool).await;
