@@ -1094,7 +1094,8 @@ impl ForwarderManager {
                     let ipv4_src = src_ipv4;
                     let count_traffic = listener.count_traffic;
                     let tcp_fast_open = listener.tcp_fast_open;
-                    let block_tls = listener.blocked_protocols.contains(&BlockedProtocol::Tls);
+                    let protocol_policy =
+                        tcp::ProtocolBlockPolicy::from_protocols(&listener.blocked_protocols);
                     let tunnel4 = listener_tunnel.clone();
                     let tunnel6 = listener_tunnel.clone();
                     // v1.2.0: both families get a gate cloned from the SAME
@@ -1137,7 +1138,7 @@ impl ForwarderManager {
                                     gate4,
                                     count_traffic,
                                     tcp_fast_open,
-                                    block_tls,
+                                    protocol_policy,
                                     tunnel4,
                                 )
                                 .await
@@ -1159,7 +1160,7 @@ impl ForwarderManager {
                                     gate6,
                                     count_traffic,
                                     tcp_fast_open,
-                                    block_tls,
+                                    protocol_policy,
                                     tunnel6,
                                 )
                                 .await

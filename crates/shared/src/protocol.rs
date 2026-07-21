@@ -61,7 +61,9 @@ where
 /// v10 = public-ingress protocol blocking. ListenerConfig carries the policy,
 /// and NodeConfigResponse carries a group-level copy for retained old entry
 /// generations; old nodes must not silently ignore it and accept blocked TLS.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 10;
+/// v11 = plaintext HTTP request blocking. The policy enum gains `http`; v10
+/// nodes cannot safely parse that variant and must fail closed until upgraded.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 11;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]

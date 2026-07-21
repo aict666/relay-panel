@@ -984,6 +984,7 @@ const IMPORT_DEFAULTS = {
     label: (
       <Space size={4}>
         <span>{g.name} (#{g.id})</span>
+        {g.blocked_protocols?.includes('http') && <Tag color="orange">{t('httpBlocked')}</Tag>}
         {g.blocked_protocols?.includes('tls') && <Tag color="red">{t('tlsBlocked')}</Tag>}
       </Space>
     ),
@@ -995,7 +996,7 @@ const IMPORT_DEFAULTS = {
     : sharedInGroups
   ).map(g => ({
     value: g.id,
-    label: `${g.name} (${g.group_type}${g.connect_host ? ` · ${g.connect_host}` : ''})${g.blocked_protocols?.includes('tls') ? ` · ${t('tlsBlocked')}` : ''}`,
+    label: `${g.name} (${g.group_type}${g.connect_host ? ` · ${g.connect_host}` : ''})${g.blocked_protocols?.includes('http') ? ` · ${t('httpBlocked')}` : ''}${g.blocked_protocols?.includes('tls') ? ` · ${t('tlsBlocked')}` : ''}`,
   }));
   const protocolOptions = [
     { value: 'tcp_udp', label: t('tcpUdp') },
@@ -1024,10 +1025,11 @@ const IMPORT_DEFAULTS = {
     ?.map(hop => hop.group_name || groupInfo.get(hop.device_group_id)?.name || `#${hop.device_group_id}`)
     .join(' → ') || '-';
   const tunnelPathText = (tunnel?: Tunnel) => hopPathText(tunnel?.hops);
-  const tunnelBlocksTls = (tunnel?: Tunnel) => {
+  const tunnelBlockedProtocols = (tunnel?: Tunnel): BlockedProtocol[] => {
     const entryGroupId = tunnel?.hops[0]?.device_group_id;
-    return entryGroupId !== undefined
-      && groupInfo.get(entryGroupId)?.blocked_protocols?.includes('tls') === true;
+    return entryGroupId === undefined
+      ? []
+      : groupInfo.get(entryGroupId)?.blocked_protocols ?? [];
   };
   const selectedCreateTunnel = createTunnelId ? tunnelMap.get(createTunnelId) : undefined;
   const selectedEditTunnel = editTunnelId
@@ -1060,7 +1062,8 @@ const IMPORT_DEFAULTS = {
             label: (
               <Space size={4}>
                 <span>{tunnel.name} · {tunnelPathText(tunnel)}</span>
-                {tunnelBlocksTls(tunnel) && <Tag color="red">{t('tlsBlocked')}</Tag>}
+                {tunnelBlockedProtocols(tunnel).includes('http') && <Tag color="orange">{t('httpBlocked')}</Tag>}
+                {tunnelBlockedProtocols(tunnel).includes('tls') && <Tag color="red">{t('tlsBlocked')}</Tag>}
               </Space>
             ),
             disabled: !tunnelMap.has(tunnel.id) || (!tunnel.enabled && tunnel.id !== selected?.id),
@@ -1076,7 +1079,8 @@ const IMPORT_DEFAULTS = {
           title={selected.enabled ? (
             <Space size={4}>
               <span>{tunnelPathText(selected)}</span>
-              {tunnelBlocksTls(selected) && <Tag color="red">{t('tlsBlocked')}</Tag>}
+              {tunnelBlockedProtocols(selected).includes('http') && <Tag color="orange">{t('httpBlocked')}</Tag>}
+              {tunnelBlockedProtocols(selected).includes('tls') && <Tag color="red">{t('tlsBlocked')}</Tag>}
             </Space>
           ) : t('tunnelDisabled')}
           description={t('tunnelPortsReused')}

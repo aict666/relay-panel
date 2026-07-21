@@ -102,11 +102,11 @@ beforeEach(() => {
 });
 
 describe('Rules import interaction', () => {
-  it('shows the TLS policy on a shared preset tunnel entry', async () => {
+  it('shows the HTTP and TLS policies on a shared preset tunnel entry', async () => {
     authState.isAdmin = false;
     authState.user = { id: 2, username: 'member' };
     const user = userEvent.setup();
-    const sharedEntry = { ...group, blocked_protocols: ['tls'] as const };
+    const sharedEntry = { ...group, blocked_protocols: ['http', 'tls'] as const };
     const tunnel: Tunnel = {
       id: 77,
       name: 'shared-path',
@@ -142,6 +142,7 @@ describe('Rules import interaction', () => {
 
     fireEvent.mouseDown(within(dialog).getByLabelText('modePresetTunnel'));
     expect(await screen.findByText(/shared-path/)).toBeInTheDocument();
+    expect(await screen.findByText('httpBlocked')).toBeInTheDocument();
     expect(await screen.findByText('tlsBlocked')).toBeInTheDocument();
   });
 

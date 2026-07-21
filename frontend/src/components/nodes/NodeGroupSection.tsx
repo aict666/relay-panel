@@ -53,6 +53,7 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
       <Text type="secondary" style={{ fontSize: 12 }}>ID: {head.group_id}</Text>
       {region ? <Tag>{region}</Tag> : null}
       {lineType ? <Tag color="blue">{lineType}</Tag> : null}
+      {head.blocked_protocols?.includes('http') ? <Tag color="orange">{t('httpBlocked')}</Tag> : null}
       {head.blocked_protocols?.includes('tls') ? <Tag color="red">{t('tlsBlocked')}</Tag> : null}
       <Tag color={online > 0 ? 'green' : undefined}>{online}/{total}</Tag>
       <span style={{ marginLeft: 'auto' }} className="rp-mono">

@@ -36,7 +36,7 @@ cd / 2>/dev/null || true
 
 # Bump this when releasing a new version. The binary is downloaded from
 # GitHub Releases assets.
-SCRIPT_VERSION="1.3.6"
+SCRIPT_VERSION="1.3.7"
 REPO="aict666/relay-panel"
 
 GREEN='\033[0;32m'

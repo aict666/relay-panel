@@ -1135,7 +1135,7 @@ mod tests {
         add_user(&pool, 2).await;
         add_group(&pool, 10, "in", 1).await;
         add_rule(&pool, 100, 2, 10, 20000).await;
-        sqlx::query("UPDATE device_groups SET blocked_protocols='[\"tls\"]' WHERE id=10")
+        sqlx::query("UPDATE device_groups SET blocked_protocols='[\"http\",\"tls\"]' WHERE id=10")
             .execute(&pool)
             .await
             .unwrap();
@@ -1145,11 +1145,11 @@ mod tests {
         assert_eq!(cfg.listeners[0].port, 20000);
         assert_eq!(
             cfg.listeners[0].blocked_protocols,
-            vec![BlockedProtocol::Tls]
+            vec![BlockedProtocol::Http, BlockedProtocol::Tls]
         );
         assert_eq!(
             cfg.public_entry_blocked_protocols,
-            vec![BlockedProtocol::Tls]
+            vec![BlockedProtocol::Http, BlockedProtocol::Tls]
         );
     }
 

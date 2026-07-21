@@ -13,6 +13,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.7] - 2026-07-21
+
+### Added
+
+- 公共 TCP 入口可尽力识别并阻断标准 HTTP/1 请求行及 HTTP/2 明文前言；分片、
+  超时、不完整或不匹配的首行按 fail-open 原样回放，并独立上报 HTTP 拦截计数。
+
+### Compatibility
+
+- 配置协议升级到 v11；面板与节点必须协调升级后再启用 HTTP 屏蔽。
+
 ## [1.3.6] - 2026-07-21
 
 ### Fixed

@@ -2,7 +2,7 @@ import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message,
 import { PlusOutlined, ReloadOutlined, CopyOutlined, EditOutlined, CloudServerOutlined, CodeOutlined, ApiOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedGroupSummary } from '../api/types';
+import type { ApiEnvelope, BlockedProtocol, DeviceGroup, NodeStatus, SharedGroupSummary } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { copyText } from '../utils/clipboard';
 import { useAuth } from '../auth/useAuth';
@@ -19,7 +19,20 @@ interface GroupFormValues {
   port_range?: string;
   rate?: number;
   hidden?: boolean;
+  block_http?: boolean;
   block_tls?: boolean;
+}
+
+function selectedBlockedProtocols(
+  ingressCapable: boolean,
+  blockHttp: boolean | undefined,
+  blockTls: boolean | undefined,
+): BlockedProtocol[] {
+  if (!ingressCapable) return [];
+  return [
+    ...(blockHttp ? ['http' as const] : []),
+    ...(blockTls ? ['tls' as const] : []),
+  ];
 }
 
 function isLocalhost(): boolean {
@@ -119,6 +132,9 @@ export default function Groups() {
   const blockedTlsCount = useCallback((groupId: number) => nodesByGroup(groupId)
     .filter(n => n.online)
     .reduce((sum, n) => sum + (n.blocked_protocol_connections?.tls ?? 0), 0), [nodesByGroup]);
+  const blockedHttpCount = useCallback((groupId: number) => nodesByGroup(groupId)
+    .filter(n => n.online)
+    .reduce((sum, n) => sum + (n.blocked_protocol_connections?.http ?? 0), 0), [nodesByGroup]);
 
   const handleCreate = async (values: GroupFormValues) => {
     if (!isAdmin || loading || loadFailed || saving) return;
@@ -126,13 +142,13 @@ export default function Groups() {
     try {
       // v1.0.8: rate defaults to 1.0 on the server when omitted; send it
       // explicitly so the value the admin picked is what gets persisted.
-      const { block_tls, ...groupValues } = values;
+      const { block_http, block_tls, ...groupValues } = values;
       const ingressCapable = values.group_type === 'in' || values.group_type === 'both';
       const payload = {
         ...groupValues,
         rate: values.rate ?? 1.0,
         hidden: values.hidden ?? false,
-        blocked_protocols: ingressCapable && block_tls ? ['tls'] : [],
+        blocked_protocols: selectedBlockedProtocols(ingressCapable, block_http, block_tls),
       };
       const res = await api.post<unknown, ApiEnvelope<DeviceGroup>>('/groups', payload);
       if (res.code !== 0) { message.error(res.message); return; }
@@ -154,6 +170,7 @@ export default function Groups() {
       port_range: g.port_range,
       rate: g.rate,
       hidden: !!g.hidden,
+      block_http: g.blocked_protocols?.includes('http') ?? false,
       block_tls: g.blocked_protocols?.includes('tls') ?? false,
     });
     setEditOpen(true);
@@ -173,9 +190,15 @@ export default function Groups() {
     // v1.0.7: only send hidden when it actually changed.
     if (values.hidden !== undefined && values.hidden !== !!editing.hidden) payload.hidden = values.hidden;
     const effectiveType = values.group_type ?? editing.group_type;
-    const nextBlockTls = (effectiveType === 'in' || effectiveType === 'both') && !!values.block_tls;
-    const previousBlockTls = editing.blocked_protocols?.includes('tls') ?? false;
-    if (nextBlockTls !== previousBlockTls) payload.blocked_protocols = nextBlockTls ? ['tls'] : [];
+    const nextBlockedProtocols = selectedBlockedProtocols(
+      effectiveType === 'in' || effectiveType === 'both',
+      values.block_http,
+      values.block_tls,
+    );
+    const previousBlockedProtocols = [...(editing.blocked_protocols ?? [])].sort();
+    if (nextBlockedProtocols.join(',') !== previousBlockedProtocols.join(',')) {
+      payload.blocked_protocols = nextBlockedProtocols;
+    }
     if (Object.keys(payload).length === 0) { setEditOpen(false); return; }
     setSaving(true);
     try {
@@ -304,9 +327,20 @@ export default function Groups() {
     { title: t('portRange'), dataIndex: 'port_range', key: 'port_range', render: (v: string) => <span className="rp-mono">{v}</span> },
     {
       title: t('protocolBlocking'), dataIndex: 'blocked_protocols', key: 'blocked_protocols', width: 120,
-      render: (protocols?: string[]) => protocols?.includes('tls')
-        ? <Tag color="red">{t('tlsBlocked')}</Tag>
-        : <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>,
+      render: (protocols?: string[]) => protocols?.length ? (
+        <Space size={4} wrap>
+          {protocols.includes('http') && <Tag color="orange">{t('httpBlocked')}</Tag>}
+          {protocols.includes('tls') && <Tag color="red">{t('tlsBlocked')}</Tag>}
+        </Space>
+      ) : <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>,
+    },
+    {
+      title: <Tooltip title={t('blockedSinceNodeStart')}>{t('blockedHttpConnections')}</Tooltip>,
+      key: 'blocked_http_connections', width: 100,
+      render: (_: unknown, g: DeviceGroup | SharedGroupSummary) => {
+        const count = blockedHttpCount(g.id);
+        return count > 0 ? count.toLocaleString() : <span style={{ color: 'var(--rp-text-tertiary)' }}>0</span>;
+      },
     },
     {
       title: <Tooltip title={t('blockedSinceNodeStart')}>{t('blockedTlsConnections')}</Tooltip>,
@@ -378,6 +412,7 @@ export default function Groups() {
             { title: 'ID', dataIndex: 'node_id', key: 'node_id', width: 120, render: (v: string | undefined) => v ? <Text code style={{ fontSize: 11 }}>{v.slice(0, 8)}...{v.slice(-4)}</Text> : '-' },
             { title: t('status'), dataIndex: 'online', key: 'online', width: 80, render: (v: boolean) => <Tag color={v ? 'green' : 'default'}>{v ? t('online') : t('offline')}</Tag> },
             { title: t('nodeVersion'), dataIndex: 'node_version', key: 'version', width: 90, render: (v: string | undefined) => v ? <span className="rp-mono" style={{ fontSize: 12 }}>{v}</span> : '-' },
+            { title: t('blockedHttpConnections'), key: 'blocked_http_connections', width: 100, render: (_: unknown, n: NodeStatus) => (n.blocked_protocol_connections?.http ?? 0).toLocaleString() },
             { title: t('blockedTlsConnections'), key: 'blocked_tls_connections', width: 100, render: (_: unknown, n: NodeStatus) => (n.blocked_protocol_connections?.tls ?? 0).toLocaleString() },
             { title: t('lastSeen'), dataIndex: 'last_seen', key: 'last_seen', width: 120, render: (v: string | undefined) => v ? <span style={{ fontSize: 12 }}>{v}</span> : '-' },
           ]}
@@ -418,7 +453,10 @@ export default function Groups() {
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input placeholder="tokyo-node-1" /></Form.Item>
           <Form.Item name="group_type" label={t('type')} rules={[{ required: true }]} initialValue="in">
             <Select options={groupTypeOptions} onChange={(value) => {
-              if (value !== 'in' && value !== 'both') createForm.setFieldValue('block_tls', false);
+              if (value !== 'in' && value !== 'both') {
+                createForm.setFieldValue('block_http', false);
+                createForm.setFieldValue('block_tls', false);
+              }
             }} />
           </Form.Item>
           <Form.Item name="connect_host" label={t('connectHost')} rules={[{ required: true }]}><Input placeholder="1.2.3.4 or node.example.com" /></Form.Item>
@@ -433,8 +471,15 @@ export default function Groups() {
           <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" initialValue={false} extra={t('groupHiddenHint')}>
             <Switch />
           </Form.Item>
-          <Form.Item name="block_tls" label={t('protocolBlocking')} valuePropName="checked" initialValue={false} extra={t('blockTlsHint')}>
-            <Switch checkedChildren="TLS" unCheckedChildren="TLS" disabled={createGroupType !== 'in' && createGroupType !== 'both'} />
+          <Form.Item label={t('protocolBlocking')} extra={t('blockProtocolHint')}>
+            <Space wrap>
+              <Form.Item name="block_http" valuePropName="checked" initialValue={false} noStyle>
+                <Switch checkedChildren="HTTP" unCheckedChildren="HTTP" disabled={createGroupType !== 'in' && createGroupType !== 'both'} />
+              </Form.Item>
+              <Form.Item name="block_tls" valuePropName="checked" initialValue={false} noStyle>
+                <Switch checkedChildren="TLS" unCheckedChildren="TLS" disabled={createGroupType !== 'in' && createGroupType !== 'both'} />
+              </Form.Item>
+            </Space>
           </Form.Item>
         </Form>
       </Modal>
@@ -443,7 +488,10 @@ export default function Groups() {
         <Form form={editForm} onFinish={handleUpdate} layout="vertical" disabled={saving || loading || loadFailed}>
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
           <Form.Item name="group_type" label={t('type')}><Select options={groupTypeOptions} onChange={(value) => {
-            if (value !== 'in' && value !== 'both') editForm.setFieldValue('block_tls', false);
+            if (value !== 'in' && value !== 'both') {
+              editForm.setFieldValue('block_http', false);
+              editForm.setFieldValue('block_tls', false);
+            }
           }} /></Form.Item>
           <Form.Item name="connect_host" label={t('connectHost')}><Input /></Form.Item>
           <Form.Item name="port_range" label={t('portRange')}><Input /></Form.Item>
@@ -453,8 +501,15 @@ export default function Groups() {
           <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" extra={t('groupHiddenHint')}>
             <Switch />
           </Form.Item>
-          <Form.Item name="block_tls" label={t('protocolBlocking')} valuePropName="checked" extra={t('blockTlsHint')}>
-            <Switch checkedChildren="TLS" unCheckedChildren="TLS" disabled={editGroupType !== 'in' && editGroupType !== 'both'} />
+          <Form.Item label={t('protocolBlocking')} extra={t('blockProtocolHint')}>
+            <Space wrap>
+              <Form.Item name="block_http" valuePropName="checked" noStyle>
+                <Switch checkedChildren="HTTP" unCheckedChildren="HTTP" disabled={editGroupType !== 'in' && editGroupType !== 'both'} />
+              </Form.Item>
+              <Form.Item name="block_tls" valuePropName="checked" noStyle>
+                <Switch checkedChildren="TLS" unCheckedChildren="TLS" disabled={editGroupType !== 'in' && editGroupType !== 'both'} />
+              </Form.Item>
+            </Space>
           </Form.Item>
         </Form>
       </Modal>
