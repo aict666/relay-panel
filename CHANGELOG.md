@@ -10,6 +10,13 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.8] - 2026-07-21
+
+### Fixed
+
+- 补齐 Linux 专属 TCP Fast Open 回归测试的入口协议屏蔽参数，恢复完整 CI 门禁；
+  运行时功能与配置协议保持不变。
+
 ## [1.3.7] - 2026-07-21
 
 ### Security

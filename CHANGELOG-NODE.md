@@ -13,6 +13,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.6] - 2026-07-21
+
+### Fixed
+
+- 补齐 Linux 专属 TCP Fast Open 回归测试调用中的 TLS 屏蔽开关参数，确保节点
+  发布提交通过 Linux 测试编译门禁；节点运行时与配置协议 v10 保持不变。
+
+### Compatibility
+
+- 需要 RelayPanel **1.3.7+**，推荐与 RelayPanel **1.3.8** 一同部署。
+
 ## [1.3.5] - 2026-07-21
 
 ### Added
