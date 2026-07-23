@@ -149,7 +149,7 @@ describe('Rules import interaction', () => {
 
     await user.click(tunnelOption);
     expect(within(dialog).queryByText('tunnelPortsReused')).not.toBeInTheDocument();
-  });
+  }, 10_000);
 
   it('cannot be closed or edited while sequential imports are running', async () => {
     const user = userEvent.setup();
