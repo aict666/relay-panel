@@ -18,14 +18,18 @@ import type { NodeDisplayRow } from '../../api/types';
 /**
  * Compare two node rows for STABLE within-group ordering. Sort keys (first
  * difference wins):
- *   1. public_ipv4 (falling back to legacy public_ip)
- *   2. public_ipv6
- *   3. node_id
+ *   1. report_ip (falling back to the legacy self-detected addresses)
+ *   2. public_ipv4 (falling back to legacy public_ip)
+ *   3. public_ipv6
+ *   4. node_id
  * Missing/empty values sort LAST (so a node that hasn't reported its IP yet
  * doesn't jump around above named nodes). The comparison is a plain string
  * compare — it just needs to be deterministic, not human-meaningful.
  */
 export function compareNodeRows<T extends NodeDisplayRow>(a: T, b: T): number {
+  const ar = a.report_ip ?? '';
+  const br = b.report_ip ?? '';
+  if (ar !== br && (ar || br)) return blankLast(ar, br);
   const av4 = a.public_ipv4 ?? a.public_ip ?? '';
   const bv4 = b.public_ipv4 ?? b.public_ip ?? '';
   if (av4 !== bv4) return blankLast(av4, bv4);

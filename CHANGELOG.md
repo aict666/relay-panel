@@ -10,6 +10,20 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.14] - 2026-07-23
+
+### Changed
+
+- 节点状态页的网络地址改为面板在最新 `report_status` 请求上实际观察到的来源
+  IP；直连读取 TCP 对端，反向代理部署兼容 `Forwarded`、`X-Forwarded-For`、
+  `X-Real-IP` 与 Cloudflare 客户端地址，并继续保留节点自测 IPv4/IPv6 供管理员
+  排查 NAT、代理和 WARP 出口差异。
+
+### Tests
+
+- 新增直连、Nginx/Caddy、RFC 7239 与 Cloudflare 上报来源解析测试，并覆盖状态
+  持久化、普通用户安全摘要、GeoIP 缓存清理和前端排序回退。
+
 ## [1.3.13] - 2026-07-23
 
 ### Security

@@ -313,6 +313,9 @@ export const enUS: Dict = {
   liveStatusHint: 'Live status reported by each running relay-node (refreshes every 5s).',
   // v0.4.14: node group layout + resource bars
   nodePublicIp: 'Public IP',
+  reportPathIp: 'Report Path IP',
+  detectedIpv4: 'Node-detected IPv4',
+  detectedIpv6: 'Node-detected IPv6',
   network: 'Network',
   regionUnknown: 'Unknown',
   region: 'Region',

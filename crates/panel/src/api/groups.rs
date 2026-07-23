@@ -153,6 +153,12 @@ pub async fn list_shared_node_summary(
     // here (lookups are triggered asynchronously at report_status time). If
     // GEOIP is disabled or the cache is empty, country stays None ("未知").
     for sm in &mut summaries {
+        if let Some(ref ip) = sm.report_ip {
+            if let Some(entry) = crate::api::geoip::read_cache(state.db.as_ref(), ip).await {
+                sm.report_ip_country_code = entry.country_code;
+                sm.report_ip_country_name = entry.country_name;
+            }
+        }
         if let Some(ref ip) = sm.public_ipv4 {
             if let Some(entry) = crate::api::geoip::read_cache(state.db.as_ref(), ip).await {
                 sm.ipv4_country_code = entry.country_code;
@@ -244,6 +250,11 @@ fn aggregate_shared_node_summaries(
                 ),
                 node_id,
                 online,
+                report_ip: s("report_ip"),
+                // Filled from the panel's GeoIP cache by the handler after
+                // this pure aggregation step.
+                report_ip_country_code: None,
+                report_ip_country_name: None,
                 public_ip: s("public_ip"),
                 // v0.4.15: dual-stack. public_ipv4 falls back to the legacy
                 // public_ip for older nodes that haven't upgraded yet.
@@ -332,6 +343,7 @@ mod tests {
             serde_json::json!({
                 "last_seen": ts,
                 "node_id": "n1",
+                "report_ip": "2001:db8::8",
                 "public_ip": "1.2.3.4",
                 "node_version": "0.4.13",
                 "config_protocol_version": 4,
@@ -448,6 +460,7 @@ mod tests {
         assert_eq!(s.boot_upload_bytes, Some(5000));
         assert_eq!(s.boot_download_bytes, Some(9000));
         // v0.4.14: extended fields exposed to regular users.
+        assert_eq!(s.report_ip.as_deref(), Some("2001:db8::8"));
         assert_eq!(s.public_ip.as_deref(), Some("1.2.3.4"));
         assert_eq!(s.node_version.as_deref(), Some("0.4.13"));
         assert_eq!(s.config_protocol_version, Some(4));
@@ -467,6 +480,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         let s = &out[0];
         assert_eq!(s.connections, 0);
+        assert!(s.report_ip.is_none());
         assert!(s.public_ip.is_none());
         assert!(s.node_version.is_none());
         assert!(s.uptime.is_none());

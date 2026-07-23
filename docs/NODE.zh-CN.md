@@ -156,6 +156,10 @@ systemctl status relay-node   # 应显示 active (running)
 - `PUBLIC_IP_CHECK_URL` 启动时检测一次，之后每 30 分钟刷新一次（不是每次
   轮询都请求）。检测失败不影响节点运行，只是面板上公网 IP 显示为「-」。
   如果不想依赖 ipify，可以指向你自己的回显 IP 服务。
+- 节点状态页“网络”列以面板在 `report_status` 请求上实际观察到的来源 IP
+  为准；经过 Nginx/Caddy/Cloudflare 时使用其转发的真实客户端 IP。节点通过
+  外部服务自测的 IPv4/IPv6 仍保留在管理员详情中，用于排查 NAT、代理或
+  WARP 出口差异。
 - `POLL_INTERVAL` 同时控制配置轮询和状态上报。调小 = 状态更新更快但 HTTP
   流量更多。10 秒是个不错的默认值。
 - `NETWORK_INTERFACE` 决定整机流量统计（面板「整机上行/下行」列）统计哪张

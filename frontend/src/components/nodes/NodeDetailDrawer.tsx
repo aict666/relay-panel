@@ -47,6 +47,7 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
 
   const v4 = row?.public_ipv4 ?? row?.public_ip;
   const v6 = row?.public_ipv6;
+  const reportIp = row?.report_ip;
 
   return (
     <Drawer title={row?.group_name || t('resourceDetails')} open={open} onClose={onClose} size={440}>
@@ -57,9 +58,17 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
             {row.online ? <Tag color="green">{t('online')}</Tag> : <Tag>{t('offline')}</Tag>}
           </Descriptions.Item>
 
-          {/* Dual-stack network — flag pill + IP, no country name. Unknown
-           *  regions render "--" inside the pill (see CountryFlag). */}
-          {v4 && (
+          {/* Prefer the address observed on the actual status-report path.
+           * Legacy rows have no report_ip and fall back to self-detection. */}
+          {reportIp && (
+            <Descriptions.Item label={t('reportPathIp')}>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <CountryFlag code={row.report_ip_country_code} />
+                <span className="rp-mono">{reportIp}</span>
+              </span>
+            </Descriptions.Item>
+          )}
+          {!reportIp && v4 && (
             <Descriptions.Item label="IPv4">
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                 <CountryFlag code={row.ipv4_country_code} />
@@ -67,7 +76,7 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
               </span>
             </Descriptions.Item>
           )}
-          {v6 && (
+          {!reportIp && v6 && (
             <Descriptions.Item label="IPv6">
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                 <CountryFlag code={row.ipv6_country_code} />
@@ -124,6 +133,16 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
                 })()}
               </Descriptions.Item>
               <Descriptions.Item label={t('networkInterface')}>{row.network_interface || '-'}</Descriptions.Item>
+              {reportIp && v4 && (
+                <Descriptions.Item label={t('detectedIpv4')}>
+                  <span className="rp-mono">{v4}</span>
+                </Descriptions.Item>
+              )}
+              {reportIp && v6 && (
+                <Descriptions.Item label={t('detectedIpv6')}>
+                  <span className="rp-mono">{v6}</span>
+                </Descriptions.Item>
+              )}
               <Descriptions.Item label={t('diskMount')}>{row.disk_mount || '-'}</Descriptions.Item>
               {row.process_uptime != null && (
                 <Descriptions.Item label={t('processUptime')}>{formatUptime(row.process_uptime, labels)}</Descriptions.Item>

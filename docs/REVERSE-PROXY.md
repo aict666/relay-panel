@@ -62,6 +62,20 @@ location / {
 > from `/api/v1/...`. Do not add a path prefix (e.g. `/panel/`) — it will break
 > the SPA router and API routes.
 
+### Node report-path IP
+
+The node-status page uses the client IP observed on the latest
+`/api/v1/node/report_status` request. For a direct deployment this is the TCP
+peer address. Behind a proxy, the panel recognizes `CF-Connecting-IP`, the
+standard `Forwarded` header, `X-Forwarded-For`, and `X-Real-IP` (in that order),
+so the Nginx configuration above and Caddy's defaults preserve the node's
+original reporting address instead of showing a proxy/container address.
+
+Only let a trusted reverse proxy reach the panel port when relying on forwarded
+headers. If the panel is reachable directly as well, a client can supply those
+headers itself. The node's independently detected egress IPv4/IPv6 remains
+available to administrators in the node detail drawer for troubleshooting.
+
 ---
 
 ## Caddy (external / host-level)
