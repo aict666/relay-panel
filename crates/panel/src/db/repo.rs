@@ -339,10 +339,15 @@ pub trait UserRepository: Send + Sync {
     async fn delete_user_cascade(&self, uid: i64) -> Result<u64, DbError>;
     /// List all users (public projection, no password).
     async fn list_users_public(&self) -> Result<Vec<crate::api::admin::UserPublic>, DbError>;
-    /// Count users with placeholder admin password (system boot check).
-    async fn count_placeholder_admin_password(&self) -> Result<i64, DbError>;
-    /// Replace placeholder admin password with a real hash (system boot).
-    async fn replace_placeholder_admin_password(&self, hash: &str) -> Result<(), DbError>;
+    /// Atomically replace the seeded/legacy initial administrator password.
+    /// The expected hash is compared byte-for-byte so concurrent panel
+    /// instances cannot both publish different first-install credentials.
+    /// Returns rows affected (0 means another instance already initialized it).
+    async fn replace_initial_admin_password(
+        &self,
+        expected_hash: &str,
+        new_hash: &str,
+    ) -> Result<u64, DbError>;
 }
 
 // ── Rule (forward_rules) ──

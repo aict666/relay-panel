@@ -332,7 +332,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_udp
     ON forward_rules (device_group_in, listen_port)
     WHERE protocol IN ('udp', 'tcp_udp');
 
--- Default admin user (password: admin123, will be hashed on init)
+-- Default administrator. The unusable placeholder is replaced at startup by a
+-- unique random password that is printed once to the panel log.
 INSERT OR IGNORE INTO users (id, username, password, admin, max_rules)
 VALUES (1, 'admin', '$2b$12$PLACEHOLDER_WILL_BE_HASHED_ON_INIT', 1, 999);
 
@@ -1821,6 +1822,7 @@ async fn add_column_if_missing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::sqlite_repo::SqliteRepository;
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
 
@@ -2475,12 +2477,11 @@ mod tests {
     }
 
     // ── Password-reset regression guards (audit item #3) ──
-    // These pin the safety contract of init's password hashing: an admin who
+    // These pin the safety contract of init's random password setup: an admin who
     // changed their password must NEVER have it reverted by a restart, a
     // migration, or a container rebuild. The hashing function is in init.rs.
 
-    /// The placeholder password IS replaced on first boot (the happy path — a
-    /// fresh DB has the placeholder, init hashes it to a real bcrypt value).
+    /// The placeholder is replaced by a unique random password on first boot.
     #[tokio::test]
     async fn placeholder_password_is_hashed_on_first_boot() {
         let pool = fresh_pool().await;
@@ -2494,9 +2495,14 @@ mod tests {
             "fresh DB should still have the placeholder: {}",
             before.0
         );
-        crate::db::init::hash_default_admin_password_if_placeholder(&pool)
+        let repo = SqliteRepository::new(pool.clone());
+        let generated = crate::db::init::initialize_random_admin_password(&repo)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("fresh install must return its generated password");
+        assert_eq!(generated.len(), 32);
+        assert!(generated.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(generated, "admin123");
         let after: (String,) = sqlx::query_as("SELECT password FROM users WHERE id=1")
             .fetch_one(&pool)
             .await
@@ -2506,6 +2512,8 @@ mod tests {
             "placeholder must be replaced with a real hash"
         );
         assert!(after.0.starts_with("$2b$12$"), "should be a bcrypt hash");
+        assert!(bcrypt::verify(&generated, &after.0).unwrap());
+        assert!(!bcrypt::verify("admin123", &after.0).unwrap());
         // The seeded default password must force a change on first login.
         let mcp: (i64,) = sqlx::query_as("SELECT must_change_password FROM users WHERE id=1")
             .fetch_one(&pool)
@@ -2532,9 +2540,11 @@ mod tests {
             .await
             .unwrap();
         // Run the init-time hashing (what every panel boot does).
-        crate::db::init::hash_default_admin_password_if_placeholder(&pool)
+        let repo = SqliteRepository::new(pool.clone());
+        let generated = crate::db::init::initialize_random_admin_password(&repo)
             .await
             .unwrap();
+        assert!(generated.is_none(), "changed password must not be replaced");
         let after: (String,) = sqlx::query_as("SELECT password FROM users WHERE id=1")
             .fetch_one(&pool)
             .await
@@ -2561,17 +2571,23 @@ mod tests {
     #[tokio::test]
     async fn password_hashing_is_idempotent() {
         let pool = fresh_pool().await;
-        crate::db::init::hash_default_admin_password_if_placeholder(&pool)
+        let repo = SqliteRepository::new(pool.clone());
+        let first_password = crate::db::init::initialize_random_admin_password(&repo)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("first call initializes the password");
         let after_first: (String,) = sqlx::query_as("SELECT password FROM users WHERE id=1")
             .fetch_one(&pool)
             .await
             .unwrap();
         // Second call — must not change anything.
-        crate::db::init::hash_default_admin_password_if_placeholder(&pool)
+        let second_password = crate::db::init::initialize_random_admin_password(&repo)
             .await
             .unwrap();
+        assert!(
+            second_password.is_none(),
+            "second call must not print a password"
+        );
         let after_second: (String,) = sqlx::query_as("SELECT password FROM users WHERE id=1")
             .fetch_one(&pool)
             .await
@@ -2580,6 +2596,38 @@ mod tests {
             after_first.0, after_second.0,
             "re-running init must not re-hash"
         );
+        assert!(bcrypt::verify(&first_password, &after_second.0).unwrap());
+    }
+
+    /// Upgrades must also remove the historical public `admin123` credential,
+    /// even though it is already stored as a normal salted bcrypt hash.
+    #[tokio::test]
+    async fn legacy_default_admin_password_is_rotated() {
+        let pool = fresh_pool().await;
+        let legacy_hash = bcrypt::hash("admin123", 12).unwrap();
+        sqlx::query("UPDATE users SET password=?, must_change_password=0 WHERE id=1")
+            .bind(&legacy_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let repo = SqliteRepository::new(pool.clone());
+        let generated = crate::db::init::initialize_random_admin_password(&repo)
+            .await
+            .unwrap()
+            .expect("legacy default must be rotated and reported");
+        let stored: String = sqlx::query_scalar("SELECT password FROM users WHERE id=1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(bcrypt::verify(&generated, &stored).unwrap());
+        assert!(!bcrypt::verify("admin123", &stored).unwrap());
+        let state: (bool, i64) =
+            sqlx::query_as("SELECT must_change_password, token_version FROM users WHERE id=1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(state.0);
+        assert_eq!(state.1, 1, "legacy sessions must be revoked");
     }
 
     /// v0.4.7 Migration 22: chain removal + tls template consolidation.

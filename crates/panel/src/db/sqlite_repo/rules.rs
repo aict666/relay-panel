@@ -599,6 +599,28 @@ impl RuleRepository for SqliteRepository {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                 return Err(DbError::RuleGroupUnavailable);
             }
+            if !owner_is_admin {
+                let authorized: Option<i64> = try_!(
+                    conn,
+                    sqlx::query_scalar(
+                        "SELECT 1 FROM device_groups dg \
+                         JOIN users group_owner ON group_owner.id=dg.uid \
+                         WHERE dg.id=? AND dg.group_type IN ('in','both') \
+                           AND group_owner.admin=1 AND (?=1 OR EXISTS (\
+                             SELECT 1 FROM user_device_groups udg \
+                             WHERE udg.user_id=? AND udg.device_group_id=dg.id))",
+                    )
+                    .bind(group_id)
+                    .bind(owner_all_groups as i32)
+                    .bind(uid)
+                    .fetch_optional(&mut *conn)
+                    .await
+                );
+                if authorized.is_none() {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(DbError::RuleGroupAccessDenied);
+                }
+            }
         }
 
         if let Some(profile_id) = tunnel_profile_id {
@@ -1242,6 +1264,27 @@ impl RuleRepository for SqliteRepository {
                     if valid.is_none() {
                         let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                         return Err(DbError::RuleGroupUnavailable);
+                    }
+                    if !owner_is_admin {
+                        let authorized: Option<i64> = try_!(
+                            sqlx::query_scalar(
+                                "SELECT 1 FROM device_groups dg \
+                                 JOIN users group_owner ON group_owner.id=dg.uid \
+                                 WHERE dg.id=? AND dg.group_type IN ('in','both') \
+                                   AND group_owner.admin=1 AND (?=1 OR EXISTS (\
+                                     SELECT 1 FROM user_device_groups udg \
+                                     WHERE udg.user_id=? AND udg.device_group_id=dg.id))",
+                            )
+                            .bind(group_id)
+                            .bind(owner_all_groups as i32)
+                            .bind(rule_owner_id)
+                            .fetch_optional(&mut *conn)
+                            .await
+                        );
+                        if authorized.is_none() {
+                            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                            return Err(DbError::RuleGroupAccessDenied);
+                        }
                     }
                 }
             }

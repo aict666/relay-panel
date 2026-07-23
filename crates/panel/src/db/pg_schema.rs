@@ -288,8 +288,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_udp
     ON forward_rules (device_group_in, listen_port)
     WHERE protocol IN ('udp', 'tcp_udp');
 
--- Default admin user (password: admin123, will be hashed on init via the
--- same UserRepository::replace_placeholder_admin_password path SQLite uses).
+-- Default administrator. The unusable placeholder is replaced at startup by a
+-- unique random password that is printed once to the panel log.
 -- id=1 is pinned so FK references (device_groups.uid, forward_rules.uid, etc.)
 -- resolve to a stable admin row across fresh deployments. ON CONFLICT (id) DO
 -- NOTHING makes re-runs idempotent. admin=TRUE (PG boolean literal).

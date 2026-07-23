@@ -990,8 +990,9 @@ const IMPORT_DEFAULTS = {
       </Space>
     ),
   }));
-  // Chain hops: entry must be inbound-capable; mid/exit can be any forwarding
-  // group. `both` is intentionally available in either position.
+  // Admin custom chains may use any forwarding group after an inbound entry.
+  // Regular users receive only their authorized inbound-capable shared groups,
+  // because every caller-controlled hop is a package authorization boundary.
   const hopGroupOptions = (isAdmin
     ? groups.filter(isForwardingGroup)
     : sharedInGroups

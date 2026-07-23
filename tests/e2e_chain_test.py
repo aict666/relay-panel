@@ -97,6 +97,21 @@ def wait_for_port(host, port, timeout=40):
     return False
 
 
+def wait_for_initial_admin_password(log_path, timeout=15):
+    """Read the one-time first-install credential without echoing it."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as log:
+                match = re.search(r"密码:\s*([0-9a-f]{32})", log.read())
+            if match is not None:
+                return match.group(1)
+        except FileNotFoundError:
+            pass
+        time.sleep(0.1)
+    raise AssertionError("generated administrator password not found in panel log")
+
+
 class TCPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         while True:
@@ -216,15 +231,22 @@ def main():
         procs.append(panel)
         print(f"[panel] PID {panel.pid}")
         assert wait_for_port("127.0.0.1", 18889), "panel did not start"
+        initial_admin_pw = wait_for_initial_admin_password(
+            os.path.join(work, "panel.log")
+        )
 
-        r = api("POST", "/auth/login", body={"username": "admin", "password": "admin123"})
+        r = api(
+            "POST",
+            "/auth/login",
+            body={"username": "admin", "password": initial_admin_pw},
+        )
         assert r["code"] == 0, r
         token = r["data"]["token"]
         chg = api(
             "PUT",
             "/user/password",
             token,
-            {"current_password": "admin123", "new_password": ADMIN_PW},
+            {"current_password": initial_admin_pw, "new_password": ADMIN_PW},
         )
         assert chg["code"] == 0, chg
         r = api("POST", "/auth/login", body={"username": "admin", "password": ADMIN_PW})

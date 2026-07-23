@@ -61,9 +61,17 @@ jobs:
 
       - name: Verify login API
         run: |
+          admin_password=$(docker compose logs --no-color panel 2>&1 \
+            | sed -n 's/.*密码:[[:space:]]*\([0-9a-f]\{32\}\).*/\1/p' \
+            | tail -n 1)
+          if [ -z "$admin_password" ]; then
+            echo "generated administrator password not found in panel log"
+            exit 1
+          fi
+          payload=$(printf '{"username":"admin","password":"%s"}' "$admin_password")
           resp=$(curl -sf -X POST http://127.0.0.1:18888/api/v1/auth/login \
             -H 'Content-Type: application/json' \
-            -d '{"username":"admin","password":"admin123"}')
+            --data-binary "$payload")
           echo "$resp" | grep -q '"code":0' && echo "login OK" || (echo "login FAILED: $resp" && exit 1)
 
       # ---- Diagnostics (only run on failure) ----

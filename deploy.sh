@@ -681,12 +681,8 @@ compose_with_profiles up -d $COMPOSE_FLAGS
 
 # ---------- 5. Verify ----------
 # Deployment success is decided by the CONTAINER + PORT + a real health
-# endpoint, NOT by logging in as admin/admin123. Existing deployments have
-# almost always changed the default password, so a 401 on the default login is
-# a normal condition for an upgrade — it must NOT fail the deploy.
-# (Regression: v0.2.x made the admin/admin123 login a hard FAIL, so every
-# upgrade on a deployment that had changed its password reported FAIL even
-# though the panel was running fine on :18888.)
+# endpoint, NOT by attempting an administrator login. Login probes are both
+# unnecessary and capable of tripping rate limits on a healthy deployment.
 
 info "Waiting for panel to become reachable ..."
 for i in $(seq 1 30); do
@@ -784,14 +780,14 @@ case "$RELAYPANEL_WEB_MODE" in
 esac
 echo "  DB:      ${RELAYPANEL_DB_MODE:-sqlite}"
 echo "  Web:     $(web_mode_label "$RELAYPANEL_WEB_MODE")"
-# Security: we deliberately do NOT print the default admin/admin123 credentials
-# here, nor do we probe them (probing an unchanged default is a needless login
-# attempt that can trip rate-limiting; printing it trains users to ignore creds
-# in shell output). First-time installers are told once in the README to change
-# the password; upgrades use whatever password the admin already set.
+# The panel itself generates the initial password and prints it only in its
+# first-initialization log. Do not copy the secret into deploy.sh output, where
+# wrappers or CI systems may capture it separately from the protected service log.
 echo "  Login:   open the URL above and sign in"
 echo ""
-echo "  If this is a FIRST install, change the default admin password now."
+echo "  First install: read the random admin password with:"
+echo "    docker compose -f $COMPOSE_FILE logs panel"
+echo "  Then sign in as admin and change the password immediately."
 if [ "${RELAYPANEL_WITH_NODE:-0}" != "1" ]; then
     echo ""
     echo "  Only the panel is running. To forward traffic, install relay-node"

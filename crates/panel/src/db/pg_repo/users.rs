@@ -588,27 +588,21 @@ impl UserRepository for PgRepository {
         Ok(users)
     }
 
-    async fn count_placeholder_admin_password(&self) -> Result<i64, DbError> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE id = 1 AND password LIKE '$2b$12$PLACEHOLDER%'",
+    async fn replace_initial_admin_password(
+        &self,
+        expected_hash: &str,
+        new_hash: &str,
+    ) -> Result<u64, DbError> {
+        // Compare-and-swap mirrors SQLite and makes multi-replica first boot
+        // deterministic: only the instance whose password was committed logs it.
+        let result = sqlx::query(
+            "UPDATE users SET password = $1, must_change_password = TRUE, \
+             token_version = token_version + 1 WHERE id = 1 AND password = $2",
         )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count)
-    }
-
-    async fn replace_placeholder_admin_password(&self, hash: &str) -> Result<(), DbError> {
-        // Also set must_change_password so the seeded "admin123" forces a change
-        // on first login. This fires ONLY while the password is still the
-        // placeholder (first boot); once the admin sets a real password the LIKE
-        // guard never matches again, so we never re-flag a real account.
-        sqlx::query(
-            "UPDATE users SET password = $1, must_change_password = TRUE \
-             WHERE id = 1 AND password LIKE '$2b$12$PLACEHOLDER%'",
-        )
-        .bind(hash)
+        .bind(new_hash)
+        .bind(expected_hash)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 }

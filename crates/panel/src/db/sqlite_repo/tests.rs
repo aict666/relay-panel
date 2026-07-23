@@ -967,30 +967,38 @@ async fn user_delete_cascade_refuses_admin_and_rolls_back() {
 }
 
 #[tokio::test]
-async fn user_placeholder_password_methods_round_trip() {
+async fn user_initial_password_compare_and_swap() {
     let db = repo().await;
-    // SCHEMA_SQL seeds user id=1 with the placeholder password, so the
-    // count should start at 1.
-    assert_eq!(db.count_placeholder_admin_password().await.unwrap(), 1);
-
-    // Replace it with a real hash; count must drop to 0 and the row updates.
-    db.replace_placeholder_admin_password("$2b$12$realhash")
+    let original: String = sqlx::query_scalar("SELECT password FROM users WHERE id=1")
+        .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(db.count_placeholder_admin_password().await.unwrap(), 0);
-
-    // A second replace is a no-op (the WHERE no longer matches).
-    db.replace_placeholder_admin_password("$2b$12$other")
+    let affected = db
+        .replace_initial_admin_password(&original, "$2b$12$realhash")
         .await
         .unwrap();
+    assert_eq!(affected, 1);
+
+    // A stale concurrent initializer cannot overwrite the winning password.
+    let affected = db
+        .replace_initial_admin_password(&original, "$2b$12$other")
+        .await
+        .unwrap();
+    assert_eq!(affected, 0);
     let stored: (String,) = sqlx::query_as("SELECT password FROM users WHERE id = 1")
         .fetch_one(&db.pool)
         .await
         .unwrap();
     assert_eq!(
         stored.0, "$2b$12$realhash",
-        "second replace must not overwrite"
+        "stale compare-and-swap must not overwrite"
     );
+    let state: (bool, i64) =
+        sqlx::query_as("SELECT must_change_password, token_version FROM users WHERE id=1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, (true, 1));
 }
 
 // ── RuleRepository ──
@@ -1910,6 +1918,99 @@ async fn rule_update_full_rolls_back_scalar_when_hop_insert_fails() {
         "scalar field escaped the rolled-back transaction"
     );
     assert_eq!(hop_count, 0);
+}
+
+/// The repository is the final TOCTOU boundary: even if an API/service check
+/// raced with an authorization change, neither create nor update may persist a
+/// caller-controlled downstream hop outside the rule owner's current grants.
+#[tokio::test]
+async fn rule_full_writes_reject_unauthorized_downstream_hops() {
+    let db = repo().await;
+    seed_user(&db, 2, false).await;
+    seed_group_typed(&db, 10, 1, "both").await;
+    seed_group_typed(&db, 20, 1, "both").await;
+    db.set_user_device_groups(2, &[10]).await.unwrap();
+
+    db.insert_quota_guarded(
+        "existing-direct",
+        2,
+        20_000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        10,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    let rule_id = db.list_rules(&ResourceScope::Owner(2)).await.unwrap()[0].id;
+
+    let update = db
+        .update_rule_full(&RuleUpdateData {
+            id: rule_id,
+            effective_device_group_in: 10,
+            route_mode: Some("chain".into()),
+            forward_mode: Some("chain".into()),
+            device_group_in: Some(10),
+            device_group_out: Some(Some(20)),
+            hops: Some(vec![(10, 20_000), (20, 30_000)]),
+            ..Default::default()
+        })
+        .await;
+    assert!(matches!(update, Err(DbError::RuleGroupAccessDenied)));
+    let stored: (String, i64) = sqlx::query_as(
+        "SELECT route_mode, (SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id=?) \
+         FROM forward_rules WHERE id=?",
+    )
+    .bind(rule_id)
+    .bind(rule_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, ("direct".into(), 0), "denied update must roll back");
+
+    let create = db
+        .create_rule_full(
+            "denied-chain",
+            2,
+            20_001,
+            "tcp",
+            "raw",
+            "raw",
+            "chain",
+            "raw",
+            None,
+            10,
+            Some(20),
+            "chain",
+            "127.0.0.1",
+            80,
+            &[relay_shared::protocol::RuleTargetRequest {
+                host: "target.example.com".into(),
+                port: 80,
+                enabled: true,
+                weight: 1,
+            }],
+            &[(10, 20_001), (20, 30_001)],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await;
+    assert!(matches!(create, Err(DbError::RuleGroupAccessDenied)));
+    let denied_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE name='denied-chain'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(denied_count, 0, "denied create must leave no partial row");
 }
 
 #[tokio::test]

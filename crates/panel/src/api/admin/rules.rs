@@ -53,34 +53,27 @@ pub async fn create_rule(
     } else {
         None
     };
-    // v1.0.4: non-admin users with a RESTRICTED permission group (group set +
-    // allow_all_groups=false) can only create rules on authorized device
-    // groups. An empty authorized list means "no groups allowed" → deny. Legacy
-    // (group_id NULL) and allow-all users skip this and defer to the service
-    // layer's normal group validation. A DB error returns 500.
+    // A regular user's custom chain may use only groups in their effective
+    // authorization set at EVERY position. Preset tunnels are different: an
+    // administrator explicitly owns/shares their internal topology, so only
+    // the preset entry is checked here.
     if !user.admin {
-        let restricted = match state.db.is_user_restricted(user.user_id).await {
-            Ok(r) => r,
+        let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
+            Ok(a) => a,
             Err(e) => {
-                tracing::error!("create_rule: restriction lookup failed: {}", e);
+                tracing::error!("create_rule: authz lookup failed: {}", e);
                 return Json(err(500, "数据库错误"));
             }
         };
-        if restricted {
-            let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::error!("create_rule: authz lookup failed: {}", e);
-                    return Json(err(500, "数据库错误"));
-                }
-            };
-            // Chain: entry is hops[0] when provided; otherwise device_group_in.
-            let entry_gid = tunnel_entry
-                .or_else(|| req.hops.as_ref().and_then(|hops| hops.first().copied()))
-                .unwrap_or(req.device_group_in);
-            if !allowed.contains(&entry_gid) {
-                return Json(err(403, "device_group_in 不在您允许的分组列表中"));
-            }
+        let requested_groups: Vec<i64> = if req.tunnel_id.is_some() {
+            vec![tunnel_entry.unwrap_or(req.device_group_in)]
+        } else if let Some(hops) = req.hops.as_ref().filter(|hops| !hops.is_empty()) {
+            hops.clone()
+        } else {
+            vec![req.device_group_in]
+        };
+        if requested_groups.iter().any(|gid| !allowed.contains(gid)) {
+            return Json(err(403, "规则包含未授权的设备分组"));
         }
     }
     match crate::service::rules::create_rule(state.db.as_ref(), user.user_id, user.admin, &req)
@@ -146,31 +139,27 @@ pub async fn update_rule(
     }
     let requested_entry_group = tunnel_entry.or(hops_entry).or(req.device_group_in);
 
-    // v1.0.4: restricted non-admin users can only switch to authorized device
-    // groups. Legacy/allow-all users skip this. DB error → 500.
+    // Custom hops are caller-controlled, so every position is authorized.
+    // A shared preset tunnel remains entry-authorized because its downstream
+    // topology is administrator-controlled.
     if !user.admin {
-        if let Some(dgi) = requested_entry_group {
-            let restricted = match state.db.is_user_restricted(user.user_id).await {
-                Ok(r) => r,
+        let requested_groups: Vec<i64> = if matches!(req.tunnel_id, Some(Some(_))) {
+            requested_entry_group.into_iter().collect()
+        } else if let Some(hops) = req.hops.as_ref().filter(|hops| !hops.is_empty()) {
+            hops.clone()
+        } else {
+            requested_entry_group.into_iter().collect()
+        };
+        if !requested_groups.is_empty() {
+            let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
+                Ok(a) => a,
                 Err(e) => {
-                    tracing::error!("update_rule: restriction lookup failed: {}", e);
+                    tracing::error!("update_rule: authz lookup failed: {}", e);
                     return Json(err(500, "数据库错误"));
                 }
             };
-            if restricted {
-                let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::error!("update_rule: authz lookup failed: {}", e);
-                        return Json(err(500, "数据库错误"));
-                    }
-                };
-                if !allowed.contains(&dgi) {
-                    return Json(err(
-                        403,
-                        "device_group_in is not in your allowed device groups",
-                    ));
-                }
+            if requested_groups.iter().any(|gid| !allowed.contains(gid)) {
+                return Json(err(403, "规则包含未授权的设备分组"));
             }
         }
     }
@@ -181,32 +170,35 @@ pub async fn update_rule(
     // skipped when that field is absent. Only needed when not switching groups
     // in the same request (that path is already covered above).
     if !user.admin && req.paused == Some(false) && requested_entry_group.is_none() {
-        let restricted = match state.db.is_user_restricted(user.user_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("update_rule: restriction lookup failed: {}", e);
-                return Json(err(500, "数据库错误"));
-            }
-        };
-        if restricted {
-            match state.db.find_rule_by_id(id, &scope).await {
-                Ok(Some(rule)) => {
-                    let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
-                        Ok(a) => a,
+        match state.db.find_rule_by_id(id, &scope).await {
+            Ok(Some(rule)) => {
+                let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!("update_rule: authz lookup failed: {}", e);
+                        return Json(err(500, "数据库错误"));
+                    }
+                };
+                let mut group_ids = vec![rule.device_group_in];
+                if rule.route_mode == "chain" && rule.tunnel_id.is_none() {
+                    match state.db.list_rule_hops(rule.id).await {
+                        Ok(hops) => {
+                            group_ids.extend(hops.into_iter().map(|hop| hop.device_group_id))
+                        }
                         Err(e) => {
-                            tracing::error!("update_rule: authz lookup failed: {}", e);
+                            tracing::error!("update_rule: hop lookup failed: {}", e);
                             return Json(err(500, "数据库错误"));
                         }
-                    };
-                    if !allowed.contains(&rule.device_group_in) {
-                        return Json(err(403, "无法启动未被授权设备分组下的规则"));
                     }
                 }
-                Ok(None) => return Json(err(404, "规则不存在")),
-                Err(e) => {
-                    tracing::error!("update_rule: rule lookup failed: {}", e);
-                    return Json(err(500, "数据库错误"));
+                if group_ids.iter().any(|gid| !allowed.contains(gid)) {
+                    return Json(err(403, "无法启动包含未授权设备分组的规则"));
                 }
+            }
+            Ok(None) => return Json(err(404, "规则不存在")),
+            Err(e) => {
+                tracing::error!("update_rule: rule lookup failed: {}", e);
+                return Json(err(500, "数据库错误"));
             }
         }
     }

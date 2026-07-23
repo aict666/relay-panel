@@ -29,14 +29,16 @@ docker compose ps
 docker compose logs --tail=100 panel
 ```
 
-浏览器打开 `http://服务器IP:18888`。默认账号是：
+浏览器打开 `http://服务器IP:18888`。管理员用户名固定为 `admin`，初始密码由面板在首次建库时随机生成。执行下面的命令查看：
 
-```text
-用户名：admin
-密码：admin123
+```bash
+cd /opt/relay-panel
+docker compose -f docker-compose.release.yaml logs panel
 ```
 
-首次登录会强制修改密码。正式暴露到公网前，请完成[安全配置](/guide/security)中的 HTTPS 和防火墙设置。
+在日志中找到“RelayPanel 首次安装管理员凭据”，使用其中的密码登录。凭据只在初始化成功的那次启动中输出，不会在后续重启时重复生成；请妥善限制容器日志的读取权限。首次登录会强制修改密码。
+
+从旧版本升级且管理员仍使用历史默认密码时，面板也会自动换成新的随机密码并在升级后的启动日志中输出。正式暴露到公网前，请完成[安全配置](/guide/security)中的 HTTPS 和防火墙设置。
 
 ## 2. 创建设备分组
 

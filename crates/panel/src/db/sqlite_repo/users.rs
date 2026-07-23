@@ -664,27 +664,22 @@ impl UserRepository for SqliteRepository {
         Ok(users)
     }
 
-    async fn count_placeholder_admin_password(&self) -> Result<i64, DbError> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE id = 1 AND password LIKE '$2b$12$PLACEHOLDER%'",
+    async fn replace_initial_admin_password(
+        &self,
+        expected_hash: &str,
+        new_hash: &str,
+    ) -> Result<u64, DbError> {
+        // Compare-and-swap is important for deployments that accidentally
+        // start two panel replicas against the same database: only the winner
+        // may print credentials that actually work.
+        let result = sqlx::query(
+            "UPDATE users SET password = ?, must_change_password = 1, \
+             token_version = token_version + 1 WHERE id = 1 AND password = ?",
         )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count)
-    }
-
-    async fn replace_placeholder_admin_password(&self, hash: &str) -> Result<(), DbError> {
-        // Also set must_change_password so the seeded "admin123" forces a change
-        // on first login. This fires ONLY while the password is still the
-        // placeholder (first boot); once the admin sets a real password the LIKE
-        // guard never matches again, so we never re-flag a real account.
-        sqlx::query(
-            "UPDATE users SET password = ?, must_change_password = 1 \
-             WHERE id = 1 AND password LIKE '$2b$12$PLACEHOLDER%'",
-        )
-        .bind(hash)
+        .bind(new_hash)
+        .bind(expected_hash)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 }
