@@ -29,7 +29,7 @@ use relay_shared::protocol::{
     TunnelRouteConfig, UotRole,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 struct ResolvedTargets {
     addrs: Vec<String>,
@@ -92,7 +92,7 @@ async fn all_custom_chain_hops_are_authorized(
     hops: &[relay_shared::models::ForwardRuleHop],
     cache: &mut HashMap<i64, Option<HashSet<i64>>>,
 ) -> Result<bool, DbError> {
-    if !cache.contains_key(&owner_id) {
+    if let Entry::Vacant(entry) = cache.entry(owner_id) {
         let authorization = if db.is_admin(owner_id).await? {
             None
         } else {
@@ -103,7 +103,7 @@ async fn all_custom_chain_hops_are_authorized(
                     .collect(),
             )
         };
-        cache.insert(owner_id, authorization);
+        entry.insert(authorization);
     }
     Ok(match cache.get(&owner_id) {
         Some(None) => true,
