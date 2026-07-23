@@ -996,23 +996,35 @@ async fn pg_user_delete_cascade_refuses_admin_and_rolls_back() {
 }
 
 #[tokio::test]
-async fn pg_user_placeholder_password_methods_round_trip() {
+async fn pg_user_initial_password_compare_and_swap() {
     let Some(db) = repo("user_ph").await else {
         return;
     };
-    assert_eq!(db.count_placeholder_admin_password().await.unwrap(), 1);
-    db.replace_placeholder_admin_password("$2b$12$realhash")
+    let original: String = sqlx::query_scalar("SELECT password FROM users WHERE id=1")
+        .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(db.count_placeholder_admin_password().await.unwrap(), 0);
-    db.replace_placeholder_admin_password("$2b$12$other")
+    let affected = db
+        .replace_initial_admin_password(&original, "$2b$12$realhash")
         .await
         .unwrap();
+    assert_eq!(affected, 1);
+    let affected = db
+        .replace_initial_admin_password(&original, "$2b$12$other")
+        .await
+        .unwrap();
+    assert_eq!(affected, 0);
     let stored: (String,) = sqlx::query_as("SELECT password FROM users WHERE id = 1")
         .fetch_one(&db.pool)
         .await
         .unwrap();
     assert_eq!(stored.0, "$2b$12$realhash");
+    let state: (bool, i64) =
+        sqlx::query_as("SELECT must_change_password, token_version FROM users WHERE id=1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, (true, 1));
     cleanup(&db).await;
 }
 
@@ -4124,6 +4136,107 @@ async fn pg_rule_update_full_rolls_back_scalar_when_hop_insert_fails() {
             .unwrap();
     assert_eq!(name, "before");
     assert_eq!(hop_count, 0);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_rule_full_writes_reject_unauthorized_downstream_hops() {
+    let Some(db) = repo("rule_hop_authz").await else {
+        return;
+    };
+    sqlx::query("INSERT INTO users (id,username,password,admin) VALUES (2,'alice','x',FALSE)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO device_groups (id,name,group_type,token,connect_host,uid) VALUES \
+         (10,'allowed','both','tok10','192.0.2.10',1), \
+         (20,'premium','both','tok20','192.0.2.20',1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.set_user_device_groups(2, &[10]).await.unwrap();
+
+    db.insert_quota_guarded(
+        "existing-direct",
+        2,
+        20_000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        10,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    let rule_id = db.list_rules(&ResourceScope::Owner(2)).await.unwrap()[0].id;
+
+    let update = db
+        .update_rule_full(&RuleUpdateData {
+            id: rule_id,
+            effective_device_group_in: 10,
+            route_mode: Some("chain".into()),
+            forward_mode: Some("chain".into()),
+            device_group_in: Some(10),
+            device_group_out: Some(Some(20)),
+            hops: Some(vec![(10, 20_000), (20, 30_000)]),
+            ..Default::default()
+        })
+        .await;
+    assert!(matches!(update, Err(DbError::RuleGroupAccessDenied)));
+    let stored: (String, i64) = sqlx::query_as(
+        "SELECT route_mode, (SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id=$1) \
+         FROM forward_rules WHERE id=$1",
+    )
+    .bind(rule_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, ("direct".into(), 0), "denied update must roll back");
+
+    let create = db
+        .create_rule_full(
+            "denied-chain",
+            2,
+            20_001,
+            "tcp",
+            "raw",
+            "raw",
+            "chain",
+            "raw",
+            None,
+            10,
+            Some(20),
+            "chain",
+            "127.0.0.1",
+            80,
+            &[relay_shared::protocol::RuleTargetRequest {
+                host: "target.example.com".into(),
+                port: 80,
+                enabled: true,
+                weight: 1,
+            }],
+            &[(10, 20_001), (20, 30_001)],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await;
+    assert!(matches!(create, Err(DbError::RuleGroupAccessDenied)));
+    let denied_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE name='denied-chain'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(denied_count, 0, "denied create must leave no partial row");
     cleanup(&db).await;
 }
 

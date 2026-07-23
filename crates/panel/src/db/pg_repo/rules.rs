@@ -638,6 +638,28 @@ impl RuleRepository for PgRepository {
                 let _ = tx.rollback().await;
                 return Err(DbError::RuleGroupUnavailable);
             }
+            if !owner_is_admin {
+                let authorized: Option<i32> = try_!(
+                    tx,
+                    sqlx::query_scalar(
+                        "SELECT 1 FROM device_groups dg \
+                         JOIN users group_owner ON group_owner.id=dg.uid \
+                         WHERE dg.id=$1 AND dg.group_type IN ('in','both') \
+                           AND group_owner.admin=TRUE AND ($2 OR EXISTS (\
+                             SELECT 1 FROM user_device_groups udg \
+                             WHERE udg.user_id=$3 AND udg.device_group_id=dg.id))",
+                    )
+                    .bind(group_id)
+                    .bind(owner_all_groups)
+                    .bind(uid)
+                    .fetch_optional(&mut *tx)
+                    .await
+                );
+                if authorized.is_none() {
+                    let _ = tx.rollback().await;
+                    return Err(DbError::RuleGroupAccessDenied);
+                }
+            }
         }
 
         if let Some(profile_id) = tunnel_profile_id {
@@ -1373,6 +1395,27 @@ impl RuleRepository for PgRepository {
                     if valid.is_none() {
                         let _ = tx.rollback().await;
                         return Err(DbError::RuleGroupUnavailable);
+                    }
+                    if !owner_is_admin {
+                        let authorized: Option<i32> = try_!(
+                            sqlx::query_scalar(
+                                "SELECT 1 FROM device_groups dg \
+                                 JOIN users group_owner ON group_owner.id=dg.uid \
+                                 WHERE dg.id=$1 AND dg.group_type IN ('in','both') \
+                                   AND group_owner.admin=TRUE AND ($2 OR EXISTS (\
+                                     SELECT 1 FROM user_device_groups udg \
+                                     WHERE udg.user_id=$3 AND udg.device_group_id=dg.id))",
+                            )
+                            .bind(group_id)
+                            .bind(owner_all_groups)
+                            .bind(rule_owner_id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                        );
+                        if authorized.is_none() {
+                            let _ = tx.rollback().await;
+                            return Err(DbError::RuleGroupAccessDenied);
+                        }
                     }
                 }
             }

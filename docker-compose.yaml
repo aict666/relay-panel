@@ -8,7 +8,8 @@
 #   2. Fill them in below (or use a .env file / secrets manager).
 #   3. Create an inbound device group in the panel UI and copy its Node Token
 #      into NODE_TOKEN for the node service.
-#   4. Change the default admin password (admin/admin123) after first login.
+#   4. Read the generated admin password from `docker compose logs panel`, then
+#      sign in as `admin` and change it immediately.
 #
 # The panel REFUSES TO START if JWT_SECRET is empty or the placeholder.
 # ============================================================================

@@ -58,52 +58,62 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .connect_with(opts)
         .await?;
 
-    // Replace the SCHEMA_SQL placeholder password with a real bcrypt hash of
-    // the default "admin123" — but ONLY when the stored password is still the
-    // placeholder. See hash_default_admin_password_if_placeholder for the
-    // safety reasoning (the short version: the WHERE clause matches ONLY the
-    // literal placeholder, never an admin-changed bcrypt hash).
-    hash_default_admin_password_if_placeholder(&pool).await?;
+    initialize_random_admin_password(&SqliteRepository::new(pool.clone()))
+        .await
+        .map_err(db_err_to_sqlx)?;
 
     Ok(pool)
 }
 
-/// Hash the default "admin123" password into users(id=1) IF AND ONLY IF the
-/// stored value is still the SCHEMA_SQL placeholder. A password an admin has
-/// already changed is NEVER touched.
+/// Initialize the built-in administrator with a unique, high-entropy password.
 ///
-/// Safety (this is the v0.3.1 audit item #3 regression guard):
-///   - `WHERE password LIKE '$2b$12$PLACEHOLDER%'` matches only the seeded
-///     placeholder string, never a real bcrypt hash (real hashes have random
-///     salt where the literal "PLACEHOLDER" sits).
-///   - The expensive bcrypt hash is computed lazily inside the branch, so a
-///     normal restart (password already set) does NOT pay ~100ms on every boot.
-///   - Migrations 1-16 never touch the password column; INSERT OR IGNORE in
-///     SCHEMA_SQL only inserts when the row is absent. So no code path resets
-///     a changed password — confirmed by `password_survives_init_when_changed`.
-pub async fn hash_default_admin_password_if_placeholder(
-    pool: &sqlx::SqlitePool,
-) -> Result<(), sqlx::Error> {
-    // v0.4.3: route through the UserRepository trait so the placeholder-hash
-    // SQL lives in exactly one place (sqlite_repo.rs), and PR2's PgRepository
-    // gets the same guard for free. init.rs still owns the SqlitePool because
-    // migrations are SQLite-specific (PRAGMA toggles, schema rebuilds) and can't
-    // be expressed through the Repository abstraction.
-    let repo = SqliteRepository::new(pool.clone());
-    let needs_hash = repo
-        .count_placeholder_admin_password()
-        .await
-        .map_err(db_err_to_sqlx)?;
-    if needs_hash > 0 {
-        let hashed = bcrypt::hash("admin123", 12).map_err(|e| {
-            sqlx::Error::Configuration(format!("hash default admin password: {e}").into())
-        })?;
-        repo.replace_placeholder_admin_password(&hashed)
-            .await
-            .map_err(db_err_to_sqlx)?;
-        tracing::info!("hashed the default admin password (first boot placeholder -> bcrypt)");
+/// This runs before the HTTP listener is bound. It handles both a fresh schema
+/// placeholder and historical installations that still use `admin123`. Any
+/// other bcrypt hash is left byte-for-byte unchanged. The compare-and-swap
+/// repository write guarantees that only the process whose password actually
+/// reached the database prints the one-time credentials.
+pub async fn initialize_random_admin_password(
+    repo: &dyn UserRepository,
+) -> Result<Option<String>, crate::db::error::DbError> {
+    let Some(admin) = repo.find_by_id(1).await? else {
+        return Ok(None);
+    };
+    if !admin.admin {
+        return Ok(None);
     }
-    Ok(())
+
+    let is_placeholder = admin.password.starts_with("$2b$12$PLACEHOLDER");
+    let is_legacy_default =
+        !is_placeholder && bcrypt::verify("admin123", &admin.password).unwrap_or(false);
+    if !is_placeholder && !is_legacy_default {
+        return Ok(None);
+    }
+
+    // UUID v4 supplies 122 random bits. The compact hexadecimal form is easy
+    // to copy from container logs and stays well within bcrypt's 72-byte limit.
+    let password = uuid::Uuid::new_v4().simple().to_string();
+    let hashed = bcrypt::hash(&password, 12).map_err(|e| {
+        crate::db::error::DbError::Other(sqlx::Error::Configuration(
+            format!("hash initial admin password: {e}").into(),
+        ))
+    })?;
+    let changed = repo
+        .replace_initial_admin_password(&admin.password, &hashed)
+        .await?;
+    if changed == 0 {
+        return Ok(None);
+    }
+
+    tracing::warn!(
+        "\n================ RelayPanel 首次安装管理员凭据 ================\n\
+         用户名: {}\n\
+         密码:   {}\n\
+         请立即登录并修改密码；该随机密码只会在初始化时输出一次。\n\
+         ================================================================",
+        admin.username,
+        password
+    );
+    Ok(Some(password))
 }
 
 /// Map a DbError back to sqlx::Error so init_db keeps its sqlx::Error return
@@ -158,35 +168,12 @@ pub async fn init_pg(database_url: &str) -> Result<sqlx::PgPool, sqlx::Error> {
     // CREATE TABLE IF NOT EXISTS can't alter existing tables).
     run_pg_migrations(&pool).await?;
 
-    // Same placeholder-password hashing as SQLite: the seed admin row has the
-    // PLACEHOLDER string, init replaces it with a real bcrypt hash of "admin123".
-    // This runs through the Repository trait so the SQL lives in pg_repo.rs.
-    hash_default_admin_password_if_placeholder_pg(&pool).await?;
-
-    Ok(pool)
-}
-
-/// PG equivalent of `hash_default_admin_password_if_placeholder`. Same safety
-/// contract: only hashes when the stored value is still the literal PLACEHOLDER.
-async fn hash_default_admin_password_if_placeholder_pg(
-    pool: &sqlx::PgPool,
-) -> Result<(), sqlx::Error> {
     use crate::db::pg_repo::PgRepository;
-    let repo = PgRepository::new(pool.clone());
-    let needs_hash = repo
-        .count_placeholder_admin_password()
+    initialize_random_admin_password(&PgRepository::new(pool.clone()))
         .await
         .map_err(db_err_to_sqlx)?;
-    if needs_hash > 0 {
-        let hashed = bcrypt::hash("admin123", 12).map_err(|e| {
-            sqlx::Error::Configuration(format!("hash default admin password: {e}").into())
-        })?;
-        repo.replace_placeholder_admin_password(&hashed)
-            .await
-            .map_err(db_err_to_sqlx)?;
-        tracing::info!("hashed the default admin password (first boot placeholder -> bcrypt)");
-    }
-    Ok(())
+
+    Ok(pool)
 }
 
 /// Detect whether a `database_url` string targets PostgreSQL. Recognized

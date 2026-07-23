@@ -144,8 +144,8 @@ Compose Caddy profile).
 
 ## Security checklist
 
-- [ ] Set a strong `admin` password — the first login forces a change from the
-  default `admin123`.
+- [ ] Read the generated initial `admin` password from `docker compose logs panel`,
+  restrict log access, and complete the forced password change on first login.
 - [ ] Set `PUBLIC_PANEL_URL` to the correct external URL.
 - [ ] Enable HTTPS (TLS) for the admin UI — never expose `:18888` directly to
   the internet without TLS.

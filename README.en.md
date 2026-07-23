@@ -70,7 +70,7 @@
 curl -fsSL https://raw.githubusercontent.com/aict666/relay-panel/main/install.sh | bash
 ```
 
-> 🔑 **Default login `admin` / `admin123` — first login forces a password change.**
+> 🔑 **The administrator username is `admin`. On first install, the panel generates a random password and prints it once in the `panel` container log; view it with `docker compose logs panel`. The first login forces a password change.**
 
 > 🖥️ **Platform**: both the panel image and the node support **amd64 / arm64**, so ARM servers can deploy directly. The panel image is a multi-arch manifest (`docker pull` picks the right arch automatically) and the node install script auto-detects the arch via `uname -m` — no manual selection needed.
 

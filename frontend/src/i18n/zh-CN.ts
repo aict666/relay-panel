@@ -12,10 +12,8 @@ export const zhCN = {
   usernameRequired: '请输入用户名',
   password: '密码',
   passwordRequired: '请输入密码',
-  // v0.3.6: defaultAdminHint removed — the login page no longer shows the
-  // default admin/admin123 credentials to every visitor. First-install
-  // instructions live in README / deploy docs only.
-  changeDefaultPasswordWarning: '首次登录后请立即修改默认密码（右上角用户菜单 → 修改密码），否则任何能访问面板的人都可以使用默认凭据登录。',
+  // 初始随机密码只写入面板启动日志，不在匿名登录页中展示。
+  changeDefaultPasswordWarning: '请使用首次安装日志中的随机管理员密码登录，并立即修改密码（右上角用户菜单 → 修改密码）。',
   sourceCode: 'Source Code / AGPL-3.0',
 
   // Nav

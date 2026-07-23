@@ -334,6 +334,21 @@ async fn user_can_bind_preset_tunnel(
         .contains(&entry.device_group_id))
 }
 
+/// Custom-chain topology is selected by the rule owner, so every hop must be
+/// in that owner's effective device-group authorization. Administrator-owned
+/// preset tunnels intentionally use the separate entry-only check above.
+async fn user_can_use_custom_chain_hops(
+    db: &dyn Repository,
+    user_id: i64,
+    hop_group_ids: &[i64],
+) -> Result<bool, DbError> {
+    if db.is_admin(user_id).await? {
+        return Ok(true);
+    }
+    let allowed = db.authorized_device_group_ids(user_id).await?;
+    Ok(hop_group_ids.iter().all(|gid| allowed.contains(gid)))
+}
+
 async fn validate_admin_owned_inbound_group(
     db: &dyn Repository,
     gid: i64,
@@ -616,6 +631,14 @@ pub async fn create_rule(
             ));
         }
         validate_chain_hops(db, &hops, "create_rule").await?;
+        if !user_can_use_custom_chain_hops(db, owner_uid, &hops)
+            .await
+            .map_err(CreateRuleError::Database)?
+        {
+            return Err(CreateRuleError::Forbidden(
+                "自定义转发链包含所有者未授权的设备分组".into(),
+            ));
+        }
         // Allow device_group_in to be omitted/wrong if hops provided — hops[0] wins.
         let entry = hops[0];
         let exit = *hops.last().unwrap();
@@ -1119,6 +1142,14 @@ pub async fn update_rule(
             validate_chain_hops(db, hops, "update_rule")
                 .await
                 .map_err(map_create_rule_validation_error)?;
+            if !user_can_use_custom_chain_hops(db, existing.uid, hops)
+                .await
+                .map_err(UpdateRuleError::Database)?
+            {
+                return Err(UpdateRuleError::Forbidden(
+                    "自定义转发链包含所有者未授权的设备分组".into(),
+                ));
+            }
         } else if existing.route_mode != "chain" {
             return Err(UpdateRuleError::BadRequest(
                 "hops: required when switching a rule to chain mode".into(),

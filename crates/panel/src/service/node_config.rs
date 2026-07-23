@@ -29,7 +29,7 @@ use relay_shared::protocol::{
     TunnelRouteConfig, UotRole,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 struct ResolvedTargets {
     addrs: Vec<String>,
@@ -79,6 +79,39 @@ async fn all_rule_hops_are_administrator_managed(
         }
     }
     Ok(true)
+}
+
+/// Runtime defense for historical/out-of-band custom chains. `None` in the
+/// cache means the owner is an administrator (unrestricted); regular users get
+/// their effective inbound-capable authorization set. Preset tunnels do not
+/// call this helper because their administrator-owned topology is authorized
+/// by the shared preset plus its entry group.
+async fn all_custom_chain_hops_are_authorized(
+    db: &dyn Repository,
+    owner_id: i64,
+    hops: &[relay_shared::models::ForwardRuleHop],
+    cache: &mut HashMap<i64, Option<HashSet<i64>>>,
+) -> Result<bool, DbError> {
+    if !cache.contains_key(&owner_id) {
+        let authorization = if db.is_admin(owner_id).await? {
+            None
+        } else {
+            Some(
+                db.authorized_device_group_ids(owner_id)
+                    .await?
+                    .into_iter()
+                    .collect(),
+            )
+        };
+        cache.insert(owner_id, authorization);
+    }
+    Ok(match cache.get(&owner_id) {
+        Some(None) => true,
+        Some(Some(allowed)) => hops
+            .iter()
+            .all(|hop| allowed.contains(&hop.device_group_id)),
+        None => false,
+    })
 }
 
 /// Render a dial address without producing ambiguous raw-IPv6 `host:port`
@@ -202,6 +235,7 @@ async fn build_node_config_inner(
     }
     let entry_blocked_protocols = decode_blocked_protocols(&group.blocked_protocols);
     let mut admin_group_cache = HashMap::from([(group.id, true)]);
+    let mut chain_authorization_cache = HashMap::new();
 
     // 2. Filtered rule query. The JOIN on users is the fix for the v0.3.5 WS
     //    drift: without it a banned / over-quota user's rules would still be
@@ -361,6 +395,21 @@ async fn build_node_config_inner(
                 );
                 continue;
             }
+            if !all_custom_chain_hops_are_authorized(
+                db,
+                rule.uid,
+                &hops,
+                &mut chain_authorization_cache,
+            )
+            .await?
+            {
+                tracing::warn!(
+                    rule_id = rule.id,
+                    owner_id = rule.uid,
+                    "skipping custom chain with an unauthorized hop"
+                );
+                continue;
+            }
             let mut uot_ready = false;
             if matches!(rule.protocol.as_str(), "udp" | "tcp_udp") {
                 if let Some(prepared) = prepare_tunnel_ports(db, rule.id, hops.clone()).await? {
@@ -433,6 +482,21 @@ async fn build_node_config_inner(
             tracing::warn!(
                 rule_id = rule.id,
                 "skipping historical chain with a non-admin-owned hop"
+            );
+            continue;
+        }
+        if !all_custom_chain_hops_are_authorized(
+            db,
+            rule.uid,
+            &hops,
+            &mut chain_authorization_cache,
+        )
+        .await?
+        {
+            tracing::warn!(
+                rule_id = rule.id,
+                owner_id = rule.uid,
+                "skipping custom chain with an unauthorized hop"
             );
             continue;
         }
@@ -1282,7 +1346,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
-             VALUES (20, 'exit', 'out', 'tok-20', 1, '2.2.2.2')",
+             VALUES (20, 'exit', 'both', 'tok-20', 1, '2.2.2.2')",
         )
         .execute(&pool)
         .await
@@ -1378,6 +1442,56 @@ mod tests {
         assert!(legacy.credential_revisions.is_empty());
     }
 
+    /// Existing rows created before the full-hop authorization fix must stop
+    /// being delivered to both entry and downstream nodes immediately.
+    #[tokio::test]
+    async fn historical_admin_owned_but_unauthorized_chain_hop_fails_closed() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        sqlx::query("UPDATE users SET all_device_groups=0 WHERE id=2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id,name,group_type,token,uid,connect_host) VALUES \
+             (10,'authorized-entry','both','entry-token',1,'192.0.2.10'), \
+             (20,'premium-relay','both','relay-token',1,'192.0.2.20')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO user_device_groups(user_id,device_group_id) VALUES(2,10)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id,name,uid,listen_port,device_group_in,device_group_out,forward_mode,route_mode,target_addr,target_port) \
+             VALUES(100,'unauthorized-chain',2,20000,10,20,'chain','chain','203.0.113.10',443)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rule_hops(rule_id,position,device_group_id,listen_port) \
+             VALUES(100,0,10,20000),(100,1,20,30000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(build_node_config(&repo(&pool), 10)
+            .await
+            .unwrap()
+            .listeners
+            .is_empty());
+        assert!(build_node_config(&repo(&pool), 20)
+            .await
+            .unwrap()
+            .listeners
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn pure_udp_chain_uses_authenticated_uot_and_warm_zero_rtt() {
         let pool = pool().await;
@@ -1385,7 +1499,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
              VALUES (10, 'entry', 'in', 'entry-secret', 1, '1.1.1.1'), \
-                    (20, 'exit', 'out', 'exit-secret', 1, '2.2.2.2')",
+                    (20, 'exit', 'both', 'exit-secret', 1, '2.2.2.2')",
         )
         .execute(&pool)
         .await
@@ -1477,7 +1591,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
              VALUES (10, 'entry', 'in', 'entry-secret', 1, '1.1.1.1'), \
-                    (20, 'exit', 'out', 'exit-secret', 1, '2.2.2.2')",
+                    (20, 'exit', 'both', 'exit-secret', 1, '2.2.2.2')",
         )
         .execute(&pool)
         .await
@@ -1529,7 +1643,7 @@ mod tests {
             "INSERT INTO device_groups \
              (id, name, group_type, token, uid, connect_host, port_range) VALUES \
              (10, 'entry', 'in', 'entry-secret', 1, '1.1.1.1', '20000-20010'), \
-             (20, 'exit', 'out', 'exit-secret', 1, '2.2.2.2', '30000-30010')",
+             (20, 'exit', 'both', 'exit-secret', 1, '2.2.2.2', '30000-30010')",
         )
         .execute(&pool)
         .await
@@ -1624,7 +1738,7 @@ mod tests {
             "INSERT INTO device_groups \
              (id, name, group_type, token, uid, connect_host, port_range) VALUES \
              (10, 'entry', 'in', 'entry-secret', 1, '1.1.1.1', '20000-20010'), \
-             (20, 'exit', 'out', 'exit-secret', 1, '2.2.2.2', '30001-30001')",
+             (20, 'exit', 'both', 'exit-secret', 1, '2.2.2.2', '30001-30001')",
         )
         .execute(&pool)
         .await

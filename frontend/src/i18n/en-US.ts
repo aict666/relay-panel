@@ -14,9 +14,8 @@ export const enUS: Dict = {
   usernameRequired: 'Username required',
   password: 'Password',
   passwordRequired: 'Password required',
-  // v0.3.6: defaultAdminHint removed — the login page no longer shows the
-  // default admin/admin123 credentials to every visitor.
-  changeDefaultPasswordWarning: 'Change the default password immediately after first login (top-right user menu → Change Password). Anyone who can reach this panel can log in with the default credentials.',
+  // The initial random password is written only to the panel startup log.
+  changeDefaultPasswordWarning: 'Sign in with the random administrator password from the first-install log, then change it immediately (top-right user menu → Change Password).',
   sourceCode: 'Source Code / AGPL-3.0',
 
   // Nav

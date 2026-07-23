@@ -137,6 +137,21 @@ def wait_for_port(host, port, timeout=30):
     return False
 
 
+def wait_for_initial_admin_password(log_path, timeout=15):
+    """Read the one-time first-install credential without echoing it."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as log:
+                match = re.search(r"密码:\s*([0-9a-f]{32})", log.read())
+            if match is not None:
+                return match.group(1)
+        except FileNotFoundError:
+            pass
+        time.sleep(0.1)
+    raise AssertionError("generated administrator password not found in panel log")
+
+
 def tcp_roundtrip(port, payload):
     with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
         s.sendall(payload)
@@ -163,18 +178,22 @@ def main():
                      REGISTRATION_ENABLED="1",
                      DATABASE_URL=f"sqlite:{db_path}?mode=rwc")
     panel = None
+    panel_log = None
     node = None
     tcp_echo = None
     udp_echo = None
     try:
         tcp_echo, udp_echo = start_echo_servers()
+        panel_log_path = os.path.join(work_dir, "panel.log")
+        panel_log = open(panel_log_path, "wb")
         panel = subprocess.Popen([PANEL_BIN], env=panel_env, cwd=work_dir,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdout=panel_log, stderr=subprocess.STDOUT)
         print(f"[panel] PID {panel.pid}")
         assert wait_for_port("127.0.0.1", 18888), "panel did not start"
+        initial_admin_pw = wait_for_initial_admin_password(panel_log_path)
 
         # 1. Login as admin
-        r = api("POST", "/auth/login", body={"username": "admin", "password": "admin123"})
+        r = api("POST", "/auth/login", body={"username": "admin", "password": initial_admin_pw})
         assert r["code"] == 0 and r["data"]["admin"], "login failed"
         admin_token = r["data"]["token"]
         admin_uid = 1  # default admin user
@@ -187,7 +206,7 @@ def main():
         # revokes this token — so we must log in again with the new password.
         new_admin_pw = "admin-e2e-pass-1"
         chg = api("PUT", "/user/password", admin_token,
-                  {"current_password": "admin123", "new_password": new_admin_pw})
+                  {"current_password": initial_admin_pw, "new_password": new_admin_pw})
         assert chg["code"] == 0, f"forced password change failed: {chg}"
         r = api("POST", "/auth/login", body={"username": "admin", "password": new_admin_pw})
         assert r["code"] == 0 and r["data"]["admin"], "re-login after password change failed"
@@ -439,6 +458,8 @@ def main():
             if server is not None:
                 server.shutdown()
                 server.server_close()
+        if panel_log is not None:
+            panel_log.close()
         shutil.rmtree(work_dir, ignore_errors=True)
 
 

@@ -1954,7 +1954,7 @@ mod tests {
             Json(rule_req("r", 20000, 11, None)),
         )
         .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
+        assert_eq!(resp.code, 403, "{}", resp.message);
     }
 
     /// v0.4.11 PR3: a non-admin CAN bind a rule to an inbound group owned by an
@@ -2060,6 +2060,59 @@ mod tests {
         );
     }
 
+    /// A custom chain is entirely selected by the user. Authorizing only its
+    /// entry would let a restricted account consume an unpurchased relay/exit.
+    #[tokio::test]
+    async fn create_rule_rejects_unauthorized_downstream_hop() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group_typed(&pool, 1, 1, "allowed-entry", "both").await;
+        add_group_typed(&pool, 2, 1, "premium-relay", "both").await;
+        sqlx::query("UPDATE device_groups SET connect_host='192.0.2.2' WHERE id=2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assign_user_groups(&pool, 2, &[1]).await;
+
+        let mut req = rule_req("unauthorized-chain", 20003, 1, None);
+        req.route_mode = relay_shared::protocol::RouteMode::Chain;
+        req.forward_mode = "chain".into();
+        req.hops = Some(vec![1, 2]);
+        req.device_group_out = Some(2);
+        let Json(denied) = create_rule(auth(2, false), State(state), Json(req)).await;
+        assert_eq!(denied.code, 403, "{}", denied.message);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM forward_rules WHERE name='unauthorized-chain'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// The service/repository must enforce the FINAL owner even when an admin
+    /// creates the rule on that user's behalf.
+    #[tokio::test]
+    async fn admin_cannot_assign_user_an_unauthorized_custom_hop() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group_typed(&pool, 1, 1, "allowed-entry", "both").await;
+        add_group_typed(&pool, 2, 1, "premium-relay", "both").await;
+        sqlx::query("UPDATE device_groups SET connect_host='192.0.2.2' WHERE id=2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assign_user_groups(&pool, 2, &[1]).await;
+
+        let mut req = rule_req("admin-owned-bypass", 20004, 1, Some(2));
+        req.route_mode = relay_shared::protocol::RouteMode::Chain;
+        req.forward_mode = "chain".into();
+        req.hops = Some(vec![1, 2]);
+        req.device_group_out = Some(2);
+        let Json(denied) = create_rule(auth(1, true), State(state), Json(req)).await;
+        assert_eq!(denied.code, 403, "{}", denied.message);
+    }
+
     /// REGRESSION: an empty authorized list means NO access → deny (the bug
     /// treated empty as "allow all").
     #[tokio::test]
@@ -2159,6 +2212,48 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored_group.0, 1, "denied update must not mutate the rule");
+    }
+
+    #[tokio::test]
+    async fn update_rule_rejects_unauthorized_downstream_hop() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group_typed(&pool, 1, 1, "allowed-entry", "both").await;
+        add_group_typed(&pool, 2, 1, "premium-relay", "both").await;
+        sqlx::query("UPDATE device_groups SET connect_host='192.0.2.2' WHERE id=2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        add_rule(&pool, 200, 2, 1, 20001, 0).await;
+        assign_user_groups(&pool, 2, &[1]).await;
+
+        let Json(denied) = update_rule(
+            auth(2, false),
+            State(state),
+            Path(200),
+            Json(UpdateRuleRequest {
+                route_mode: Some(relay_shared::protocol::RouteMode::Chain),
+                forward_mode: Some("chain".into()),
+                device_group_in: Some(1),
+                device_group_out: Some(2),
+                hops: Some(vec![1, 2]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(denied.code, 403, "{}", denied.message);
+        let route_mode: String =
+            sqlx::query_scalar("SELECT route_mode FROM forward_rules WHERE id=200")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let hop_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM forward_rule_hops WHERE rule_id=200")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(route_mode, "direct");
+        assert_eq!(hop_count, 0);
     }
 
     #[tokio::test]
@@ -2634,7 +2729,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp.code, 400,
+            resp.code, 403,
             "a user's own (non-admin) group must be rejected: {}",
             resp.message
         );
@@ -2658,7 +2753,7 @@ mod tests {
         req.device_group_out = Some(31);
 
         let Json(resp) = create_rule(auth(2, false), State(state), Json(req)).await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
+        assert_eq!(resp.code, 403, "{}", resp.message);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM forward_rules")
                 .fetch_one(&pool)
@@ -2683,7 +2778,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp.code, 400,
+            resp.code, 403,
             "an admin 'out' group must be rejected as device_group_in: {}",
             resp.message
         );
@@ -3294,8 +3389,7 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("device_group_in"));
+        assert_eq!(resp.code, 403, "{}", resp.message);
     }
 
     /// v0.4.20: device_group_out is no longer supported — any non-null value
@@ -3346,7 +3440,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp.code, 400,
+            resp.code, 403,
             "swapping to the user's own (non-admin) group must be rejected: {}",
             resp.message
         );
