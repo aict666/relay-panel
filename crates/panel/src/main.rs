@@ -127,5 +127,13 @@ async fn main() {
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // Attach the TCP peer address to every request. Status reporting uses it
+    // as the direct-connection fallback when no reverse proxy supplied a
+    // forwarded client address.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

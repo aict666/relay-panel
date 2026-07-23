@@ -361,6 +361,13 @@ pub struct SharedNodeSummary {
     pub node_id: String,
     /// This node's last_seen is within the online window (backend SoT).
     pub online: bool,
+    /// Source IP observed on the node's latest status-report path. When the
+    /// panel is behind a supported reverse proxy this is the forwarded
+    /// original client; otherwise it is the direct TCP peer.
+    pub report_ip: Option<String>,
+    /// GeoIP for `report_ip`, resolved by the panel.
+    pub report_ip_country_code: Option<String>,
+    pub report_ip_country_name: Option<String>,
     /// v0.4.14: node public IP (exposed to regular users). v0.4.15: this is the
     /// legacy field (carries IPv4); prefer `public_ipv4` / `public_ipv6`.
     pub public_ip: Option<String>,

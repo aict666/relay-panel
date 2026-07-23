@@ -164,6 +164,11 @@ Notes:
 - `PUBLIC_IP_CHECK_URL` is hit once at startup and then every 30 minutes (not
   every poll). Failure is non-fatal: the node just reports no public IP.
   Point this at your own echo service if you don't want to depend on ipify.
+- The node-status Network column uses the source IP that the panel observes on
+  the actual `report_status` request. Nginx/Caddy/Cloudflare deployments use
+  the forwarded original client address. The independently detected egress
+  IPv4/IPv6 values remain in the administrator detail drawer for diagnosing
+  NAT, proxy, or WARP differences.
 - `POLL_INTERVAL` controls both config polling AND status reporting. Lower =
   faster status updates but more HTTP traffic. 10s is a good default.
 - `NETWORK_INTERFACE` selects which NIC the panel's "Machine Upload/Download"

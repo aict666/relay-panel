@@ -300,6 +300,10 @@ export interface NodeStatus {
   process_uptime?: number | null;
   last_seen: string;
   // --- Extended metrics (all optional; "-" is shown when missing/old node) ---
+  /** IP observed by the panel on the latest status-report path. */
+  report_ip?: string | null;
+  report_ip_country_code?: string | null;
+  report_ip_country_name?: string | null;
   public_ip?: string | null;
   /** v0.4.15: dual-stack public IPs. public_ipv4 falls back to public_ip for
    *  older nodes. public_ipv6 is null when the node has no IPv6. */
@@ -501,6 +505,10 @@ export interface SharedNodeSummary {
   blocked_protocols?: BlockedProtocol[];
   node_id: string;
   online: boolean;
+  /** IP observed by the panel on the latest status-report path. */
+  report_ip?: string | null;
+  report_ip_country_code?: string | null;
+  report_ip_country_name?: string | null;
   public_ip?: string | null;
   /** v0.4.15: dual-stack public IPs + node-level GeoIP. */
   public_ipv4?: string | null;
@@ -557,6 +565,9 @@ export interface NodeDisplayRow {
   uptime?: number | null;
   process_uptime?: number | null;
   last_seen?: string | null;
+  report_ip?: string | null;
+  report_ip_country_code?: string | null;
+  report_ip_country_name?: string | null;
   public_ip?: string | null;
   public_ipv4?: string | null;
   public_ipv6?: string | null;

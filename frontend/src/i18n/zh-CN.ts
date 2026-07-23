@@ -311,6 +311,9 @@ export const zhCN = {
   liveStatusHint: '各运行中的 relay-node 上报的实时状态（每 5 秒刷新）。',
   // v0.4.14: node group layout + resource bars
   nodePublicIp: '公网 IP',
+  reportPathIp: '上报链路 IP',
+  detectedIpv4: '节点自测 IPv4',
+  detectedIpv6: '节点自测 IPv6',
   network: '网络',
   regionUnknown: '未知',
   region: '地区',

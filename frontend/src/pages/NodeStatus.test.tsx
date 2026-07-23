@@ -144,6 +144,7 @@ const mk = (
   group_name: string,
   opts: Partial<{
     node_id: string;
+    report_ip: string;
     public_ipv4: string;
     public_ip: string;
     public_ipv6: string;
@@ -154,6 +155,7 @@ const mk = (
     group_id,
     group_name,
     node_id: opts.node_id ?? `node-${group_id}`,
+    report_ip: opts.report_ip,
     public_ipv4: opts.public_ipv4,
     public_ip: opts.public_ip,
     public_ipv6: opts.public_ipv6,
@@ -188,6 +190,15 @@ describe('stableGroupedRows — pure ordering', () => {
     ];
     const [[, group]] = stableGroupedRows(rows);
     expect(group.map((r) => r.node_id)).toEqual(['n1', 'n2', 'n3']);
+  });
+
+  it('prefers the actual report-path IP when present', () => {
+    const rows = [
+      mk(1, 'g', { node_id: 'later', report_ip: '9.9.9.9', public_ipv4: '1.1.1.1' }),
+      mk(1, 'g', { node_id: 'first', report_ip: '2.2.2.2', public_ipv4: '8.8.8.8' }),
+    ];
+    const [[, group]] = stableGroupedRows(rows);
+    expect(group.map((r) => r.node_id)).toEqual(['first', 'later']);
   });
 
   it('breaks ties on public_ipv6 then node_id', () => {

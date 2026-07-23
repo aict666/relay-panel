@@ -1,8 +1,13 @@
 use crate::api::AppState;
 use axum::response::{IntoResponse, Response};
-use axum::{extract::State, http::HeaderMap, http::StatusCode, Json};
+use axum::{
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use relay_shared::models::*;
 use relay_shared::protocol::*;
+use std::net::{IpAddr, SocketAddr};
 
 /// Extract the node token from the `Authorization: Bearer <NODE_TOKEN>` header.
 /// The token is accepted ONLY from this header — never from the query string
@@ -42,6 +47,93 @@ pub(crate) fn extract_config_protocol_version(headers: &HeaderMap) -> Option<u32
         .get("X-Config-Protocol-Version")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// Parse the address forms commonly emitted by reverse proxies:
+///
+/// - `203.0.113.7`
+/// - `203.0.113.7:43210`
+/// - `[2001:db8::7]:43210`
+/// - `for="[2001:db8::7]:43210"` (RFC 7239 Forwarded)
+fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+    let mut value = value.trim();
+    if value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("for="))
+    {
+        value = &value[4..];
+    }
+    value = value.trim().trim_matches('"');
+    if value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
+        return None;
+    }
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| value.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
+        .or_else(|| {
+            value
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .and_then(|v| v.parse::<IpAddr>().ok())
+        })
+}
+
+/// Resolve the IP used by the node's actual `report_status` path.
+///
+/// Reverse-proxy headers take precedence because the panel's TCP peer is then
+/// the proxy/container address. The direct socket peer is the final fallback.
+/// Only an authenticated node report is persisted, so accepting these headers
+/// does not create an unauthenticated status-write path.
+pub(crate) fn extract_report_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
+    // Cloudflare terminates the client connection before an origin proxy, so
+    // this is the only header that still identifies the node in that topology.
+    for value in headers.get_all("cf-connecting-ip") {
+        if let Ok(value) = value.to_str() {
+            if let Some(ip) = parse_forwarded_ip(value) {
+                return Some(ip);
+            }
+        }
+    }
+
+    // RFC 7239: use the first valid `for=` hop (the original client).
+    for value in headers.get_all("forwarded") {
+        let Ok(value) = value.to_str() else { continue };
+        for hop in value.split(',') {
+            for parameter in hop.split(';') {
+                if parameter
+                    .trim()
+                    .get(..4)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("for="))
+                {
+                    if let Some(ip) = parse_forwarded_ip(parameter) {
+                        return Some(ip);
+                    }
+                }
+            }
+        }
+    }
+
+    // Nginx/Caddy convention. The left-most valid entry is the original
+    // client; later entries are intermediary proxies.
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(value) = value.to_str() else { continue };
+        for hop in value.split(',') {
+            if let Some(ip) = parse_forwarded_ip(hop) {
+                return Some(ip);
+            }
+        }
+    }
+
+    for value in headers.get_all("x-real-ip") {
+        if let Ok(value) = value.to_str() {
+            if let Some(ip) = parse_forwarded_ip(value) {
+                return Some(ip);
+            }
+        }
+    }
+
+    peer.map(|addr| addr.ip())
 }
 
 /// v0.4.0: the config-protocol compatibility gate. Returns true if the node's
@@ -273,6 +365,7 @@ pub async fn report_traffic(
 pub async fn report_status(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<StatusReport>,
 ) -> Json<ApiResponse<()>> {
     // Token comes ONLY from the Authorization header (v0.3.9: body token
@@ -321,6 +414,11 @@ pub async fn report_status(
         },
         None => None,
     };
+
+    // This is the address family/path that actually delivered the heartbeat
+    // to the panel. It is deliberately independent of the node's external
+    // ipify-style self-detection fields.
+    let report_ip = extract_report_ip(&headers, Some(peer)).map(|ip| ip.to_string());
 
     {
         let g = group;
@@ -400,6 +498,7 @@ pub async fn report_status(
             // "配置协议不兼容，请升级节点" when it doesn't match the panel's.
             "config_protocol_version": req.config_protocol_version,
             "last_seen": chrono::Utc::now().to_rfc3339(),
+            "report_ip": report_ip,
             "public_ip": req.public_ip,
             // v0.4.15: dual-stack public IPs. Falls back to public_ip (legacy
             // IPv4) when the node hasn't upgraded yet.
@@ -452,9 +551,13 @@ pub async fn report_status(
             let db = state.db.clone();
             let ttl = state.config.geoip_cache_ttl as i64;
             let inflight = state.geoip_in_flight.clone();
+            let report_ip = report_ip.clone();
             let v4 = req.public_ipv4.clone().or(req.public_ip.clone());
             let v6 = req.public_ipv6.clone();
             tokio::spawn(async move {
+                if let Some(ip) = report_ip {
+                    let _ = crate::api::geoip::lookup(db.as_ref(), ttl, &inflight, &ip).await;
+                }
                 if let Some(ip) = v4 {
                     let _ = crate::api::geoip::lookup(db.as_ref(), ttl, &inflight, &ip).await;
                 }
@@ -519,6 +622,52 @@ mod tests {
         assert!(normalize_node_id("node id").is_none());
         assert!(normalize_node_id("node/path?query").is_none());
         assert!(normalize_node_id(&"a".repeat(129)).is_none());
+    }
+
+    #[test]
+    fn report_ip_prefers_forwarded_client_over_proxy_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "2402:4e00:c013:8600::7, 172.18.0.4".parse().unwrap(),
+        );
+        let peer = "172.18.0.3:43210".parse().unwrap();
+        assert_eq!(
+            extract_report_ip(&headers, Some(peer)),
+            Some("2402:4e00:c013:8600::7".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn report_ip_supports_standard_forwarded_and_socket_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            r#"for="[2001:db8::7]:4711";proto=https"#.parse().unwrap(),
+        );
+        assert_eq!(
+            extract_report_ip(&headers, Some("10.0.0.2:80".parse().unwrap())),
+            Some("2001:db8::7".parse().unwrap())
+        );
+
+        assert_eq!(
+            extract_report_ip(
+                &HeaderMap::new(),
+                Some("203.0.113.9:43210".parse().unwrap())
+            ),
+            Some("203.0.113.9".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn report_ip_uses_cloudflare_original_client_header_first() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "198.51.100.8".parse().unwrap());
+        headers.insert("x-forwarded-for", "198.51.100.9".parse().unwrap());
+        assert_eq!(
+            extract_report_ip(&headers, Some("10.0.0.2:80".parse().unwrap())),
+            Some("198.51.100.8".parse().unwrap())
+        );
     }
 
     async fn full_state() -> (AppState, SqlitePool) {
@@ -590,6 +739,10 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
         h
+    }
+
+    fn test_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:43210".parse().unwrap())
     }
 
     fn empty_status_report() -> StatusReport {
@@ -850,7 +1003,13 @@ mod tests {
     async fn node_http_status_compat_status_missing_token_is_http200_business401() {
         let (state, _pool) = seeded_state().await;
         let h = HeaderMap::new(); // no Authorization
-        let Json(resp) = report_status(State(state.clone()), h, Json(empty_status_report())).await;
+        let Json(resp) = report_status(
+            State(state.clone()),
+            h,
+            test_peer(),
+            Json(empty_status_report()),
+        )
+        .await;
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
     }
 
@@ -860,6 +1019,7 @@ mod tests {
         let Json(resp) = report_status(
             State(state),
             auth_headers("rotated-or-unknown-token"),
+            test_peer(),
             Json(empty_status_report()),
         )
         .await;
@@ -877,6 +1037,7 @@ mod tests {
         let Json(resp) = report_status(
             State(state),
             auth_headers("any-token"),
+            test_peer(),
             Json(empty_status_report()),
         )
         .await;
@@ -1090,8 +1251,13 @@ mod tests {
                 7,
             )])),
         };
-        let Json(resp) =
-            report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;
+        let Json(resp) = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            ConnectInfo("203.0.113.27:45678".parse().unwrap()),
+            Json(req),
+        )
+        .await;
         assert_eq!(resp.code, 0, "valid report → success");
 
         // The per-node status key is node_status:{group_id}:{node_id}.
@@ -1106,6 +1272,11 @@ mod tests {
             v.get("install_method").and_then(|x| x.as_str()),
             Some("systemd"),
             "install_method must be persisted so the upgrade UI can offer a self-upgrade"
+        );
+        assert_eq!(
+            v.get("report_ip").and_then(|x| x.as_str()),
+            Some("203.0.113.27"),
+            "status must persist the IP of the actual report path"
         );
         assert_eq!(
             v.pointer("/blocked_protocol_connections/tls")
@@ -1149,8 +1320,13 @@ mod tests {
             blocked_protocol_connections: None,
         };
 
-        let Json(resp) =
-            report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;
+        let Json(resp) = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            test_peer(),
+            Json(req),
+        )
+        .await;
         assert_eq!(resp.code, 400);
         assert!(state
             .db
@@ -1195,7 +1371,8 @@ mod tests {
             blocked_protocol_connections: None,
         };
 
-        let Json(resp) = report_status(State(state), auth_headers("tok-A"), Json(req)).await;
+        let Json(resp) =
+            report_status(State(state), auth_headers("tok-A"), test_peer(), Json(req)).await;
         assert_eq!(resp.code, 500);
     }
 }

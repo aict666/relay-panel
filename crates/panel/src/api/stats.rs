@@ -47,7 +47,7 @@ pub(crate) fn parse_status_key(key: &str) -> Option<(i64, Option<&str>)> {
 pub(crate) fn public_ips_from_status_json(raw: &str) -> Option<Vec<String>> {
     let status_json: serde_json::Value = serde_json::from_str(raw).ok()?;
     let mut ips: Vec<String> = Vec::new();
-    for field in ["public_ipv4", "public_ipv6", "public_ip"] {
+    for field in ["report_ip", "public_ipv4", "public_ipv6", "public_ip"] {
         if let Some(ip) = status_json
             .get(field)
             .and_then(|v| v.as_str())
@@ -449,6 +449,16 @@ pub async fn get_node_status(
                 status["public_ipv4"] = serde_json::json!(ip);
             }
         }
+        if let Some(ip) = status
+            .get("report_ip")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(entry) = crate::api::geoip::read_cache(state.db.as_ref(), ip).await {
+                status["report_ip_country_code"] = serde_json::json!(entry.country_code);
+                status["report_ip_country_name"] = serde_json::json!(entry.country_name);
+            }
+        }
         for ip_key in ["public_ipv4", "public_ipv6"] {
             if let Some(ip) = status
                 .get(ip_key)
@@ -548,8 +558,8 @@ pub async fn delete_node_status(
     // caches for sibling nodes.
     //
     // We read the JSON BEFORE the delete so deleted_by is unambiguous, and
-    // we deduplicate IPs so the same IP from public_ip / public_ipv4 /
-    // public_ipv6 only triggers one geoip delete.
+    // we deduplicate IPs so the same IP from report_ip / public_ip /
+    // public_ipv4 / public_ipv6 only triggers one geoip delete.
     let raw_status = match state.db.get(&key).await {
         Ok(raw) => raw,
         Err(error) => {
@@ -878,14 +888,15 @@ mod tests {
     // ── GeoIP cache cleanup on node delete (v0.4.19) ──
 
     #[test]
-    fn public_ips_from_status_json_extracts_ipv4_ipv6_and_legacy_public_ip() {
+    fn public_ips_from_status_json_extracts_report_and_detected_ips() {
         let raw = r#"{
+            "report_ip": "203.0.113.8",
             "public_ipv4": "1.1.1.1",
             "public_ipv6": "2001::1",
             "public_ip": "8.8.8.8"
         }"#;
         let ips = super::public_ips_from_status_json(raw).unwrap();
-        assert_eq!(ips, vec!["1.1.1.1", "2001::1", "8.8.8.8"]);
+        assert_eq!(ips, vec!["1.1.1.1", "2001::1", "203.0.113.8", "8.8.8.8"]);
     }
 
     #[test]
