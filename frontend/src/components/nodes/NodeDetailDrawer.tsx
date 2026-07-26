@@ -4,6 +4,7 @@ import { DeleteOutlined } from '@ant-design/icons';
 import { formatPercent, formatBytes, formatBps, formatUptime } from '../../utils/format';
 import { useI18n } from '../../i18n/context';
 import { CountryFlag } from './CountryFlag';
+import { hasConnectionCountAnomaly } from './shared';
 import type { ApiEnvelope, NodeDisplayRow } from '../../api/types';
 import api from '../../api/client';
 
@@ -86,7 +87,14 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
           )}
 
           <Descriptions.Item label={t('nodeVersion')}>{row.node_version || '-'}</Descriptions.Item>
-          <Descriptions.Item label={t('connections')}>{row.connections || 0}</Descriptions.Item>
+          <Descriptions.Item label={t('connections')}>
+            {(row.connections || 0).toLocaleString()}
+            {hasConnectionCountAnomaly(row) ? (
+              <span style={{ marginLeft: 8, color: 'var(--rp-warning, #d97706)', fontSize: 12 }}>
+                {t('connectionsAnomalyHint')}
+              </span>
+            ) : null}
+          </Descriptions.Item>
           <Descriptions.Item label={t('capacityScore')}>
             {row.capacity_score == null ? '-' : (
               <Tag color={row.capacity_score >= 50 ? 'green' : row.capacity_score >= 20 ? 'orange' : 'red'}>

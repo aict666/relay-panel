@@ -1,10 +1,26 @@
 /* eslint-disable react-refresh/only-export-components */
-import { Tag, Typography } from 'antd';
+import { Tag, Tooltip, Typography } from 'antd';
+import { WarningOutlined } from '@ant-design/icons';
 import type { Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { CountryFlag } from './CountryFlag';
 
 const { Text } = Typography;
+
+/**
+ * Sustained NIC rate with zero reported sessions usually means the node is
+ * forwarding via a path that doesn't track connections (historically: shared
+ * tunnels) or the node binary is too old. 10 KB/s total is above idle chatter.
+ */
+export const CONNECTION_ANOMALY_BPS = 10_000;
+
+/** True when an online node reports 0 connections but non-trivial NIC traffic. */
+export function hasConnectionCountAnomaly(row: Pick<NodeDisplayRow, 'online' | 'connections' | 'upload_bps' | 'download_bps'>): boolean {
+  if (!row.online) return false;
+  if ((row.connections ?? 0) > 0) return false;
+  const rate = (row.upload_bps ?? 0) + (row.download_bps ?? 0);
+  return rate >= CONNECTION_ANOMALY_BPS;
+}
 
 /** Network cell. New status rows show the IP observed on the actual report
  *  path. Old rows fall back to the node's legacy self-detected IPv4/IPv6. */
@@ -40,4 +56,24 @@ export function statusTag(r: NodeDisplayRow, t: Tfn, panelProtocol: number) {
     return <Tag color="red">{t('protocolIncompatible')}</Tag>;
   }
   return r.online ? <Tag color="green">{t('online')}</Tag> : <Tag>{t('offline')}</Tag>;
+}
+
+/** Active session count with a soft warning when NIC rates suggest undercount. */
+export function ConnectionsCell({ row, t }: { row: NodeDisplayRow; t: Tfn }) {
+  const value = row.connections ?? 0;
+  const anomaly = hasConnectionCountAnomaly(row);
+  const tip = anomaly ? t('connectionsAnomalyHint') : t('connectionsHint');
+  return (
+    <Tooltip title={tip}>
+      <span className="rp-mono" style={anomaly ? { color: 'var(--rp-warning, #d97706)' } : undefined}>
+        {value}
+        {anomaly ? (
+          <WarningOutlined
+            style={{ marginLeft: 4, fontSize: 12 }}
+            aria-label={t('connectionsAnomalyHint')}
+          />
+        ) : null}
+      </span>
+    </Tooltip>
+  );
 }

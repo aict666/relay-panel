@@ -1740,18 +1740,22 @@ impl ForwarderManager {
             );
             let state4 = state.clone();
             let state6 = state.clone();
+            // Shared-tunnel hops must report active streams too; without this
+            // middle/exit nodes always showed connections=0 on the panel.
+            let connections4 = self.connections.clone();
+            let connections6 = self.connections.clone();
             let handle = tokio::spawn(async move {
                 type SrvResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
                 let v4_fut = async move {
                     if let Some(listener) = v4 {
-                        super::tunnel::serve_listener(listener, state4).await
+                        super::tunnel::serve_listener(listener, state4, connections4).await
                     } else {
                         std::future::pending::<SrvResult>().await
                     }
                 };
                 let v6_fut = async move {
                     if let Some(listener) = v6 {
-                        super::tunnel::serve_listener(listener, state6).await
+                        super::tunnel::serve_listener(listener, state6, connections6).await
                     } else {
                         std::future::pending::<SrvResult>().await
                     }

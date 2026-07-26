@@ -19,6 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 
 use super::selector::{TargetLease, TargetSelector};
+use crate::reporter::ConnectionTracker;
 
 const MAGIC: &[u8; 8] = b"RPTUN001";
 const VERSION: u8 = 2;
@@ -642,9 +643,15 @@ fn build_context(
     })
 }
 
+/// Accept authenticated preset-tunnel streams on a shared TCP listener.
+///
+/// `connections` is the node-wide active-session counter reported to the panel.
+/// Without it, middle/exit hops that only serve shared tunnels always showed
+/// `connections=0` despite actively forwarding (machine NIC rates still rose).
 pub async fn serve_listener(
     listener: TcpListener,
     state: TunnelListenerState,
+    connections: Arc<ConnectionTracker>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -663,9 +670,10 @@ pub async fn serve_listener(
             drop(stream);
             continue;
         };
+        let connections = connections.clone();
         tokio::spawn(async move {
             tokio::select! {
-                result = handle_connection(stream, peer, permit, context) => {
+                result = handle_connection(stream, peer, permit, context, connections) => {
                     if let Err(error) = result {
                         tracing::debug!(
                             "shared tunnel connection from {} rejected/ended: {}",
@@ -707,6 +715,7 @@ async fn handle_connection(
     _peer: SocketAddr,
     permit: OwnedSemaphorePermit,
     context: Arc<TunnelConnectionContext>,
+    connections: Arc<ConnectionTracker>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     inbound.set_nodelay(true)?;
     super::outbound::apply_keepalive(&inbound, "preset tunnel accept");
@@ -753,6 +762,16 @@ async fn handle_connection(
     }
     let tunnel_id = context.config.tunnel_id;
     let next = context.config.next.clone();
+
+    // Count data-plane tunnels only. Probes are short-lived health checks and
+    // would otherwise inflate the panel's "connections" column on quiet nodes.
+    // Guard lives for the whole task (including cancel/select paths) so Drop
+    // always decrements — same RAII pattern as public TCP/TLS listeners.
+    let _conn_guard = if header.mode != TunnelMode::Probe {
+        Some(connections.tcp_handle())
+    } else {
+        None
+    };
 
     let forwarding = async move {
         if header.mode == TunnelMode::Probe {
@@ -938,6 +957,25 @@ mod tests {
             Arc::new(ReplayCache::default()),
             Arc::new(Semaphore::new(64)),
             runtime,
+        )
+    }
+
+    fn tracker() -> Arc<ConnectionTracker> {
+        Arc::new(ConnectionTracker::new())
+    }
+
+    async fn spawn_tunnel_listener(
+        listener: TcpListener,
+        state: TunnelListenerState,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+        Arc<ConnectionTracker>,
+    ) {
+        let connections = tracker();
+        let cn = connections.clone();
+        (
+            tokio::spawn(async move { serve_listener(listener, state, cn).await }),
+            connections,
         )
     }
 
@@ -1318,7 +1356,7 @@ mod tests {
             max_unauthenticated: 16,
             clients: vec![],
         };
-        let server = tokio::spawn(serve_listener(listener, listener_state(config)));
+        let (server, _) = spawn_tunnel_listener(listener, listener_state(config)).await;
 
         for (rule_id, expected) in [(101, b'A'), (102, b'B')] {
             let mut client = TcpStream::connect(address).await.unwrap();
@@ -1373,7 +1411,7 @@ mod tests {
             max_unauthenticated: 16,
             clients: vec![],
         };
-        let server = tokio::spawn(serve_listener(listener, listener_state(config)));
+        let (server, _) = spawn_tunnel_listener(listener, listener_state(config)).await;
 
         for expected in [b'A', b'B'] {
             let mut client = TcpStream::connect(address).await.unwrap();
@@ -1425,7 +1463,7 @@ mod tests {
             clients: vec![],
         };
         let state = listener_state(config.clone());
-        let server = tokio::spawn(serve_listener(listener, state.clone()));
+        let (server, _) = spawn_tunnel_listener(listener, state.clone()).await;
 
         config.routes = vec![route(104, "tcp", target_a), route(105, "tcp", target_b)];
         state.update(
@@ -1515,7 +1553,7 @@ mod tests {
         let exit_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let exit_address = exit_listener.local_addr().unwrap();
         let exit_token = "exit-key".repeat(8);
-        let exit_task = tokio::spawn(serve_listener(
+        let (exit_task, _) = spawn_tunnel_listener(
             exit_listener,
             listener_state(TunnelListenerConfig {
                 tunnel_id: 88,
@@ -1529,12 +1567,13 @@ mod tests {
                 max_unauthenticated: 16,
                 clients: vec![],
             }),
-        ));
+        )
+        .await;
 
         let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_address = relay_listener.local_addr().unwrap();
         let relay_token = "relay-key".repeat(8);
-        let relay_task = tokio::spawn(serve_listener(
+        let (relay_task, _) = spawn_tunnel_listener(
             relay_listener,
             listener_state(TunnelListenerConfig {
                 tunnel_id: 88,
@@ -1553,7 +1592,8 @@ mod tests {
                 max_unauthenticated: 16,
                 clients: vec![],
             }),
-        ));
+        )
+        .await;
 
         let mut client = TcpStream::connect(relay_address).await.unwrap();
         write_header(
@@ -1580,5 +1620,151 @@ mod tests {
         target_task.await.unwrap();
         relay_task.abort();
         exit_task.abort();
+    }
+
+    /// Shared-tunnel middle/exit hops previously never touched ConnectionTracker,
+    /// so the panel always showed connections=0 while NIC rates still climbed.
+    #[tokio::test]
+    async fn data_plane_tunnel_stream_increments_connection_tracker() {
+        let hold = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = hold.local_addr().unwrap().to_string();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let hold_task = tokio::spawn(async move {
+            let (mut stream, _) = hold.accept().await.unwrap();
+            // Drain the first payload so the tunnel finishes dialing, then park
+            // until the test releases us (keeps copy_raw alive).
+            let mut buf = [0u8; 4];
+            let _ = stream.read_exact(&mut buf).await;
+            let _ = release_rx.await;
+            drop(stream);
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "conn-count-key".repeat(6);
+        let (server, connections) = spawn_tunnel_listener(
+            listener,
+            listener_state(TunnelListenerConfig {
+                tunnel_id: 91,
+                port: address.port(),
+                hop_position: 1,
+                auth_token: token.clone(),
+                link_scope: "91:0".into(),
+                next: None,
+                routes: vec![route(301, "tcp", target_address)],
+                handshake_timeout_ms: 1_000,
+                max_unauthenticated: 16,
+                clients: vec![],
+            }),
+        )
+        .await;
+
+        assert_eq!(connections.current().await, 0);
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        write_header(
+            &mut client,
+            &TunnelClientConfig {
+                tunnel_id: 91,
+                rule_id: 301,
+                hop_position: 0,
+                address: address.to_string(),
+                auth_token: token,
+                link_scope: "91:0".into(),
+            },
+            TunnelMode::Tcp,
+        )
+        .await
+        .unwrap();
+        // Keep the stream open so the tunnel task stays in copy_raw.
+        client.write_all(b"hold").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if connections.current().await >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authenticated tunnel TCP stream must count as an active connection");
+
+        // Close both ends so copy_raw returns and the RAII guard decrements.
+        let _ = release_tx.send(());
+        let _ = client.shutdown().await;
+        drop(client);
+        let _ = hold_task.await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if connections.current().await == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closing the tunnel stream must release the connection count");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_mode_does_not_inflate_connection_tracker() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap().to_string();
+        let target_task = tokio::spawn(async move {
+            let (_stream, _) = target.accept().await.unwrap();
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "probe-count-key".repeat(6);
+        let (server, connections) = spawn_tunnel_listener(
+            listener,
+            listener_state(TunnelListenerConfig {
+                tunnel_id: 92,
+                port: address.port(),
+                hop_position: 1,
+                auth_token: token.clone(),
+                link_scope: "92:0".into(),
+                next: None,
+                routes: vec![route(302, "tcp", target_address)],
+                handshake_timeout_ms: 1_000,
+                max_unauthenticated: 16,
+                clients: vec![],
+            }),
+        )
+        .await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        write_header(
+            &mut client,
+            &TunnelClientConfig {
+                tunnel_id: 92,
+                rule_id: 302,
+                hop_position: 0,
+                address: address.to_string(),
+                auth_token: token,
+                link_scope: "92:0".into(),
+            },
+            TunnelMode::Probe,
+        )
+        .await
+        .unwrap();
+        let mut result = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut result))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, [1]);
+        // Give the tunnel task a moment to finish; probes must never leave a
+        // residual count (and ideally never increment at all).
+        tokio::task::yield_now().await;
+        assert_eq!(connections.current().await, 0);
+
+        target_task.await.unwrap();
+        server.abort();
     }
 }

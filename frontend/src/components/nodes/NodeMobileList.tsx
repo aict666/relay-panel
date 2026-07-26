@@ -4,7 +4,7 @@ import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined } from 
 import type { Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { NodeResourceBar } from './NodeResourceBar';
-import { NetworkCell, statusTag } from './shared';
+import { ConnectionsCell, NetworkCell, statusTag } from './shared';
 import { formatBps, formatUptime } from '../../utils/format';
 import { versionRelation, versionTagColor } from '../../utils/version';
 import { resolveNodeUpgrade, type NodeUpgradeState } from './upgrade';
@@ -46,7 +46,21 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
         return (
           <div
             key={`${r.group_id}:${r.node_id || 'none'}`}
-            style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: 10 }}
+            role={isPlaceholder ? undefined : 'button'}
+            tabIndex={isPlaceholder ? undefined : 0}
+            onClick={() => { if (!isPlaceholder) openDetail(r); }}
+            onKeyDown={(e) => {
+              if (!isPlaceholder && (e.key === 'Enter' || e.key === ' ')) {
+                e.preventDefault();
+                openDetail(r);
+              }
+            }}
+            style={{
+              border: '1px solid var(--rp-border, #f0f0f0)',
+              borderRadius: 8,
+              padding: 10,
+              cursor: isPlaceholder ? undefined : 'pointer',
+            }}
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 4 }}>
               {statusTag(r, t, panelProtocol)}
@@ -61,18 +75,23 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
                 ) : null}
                 {/* upgrade affordance — same ladder as desktop */}
                 {onUpgrade ? (
-                  <MobileUpgradeAffordance
-                    state={upgradeState}
-                    latestNodeVersion={latestNodeVersion}
-                    t={t}
-                    onUpgrade={() => onUpgrade(r)}
-                  />
+                  <span onClick={(e) => e.stopPropagation()}>
+                    <MobileUpgradeAffordance
+                      state={upgradeState}
+                      latestNodeVersion={latestNodeVersion}
+                      t={t}
+                      onUpgrade={() => onUpgrade(r)}
+                    />
+                  </span>
                 ) : null}
                 <Button
                   size="small"
                   type="link"
                   disabled={isPlaceholder}
-                  onClick={() => openDetail(r)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    openDetail(r);
+                  }}
                   aria-label={t('resourceDetails')}
                 >
                   {t('resourceDetails')}
@@ -80,9 +99,10 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
               </span>
             </div>
             <NetworkCell row={r} t={t} />
-            <div style={{ fontSize: 12, color: '#888', marginTop: 4 }}>
-              ↑ {formatBps(r.upload_bps)} ↓ {formatBps(r.download_bps)}
-              {' · '}{t('systemUptime')}: {formatUptime(r.uptime, labels)}
+            <div style={{ fontSize: 12, color: '#888', marginTop: 4, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+              <span>{t('connections')}: <ConnectionsCell row={r} t={t} /></span>
+              <span>↑ {formatBps(r.upload_bps)} ↓ {formatBps(r.download_bps)}</span>
+              <span>{t('systemUptime')}: {formatUptime(r.uptime, labels)}</span>
             </div>
             <div style={{ display: 'flex', gap: 12, marginTop: 6 }}>
               <div style={{ flex: 1 }}>

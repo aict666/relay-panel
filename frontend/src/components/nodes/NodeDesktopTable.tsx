@@ -6,7 +6,7 @@ import type { NodeDisplayRow } from '../../api/types';
 import { NodeResourceBar, NodeDiskBar } from './NodeResourceBar';
 import { formatBps, formatBytes, formatUptime, formatPercent } from '../../utils/format';
 import { versionRelation, versionTagColor } from '../../utils/version';
-import { NetworkCell } from './shared';
+import { ConnectionsCell, NetworkCell } from './shared';
 import { resolveNodeUpgrade } from './upgrade';
 
 interface Props {
@@ -94,7 +94,10 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
                   type="link"
                   icon={<CloudDownloadOutlined />}
                   aria-label={t('nodeUpgrade')}
-                  onClick={() => onUpgrade(r)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onUpgrade(r);
+                  }}
                 />
               </Tooltip>
             );
@@ -109,8 +112,9 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
       render: (_: unknown, r: NodeDisplayRow) => <NetworkCell row={r} t={t} />,
     },
     {
-      title: t('connections'), dataIndex: 'connections', key: 'connections', width: 70,
-      render: (v: number) => <span className="rp-mono">{v || 0}</span>,
+      title: <Tooltip title={t('connectionsHint')}>{t('connections')}</Tooltip>,
+      dataIndex: 'connections', key: 'connections', width: 88,
+      render: (_: unknown, r: NodeDisplayRow) => <ConnectionsCell row={r} t={t} />,
     },
     {
       title: 'CPU', key: 'cpu', width: 84,
@@ -143,20 +147,36 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
     {
       title: t('resourceDetails'), key: 'detail', width: 70, fixed: 'right' as const,
       render: (_: unknown, r: NodeDisplayRow) => (
-        <Button size="small" type="link" onClick={() => openDetail(r)}>{t('resourceDetails')}</Button>
+        <Button
+          size="small"
+          type="link"
+          onClick={(e) => {
+            e.stopPropagation();
+            openDetail(r);
+          }}
+        >
+          {t('resourceDetails')}
+        </Button>
       ),
     },
   ];
 
   return (
     <Table
-      className="rp-responsive-table"
+      className="rp-responsive-table rp-node-table"
       dataSource={rows}
       columns={columns}
       rowKey={(r) => `${r.group_id}:${r.node_id || 'legacy'}`}
       pagination={false}
       size="small"
       scroll={{ x: 'max-content' }}
+      onRow={(r) => ({
+        onClick: () => {
+          if (r.node_id) openDetail(r);
+        },
+        title: r.node_id ? t('clickRowForDetails') : undefined,
+        style: r.node_id ? { cursor: 'pointer' } : undefined,
+      })}
     />
   );
 }

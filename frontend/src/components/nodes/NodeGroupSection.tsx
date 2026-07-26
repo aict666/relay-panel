@@ -25,13 +25,14 @@ interface Props {
 }
 
 /** Per-group summary: online/total (placeholders excluded) + aggregate live
- *  upload/download across ONLINE nodes only. */
+ *  rates / connections across ONLINE nodes only. */
 function groupSummary(rows: NodeDisplayRow[]) {
   const real = rows.filter((r) => r.node_id);
   const onlineRows = real.filter((r) => r.online);
   return {
     total: real.length,
     online: onlineRows.length,
+    connections: onlineRows.reduce((s, r) => s + (r.connections || 0), 0),
     up: onlineRows.reduce((s, r) => s + (r.upload_bps || 0), 0),
     down: onlineRows.reduce((s, r) => s + (r.download_bps || 0), 0),
   };
@@ -42,7 +43,7 @@ function groupSummary(rows: NodeDisplayRow[]) {
  *  placeholder row shows "no node reporting". */
 export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade }: Props) {
   const head = rows[0];
-  const { total, online, up, down } = groupSummary(rows);
+  const { total, online, connections, up, down } = groupSummary(rows);
   const region = head.region;
   const lineType = head.line_type;
   const onlyPlaceholder = rows.length === 1 && !head.node_id;
@@ -58,6 +59,8 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
       <Tag color={online > 0 ? 'green' : undefined}>{online}/{total}</Tag>
       <span style={{ marginLeft: 'auto' }} className="rp-mono">
         <Text type="secondary" style={{ fontSize: 12 }}>
+          {t('groupConnections')} {connections.toLocaleString()}
+          {' · '}
           <ArrowUpOutlined /> {formatBps(up)} <ArrowDownOutlined /> {formatBps(down)}
         </Text>
       </span>

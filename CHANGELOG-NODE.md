@@ -13,6 +13,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.8] - 2026-07-26
+
+### Fixed
+
+- 预设隧道 / 共享隧道 listener 现在接入 `ConnectionTracker`：中继与出口 hop 的
+  活跃 TCP 隧道流会正确上报「连接数」，不再在有转发流量时恒为 0。健康探测
+  （Probe）仍不计连接，避免空闲节点虚高。
+
+### Compatibility
+
+- 面板侧展示与异常提示建议 **RelayPanel 1.3.15+**；配置协议版本不变（仍为 v11）。
+
 ## [1.3.7] - 2026-07-21
 
 ### Added

@@ -67,6 +67,20 @@ describe('NodeGroupSection mobile vs desktop', () => {
     expect(screen.getByText('httpBlocked')).toBeInTheDocument();
     expect(screen.getByText('tlsBlocked')).toBeInTheDocument();
   });
+
+  it('shows aggregate connection count in the group header', () => {
+    const multi = [
+      row({ node_id: 'a', online: true, connections: 3, upload_bps: 100 }),
+      row({ node_id: 'b', online: true, connections: 5, upload_bps: 50 }),
+      row({ node_id: 'c', online: false, connections: 99, upload_bps: 999 }),
+    ];
+    render(
+      <NodeGroupSection rows={multi} panelProtocol={0} latestNodeVersion="1.1.0" nodeVersionCheckFailed={false} isMobile={false} t={t} openDetail={vi.fn()} />,
+    );
+    // Online-only sum: 3 + 5. Offline 99 must not contribute.
+    expect(screen.getByText(/groupConnections/)).toBeInTheDocument();
+    expect(screen.getByText(/8/)).toBeInTheDocument();
+  });
 });
 
 // ── v1.2: node version is compared against the latest NODE release, not the

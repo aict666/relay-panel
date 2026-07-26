@@ -907,6 +907,14 @@ html, body, #root {
   box-shadow: none;
 }
 
+/* Node status board: whole row opens the detail drawer. */
+.rp-node-table .ant-table-tbody > tr.ant-table-row {
+  transition: background-color 0.12s ease;
+}
+.rp-node-table .ant-table-tbody > tr.ant-table-row:hover > td {
+  background: var(--rp-table-row-hover) !important;
+}
+
 .rp-rules-table .ant-table-cell-fix-right {
   box-shadow: -8px 0 16px -16px rgba(16, 24, 40, 0.45);
 }
