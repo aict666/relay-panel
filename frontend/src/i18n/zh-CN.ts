@@ -352,6 +352,11 @@ export const zhCN = {
   connectionsHint: '本机活跃转发会话（TCP 连接 + UDP 会话），不含 SSH 等系统流量。',
   connectionsAnomalyHint: '有明显网卡流量但连接数为 0：可能是中继/出口隧道路径未统计，或节点版本过旧。升级节点后应恢复。',
   groupConnections: '连接',
+  // v1.3.16: 控制通道（WS）与"在线"（HTTP 上报心跳）是两条独立通道，分开展示。
+  controlChannel: '控制通道',
+  controlChannelConns: 'WS 连接 {total} · 未识别 {unidentified}',
+  controlChannelOfflineTip: '控制通道离线：节点仍在上报状态、转发也正常，但诊断、重启规则、配置即时下发均不可用（配置只能等 HTTP 轮询）。常见原因是 wss 连接被阻断，或反向代理没有转发 Upgrade 请求。',
+  controlChannelUnidentifiedTip: '该节点当前不可寻址，同时其分组内存在未识别的 WS 连接。由于这些连接没有 node_id，面板无法判断它们具体属于哪个节点。若该分组只有一个节点，通常是 X-Node-ID 被中间层剥除；升级节点后可在连接内补报身份。',
   clickRowForDetails: '点击行查看详情',
   uptime: '运行时长',
   systemUptime: '系统运行时长',

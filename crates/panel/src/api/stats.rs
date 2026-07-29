@@ -399,6 +399,16 @@ pub async fn get_node_status(
     // endpoint uses, so the admin /nodes board and the user /nodes/shared board
     // never disagree about who's online. The frontend must NOT recompute it.
     let now = chrono::Utc::now();
+    // v1.3.16: memoised per-group WS registry snapshot (live node ids + the
+    // connection census) so a board with many nodes takes one read lock per
+    // group instead of one per row.
+    let mut ws_stats: std::collections::HashMap<
+        i64,
+        (
+            std::collections::HashSet<String>,
+            crate::api::ws::GroupConnStats,
+        ),
+    > = std::collections::HashMap::new();
     for (key, value) in &rows {
         let (group_id, node_id_from_key) = match parse_status_key(key) {
             Some(parsed) => parsed,
@@ -475,6 +485,39 @@ pub async fn get_node_status(
         }
 
         status["online"] = serde_json::json!(status_is_online(value, now));
+
+        // v1.3.16: control-plane liveness, reported SEPARATELY from `online`.
+        //
+        // `online` above is the HTTP status-report heartbeat — the data plane.
+        // A node can keep reporting happily while its WS control channel is
+        // down, and then diagnosis, rule restart and instant config push are
+        // all unavailable while the board still says 在线. That gap is exactly
+        // how a stripped X-Node-ID or a blocked wss:// upgrade stayed invisible
+        // until someone happened to click "诊断".
+        //
+        // `ws_conn_total` / `ws_conn_unidentified` separate the two causes,
+        // which need different fixes:
+        //   offline + total 0            → the node never established a socket
+        //                                  (wss blocked, proxy won't upgrade)
+        //   offline + unidentified > 0   → this group has a socket that arrived
+        //                                  with no identity. It cannot be tied to
+        //                                  this specific row because the missing
+        //                                  node_id is the correlation key.
+        // One registry read per GROUP, not per node: a group's rows are
+        // contiguous in the scan only by luck, so memoise instead of assuming.
+        if let std::collections::hash_map::Entry::Vacant(slot) = ws_stats.entry(group_id) {
+            let online_ids = state.node_connections.online_node_ids(group_id).await;
+            let conns = state.node_connections.group_conn_stats(group_id).await;
+            slot.insert((online_ids, conns));
+        }
+        let (online_ids, conns) = &ws_stats[&group_id];
+        let control_online = status
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|nid| online_ids.contains(nid));
+        status["control_channel_online"] = serde_json::json!(control_online);
+        status["ws_conn_total"] = serde_json::json!(conns.total);
+        status["ws_conn_unidentified"] = serde_json::json!(conns.unidentified);
 
         statuses.push(status);
     }

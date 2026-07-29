@@ -4,6 +4,7 @@ import { WarningOutlined } from '@ant-design/icons';
 import type { Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { CountryFlag } from './CountryFlag';
+import { controlChannelTipKey, resolveControlChannel } from './controlChannel';
 
 const { Text } = Typography;
 
@@ -49,13 +50,46 @@ export function NetworkCell({ row }: { row: NodeDisplayRow; t: Tfn }) {
   );
 }
 
-/** Status tag with protocol-mismatch detection. */
+/** v1.3.16: amber warning next to a reporting node's primary status tag when
+ *  its CONTROL channel is down.
+ *  Renders nothing in the states that carry no information (see
+ *  resolveControlChannel), so a healthy or fully-offline node is unchanged. */
+export function ControlChannelWarning({ row, t }: { row: NodeDisplayRow; t: Tfn }) {
+  const tipKey = controlChannelTipKey(resolveControlChannel(row));
+  if (!tipKey) return null;
+  return (
+    <Tooltip title={t(tipKey)}>
+      <WarningOutlined
+        style={{ color: 'var(--rp-warning, #d97706)', fontSize: 12 }}
+        aria-label={t(tipKey)}
+      />
+    </Tooltip>
+  );
+}
+
+/** Status tag with protocol-mismatch detection.
+ *
+ *  v1.3.16: an online node can still have a dead control channel, which used to
+ *  be invisible here — the board said 在线 while diagnosis said the opposite.
+ *  The tag keeps meaning exactly what it always meant (the node is reporting);
+ *  the control plane gets its own adjacent marker rather than being folded into
+ *  the same green/grey signal. */
 export function statusTag(r: NodeDisplayRow, t: Tfn, panelProtocol: number) {
   const v = r.config_protocol_version;
-  if (v != null && panelProtocol > 0 && v !== panelProtocol) {
-    return <Tag color="red">{t('protocolIncompatible')}</Tag>;
-  }
-  return r.online ? <Tag color="green">{t('online')}</Tag> : <Tag>{t('offline')}</Tag>;
+  const protocolIncompatible = v != null && panelProtocol > 0 && v !== panelProtocol;
+  const primaryTag = protocolIncompatible ? (
+    <Tag color="red" style={{ marginInlineEnd: 0 }}>{t('protocolIncompatible')}</Tag>
+  ) : r.online ? (
+    <Tag color="green" style={{ marginInlineEnd: 0 }}>{t('online')}</Tag>
+  ) : (
+    <Tag style={{ marginInlineEnd: 0 }}>{t('offline')}</Tag>
+  );
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      {primaryTag}
+      <ControlChannelWarning row={r} t={t} />
+    </span>
+  );
 }
 
 /** Active session count with a soft warning when NIC rates suggest undercount. */

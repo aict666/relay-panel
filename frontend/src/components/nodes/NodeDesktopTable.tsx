@@ -6,7 +6,7 @@ import type { NodeDisplayRow } from '../../api/types';
 import { NodeResourceBar, NodeDiskBar } from './NodeResourceBar';
 import { formatBps, formatBytes, formatUptime, formatPercent } from '../../utils/format';
 import { versionRelation, versionTagColor } from '../../utils/version';
-import { ConnectionsCell, NetworkCell } from './shared';
+import { ConnectionsCell, NetworkCell, statusTag } from './shared';
 import { resolveNodeUpgrade } from './upgrade';
 
 interface Props {
@@ -33,14 +33,11 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
 
   const columns = [
     {
-      title: t('status'), key: 'status', width: 84, fixed: 'left' as const,
-      render: (_: unknown, r: NodeDisplayRow) => {
-        const v = r.config_protocol_version;
-        if (v != null && panelProtocol > 0 && v !== panelProtocol) {
-          return <Tag color="red">{t('protocolIncompatible')}</Tag>;
-        }
-        return r.online ? <Tag color="green">{t('online')}</Tag> : <Tag>{t('offline')}</Tag>;
-      },
+      // v1.3.16: was an inline copy of statusTag's logic; now shares it with the
+      // mobile list so the control-channel warning can't appear on one view and
+      // not the other.
+      title: t('status'), key: 'status', width: 100, fixed: 'left' as const,
+      render: (_: unknown, r: NodeDisplayRow) => statusTag(r, t, panelProtocol),
     },
     // v1.0.10: node version moved forward, with the upgrade action right after it.
     // v1.2: compared against the latest NODE release (latestNodeVersion), not

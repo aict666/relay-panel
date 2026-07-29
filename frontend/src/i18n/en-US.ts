@@ -354,6 +354,12 @@ export const enUS: Dict = {
   connectionsHint: 'Active forwarded sessions on this node (TCP connections + UDP sessions). Excludes SSH and other system traffic.',
   connectionsAnomalyHint: 'Non-trivial NIC traffic with 0 connections: middle/exit tunnel hops may under-count, or the node binary is outdated. Upgrade the node to restore accurate counts.',
   groupConnections: 'conn',
+  // v1.3.16: the control channel (WS) and "online" (HTTP report heartbeat) are
+  // independent channels and are now surfaced separately.
+  controlChannel: 'Control channel',
+  controlChannelConns: '{total} WS conn · {unidentified} unidentified',
+  controlChannelOfflineTip: 'Control channel offline: the node still reports status and still forwards traffic, but diagnosis, rule restart and instant config push are all unavailable (config only lands on the next HTTP poll). Usually a blocked wss:// connection, or a reverse proxy that does not forward the Upgrade request.',
+  controlChannelUnidentifiedTip: 'This node is not addressable, and its group also has one or more unidentified WS connections. Because those connections have no node_id, the panel cannot tell which node they belong to. If this is a single-node group, an intermediary probably stripped X-Node-ID; upgrade the node so it can restate its identity on the socket.',
   clickRowForDetails: 'Click row for details',
   uptime: 'Uptime',
   systemUptime: 'System Uptime',

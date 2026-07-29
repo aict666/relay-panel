@@ -740,12 +740,7 @@ pub(crate) async fn group_node_statuses(
             .and_then(|x| x.as_str())
             .map(|s| s.to_string())
             .unwrap_or(node_id);
-        // v0.4.15: public_ip for display ("分组名 · 公网IP"). Read defensively —
-        // older/edge nodes may omit it.
-        let public_ip = v
-            .get("public_ip")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string());
+        let public_ip = display_public_ip(&v);
         out.push(NodeStatusRow {
             node_id: nid,
             node_version,
@@ -754,6 +749,30 @@ pub(crate) async fn group_node_statuses(
         });
     }
     Ok(out)
+}
+
+/// The address to show beside a node in diagnose output ("分组名 · 公网IP").
+///
+/// v0.4.15 read only the legacy `public_ip`. v1.3.16 falls back the same way
+/// the node board does (groups.rs) — otherwise the two screens disagree about
+/// the same node. `public_ip` is only populated when the node successfully
+/// detected an IPv4 egress address; a node whose outbound IPv4 probe is blocked
+/// while its reports reach the panel fine left it null, and the diagnose dialog
+/// showed "IP 未上报" for a node the board was displaying an address for.
+///
+/// `report_ip` is the last resort deliberately: it is the panel's OWN view of
+/// where the node's reports arrived from, so it exists for any node that is
+/// reporting at all — but it is the proxy-observed address, not the node's
+/// self-detected one, hence lowest priority.
+fn display_public_ip(v: &serde_json::Value) -> Option<String> {
+    ["public_ip", "public_ipv4", "public_ipv6", "report_ip"]
+        .into_iter()
+        .find_map(|key| {
+            v.get(key)
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
 }
 
 /// v0.4.15: pure classification decision for one node, extracted so the four
@@ -814,6 +833,45 @@ mod tests {
     fn with_challenge(mut r: DiagnoseResult, challenge: &str) -> DiagnoseResult {
         r.challenge = challenge.into();
         r
+    }
+
+    /// v1.3.16: the diagnose label must resolve an address whenever the node
+    /// board can, or the two screens contradict each other for the same node.
+    /// The real-world case that motivated this is the last one: a node whose
+    /// outbound IPv4 detection is blocked reports no public_ip/public_ipv4 at
+    /// all, and used to render as "IP 未上报".
+    #[test]
+    fn display_public_ip_falls_back_through_every_address_field() {
+        let ip = |json: serde_json::Value| display_public_ip(&json);
+
+        assert_eq!(
+            ip(serde_json::json!({"public_ip": "1.2.3.4", "report_ip": "5.6.7.8"})),
+            Some("1.2.3.4".into()),
+            "legacy public_ip wins when present"
+        );
+        assert_eq!(
+            ip(serde_json::json!({"public_ipv4": "1.2.3.4", "report_ip": "5.6.7.8"})),
+            Some("1.2.3.4".into()),
+            "self-detected v4 outranks the panel-observed report_ip"
+        );
+        assert_eq!(
+            ip(serde_json::json!({"public_ipv6": "2402::1", "report_ip": "5.6.7.8"})),
+            Some("2402::1".into()),
+            "a v6-only node shows its v6 address"
+        );
+        assert_eq!(
+            ip(
+                serde_json::json!({"public_ip": null, "public_ipv4": null, "report_ip": "203.0.113.93"})
+            ),
+            Some("203.0.113.93".into()),
+            "blocked IPv4 detection still yields the panel-observed address"
+        );
+        assert_eq!(
+            ip(serde_json::json!({"public_ip": "", "report_ip": "5.6.7.8"})),
+            Some("5.6.7.8".into()),
+            "an empty string is not an address"
+        );
+        assert_eq!(ip(serde_json::json!({"cpu": 1})), None, "nothing to show");
     }
 
     #[tokio::test]

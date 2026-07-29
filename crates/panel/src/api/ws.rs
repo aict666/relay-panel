@@ -8,9 +8,9 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use relay_shared::protocol::NodeConfigResponse;
+use relay_shared::protocol::{NodeConfigResponse, NodeHelloMessage};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -24,6 +24,14 @@ struct ConnEntry {
 }
 /// Per-group map of live connection senders.
 type GroupConns = HashMap<u64, ConnEntry>;
+
+/// v1.3.16: how many live WS connections a group has, and how many of them the
+/// panel cannot address because they carry no node identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupConnStats {
+    pub total: usize,
+    pub unidentified: usize,
+}
 /// Shared registry: group_id -> that group's live connections.
 type ConnMap = Arc<RwLock<HashMap<i64, GroupConns>>>;
 
@@ -205,6 +213,49 @@ impl NodeConnections {
             .get(&group_id)
             .map(|c| c.len())
             .unwrap_or(0)
+    }
+
+    /// v1.3.16: live-connection census for ONE group, for the node-status
+    /// board's control-channel column.
+    ///
+    /// `unidentified` is the diagnostic that matters: a group with live sockets
+    /// but no identity on them means the node connected and something on the
+    /// path ate its identity (a stripped `X-Node-ID` on a node too old to send
+    /// [`NodeHelloMessage`]). Without this number, "control channel offline"
+    /// looks identical to "node never dialled in", and the two have completely
+    /// different fixes.
+    pub async fn group_conn_stats(&self, group_id: i64) -> GroupConnStats {
+        self.inner
+            .read()
+            .await
+            .get(&group_id)
+            .map(|conns| GroupConnStats {
+                total: conns.len(),
+                unidentified: conns.values().filter(|e| e.node_id.is_none()).count(),
+            })
+            .unwrap_or_default()
+    }
+
+    /// v1.3.16: attach an identity to an ALREADY-REGISTERED connection, the
+    /// panel half of the [`NodeHelloMessage`] fallback.
+    ///
+    /// Only fills a hole — a connection that already has an id keeps it, and
+    /// this returns false. That restriction is deliberate: the handshake header
+    /// is observed before any node-controlled frame, so letting a text frame
+    /// overwrite it would let one authenticated node in a group re-label its
+    /// socket as a DIFFERENT node in that group and receive the other node's
+    /// directed commands. Filling `None` grants no such power — an unidentified
+    /// connection is one nothing can be routed to.
+    pub async fn attach_node_id(&self, group_id: i64, conn_id: u64, node_id: String) -> bool {
+        let mut map = self.inner.write().await;
+        let Some(entry) = map.get_mut(&group_id).and_then(|c| c.get_mut(&conn_id)) else {
+            return false;
+        };
+        if entry.node_id.is_some() {
+            return false;
+        }
+        entry.node_id = Some(node_id);
+        true
     }
 
     /// Force-close every live connection for ONE group. Used by token rotation:
@@ -462,6 +513,12 @@ async fn handle_node_ws(
     // expected well within this window.
     const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
+    // v1.3.16: does this connection already have an identity? Set when the
+    // handshake carried X-Node-ID, or once a node_hello frame supplies one.
+    // Checked first on every text frame so the steady state costs an atomic
+    // load rather than a registry write lock.
+    let identified = AtomicBool::new(node_id.is_some());
+
     // Drive both halves. `receiver.recv()` (wrapped in a timeout) and
     // `push_rx.recv()` borrow different variables, so select! can hold both
     // pending at once; the branch bodies both use `sender` but only one
@@ -487,6 +544,14 @@ async fn handle_node_ws(
                     tracing::info!("websocket disconnected: group_id={}", group_id);
                     break;
                 }
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    // v1.3.16: the only node → panel frame we accept. It repairs
+                    // an identity-less registration when the handshake's
+                    // X-Node-ID was stripped in transit (see NodeHelloMessage).
+                    // Anything else stays ignored, as before.
+                    handle_node_hello(&node_connections, group_id, conn_id, &identified, &text)
+                        .await;
+                }
                 Ok(Some(Ok(_))) => {
                     // ignore other message types
                 }
@@ -507,6 +572,53 @@ async fn handle_node_ws(
     }
 
     node_connections.unregister(group_id, conn_id).await;
+}
+
+/// v1.3.16: repair an identity-less registration from a node_hello frame.
+///
+/// A connection that already has an identity is left alone (see
+/// [`NodeConnections::attach_node_id`] for why overwriting must not be
+/// possible). A frame that isn't a well-formed node_hello is ignored exactly
+/// as every other text frame always was.
+async fn handle_node_hello(
+    node_connections: &NodeConnections,
+    group_id: i64,
+    conn_id: u64,
+    identified: &AtomicBool,
+    text: &str,
+) {
+    if identified.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(hello) = serde_json::from_str::<NodeHelloMessage>(text) else {
+        return;
+    };
+    if hello.msg_type != NodeHelloMessage::TYPE {
+        return;
+    }
+    // Same validation the X-Node-ID header goes through — a hello is exactly
+    // as trusted as the header (both arrive on an already token-authenticated
+    // socket), so it must be exactly as constrained.
+    let Some(node_id) = crate::api::node::normalize_node_id(&hello.node_id) else {
+        tracing::warn!(group_id, "node_hello carried a malformed node_id; ignoring");
+        return;
+    };
+    if node_connections
+        .attach_node_id(group_id, conn_id, node_id.clone())
+        .await
+    {
+        identified.store(true, Ordering::Relaxed);
+        // WARN, not INFO: reaching this line means the handshake header was
+        // lost somewhere between the node and the panel. The control channel
+        // works from here on, but the operator should know their path strips
+        // headers — the next thing it eats may not have a fallback.
+        tracing::warn!(
+            group_id,
+            %node_id,
+            node_version = %hello.node_version,
+            "node identified via node_hello — X-Node-ID did not survive the path to the panel"
+        );
+    }
 }
 
 fn policy_fail_closed_snapshot() -> NodeConfigResponse {
@@ -765,5 +877,81 @@ mod tests {
         assert!(ids.contains("node-b"));
         // An empty group → empty set.
         assert!(conns.online_node_ids(42).await.is_empty());
+    }
+
+    /// v1.3.16: the census separates "no socket at all" from "socket present
+    /// but unaddressable" — the two look identical through online_node_ids, and
+    /// they have completely different fixes (unblock wss vs upgrade the node).
+    #[tokio::test]
+    async fn group_conn_stats_counts_unidentified_connections() {
+        let conns = NodeConnections::new();
+
+        assert_eq!(
+            conns.group_conn_stats(1).await,
+            GroupConnStats {
+                total: 0,
+                unidentified: 0
+            },
+            "a group nothing has dialled into"
+        );
+
+        let (_, _a) = conns.register(1, Some("node-a".into())).await;
+        let (_, _stripped) = conns.register(1, None).await;
+
+        assert_eq!(
+            conns.group_conn_stats(1).await,
+            GroupConnStats {
+                total: 2,
+                unidentified: 1
+            },
+            "one healthy socket, one that arrived without an identity"
+        );
+    }
+
+    /// v1.3.16: node_hello fills a MISSING identity, so a node whose X-Node-ID
+    /// was stripped in transit becomes addressable without reconnecting.
+    #[tokio::test]
+    async fn attach_node_id_fills_missing_identity() {
+        let conns = NodeConnections::new();
+        let (conn_id, mut rx) = conns.register(1, None).await;
+
+        assert!(conns.online_node_ids(1).await.is_empty());
+        assert!(conns.attach_node_id(1, conn_id, "node-a".into()).await);
+
+        assert!(conns.online_node_ids(1).await.contains("node-a"));
+        // And it is now genuinely reachable by directed send, not merely listed.
+        assert_eq!(conns.send_node(1, "node-a", "probe").await, 1);
+        assert_eq!(rx.recv().await.as_deref(), Some("probe"));
+    }
+
+    /// A connection that already has an identity must NOT be relabelled: the
+    /// handshake header is observed before any node-controlled frame, so
+    /// allowing an overwrite would let one authenticated node in a group
+    /// impersonate another node in that group and receive its directed commands.
+    #[tokio::test]
+    async fn attach_node_id_never_overwrites_an_existing_identity() {
+        let conns = NodeConnections::new();
+        let (conn_id, mut rx_victim) = conns.register(1, Some("victim".into())).await;
+
+        assert!(!conns.attach_node_id(1, conn_id, "attacker".into()).await);
+
+        let ids = conns.online_node_ids(1).await;
+        assert!(ids.contains("victim"));
+        assert!(!ids.contains("attacker"));
+        // Commands for "victim" still land on the victim's own socket.
+        assert_eq!(conns.send_node(1, "victim", "probe").await, 1);
+        assert_eq!(rx_victim.recv().await.as_deref(), Some("probe"));
+    }
+
+    /// Attaching to a connection that has already gone away is a no-op rather
+    /// than resurrecting a registry entry for a dead socket.
+    #[tokio::test]
+    async fn attach_node_id_ignores_unknown_connection() {
+        let conns = NodeConnections::new();
+        let (conn_id, _rx) = conns.register(1, None).await;
+
+        assert!(!conns.attach_node_id(999, conn_id, "node-a".into()).await);
+        assert!(!conns.attach_node_id(1, conn_id + 1, "node-a".into()).await);
+        assert!(conns.online_node_ids(1).await.is_empty());
     }
 }

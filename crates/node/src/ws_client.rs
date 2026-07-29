@@ -227,6 +227,29 @@ async fn connect_and_run(
         }
     };
 
+    // v1.3.9: restate our identity IN-BAND, immediately after the upgrade.
+    // The X-Node-ID header above is the fast path, but it is a non-standard
+    // header and intermediaries strip those; when that happens the panel keeps
+    // a healthy socket registered under no identity and every directed command
+    // (diagnose, restart, upgrade) silently skips this node forever — nothing
+    // on either side notices, so nothing reconnects. A text frame is not
+    // rewritable by an HTTP intermediary, so this repairs that case. An older
+    // panel ignores the frame.
+    if !node_id.is_empty() {
+        let hello = relay_shared::protocol::NodeHelloMessage::new(
+            node_id.to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        match serde_json::to_string(&hello) {
+            Ok(json) => {
+                if let Err(e) = ws_stream.send(Message::Text(json.into())).await {
+                    return WsExit::Error(format!("hello send: {}", e));
+                }
+            }
+            Err(e) => tracing::warn!("websocket: could not serialize node_hello: {}", e),
+        }
+    }
+
     // ── Heartbeat state ──
     // All timestamps are millis relative to `session_start` (a monotonic
     // Instant captured once per connection). We avoid SystemTime (can jump

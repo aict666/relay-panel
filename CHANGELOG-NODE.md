@@ -13,6 +13,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.9] - 2026-07-29
+
+### Added
+
+- WS 控制通道建立后立即发送 `node_hello`，在通道内补报 `node_id`。`X-Node-ID`
+  是非标准请求头，中间层（CDN、反向代理）可以将其剥除；一旦剥除，面板会把这条
+  完全健康的连接登记为「无身份」，诊断、重启规则、自升级全部静默跳过该节点，而
+  节点侧看到的连接是正常的、永不重连——该状态无法自愈。文本帧不会被 HTTP 中间层
+  改写，因此可作为可靠回退；请求头仍是快路径。
+
+### Compatibility
+
+- 面板侧需 **RelayPanel 1.3.16+** 才会处理 `node_hello`；旧面板忽略未知文本帧，
+  行为不变。配置协议版本不变（仍为 v11）。
+
 ## [1.3.8] - 2026-07-26
 
 ### Fixed

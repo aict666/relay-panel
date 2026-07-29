@@ -1,5 +1,5 @@
  
-import { Alert, Drawer, Descriptions, Tag, Button, Popconfirm, message, Space } from 'antd';
+import { Alert, Drawer, Descriptions, Tag, Button, Popconfirm, message, Space, Typography } from 'antd';
 import { DeleteOutlined } from '@ant-design/icons';
 import { formatPercent, formatBytes, formatBps, formatUptime } from '../../utils/format';
 import { useI18n } from '../../i18n/context';
@@ -132,6 +132,26 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
           {isAdmin && (
             <>
               <Descriptions.Item label="node_id">{row.node_id || '-'}</Descriptions.Item>
+              {/* v1.3.16: the control plane, stated outright. Unlike the status
+                  column this shows even for a fully-offline node — when you've
+                  opened the drawer you're troubleshooting, and "did the socket
+                  ever come up" is the first question. The connection census is
+                  group-level context: unidentified sockets cannot be attributed
+                  to this row because they have no node_id. */}
+              <Descriptions.Item label={t('controlChannel')}>
+                {row.control_channel_online == null ? '-' : row.control_channel_online ? (
+                  <Tag color="green">{t('online')}</Tag>
+                ) : (
+                  <Space size={4} wrap>
+                    <Tag color={row.online ? 'orange' : undefined}>{t('offline')}</Tag>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {t('controlChannelConns')
+                        .replace('{total}', String(row.ws_conn_total ?? 0))
+                        .replace('{unidentified}', String(row.ws_conn_unidentified ?? 0))}
+                    </Typography.Text>
+                  </Space>
+                )}
+              </Descriptions.Item>
               <Descriptions.Item label={t('configProtocolVersion')}>
                 {(() => {
                   const v = row.config_protocol_version;

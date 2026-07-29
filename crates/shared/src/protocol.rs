@@ -942,6 +942,52 @@ impl DiagnoseRuleMessage {
     }
 }
 
+/// Node → panel, the FIRST message a node sends after the WS upgrade completes.
+/// It re-states the node identity that `X-Node-ID` carries in the handshake.
+/// (Panel v1.3.16 / node v1.3.9 — the two release on independent tracks.)
+///
+/// Why this exists: `X-Node-ID` is a non-standard request header, and any
+/// intermediary on the path (CDN, corporate proxy, a self-hosted relay in front
+/// of the panel) is free to strip headers it doesn't recognise. When that
+/// happens the socket is perfectly healthy — config pushes flow, heartbeats
+/// answer — but the panel registers the connection with `node_id: None` and
+/// every node-directed feature (diagnosis, rule restart, self-upgrade) silently
+/// treats the node as "control channel offline" FOREVER. The node has no way to
+/// notice, so nothing ever reconnects: the failure cannot self-heal.
+///
+/// Sending the identity in-band closes that hole: the payload is a WS text
+/// frame, which no HTTP intermediary rewrites. The header stays as the fast
+/// path (it is available before the socket is registered); this message is the
+/// fallback that repairs the registration a few milliseconds later.
+///
+/// Compatibility both ways: an older panel ignores unknown text frames, and an
+/// older node simply never sends one (the panel keeps using the header). No
+/// CONFIG_PROTOCOL_VERSION bump — this does not touch the config structure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeHelloMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String, // "node_hello"
+    /// The node's stable per-machine id, identical to the `X-Node-ID` header
+    /// value. The panel validates its shape before trusting it.
+    pub node_id: String,
+    /// The node binary's version, for panel-side logging when a node arrives
+    /// over the fallback path. Informational only.
+    #[serde(default)]
+    pub node_version: String,
+}
+
+impl NodeHelloMessage {
+    pub const TYPE: &'static str = "node_hello";
+
+    pub fn new(node_id: String, node_version: String) -> Self {
+        Self {
+            msg_type: Self::TYPE.into(),
+            node_id,
+            node_version,
+        }
+    }
+}
+
 /// v1.2.0: panel → node over WS, routed with `send_node` so only the targeted
 /// node acts on it. Asks the node to tear down and re-create the listeners
 /// belonging to ONE rule, which drops every connection currently held by that

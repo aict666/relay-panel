@@ -30,6 +30,18 @@ describe('statusTag', () => {
     expect(screen.getByText('protocolIncompatible')).toBeInTheDocument();
     expect(screen.queryByText('online')).not.toBeInTheDocument();
   });
+
+  it('keeps the independent control-channel warning beside a protocol mismatch', () => {
+    render(<>{statusTag(row({
+      online: true,
+      config_protocol_version: 1,
+      control_channel_online: false,
+      ws_conn_total: 0,
+      ws_conn_unidentified: 0,
+    }), t, 2)}</>);
+    expect(screen.getByText('protocolIncompatible')).toBeInTheDocument();
+    expect(screen.getByLabelText('controlChannelOfflineTip')).toBeInTheDocument();
+  });
 });
 
 describe('NodeGroupSection mobile vs desktop', () => {

@@ -331,6 +331,17 @@ export interface NodeStatus {
   listener_errors?: ListenerError[] | null;
   /** Cumulative policy rejects since this node process started. */
   blocked_protocol_connections?: Record<string, number> | null;
+  /** v1.3.16: is the node's WS CONTROL channel live? Distinct from `online`,
+   *  which only reflects the HTTP status-report heartbeat. When this is false
+   *  the node still forwards traffic, but diagnosis, rule restart and instant
+   *  config push are all unavailable. Absent when talking to an older panel. */
+  control_channel_online?: boolean | null;
+  /** v1.3.16: live WS connections in this node's GROUP (not per-node), and how
+   *  many of them carry no node identity. An unidentified connection is useful
+   *  group-level evidence, but cannot be attributed to a particular node row
+   *  because it has no node_id to correlate. */
+  ws_conn_total?: number | null;
+  ws_conn_unidentified?: number | null;
 }
 
 export interface LoginResponse {
@@ -585,6 +596,11 @@ export interface NodeDisplayRow {
   boot_download_bytes?: number | null;
   network_interface?: string | null;
   listener_errors?: ListenerError[] | null;
+  /** v1.3.16: WS control-plane liveness. Admin rows only — /nodes/shared does
+   *  not expose it, so the user board simply never shows the warning. */
+  control_channel_online?: boolean | null;
+  ws_conn_total?: number | null;
+  ws_conn_unidentified?: number | null;
   /** Shared-group-only metadata (user view). */
   region?: string | null;
   line_type?: string | null;
