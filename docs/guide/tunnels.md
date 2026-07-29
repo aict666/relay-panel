@@ -72,6 +72,92 @@ UDP 沿用 UOT datagram 帧。一个规则的多个 UDP 会话共享自己的暖
 - TCP 与 `tcp_udp` 诊断会发送认证 `probe`，逐 hop 验证共享 listener、规则路由和最终目标；纯 UDP 仍不支持诊断。
 - 隧道管理中的“诊断”会选择该隧道上一条正在运行的 TCP 或 `tcp_udp` 规则作为安全探针，因此隧道必须已启用并至少有一条符合条件的绑定规则；探测地址仍只来自面板配置。
 
+## 诊断显示 early eof：先检查节点时间 {#tunnel-early-eof}
+
+诊断结果中的 `early eof` 表示：入口节点已经连上下一跳的共享 TCP
+listener，并发送了隧道认证头，但还没读到下一跳返回的 1 字节探针结果，连接就被
+提前关闭。它不等同于“node 进程崩溃”，也不能只凭连续 `ping` 是否丢包来判断。
+
+隧道认证头包含受 HMAC 保护的 Unix 时间戳，接收节点只接受 **60 秒以内**的系统
+时钟偏差。相邻节点时差超过该窗口时，下一跳会拒绝认证头并关闭连接；入口节点
+通常只能看到 `early eof`。当时差恰好在 60 秒边缘波动时，同一条隧道可能表现为
+时好时坏。
+
+### 1. 先排除 node 重启
+
+在每个 hop 上执行：
+
+```bash
+systemctl show relay-node \
+  -p ActiveState -p SubState -p MainPID -p NRestarts -p ActiveEnterTimestamp
+```
+
+如果 `MainPID` 稳定、`NRestarts=0` 且服务为 `active/running`，说明问题不是
+relay-node 反复崩溃或被 systemd 重启。
+
+### 2. 比较相邻节点的系统时间
+
+尽量同时在入口、下一跳和出口执行：
+
+```bash
+date +'%s.%N %Y-%m-%dT%H:%M:%S%z'
+timedatectl status
+```
+
+重点检查：
+
+- `System clock synchronized: yes`
+- `NTP service: active`
+- 相邻节点的 Unix 时间差明显小于 60 秒
+
+时区名称可以不同，只要 Unix 时间一致即可。不要只比较界面上显示的本地时钟。
+
+### 3. 启用持续时间同步
+
+系统已经安装 `systemd-timesyncd` 时，可以执行：
+
+```bash
+sudo timedatectl set-ntp true
+```
+
+Debian/Ubuntu 精简系统若显示 `NTP service: n/a`，可安装 chrony：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y chrony
+sudo systemctl enable --now chrony
+sudo chronyc makestep
+```
+
+然后验证：
+
+```bash
+timedatectl show -p NTP -p NTPSynchronized
+chronyc tracking
+```
+
+预期看到 `NTP=yes`、`NTPSynchronized=yes`，并且 `Leap status` 为 `Normal`。
+较大的首次校时会调整系统时间，建议在维护窗口执行；它通常不会重启 relay-node，
+但仍应复核现有业务连接。
+
+### 4. 重新运行隧道诊断
+
+校时完成后，在 **隧道管理 → 诊断** 重新发起探针。正常结果应显示
+“可达”和端到端耗时，而不是 `early eof`。如果仍失败，再按以下边界排查：
+
+| 现象 | 已证明的范围 | 优先检查 |
+|---|---|---|
+| `ping` 下一跳正常 | 只有 IP/ICMP 路由 | 共享 TCP 端口、认证头、系统时间 |
+| `nc -vz 下一跳 共享端口` 成功 | 只有 TCP 三次握手和 listener 存在 | HMAC、规则 ID、hop、最终目标 |
+| 诊断 `timeout` | 3 秒内没有完成端到端探针 | 防火墙、下一跳路由、目标端口 |
+| 诊断 `early eof` | TCP 已接通，但没有返回探针状态 | 时钟偏差、HMAC/凭据、规则或 hop 不匹配 |
+| 控制通道离线 | node 到面板的 WSS 通道不可用 | `PANEL_URL`、反向代理、node 到面板的网络 |
+
+控制通道与数据隧道是两条不同链路。WebSocket 控制通道断开时，节点仍会使用缓存
+配置继续转发，并通过 HTTP 轮询配置；相反，控制通道在线也不能证明入口到下一跳
+的共享隧道端口可用。应分别测试 node → 面板的 HTTPS/WSS，以及入口 → 下一跳 →
+最终目标的数据路径。
+
 ## 删除保护
 
 仍被规则引用的隧道不能删除。被隧道路径引用的设备组也不能删除。修改已被使用的隧道入口时，面板会原子检查所有普通规则所有者对新入口的授权；存在未授权用户时整次更新回滚。

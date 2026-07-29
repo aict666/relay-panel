@@ -58,6 +58,11 @@ journalctl -u relay-node --since '10 minutes ago' --no-pager
 
 TFO 关闭后仍失败，通常不是 0-RTT 导致，应继续检查下一跳和目标。
 
+预设隧道诊断显示 `early eof` 时，不要只检查 ping。该结果通常表示下一跳已经接受
+TCP 连接，但在返回探针状态前拒绝了认证头或关闭了连接；应优先比较相邻节点的
+系统时间，并确认所有 hop 都启用了 NTP。完整步骤见
+[“early eof”与节点时间同步](/guide/tunnels#tunnel-early-eof)。
+
 ## UDP 无流量或多跳失败
 
 - 使用真实业务协议测试，UDP 发送成功不代表目标已应答。
