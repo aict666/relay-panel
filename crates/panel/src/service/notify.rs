@@ -48,8 +48,7 @@ pub const ALERT_OBSERVATION_GRACE_SECS: i64 = 60;
 /// Checked at COMPILE time: a runtime assert comparing two constants is
 /// something clippy (rightly) rejects, and this way lowering either constant
 /// fails the build rather than a test run.
-const _: () =
-    assert!(MIN_OFFLINE_ALERT_SECS > crate::service::dashboard_metrics::NODE_ONLINE_WINDOW_SECS);
+const _: () = assert!(MIN_OFFLINE_ALERT_SECS > crate::service::traffic::NODE_ONLINE_WINDOW_SECS);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

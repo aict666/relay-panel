@@ -28,9 +28,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::api::stats::status_last_seen;
 use crate::api::AppState;
 use crate::service::notify::{self, NotifyConfig};
+use crate::service::traffic::status_last_seen;
 
 /// How often to scan. The finest alert threshold is 60s, so 30s keeps the
 /// reported delay within half a threshold while costing one kvs scan a minute.

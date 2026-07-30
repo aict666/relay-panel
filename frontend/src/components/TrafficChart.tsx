@@ -1,5 +1,5 @@
 import { Card, Segmented, Select, Space, Spin, Empty, message } from 'antd';
-import { Column } from '@ant-design/charts';
+import { Line } from '@ant-design/charts';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, TrafficHistoryResponse } from '../api/types';
@@ -113,9 +113,9 @@ export default function TrafficChart({ rules }: Props) {
         {!loading && !hasData ? (
           <Empty description={t('noTrafficYet')} image={Empty.PRESENTED_IMAGE_SIMPLE} />
         ) : (
-          <Column
+          <Line
             /* @ant-design/charts v2 (G2 v5) options — NOT the v1 G2Plot shape
-               (columnStyle/xAxis/yAxis), which v2 ignores. Note for anyone
+               (lineStyle/xAxis/yAxis), which v2 ignores. Note for anyone
                debugging "the chart is blank" in an embedded/背景 tab: G2 v5
                renders on requestAnimationFrame, and a hidden tab never fires
                rAF — the canvas stays empty with zero errors. Check
@@ -124,17 +124,13 @@ export default function TrafficChart({ rules }: Props) {
             data={points}
             xField="label"
             yField="billed"
-            /* Stacked by line: one bar per time bucket, one segment per line.
-               Part-to-whole over time — you see the total AND which line is
-               responsible for it, which is the actual question being asked. */
             colorField="groupLabel"
-            stack
             scale={{ color: { range: SERIES_COLORS_LIGHT } }}
             /* A legend is mandatory at >= 2 series: identity must never rest on
                color alone. Three of the light steps sit below 3:1 against the
                surface, so the label IS the required relief. */
             legend={{ color: { position: 'top', layout: { justifyContent: 'flex-end' } } }}
-            style={{ radiusTopLeft: 4, radiusTopRight: 4 }}
+            style={{ lineWidth: 2 }}
             axis={{
               // 30 days of labels don't fit; let the axis thin them out.
               x: { labelAutoHide: true, labelAutoRotate: false, title: false },

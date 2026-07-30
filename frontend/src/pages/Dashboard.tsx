@@ -1,24 +1,17 @@
-import { Card, Col, Row, Table, Tag, Typography, Alert, Modal, Button, Space, Tooltip } from 'antd';
+import { Card, Col, Row, Tag, Typography, Alert, Modal, Button, Space, Tooltip } from 'antd';
 import {
   CloudServerOutlined, ApiOutlined, UserOutlined, DashboardOutlined, ReloadOutlined,
-  ArrowUpOutlined, ArrowDownOutlined,
 } from '@ant-design/icons';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import type {
   ApiEnvelope,
-  DashboardHistory,
-  DashboardHistoryRange,
   User,
   ForwardRule,
   DeviceGroup,
-  NodeStatus,
 } from '../api/types';
 import { useI18n } from '../i18n/context';
-import { aggregateNodesByGroup } from '../components/nodes/aggregate';
-import { formatBps, formatBytes } from '../utils/format';
-import DashboardCharts from '../components/dashboard/DashboardCharts';
 import TrafficChart from '../components/TrafficChart';
 import NodeMetricsChart from '../components/NodeMetricsChart';
 
@@ -50,15 +43,7 @@ export default function Dashboard() {
   const { t } = useI18n();
   const navigate = useNavigate();
   const [stats, setStats] = useState({ users: 0, rules: 0, groups: 0 });
-  const [nodes, setNodes] = useState<NodeStatus[]>([]);
-  const [deviceGroups, setDeviceGroups] = useState<DeviceGroup[]>([]);
   const [rules, setRules] = useState<ForwardRule[]>([]);
-  const [historyRange, setHistoryRange] = useState<DashboardHistoryRange>('24h');
-  const [history, setHistory] = useState<DashboardHistory | null>(null);
-  const [historyLoading, setHistoryLoading] = useState(true);
-  const [historyError, setHistoryError] = useState(false);
-  const [catalogError, setCatalogError] = useState(false);
-  const [nodesError, setNodesError] = useState(false);
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [showChangelog, setShowChangelog] = useState(false);
   const [versionRefreshing, setVersionRefreshing] = useState(false);
@@ -83,19 +68,7 @@ export default function Dashboard() {
           groups: groups.data?.length || 0,
         });
         setRules(rules.data || []);
-        setDeviceGroups(groups.data || []);
-        setCatalogError(false);
-      } catch {
-        setCatalogError(true);
-      }
-
-      try {
-        const nodeStatus = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
-        setNodes(nodeStatus.data || []);
-        setNodesError(false);
-      } catch {
-        setNodesError(true);
-      }
+      } catch { /* Keep the previous KPI values and retry on the next poll. */ }
     } finally {
       loadInFlightRef.current = false;
     }
@@ -165,113 +138,12 @@ export default function Dashboard() {
     return () => { clearInterval(ti); clearInterval(tv); };
   }, []);
 
-  useEffect(() => {
-    let active = true;
-    const loadHistory = async () => {
-      if (active) setHistoryLoading(true);
-      try {
-        const response = await api.get<unknown, ApiEnvelope<DashboardHistory>>(
-          `/dashboard/history?range=${historyRange}`,
-        );
-        if (!response.data) throw new Error(response.message || 'history unavailable');
-        if (active) {
-          setHistory(response.data);
-          setHistoryError(false);
-        }
-      } catch {
-        if (active) setHistoryError(true);
-      } finally {
-        if (active) setHistoryLoading(false);
-      }
-    };
-    loadHistory();
-    const timer = setInterval(loadHistory, 60000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
-  }, [historyRange]);
-
-  // v0.4.17: collapse raw /nodes rows into one summary per group. The whole
-  //  row is clickable → /nodes for per-node detail (kept there to avoid
-  //  duplicating the node-status page on the dashboard).
-  const nodeGroups = useMemo(() => aggregateNodesByGroup(nodes), [nodes]);
-
-  const handleHistoryRangeChange = (range: DashboardHistoryRange) => {
-    setHistory(null);
-    setHistoryError(false);
-    setHistoryRange(range);
-  };
-
   // KPI tiles. Each is a shortcut to the page that owns the number, so the
   // dashboard doubles as navigation instead of being a read-only wall.
   const kpis = [
     { label: t('users'), value: stats.users, icon: <UserOutlined />, to: '/users', tone: '' },
     { label: t('forwardRules'), value: stats.rules, icon: <ApiOutlined />, to: '/rules', tone: 'rp-stat-icon-cyan' },
     { label: t('deviceGroups'), value: stats.groups, icon: <CloudServerOutlined />, to: '/groups', tone: 'rp-stat-icon-emerald' },
-  ];
-
-  const statusColor = (s: string) =>
-    s === 'online' ? 'green' : s === 'partial' ? 'orange' : 'red';
-  const statusLabel = (s: string) =>
-    s === 'online' ? t('groupStatusOnline')
-      : s === 'partial' ? t('groupStatusPartial')
-        : t('groupStatusOffline');
-
-  const groupColumns = [
-    {
-      title: t('groupName'), key: 'group', width: 200,
-      render: (_: unknown, r: ReturnType<typeof aggregateNodesByGroup>[number]) => (
-        <Space size={6}>
-          <Text strong>{r.group_name || '-'}</Text>
-          <Text type="secondary" style={{ fontSize: 12 }}>ID: {r.group_id}</Text>
-        </Space>
-      ),
-    },
-    {
-      title: t('status'), key: 'status', width: 100,
-      render: (_: unknown, r: ReturnType<typeof aggregateNodesByGroup>[number]) => (
-        <Tag color={statusColor(r.status)}>{statusLabel(r.status)}</Tag>
-      ),
-    },
-    {
-      title: t('groupNodes'), key: 'nodes', width: 90,
-      render: (_: unknown, r: ReturnType<typeof aggregateNodesByGroup>[number]) => (
-        <span className="rp-mono">{r.online_nodes}/{r.total_nodes}</span>
-      ),
-    },
-    {
-      title: t('connections'), dataIndex: 'connections', key: 'connections', width: 90,
-      render: (v: number) => <span className="rp-mono">{v}</span>,
-    },
-    {
-      title: t('groupRate'), key: 'rate', width: 180,
-      render: (_: unknown, r: ReturnType<typeof aggregateNodesByGroup>[number]) => (
-        <span className="rp-mono" style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 8 }}>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            <ArrowUpOutlined /> {formatBps(r.upload_bps)}
-          </Text>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            <ArrowDownOutlined /> {formatBps(r.download_bps)}
-          </Text>
-        </span>
-      ),
-    },
-    {
-      title: t('groupTraffic'), key: 'traffic', width: 200,
-      render: (_: unknown, r: ReturnType<typeof aggregateNodesByGroup>[number]) => (
-        <Tooltip title={t('groupTrafficHint')}>
-          <span className="rp-mono" style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 8 }}>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              <ArrowUpOutlined /> {formatBytes(r.upload_bytes)}
-            </Text>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              <ArrowDownOutlined /> {formatBytes(r.download_bytes)}
-            </Text>
-          </span>
-        </Tooltip>
-      ),
-    },
   ];
 
   // Version banner logic
@@ -379,35 +251,6 @@ export default function Dashboard() {
 
       <TrafficChart rules={rules.map((rule) => ({ id: rule.id, name: rule.name }))} />
       <NodeMetricsChart />
-
-      <DashboardCharts
-        history={history}
-        historyRange={historyRange}
-        historyLoading={historyLoading}
-        historyError={historyError}
-        liveDataError={catalogError || nodesError}
-        deviceGroups={deviceGroups}
-        nodeGroups={nodeGroups}
-        rules={rules}
-        onHistoryRangeChange={handleHistoryRangeChange}
-        onNavigate={navigate}
-      />
-
-      <Card title={t('nodeStatus')}>
-        {nodeGroups.length === 0
-          ? <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--rp-text-tertiary)', fontSize: 13 }}>{t('noNodesReporting')}</div>
-          : <Table
-              className="rp-responsive-table"
-              dataSource={nodeGroups}
-              columns={groupColumns}
-              rowKey="group_id"
-              pagination={false}
-              size="small"
-              scroll={{ x: 'max-content' }}
-              onRow={() => ({ onClick: () => navigate('/nodes'), style: { cursor: 'pointer' } })}
-            />
-        }
-      </Card>
 
       <Modal
         title={t('changelogTitle') + ' — ' + (versionInfo?.latest_version || '')}

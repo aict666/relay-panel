@@ -94,28 +94,6 @@ export const enUS: Dict = {
   balance: 'Balance',
   joined: 'Joined',
 
-  // Dashboard
-  noNodesReporting: 'No nodes reporting. Start a relay-node to see live status.',
-  dashboardNetworkTrend: 'Machine Network & Connections',
-  dashboardNetworkTrendHint: 'Bandwidth comes from each online node’s monitored NIC and includes SSH, system updates, and other non-RelayPanel traffic. Bandwidth and connections retain each bucket’s peak so short spikes remain visible in longer ranges.',
-  dashboardUpload: 'Upload',
-  dashboardDownload: 'Download',
-  dashboardConnectionsPeak: 'Peak connections',
-  dashboardHistoryCollecting: 'Collecting history; the first point appears in about one minute',
-  dashboardHistoryFailed: 'Could not load history; retrying in 60 seconds',
-  dashboardLiveFailed: 'Could not load live group or rule data; retrying in 10 seconds',
-  dashboardGroupHealth: 'Group Health',
-  dashboardHealthPartial: 'Partial',
-  dashboardHealthUnreported: 'Not reporting',
-  dashboardNoGroups: 'No device groups',
-  dashboardGroupRateTop: 'Live Bandwidth by Group · Top 8',
-  dashboardGroupRateHint: 'Current monitored-NIC rate from online nodes; this is not RelayPanel forwarded traffic.',
-  dashboardNoLiveTraffic: 'No live bandwidth to display',
-  dashboardRuleTrafficTop: 'Cumulative Rule Traffic · Top 5',
-  dashboardRuleTrafficHint: 'Actual bytes forwarded by RelayPanel since the last traffic reset.',
-  dashboardNoRuleTraffic: 'No rules have transferred traffic yet',
-  dashboardViewAll: 'View all',
-
   // Rules page
   addRule: 'Add Rule',
   listenIp: 'Listen IP',

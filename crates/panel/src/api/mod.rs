@@ -268,10 +268,6 @@ pub fn routes() -> Router<AppState> {
         // Stats & monitoring
         .route("/stats", axum::routing::get(stats::get_stats))
         .route(
-            "/dashboard/history",
-            axum::routing::get(stats::get_dashboard_history),
-        )
-        .route(
             "/stats/traffic",
             axum::routing::get(stats::get_traffic_history),
         )

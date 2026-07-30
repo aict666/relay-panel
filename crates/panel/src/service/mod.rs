@@ -1,7 +1,6 @@
 pub mod announcements;
 pub mod audit;
 pub mod auto_restart;
-pub mod dashboard_metrics;
 pub mod groups;
 pub mod history_prune;
 pub mod node_config;

@@ -11,13 +11,33 @@ use crate::db::error::DbError;
 use crate::db::repo::TrafficEntryResult;
 use crate::db::Repository;
 use crate::service::notify::{NotifyConfig, ALERT_OBSERVATION_GRACE_SECS, NOTIFY_CONFIG_KEY};
+use chrono::{DateTime, Utc};
 use relay_shared::protocol::TrafficEntry;
+
+/// The single backend source of truth for node availability.
+pub(crate) const NODE_ONLINE_WINDOW_SECS: i64 = 30;
 
 /// Stale-status threshold in seconds. The frontend marks a node offline after
 /// 30s of silence (Nodes.tsx); we keep the row for 2 min past last_seen before
 /// deleting — long enough to ride out a brief network blip / restart, short
 /// enough that a permanently-offline node doesn't linger as a ghost row.
 pub(crate) const STALE_STATUS_THRESHOLD_SECS: i64 = 120;
+
+/// Extract `last_seen` (RFC3339) from a stored node-status JSON value.
+pub(crate) fn status_last_seen(value: &str) -> Option<DateTime<Utc>> {
+    let v: serde_json::Value = serde_json::from_str(value).ok()?;
+    let s = v.get("last_seen").and_then(|s| s.as_str())?;
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// A node is online when its most recent report is within the shared window.
+pub(crate) fn status_is_online(value: &str, now: DateTime<Utc>) -> bool {
+    status_last_seen(value)
+        .map(|t| (now - t).num_seconds() <= NODE_ONLINE_WINDOW_SECS)
+        .unwrap_or(false)
+}
 
 /// Outcome of applying a node traffic report. The handler maps each variant to
 /// the node-compat wire response (business `code` in the JSON body).
@@ -155,8 +175,7 @@ pub async fn sweep_stale_status(db: &dyn Repository) -> Result<(), DbError> {
     sweep_stale_status_at(db, chrono::Utc::now()).await
 }
 
-/// Time-injected variant used by the dashboard sampler and tests so one pass
-/// uses the same `now` for stale cleanup and online classification.
+/// Time-injected variant used by tests so one pass uses a stable clock.
 pub(crate) async fn sweep_stale_status_at(
     db: &dyn Repository,
     now: chrono::DateTime<chrono::Utc>,
@@ -194,6 +213,18 @@ mod tests {
     use super::*;
     use crate::db::sqlite_repo::SqliteRepository;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+
+    #[test]
+    fn node_online_status_uses_the_shared_thirty_second_window() {
+        let now = DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let status = |last_seen: &str| serde_json::json!({ "last_seen": last_seen }).to_string();
+
+        assert!(status_is_online(&status("2026-07-30T11:59:30Z"), now));
+        assert!(!status_is_online(&status("2026-07-30T11:59:29Z"), now));
+        assert!(!status_is_online("not-json", now));
+    }
 
     #[test]
     fn billing_delta_rejects_float_cast_saturation_at_i64_boundary() {
