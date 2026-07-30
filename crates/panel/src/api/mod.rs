@@ -312,4 +312,8 @@ pub fn routes() -> Router<AppState> {
             "/node/diagnose_result",
             axum::routing::post(diagnose::receive_diagnose_result),
         )
+        // Keep unknown API paths inside the API boundary. Without this
+        // fallback, the outer SPA fallback serves index.html with HTTP 200,
+        // making a retired or misspelled endpoint appear to exist.
+        .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
 }

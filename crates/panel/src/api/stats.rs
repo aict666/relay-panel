@@ -989,11 +989,15 @@ mod tests {
             diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
             geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         };
-        let response = crate::api::routes()
+        // Exercise the production nesting boundary: an unknown API route must
+        // not escape to the outer SPA fallback.
+        let response = axum::Router::new()
+            .nest("/api/v1", crate::api::routes())
+            .fallback(|| async { StatusCode::OK })
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/dashboard/history?range=24h")
+                    .uri("/api/v1/dashboard/history?range=24h")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -10,6 +10,13 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.19] - 2026-07-30
+
+### Fixed
+
+- 未注册的 `/api/v1/*` 路径现在明确返回 404，不再回退到前端
+  `index.html`；已下线的仪表盘历史接口因此具备正确的 HTTP 语义。
+
 ## [1.3.18] - 2026-07-30
 
 ### Changed
