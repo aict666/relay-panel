@@ -80,6 +80,8 @@ impl TrafficRepository for PgRepository {
             rule_id: i64,
             uid: i64,
             real_delta: i64,
+            delta_up: i64,
+            delta_down: i64,
             /// v1.0.8: billed bytes charged to the USER = round((up+down) * rate).
             /// Separate from delta_up/delta_down (real bytes for the rule).
             billed_delta: i64,
@@ -143,6 +145,8 @@ impl TrafficRepository for PgRepository {
                 rule_id: rid,
                 uid,
                 real_delta: rule_delta_sum,
+                delta_up: *dup as i64,
+                delta_down: *ddown as i64,
                 billed_delta,
             });
         }
@@ -222,12 +226,31 @@ impl TrafficRepository for PgRepository {
         // ── Pass 4: apply real rule bytes, then one aggregated billed update
         // per user. Rows remain locked from pass 3, so these increments cannot
         // cross a reset or another report between validation and commit. ──
+        let hour_ts = chrono::Utc::now().format("%Y-%m-%d %H:00:00").to_string();
         for r in &resolved {
             sqlx::query("UPDATE forward_rules SET traffic_used = traffic_used + $1 WHERE id = $2")
                 .bind(r.real_delta)
                 .bind(r.rule_id)
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query(
+                "INSERT INTO traffic_history
+                   (rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (rule_id, group_id, hour_ts) DO UPDATE SET
+                   real_upload = traffic_history.real_upload + EXCLUDED.real_upload,
+                   real_download = traffic_history.real_download + EXCLUDED.real_download,
+                   billed_total = traffic_history.billed_total + EXCLUDED.billed_total",
+            )
+            .bind(r.rule_id)
+            .bind(r.uid)
+            .bind(group_id)
+            .bind(&hour_ts)
+            .bind(r.delta_up)
+            .bind(r.delta_down)
+            .bind(r.billed_delta)
+            .execute(&mut *tx)
+            .await?;
         }
         for uid in user_ids {
             let billed_delta = checked_user_delta.get(&uid).copied().unwrap_or(0);
@@ -240,5 +263,192 @@ impl TrafficRepository for PgRepository {
 
         tx.commit().await?;
         Ok(vec![TrafficEntryResult::Ok])
+    }
+
+    async fn query_traffic_history(
+        &self,
+        uid: Option<i64>,
+        rule_id: Option<i64>,
+        since: &str,
+        daily: bool,
+    ) -> Result<Vec<TrafficHistoryBucket>, DbError> {
+        let sql = if daily {
+            "SELECT substr(th.hour_ts, 1, 10) AS bucket,
+                    th.group_id,
+                    COALESCE(dg.name, '#' || th.group_id) AS group_name,
+                    SUM(th.real_upload)::BIGINT AS real_upload,
+                    SUM(th.real_download)::BIGINT AS real_download,
+                    SUM(th.billed_total)::BIGINT AS billed_total
+             FROM traffic_history th
+             LEFT JOIN device_groups dg ON dg.id = th.group_id
+             WHERE th.hour_ts >= $1 AND th.uid = COALESCE($2, th.uid)
+               AND th.rule_id = COALESCE($3, th.rule_id)
+             GROUP BY bucket, th.group_id, dg.name
+             ORDER BY bucket, th.group_id"
+        } else {
+            "SELECT th.hour_ts AS bucket,
+                    th.group_id,
+                    COALESCE(dg.name, '#' || th.group_id) AS group_name,
+                    SUM(th.real_upload)::BIGINT AS real_upload,
+                    SUM(th.real_download)::BIGINT AS real_download,
+                    SUM(th.billed_total)::BIGINT AS billed_total
+             FROM traffic_history th
+             LEFT JOIN device_groups dg ON dg.id = th.group_id
+             WHERE th.hour_ts >= $1 AND th.uid = COALESCE($2, th.uid)
+               AND th.rule_id = COALESCE($3, th.rule_id)
+             GROUP BY bucket, th.group_id, dg.name
+             ORDER BY bucket, th.group_id"
+        };
+        Ok(sqlx::query_as(sql)
+            .bind(since)
+            .bind(uid)
+            .bind(rule_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn prune_traffic_history(&self, cutoff: &str) -> Result<u64, DbError> {
+        Ok(
+            sqlx::query("DELETE FROM traffic_history WHERE hour_ts < $1")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    async fn record_node_metrics(&self, m: &NodeMetricSample) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO node_metrics_history
+               (node_id, group_id, hour_ts, samples, cpu_sum, cpu_max,
+                mem_sum, mem_max, conn_sum, conn_max)
+             VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (node_id, hour_ts) DO UPDATE SET
+               group_id = EXCLUDED.group_id,
+               samples = node_metrics_history.samples + 1,
+               cpu_sum = node_metrics_history.cpu_sum + EXCLUDED.cpu_sum,
+               cpu_max = GREATEST(node_metrics_history.cpu_max, EXCLUDED.cpu_max),
+               mem_sum = node_metrics_history.mem_sum + EXCLUDED.mem_sum,
+               mem_max = GREATEST(node_metrics_history.mem_max, EXCLUDED.mem_max),
+               conn_sum = node_metrics_history.conn_sum + EXCLUDED.conn_sum,
+               conn_max = GREATEST(node_metrics_history.conn_max, EXCLUDED.conn_max)",
+        )
+        .bind(&m.node_id)
+        .bind(m.group_id)
+        .bind(&m.hour_ts)
+        .bind(m.cpu)
+        .bind(m.cpu)
+        .bind(m.mem)
+        .bind(m.mem)
+        .bind(m.connections)
+        .bind(m.connections)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn query_node_metrics(
+        &self,
+        since: &str,
+        daily: bool,
+    ) -> Result<Vec<NodeMetricBucket>, DbError> {
+        let sql = if daily {
+            "SELECT LEFT(nm.hour_ts, 10) AS bucket,
+                    nm.node_id, nm.group_id,
+                    COALESCE(dg.name, '#' || nm.group_id::text) AS group_name,
+                    SUM(nm.cpu_sum) / GREATEST(SUM(nm.samples), 1) AS cpu_avg,
+                    MAX(nm.cpu_max) AS cpu_max,
+                    SUM(nm.mem_sum) / GREATEST(SUM(nm.samples), 1) AS mem_avg,
+                    MAX(nm.mem_max) AS mem_max,
+                    SUM(nm.conn_sum)::double precision / GREATEST(SUM(nm.samples), 1) AS conn_avg,
+                    MAX(nm.conn_max) AS conn_max
+             FROM node_metrics_history nm
+             LEFT JOIN device_groups dg ON dg.id = nm.group_id
+             WHERE nm.hour_ts >= $1
+             GROUP BY bucket, nm.node_id, nm.group_id, dg.name
+             ORDER BY bucket, nm.node_id"
+        } else {
+            "SELECT nm.hour_ts AS bucket,
+                    nm.node_id, nm.group_id,
+                    COALESCE(dg.name, '#' || nm.group_id::text) AS group_name,
+                    nm.cpu_sum / GREATEST(nm.samples, 1) AS cpu_avg,
+                    nm.cpu_max,
+                    nm.mem_sum / GREATEST(nm.samples, 1) AS mem_avg,
+                    nm.mem_max,
+                    nm.conn_sum::double precision / GREATEST(nm.samples, 1) AS conn_avg,
+                    nm.conn_max
+             FROM node_metrics_history nm
+             LEFT JOIN device_groups dg ON dg.id = nm.group_id
+             WHERE nm.hour_ts >= $1
+             ORDER BY nm.hour_ts, nm.node_id"
+        };
+        Ok(sqlx::query_as(sql)
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn prune_node_metrics(&self, cutoff: &str) -> Result<u64, DbError> {
+        Ok(
+            sqlx::query("DELETE FROM node_metrics_history WHERE hour_ts < $1")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    async fn record_audit(&self, e: &NewAuditEntry) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO audit_log
+               (ts, actor_id, actor_name, action, target_type, target_id, detail)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&e.ts)
+        .bind(e.actor_id)
+        .bind(&e.actor_name)
+        .bind(&e.action)
+        .bind(&e.target_type)
+        .bind(&e.target_id)
+        .bind(&e.detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn query_audit_log(
+        &self,
+        action: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditEntry>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT id, ts, actor_id, actor_name, action, target_type, target_id, detail
+             FROM audit_log
+             WHERE action = COALESCE($1, action)
+             ORDER BY id DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(action)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn count_audit_log(&self, action: Option<&str>) -> Result<i64, DbError> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM audit_log WHERE action = COALESCE($1, action)")
+                .bind(action)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
+    }
+
+    async fn prune_audit_log(&self, cutoff: &str) -> Result<u64, DbError> {
+        Ok(sqlx::query("DELETE FROM audit_log WHERE ts < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
     }
 }

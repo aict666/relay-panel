@@ -28,6 +28,12 @@ const Account = lazy(() => import('./pages/Account'));
 const SystemSettings = lazy(() => import('./pages/SystemSettings'));
 const Plans = lazy(() => import('./pages/Plans'));
 const Tunnels = lazy(() => import('./pages/Tunnels'));
+const RedeemCodes = lazy(() => import('./pages/RedeemCodes'));
+const AuditLog = lazy(() => import('./pages/AuditLog'));
+const SiteSettings = lazy(() => import('./pages/SiteSettings'));
+const NotifySettings = lazy(() => import('./pages/NotifySettings'));
+const Announcements = lazy(() => import('./pages/Announcements'));
+const AnnouncementAdmin = lazy(() => import('./pages/AnnouncementAdmin'));
 const Shop = lazy(() => import('./pages/Shop'));
 const Forbidden = lazy(() => import('./pages/Forbidden'));
 const RoleHome = lazy(() => import('./RoleHome'));
@@ -74,6 +80,12 @@ export const router = createBrowserRouter([
       // v1.0.8: admin plan management (CRUD).
       { path: 'plans', element: <RequireAdmin><Plans /></RequireAdmin> },
       { path: 'tunnels', element: <RequireAdmin><Tunnels /></RequireAdmin> },
+      { path: 'redeem-codes', element: <RequireAdmin><RedeemCodes /></RequireAdmin> },
+      { path: 'audit-log', element: <RequireAdmin><AuditLog /></RequireAdmin> },
+      { path: 'site-settings', element: <RequireAdmin><SiteSettings /></RequireAdmin> },
+      { path: 'notify-settings', element: <RequireAdmin><NotifySettings /></RequireAdmin> },
+      { path: 'announcement-admin', element: <RequireAdmin><AnnouncementAdmin /></RequireAdmin> },
+      { path: 'announcements', element: <Announcements /> },
       // v0.4.20: tunnel-profiles route hidden; component kept for future recovery.
       { path: 'users', element: <RequireAdmin><Users /></RequireAdmin> },
       { path: 'settings', element: <RequireAdmin><SystemSettings /></RequireAdmin> },

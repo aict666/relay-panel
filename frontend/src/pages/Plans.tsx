@@ -6,6 +6,7 @@ import type { ApiEnvelope, Plan, DeviceGroup, Tunnel } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { MAX_SAFE_TRAFFIC_GB, bytesToGb, gbToBytes, trafficGbChanged } from '../utils/traffic';
+import AllOrders from '../components/AllOrders';
 
 const { Text } = Typography;
 
@@ -271,6 +272,8 @@ export default function Plans() {
         <Alert type="error" showIcon style={{ marginBottom: 12 }} title={t('loadFailed')} />
       )}
       <Table className="rp-responsive-table" dataSource={plans} columns={columns} rowKey="id" loading={loading} pagination={{ pageSize: 20 }} scroll={{ x: 'max-content' }} />
+
+      <AllOrders />
 
       <Modal title={t('addPlan')} open={createOpen} onCancel={() => { if (!saving) setCreateOpen(false); }} onOk={() => createForm.submit()} confirmLoading={saving} okButtonProps={{ disabled: loading || loadFailed }} okText={t('create')} cancelText={t('cancel')} width={520}>
         <Form form={createForm} onFinish={handleCreate} layout="vertical" disabled={saving || loading || loadFailed} initialValues={{ plan_type: 'data', duration_days: 0, hidden: false, reset_traffic: false, description: '', grant_all_groups: false, device_group_ids: [] }}>

@@ -1,5 +1,5 @@
-import { Card, Row, Col, Button, Spin, Tag, Modal, Table, Typography, message, Result, Alert, Space } from 'antd';
-import { ShoppingOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Card, Row, Col, Button, Spin, Tag, Modal, Table, Typography, message, Result, Alert, Space, Form, Input } from 'antd';
+import { ShoppingOutlined, ReloadOutlined, WalletOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, Plan, Order, UserSelf } from '../api/types';
@@ -24,6 +24,9 @@ export default function Shop() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [buying, setBuying] = useState<Plan | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [redeemOpen, setRedeemOpen] = useState(false);
+  const [redeeming, setRedeeming] = useState(false);
+  const [redeemForm] = Form.useForm();
   const loadGenerationRef = useRef(0);
 
   const load = useCallback(async () => {
@@ -89,6 +92,33 @@ export default function Shop() {
     }
   };
 
+  const handleRedeem = async (values: { code: string }) => {
+    if (loading || loadFailed || submitting || redeeming) return;
+    setRedeeming(true);
+    try {
+      const res = await api.post<unknown, ApiEnvelope<{ amount: string; balance: string }>>(
+        '/user/redeem',
+        { code: values.code },
+      );
+      if (res.code !== 0 || !res.data) {
+        message.error(res.message || t('redeemFailed'));
+        return;
+      }
+      message.success(
+        t('redeemSuccess')
+          .replace('{amount}', res.data.amount)
+          .replace('{balance}', res.data.balance),
+      );
+      setRedeemOpen(false);
+      redeemForm.resetFields();
+      await load();
+    } catch {
+      message.error(t('redeemFailed'));
+    } finally {
+      setRedeeming(false);
+    }
+  };
+
   if (loading && !me && plans.length === 0 && orders.length === 0) {
     return <div style={{ textAlign: 'center', padding: 48 }}><Spin /></div>;
   }
@@ -138,9 +168,22 @@ export default function Shop() {
       {/* Current balance. Purchase effects are shown in confirmation. */}
       {me && (
         <Card size="small" style={{ marginBottom: 16 }}>
-          <Space>
+          <Space wrap>
             <Text strong>{t('accountBalance')}:</Text>
             <span className="rp-mono">{me.balance}</span>
+            <Button
+              size="small"
+              type="primary"
+              ghost
+              icon={<WalletOutlined />}
+              disabled={loading || submitting || redeeming}
+              onClick={() => {
+                redeemForm.resetFields();
+                setRedeemOpen(true);
+              }}
+            >
+              {t('redeem')}
+            </Button>
           </Space>
         </Card>
       )}
@@ -231,6 +274,30 @@ export default function Shop() {
             )}
           </div>
         )}
+      </Modal>
+
+      <Modal
+        title={t('redeem')}
+        open={redeemOpen}
+        onCancel={() => {
+          if (!redeeming) setRedeemOpen(false);
+        }}
+        onOk={() => redeemForm.submit()}
+        okText={t('redeemConfirm')}
+        cancelText={t('cancel')}
+        confirmLoading={redeeming}
+        okButtonProps={{ disabled: loading || loadFailed || submitting }}
+      >
+        <Form form={redeemForm} onFinish={handleRedeem} layout="vertical" disabled={redeeming}>
+          <Form.Item
+            name="code"
+            label={t('redeemCode')}
+            extra={t('redeemCodeHint')}
+            rules={[{ required: true, message: t('redeemCodeRequired') }]}
+          >
+            <Input placeholder="XXXX-XXXX-XXXX-XXXX" autoComplete="off" />
+          </Form.Item>
+        </Form>
       </Modal>
     </>
   );

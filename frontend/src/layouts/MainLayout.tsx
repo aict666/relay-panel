@@ -1,6 +1,6 @@
 import {
   Layout, Menu, Button, Segmented, Modal, Form, Input, message, Spin,
-  Grid, Drawer, Dropdown, Avatar,
+  Grid, Drawer, Dropdown, Avatar, Badge,
 } from 'antd';
 import type { MenuProps } from 'antd';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
@@ -19,20 +19,25 @@ import {
   MenuUnfoldOutlined,
   ThunderboltFilled,
   GithubOutlined,
+  NotificationOutlined,
+  GiftOutlined,
+  AuditOutlined,
 } from '@ant-design/icons';
 import { useI18n } from '../i18n/context';
 import api from '../api/client';
 import type { ApiEnvelope } from '../api/types';
 import { useAuth } from '../auth/useAuth';
 import { makePasswordValidator } from '../utils/password';
-import { useSiteConfig } from '../site/useSiteConfig';
+import { useSite } from '../hooks/useSite';
+import { useAnnouncementBadge } from '../hooks/useAnnouncementBadge';
 
 const { Sider, Content, Header } = Layout;
 const PROJECT_URL = 'https://github.com/aict666/relay-panel';
 
 /** Sidebar masthead. Shrinks to just the mark when the rail is collapsed. */
 function Brand({ collapsed = false }: { collapsed?: boolean }) {
-  const { siteName } = useSiteConfig();
+  const site = useSite();
+  const siteName = site.site_name || 'RelayPanel';
   return (
     <div className="rp-brand">
       <span className="rp-brand-mark"><ThunderboltFilled /></span>
@@ -69,6 +74,7 @@ export default function MainLayout() {
   const location = useLocation();
   const { t, lang, setLang } = useI18n();
   const { isAdmin, user, logout: authLogout } = useAuth();
+  const { unread } = useAnnouncementBadge(user?.id ?? null);
   const [changePwOpen, setChangePwOpen] = useState(false);
   const [pwForm] = Form.useForm();
   const [pwSubmitting, setPwSubmitting] = useState(false);
@@ -95,8 +101,13 @@ export default function MainLayout() {
     { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
     { key: '/tunnels', icon: <ApiOutlined />, label: t('tunnelManagement') },
     { key: '/plans', icon: <ShoppingOutlined />, label: t('planManagement') },
+    { key: '/redeem-codes', icon: <GiftOutlined />, label: t('redeemCodes') },
     { key: '/users', icon: <UserOutlined />, label: t('users') },
     { key: '/settings', icon: <SettingOutlined />, label: t('systemSettings') },
+    { key: '/notify-settings', icon: <NotificationOutlined />, label: t('notifySettings') },
+    { key: '/announcement-admin', icon: <NotificationOutlined />, label: t('announcementAdmin') },
+    { key: '/site-settings', icon: <SettingOutlined />, label: t('siteSettings') },
+    { key: '/audit-log', icon: <AuditOutlined />, label: t('auditLog') },
   ];
   // Admins get three sections so the 9-entry list scans; regular users have
   // four entries, where a section header would be noise.
@@ -232,6 +243,16 @@ export default function MainLayout() {
             </span>
           </div>
           <div className="rp-header-actions">
+            <Badge dot={unread} offset={[-4, 2]}>
+              <Button
+                type="text"
+                size="small"
+                icon={<NotificationOutlined />}
+                onClick={() => navigate('/announcements')}
+              >
+                {t('announcements')}
+              </Button>
+            </Badge>
             <Segmented
               size="small"
               value={lang}

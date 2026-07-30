@@ -3248,6 +3248,21 @@ async fn settings_allowed_plan_ids_round_trip() {
     );
     assert_eq!(s.site_name, "My Relay", "SQLite site-name round-trip");
 
+    db.set_site_config_compatible(
+        "site:config",
+        r#"{"site_name":"Unified","subtitle":"hello"}"#,
+        "Unified",
+    )
+    .await
+    .unwrap();
+    let compatible = db.get_registration_settings().await.unwrap().unwrap();
+    assert_eq!(compatible.site_name, "Unified");
+    assert_eq!(
+        db.get("site:config").await.unwrap().as_deref(),
+        Some(r#"{"site_name":"Unified","subtitle":"hello"}"#),
+        "site JSON and legacy name must commit together"
+    );
+
     let missing = db
         .set_system_settings_checked(true, 1, &[1, 999_999], "Invalid")
         .await
@@ -6989,4 +7004,309 @@ async fn group_token_revision_and_preset_tunnel_invariants_are_atomic() {
         db.delete_tunnel(tunnel_id).await.unwrap(),
         TunnelDeleteOutcome::Deleted
     );
+}
+
+// ── Upstream common-feature integration contracts ──
+
+#[tokio::test]
+async fn integrated_redeem_code_credits_exactly_once() {
+    let db = repo().await;
+    seed_user(&db, 901, false).await;
+    db.create_redeem_codes(&[NewRedeemCode {
+        code: "AAAA1111BBBB2222".into(),
+        amount: "10.50".into(),
+        expires_at: None,
+        batch_id: "integration".into(),
+        remark: String::new(),
+    }])
+    .await
+    .unwrap();
+
+    let (amount, balance) = db
+        .redeem_code("AAAA1111BBBB2222", 901, "2026-07-30 10:00:00")
+        .await
+        .unwrap();
+    assert_eq!((amount.as_str(), balance.as_str()), ("10.50", "10.50"));
+    assert!(matches!(
+        db.redeem_code("AAAA1111BBBB2222", 901, "2026-07-30 10:00:01")
+            .await,
+        Err(RedeemCodeError::NotRedeemable)
+    ));
+    let stored: String = sqlx::query_scalar("SELECT balance FROM users WHERE id = 901")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, "10.50");
+}
+
+#[tokio::test]
+async fn integrated_traffic_history_matches_billing_and_keeps_the_line() {
+    let db = repo().await;
+    seed_user(&db, 902, false).await;
+    seed_group(&db, 902).await;
+    sqlx::query("UPDATE device_groups SET rate = 2.0 WHERE id = 902")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (902, 'history', 902, 19002, 902, '127.0.0.1', 80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.apply_traffic_batch(
+        902,
+        &[TrafficEntry {
+            rule_id: 902,
+            upload: 100,
+            download: 50,
+        }],
+    )
+    .await
+    .unwrap();
+
+    let buckets = db
+        .query_traffic_history(Some(902), Some(902), "2000-01-01 00:00:00", false)
+        .await
+        .unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].group_id, 902);
+    assert_eq!(buckets[0].real_upload, 100);
+    assert_eq!(buckets[0].real_download, 50);
+    assert_eq!(buckets[0].billed_total, 300);
+    let charged: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id = 902")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(charged, buckets[0].billed_total);
+}
+
+#[tokio::test]
+async fn traffic_history_splits_same_hour_when_rule_changes_group() {
+    let db = repo().await;
+    seed_user(&db, 912, false).await;
+    seed_group(&db, 912).await;
+    seed_group(&db, 913).await;
+    sqlx::query(
+        "INSERT INTO forward_rules
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port)
+         VALUES (912, 'moving-history', 912, 19012, 912, '127.0.0.1', 80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.apply_traffic_batch(
+        912,
+        &[TrafficEntry {
+            rule_id: 912,
+            upload: 10,
+            download: 0,
+        }],
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE forward_rules SET device_group_in = 913 WHERE id = 912")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.apply_traffic_batch(
+        913,
+        &[TrafficEntry {
+            rule_id: 912,
+            upload: 20,
+            download: 0,
+        }],
+    )
+    .await
+    .unwrap();
+
+    let buckets = db
+        .query_traffic_history(Some(912), Some(912), "2000-01-01 00:00:00", false)
+        .await
+        .unwrap();
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(
+        buckets
+            .iter()
+            .map(|b| b.group_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([912, 913])
+    );
+}
+
+#[tokio::test]
+async fn purchase_order_survives_buyer_deletion() {
+    let db = repo().await;
+    seed_user(&db, 914, false).await;
+    db.insert_order(914, None, "historic-plan", "12.34")
+        .await
+        .unwrap();
+
+    assert_eq!(db.delete_user_cascade(914).await.unwrap(), 1);
+    assert!(!db.exists_by_id(914).await.unwrap());
+    let orders = db.list_all_orders(20, 0).await.unwrap();
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].user_id, 914);
+    assert_eq!(orders[0].plan_name, "historic-plan");
+}
+
+#[tokio::test]
+async fn upgrade_from_revision_40_replaces_legacy_history_constraints() {
+    let db = repo().await;
+    seed_user(&db, 915, false).await;
+
+    sqlx::query("DROP TABLE orders")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            plan_id INTEGER,
+            plan_name TEXT NOT NULL,
+            price TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO orders (id,user_id,plan_name,price,created_at)
+         VALUES (7,915,'legacy','1.00','2026-07-30 00:00:00')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    sqlx::query("DROP TABLE traffic_history")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE traffic_history (
+            rule_id INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            group_id INTEGER NOT NULL DEFAULT 0,
+            hour_ts TEXT NOT NULL,
+            real_upload INTEGER NOT NULL DEFAULT 0,
+            real_download INTEGER NOT NULL DEFAULT 0,
+            billed_total INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (rule_id, hour_ts)
+        )",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    crate::db::schema::run_migrations(&db.pool).await.unwrap();
+    sqlx::query("DELETE FROM users WHERE id = 915")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let order_user: i64 = sqlx::query_scalar("SELECT user_id FROM orders WHERE id = 7")
+        .fetch_one(&db.pool)
+        .await
+        .expect("legacy order must survive buyer deletion");
+    assert_eq!(order_user, 915);
+
+    for group_id in [10_i64, 11_i64] {
+        sqlx::query(
+            "INSERT INTO traffic_history
+             (rule_id,uid,group_id,hour_ts,billed_total)
+             VALUES (7,915,?,'2026-07-30 00:00:00',100)",
+        )
+        .bind(group_id)
+        .execute(&db.pool)
+        .await
+        .expect("same rule/hour in another group must be a separate row");
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM traffic_history WHERE rule_id = 7")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2);
+}
+
+#[tokio::test]
+async fn integrated_node_metrics_keep_average_and_peak() {
+    let db = repo().await;
+    for cpu in [0.1, 0.9, 0.2] {
+        db.record_node_metrics(&NodeMetricSample {
+            node_id: "integration-node".into(),
+            group_id: 903,
+            hour_ts: "2026-07-30 10:00:00".into(),
+            cpu,
+            mem: 0.5,
+            connections: 10,
+        })
+        .await
+        .unwrap();
+    }
+    let rows = db
+        .query_node_metrics("2026-07-30 00:00:00", false)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!((rows[0].cpu_avg - 0.4).abs() < 1e-12);
+    assert!((rows[0].cpu_max - 0.9).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn integrated_audit_filter_and_announcement_priority_work() {
+    let db = repo().await;
+    for action in ["delete_rule", "rotate_group_token", "delete_rule"] {
+        db.record_audit(&NewAuditEntry {
+            ts: "2026-07-30 10:00:00".into(),
+            actor_id: Some(1),
+            actor_name: "admin".into(),
+            action: action.into(),
+            target_type: "integration".into(),
+            target_id: "1".into(),
+            detail: String::new(),
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(db.count_audit_log(Some("delete_rule")).await.unwrap(), 2);
+    assert!(db
+        .query_audit_log(Some("delete_rule"), 10, 0)
+        .await
+        .unwrap()
+        .iter()
+        .all(|entry| entry.action == "delete_rule"));
+
+    let ordinary = NewAnnouncement {
+        title: "new".into(),
+        content: "new".into(),
+        kind: "info".into(),
+        pinned: false,
+        published_at: "2026-07-30 10:00:00".into(),
+        expires_at: None,
+        author_id: Some(1),
+        author_name: "admin".into(),
+    };
+    let pinned = NewAnnouncement {
+        title: "pinned".into(),
+        content: "pinned".into(),
+        kind: "warning".into(),
+        pinned: true,
+        published_at: "2026-07-29 10:00:00".into(),
+        expires_at: None,
+        author_id: Some(1),
+        author_name: "admin".into(),
+    };
+    db.create_announcement(&ordinary).await.unwrap();
+    db.create_announcement(&pinned).await.unwrap();
+    let active = db
+        .active_announcement("2026-07-30 11:00:00")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.title, "pinned");
 }

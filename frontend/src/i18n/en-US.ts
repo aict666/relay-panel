@@ -686,4 +686,438 @@ export const enUS: Dict = {
   unsuspendConfirm: 'Restore this user? Forwarding resumes automatically.',
   userSuspended: 'User suspended',
   userUnsuspended: 'User restored',
+  // Common features integrated from upstream.
+  autoRefresh10s: 'auto-refresh 10s',
+
+  nodeMetricsHistory: 'Node metrics',
+
+  metricCpu: 'CPU',
+
+  metricMem: 'Memory',
+
+  metricConn: 'Connections',
+
+  metricAvg: 'avg',
+
+  metricPeak: 'peak',
+
+  noNodeMetricsYet: 'No node metrics yet. Recording starts once nodes report; kept for 7 days.',
+
+  searchRulePlaceholder: 'Search name / port / target',
+
+  entryTransportUdpOnlyRaw: 'UDP rules only support raw transport',
+
+  importHint: 'Paste simplified rule JSON. Format: [{"dest":["ip:port"],"listen_port":port,"name":"name"}]',
+
+  rateLimitsHint: 'Per-rule cap shared across all connections (0 = unlimited). Each node enforces it independently.',
+
+  rotateToken: 'Rotate token',
+
+  rotateTokenHint: 'Issue a new node token and revoke the old one immediately. Every node in this group is disconnected and must be re-enrolled one by one.',
+
+  rotateTokenConfirmTitle: 'Rotate node token',
+
+  rotateTokenConfirmOk: 'Rotate',
+
+  rotateTokenWarnTitle: '{count} node(s) in this group will disconnect immediately',
+
+  rotateTokenWarnDesc: 'The old token stops working at once, and a node reconnecting with it is rejected. Forwarding only resumes after the enrollment command is re-run on every node — the panel cannot do it for you, because the token is exactly what a node authenticates with. Use this when a token has leaked.',
+
+  rotateTokenTypeName: 'Type the group name to confirm: {name}',
+
+  tokenRotated: 'Token rotated',
+
+  tokenRotatedHint: 'The old token is revoked, so every node in this group is now offline. Run the command below on each node. Copy the new token somewhere safe first.',
+
+  tokenRotateFailed: 'Failed to rotate token',
+
+  rateHint: 'User quota is charged at this rate; rule/node stats keep real bytes. 1.0 = bill as used.',
+
+  groupHiddenHint: "When on, this group is hidden only from regular users' Node Status page; admins are unaffected. Rules keep working (still selectable for new rules; existing rules forward and display normally).",
+
+  searchUserPlaceholder: 'Search username or ID',
+  // v1.0.7: admin edit-user-plan panel
+
+  assignPlanHint: 'Assign a plan to this user, charging their balance at the plan price (same rules as a self-purchase).',
+
+  renewSamePlanHint: 'This is the current plan — it will be renewed (time plan: extend expiry; data plan: add traffic), not switched.',
+
+  expiryOnlyForTimePlan: 'Only time-limited plans have an editable expiry; data plans are unlimited duration.',
+
+  createUserRoleNote: 'Admins can only create regular users.',
+
+  diagnoseScopeHint: 'Diagnosis shows only the TCP diagnosis the relay-node itself runs: whether the listener is up, and the relay-node→target TCP connectivity and connect time. The latency is the relay-node→target TCP handshake time, NOT the client end-to-end latency through the full forwarding path. Pure-UDP rules are not supported; TCP+UDP rules diagnose TCP only.',
+
+  loadFailedRetry: 'Failed to load data. Please retry later.',
+  // v0.4.11 PR2: nodes page
+
+  basicSettings: 'Basic settings',
+
+  userAndBilling: 'Users & billing',
+
+  allowedPlansHint: 'Plans users can choose from during registration.',
+
+  registrationSettingsHint: 'When enabled, users can self-register and are bound to the default plan.',
+  // v0.4.10 PR4: password reset + forced change
+
+  trafficHistory: 'Traffic',
+
+  range1d: '24 hours',
+
+  range7d: '7 days',
+
+  range30d: '30 days',
+
+  allRules: 'All rules',
+
+  billedTraffic: 'Billed traffic',
+
+  realUpload: 'Real upload',
+
+  realDownload: 'Real download',
+
+  noTrafficYet: 'No traffic recorded in this window (recording starts after the panel upgrade)',
+
+  otherLines: 'Other lines',
+
+  // ── v1.2.0: node offline notifications ──
+
+  notifySettings: 'Notifications',
+
+  notifyIntro: 'Node offline alerts',
+
+  notifyIntroDesc: 'Alerts when a node stays offline past the threshold, and again when it recovers. The alert threshold is deliberately separate from the "online" dot in the UI: 30s is right for a status light, but alerting that fast gets you paged by every network blip — and a noisy channel is one you end up muting.',
+
+  notifyEnabled: 'Enable notifications',
+
+  offlineAlertSecs: 'Offline alert threshold',
+
+  offlineAlertSecsHint: 'How long a node must stay offline before alerting. Minimum {min}s. Default 180s (~6 missed reports), which rides out transient blips.',
+
+  offlineAlertSecsTooSmall: 'Minimum {min} seconds',
+
+  seconds: 'seconds',
+
+  notifyRecovery: 'Notify on recovery',
+
+  notifyRecoveryHint: 'Send a follow-up when the node reports in again. Without it you get told something broke but never that it was fixed.',
+
+  enableChannel: 'Enable this channel',
+
+  email: 'Email',
+
+  smtpHost: 'SMTP host',
+
+  smtpPort: 'Port',
+
+  smtpPortHint: 'Usually 465 (SSL/TLS) or 587 (STARTTLS).',
+
+  smtpTls: 'Use SSL/TLS',
+
+  smtpTlsHint: 'On = implicit TLS (usually 465). Off = STARTTLS (usually 587).',
+
+  smtpUsername: 'Username',
+
+  smtpPassword: 'Password',
+
+  smtpFrom: 'From',
+
+  smtpFromHint: 'Defaults to the username. Many providers reject a From that is not the authenticated mailbox.',
+
+  smtpTo: 'To',
+
+  smtpToHint: 'Comma-separate multiple recipients.',
+
+  telegramChatIdHint: 'Message your bot, then open https://api.telegram.org/bot<TOKEN>/getUpdates to find the chat id. Group ids are negative.',
+
+  credentialKeepHint: 'Leave empty to keep the stored value.',
+
+  credentialConfigured: 'Configured (leave empty to keep)',
+
+  credentialEmpty: 'Not configured',
+
+  saveAndTest: 'Save & send test',
+
+  notifyTestSent: 'Test message sent — check your inbox/chat',
+
+  notifyTestFailed: 'Test send failed',
+
+  notifyCredentialNote: 'Note: the bot token and SMTP password are stored in plaintext (same as node tokens). The API never returns them to the browser.',
+
+  // ── v1.2.0: redeem codes ──
+  // ── v1.2.4: account money history ──
+
+  rechargeHistory: 'Top-up History',
+
+  rechargeAmount: 'Amount',
+
+  rechargeTime: 'Redeemed at',
+
+  noRecharges: 'No top-ups yet',
+  // ── v1.2.4: announcements ──
+
+  announcements: 'Announcements',
+
+  announcementAdmin: 'Announcements',
+
+  announcementTitle: 'Title',
+
+  newAnnouncement: 'New announcement',
+
+  editAnnouncement: 'Edit announcement',
+
+  announcementContentRequired: 'Content is required',
+
+  noAnnouncements: 'No announcements yet',
+
+  viewAllAnnouncements: 'View all',
+
+  viewAnnouncementDetail: 'Details',
+
+  publishedAt: 'Published',
+
+  expiresAt: 'Expires',
+
+  pinned: 'Pinned',
+
+  pinnedHint: 'The banner shows the newest notice by default; pinning keeps this one there.',
+
+  expired: 'Expired',
+
+  actions: 'Actions',
+
+  confirmDelete: 'Delete this?',
+  // Short labels for tags — the Tag's colour already carries the severity, so
+  // repeating "(blue)" there is noise. The form's picker keeps the long names.
+
+  announcementKindInfo: 'Info',
+
+  announcementKindSuccess: 'Success',
+
+  announcementKindWarning: 'Warning',
+
+  announcementKindError: 'Error',
+
+  allOrders: 'All Purchases',
+
+  orderUser: 'User',
+
+  noOrdersAll: 'No purchases yet',
+
+  audit_update_site_settings: 'Update site settings',
+
+  audit_create_announcement: 'Post announcement',
+
+  audit_update_announcement: 'Edit announcement',
+
+  audit_delete_announcement: 'Delete announcement',
+  // Target types: the table stores wire values (user/rule/...); the list reads
+  // them as words.
+
+  auditTargetUser: 'User',
+
+  auditTargetRule: 'Rule',
+
+  auditTargetGroup: 'Group',
+
+  auditTargetNode: 'Node',
+
+  auditTargetAnnouncement: 'Announcement',
+
+  auditTargetRedeemCode: 'Redeem code',
+
+  auditTargetRedeemBatch: 'Code batch',
+
+  auditTargetSettings: 'Settings',
+
+  auditTargetSettingsNotify: 'Notification settings',
+
+  auditTargetSettingsSite: 'Site settings',
+  // ── v1.2.4: site settings ──
+
+  siteSettings: 'Site Settings',
+
+  siteNameHint: 'Shown on the login page, in the sidebar, and as the browser tab title. Empty falls back to RelayPanel.',
+
+  siteSubtitle: 'Subtitle',
+
+  siteSubtitleHint: 'Small text under the name on the login page. Empty keeps the default.',
+
+  siteAnnouncement: 'Announcement',
+
+  siteAnnouncementHint: 'Shown at the top of the dashboard and account page; empty hides it. Visible to signed-in users only.',
+
+  siteAnnouncementSyntax: 'Formatting: **bold**, *italic*, `code`, [links](https://…), - lists. Only http/https links are accepted; anything else stays literal text.',
+
+  siteAnnouncementType: 'Banner style',
+
+  siteAnnouncementTypeHint: 'Sets the banner colour. Maintenance notices fit Warning, outages fit Error, everything else Info.',
+
+  siteAnnouncementPreview: 'Preview',
+
+  announcementTypeInfo: 'Info (blue)',
+
+  announcementTypeSuccess: 'Success (green)',
+
+  announcementTypeWarning: 'Warning (amber)',
+
+  announcementTypeError: 'Error (red)',
+
+  siteContact: 'Support contact',
+
+  siteContactHint: 'Shown on the account page — a Telegram handle, an email, whatever. Empty hides the row.',
+
+  siteFieldTooLong: 'Too long',
+
+  siteSettingsHint: 'Takes effect immediately. The announcement and contact require sign-in to read and never appear on the login page.',
+  // ── v1.2.4: audit log ──
+
+  auditLog: 'Audit Log',
+
+  auditTime: 'Time (UTC)',
+
+  auditActor: 'Actor',
+
+  auditAction: 'Action',
+
+  auditTarget: 'Target',
+
+  auditDetail: 'Detail',
+
+  auditAllActions: 'All actions',
+
+  auditSystemActor: 'System',
+
+  auditRetentionHint: 'Retained for one year',
+
+  audit_create_user: 'Create user',
+
+  audit_delete_user: 'Delete user',
+
+  audit_reset_password: 'Reset password',
+
+  audit_reset_traffic: 'Reset traffic',
+
+  audit_admin_buy_plan: 'Assign plan',
+
+  audit_admin_set_plan: 'Adjust plan',
+
+  audit_delete_rule: 'Delete rule',
+
+  audit_restart_rule: 'Restart rule',
+
+  audit_delete_group: 'Delete group',
+
+  audit_rotate_group_token: 'Rotate node token',
+
+  audit_upgrade_node: 'Upgrade node',
+
+  audit_create_redeem_codes: 'Generate codes',
+
+  audit_void_redeem_code: 'Void code',
+
+  audit_delete_redeem_codes: 'Delete codes',
+
+  audit_redeem_code: 'Redeem code',
+
+  audit_update_notify_settings: 'Update notify settings',
+
+  redeemCodes: 'Redeem Codes',
+
+  generateCodes: 'Generate Codes',
+
+  codeCount: 'How many',
+
+  codeCountRequired: 'Enter how many to generate',
+
+  faceValue: 'Face value',
+
+  faceValueHint: 'Amount each code credits. Up to two decimal places.',
+
+  faceValueRequired: 'Enter a face value',
+
+  code: 'Code',
+
+  batch: 'Batch',
+
+  remarkPlaceholder: 'Optional — what this batch is for',
+
+  codeExpiresAt: 'Expires at',
+
+  expiresAtHint: 'Empty = never expires. Format YYYY-MM-DD HH:MM:SS (UTC). An expired code is refused but NOT voided, so you can extend the batch instead of regenerating it.',
+
+  codeUnused: 'Unused',
+
+  codeUsed: 'Used',
+
+  codeVoid: 'Voided',
+
+  usedBy: 'Redeemed by',
+
+  usedAt: 'Redeemed at',
+
+  deletedUser: '(account deleted)',
+
+  void: 'Void',
+
+  voidCodeConfirm: 'Void this code? It can never be redeemed afterwards.',
+
+  codeVoided: 'Code voided',
+
+  codeVoidFailed: 'Failed to void',
+
+  codesCreated: 'Generated {count} codes',
+
+  codesCreateFailed: 'Generation failed',
+
+  justGenerated: 'Generated {count} codes (batch {batch}) — copy them now',
+
+  copyAll: 'Copy all',
+
+  exportTxt: 'Export TXT',
+
+  dismiss: 'Dismiss',
+
+  copied: 'Copied',
+
+  deleteCodesConfirm: 'Delete {count} selected codes?',
+
+  deleteCodesDesc: 'Used codes are never deleted — they are the record of money that entered the system.',
+
+  codesDeleted: 'Deleted {count}',
+
+  codesDeletedPartial: 'Deleted {ok}, skipped {skipped} (used codes cannot be deleted)',
+
+  codesDeleteFailed: 'Delete failed',
+  // User-facing top-up
+
+  redeem: 'Redeem code',
+
+  redeemConfirm: 'Redeem',
+
+  redeemCode: 'Code',
+
+  redeemCodeHint: 'Case and dashes do not matter — just paste it.',
+
+  redeemCodeRequired: 'Enter a code',
+
+  redeemSuccess: 'Redeemed +{amount}. Balance is now {balance}',
+
+  redeemFailed: 'Redemption failed',
+
+  // ── v1.2.0: rule restart + connection cap + scheduled restart ──
+
+  maxConnectionsHint: '0 = unlimited. TCP only, and counted PER NODE — a rule running on 3 nodes allows 3x this number in total. Connections past the cap are refused immediately. Changing the cap does not drop existing connections; it applies to new ones from now on.',
+
+  maxConnectionsUdpUnsupported: 'Not applicable to UDP rules: the cap is checked at accept(), and UDP has no connections to accept (sessions self-expire after 60s idle, so they cannot pile up the same way). A TCP+UDP rule can set it — it governs the TCP half.',
+
+  autoRestartHint: '0 = off. Drops all of this rule\'s connections on this interval to clear accumulation. Minimum {min} minutes. The timer restarts when the panel restarts.',
+
+  planTrafficGbHint: '0 = unlimited',
+
+  planResetTrafficHint: 'Zero traffic_used on purchase',
+
+  planGrantAllHint: 'When on, buying this plan grants access to ALL inbound groups (including ones created later).',
+
+  planGrantGroupsHint: "Buying/assigning this plan REPLACES the user's current authorization with these groups (not appended); not revoked on expiry. Device-group authorization is managed entirely by the plan (there is no manual assignment in the edit-user modal).",
 };

@@ -119,6 +119,220 @@ export interface ForwardRule {
   created_at: string;
 }
 
+/** v1.2.0: one traffic-history bucket. `bucket` is 'YYYY-MM-DD HH:00:00' UTC;
+ *  the chart converts to the viewer's timezone. `billed_total` is the exact
+ *  number charged against quota in that hour. */
+export interface TrafficHistoryBucket {
+  bucket: string;
+  /** v1.2.0: the inbound line (device group) this slice belongs to. 0 =
+   *  unknown — pre-column history whose rule has since been deleted. */
+  group_id: number;
+  /** The line's name, or "#id" once the group is deleted (the history
+   *  deliberately outlives it). */
+  group_name: string;
+  real_upload: number;
+  real_download: number;
+  billed_total: number;
+}
+
+/** v1.2.4: one node's metrics for one bucket. CPU/memory are 0..1 fractions;
+ *  connections is a raw count. `*_avg` is the sample-weighted mean of the
+ *  bucket, `*_max` its peak — both are kept because an average alone flattens
+ *  the spike that caused a stall. */
+export interface NodeMetricBucket {
+  /** 'YYYY-MM-DD HH:00:00' UTC — the chart converts to the viewer's timezone. */
+  bucket: string;
+  node_id: string;
+  group_id: number;
+  /** The line's name, or "#id" once the group is deleted. */
+  group_name: string;
+  cpu_avg: number;
+  cpu_max: number;
+  mem_avg: number;
+  mem_max: number;
+  conn_avg: number;
+  conn_max: number;
+}
+
+export interface NodeMetricsResponse {
+  granularity: string;
+  since: string;
+  buckets: NodeMetricBucket[];
+}
+
+export interface TrafficHistoryResponse {
+  granularity: string;
+  /** Inclusive UTC lower bound, for zero-filling leading buckets. */
+  since: string;
+  buckets: TrafficHistoryBucket[];
+}
+
+/** v1.2.0: notification settings as returned by the API.
+ *
+ *  Credentials are NEVER included — only `*_set` booleans saying whether one is
+ *  stored. Submitting an empty credential means "keep the stored one", so the
+ *  form can round-trip without ever holding the secret. */
+export interface NotifyConfigPublic {
+  enabled: boolean;
+  offline_alert_secs: number;
+  notify_recovery: boolean;
+  telegram_enabled: boolean;
+  telegram_chat_id: string;
+  telegram_bot_token_set: boolean;
+  email_enabled: boolean;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_username: string;
+  smtp_password_set: boolean;
+  smtp_from: string;
+  smtp_to: string;
+  smtp_tls: boolean;
+}
+
+/** v1.2.0: result of a test send. `ok: false` still arrives as HTTP 200 — the
+ *  request worked, the delivery didn't, and `detail` carries the provider's own
+ *  words so the operator can actually fix it. */
+export interface TestNotifyResult {
+  ok: boolean;
+  detail: string;
+}
+
+/** Minimum offline-alert threshold in seconds. Mirrors
+ *  service::notify::MIN_OFFLINE_ALERT_SECS. */
+export const MIN_OFFLINE_ALERT_SECS = 60;
+
+/** v1.2.0: a balance top-up code. `code` arrives in DISPLAY form (dashed);
+ *  the backend stores it without dashes and normalizes user input, so a user
+ *  may type it with or without them, in any case. */
+export interface RedeemCode {
+  id: number;
+  code: string;
+  amount: string;
+  /** "unused" | "used" | "void" */
+  status: string;
+  used_by?: number | null;
+  /** Redeemer's username, resolved server-side. Null when unused, or when the
+   *  account was deleted (used_by kept as the money-in record). */
+  used_by_username?: string | null;
+  used_at?: string | null;
+  /** null = never expires */
+  expires_at?: string | null;
+  batch_id: string;
+  remark: string;
+  created_at: string;
+}
+
+export interface ListCodesResponse {
+  items: RedeemCode[];
+  total: number;
+}
+
+/** v1.2.4: one of the caller's own redeem-code top-ups. `code` arrives already
+ *  masked to the last group — the server never sends the full value here. */
+export interface MyRedeemRecord {
+  id: number;
+  code: string;
+  amount: string;
+  used_at: string | null;
+}
+
+/** v1.2.4: one site announcement. Replaces the single announcement string that
+ *  used to live in the site config. */
+export interface Announcement {
+  id: number;
+  title: string;
+  content: string;
+  /** "info" | "success" | "warning" | "error". */
+  kind: string;
+  pinned: boolean;
+  published_at: string;
+  /** null = never auto-hides. */
+  expires_at: string | null;
+  author_id: number | null;
+  /** Snapshot — survives deletion of the admin who posted it. */
+  author_name: string;
+}
+
+export interface AnnouncementList {
+  items: Announcement[];
+  total: number;
+}
+
+/** v1.2.4: one site announcement. Replaces the single announcement string that
+ *  used to live in the site config. */
+export interface Announcement {
+  id: number;
+  title: string;
+  content: string;
+  /** "info" | "success" | "warning" | "error". */
+  kind: string;
+  pinned: boolean;
+  published_at: string;
+  /** null = never auto-hides. */
+  expires_at: string | null;
+  author_id: number | null;
+  /** Snapshot — survives deletion of the admin who posted it. */
+  author_name: string;
+}
+
+export interface AnnouncementList {
+  items: Announcement[];
+  total: number;
+}
+
+/** v1.2.4: public site branding. No announcement/contact — those are behind
+ *  the authenticated /user/site-notice endpoint. */
+export interface PublicSite {
+  site_name: string;
+  subtitle: string;
+}
+
+/** v1.2.4: the signed-in half of the site config. */
+export interface SiteNotice {
+  contact: string;
+}
+
+/** v1.2.4: the full site config, as the admin form reads and writes it. */
+export interface SiteConfig extends PublicSite, SiteNotice {}
+
+/** v1.2.4: one recorded admin action. */
+export interface AuditEntry {
+  id: number;
+  ts: string;
+  /** Null when the actor's account was deleted or the action was automatic. */
+  actor_id: number | null;
+  /** Snapshot of the actor's username, stored at write time so it survives
+   *  deletion of the account. */
+  actor_name: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  /** Free-form context. Never contains a secret — see service::audit. */
+  detail: string;
+}
+
+export interface AuditLogResponse {
+  items: AuditEntry[];
+  total: number;
+}
+
+export interface CreateCodesResponse {
+  batch_id: string;
+  /** Rows actually created — a duplicate code is skipped, not fatal. */
+  created: number;
+  /** The generated codes, display form, returned once at generation time. */
+  codes: string[];
+}
+
+export interface RedeemResult {
+  amount: string;
+  balance: string;
+}
+
+/** Max codes one generation request may create. Mirrors
+ *  relay_shared::models::MAX_REDEEM_BATCH. */
+export const MAX_REDEEM_BATCH = 1000;
+
 /** v1.2.0: the API's floor for a non-zero auto_restart_minutes. Mirrors
  *  relay_shared::models::MIN_AUTO_RESTART_MINUTES — the backend rejects
  *  anything between 1 and this, so the form must not offer it. */

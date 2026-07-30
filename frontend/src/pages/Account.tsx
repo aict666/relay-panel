@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Card, Descriptions, Spin, Button, Space, Modal, Form, Input, message, Typography, Result, Progress, Alert, Tag } from 'antd';
-import { LockOutlined, LogoutOutlined } from '@ant-design/icons';
+import { LockOutlined, LogoutOutlined, WalletOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import type { ApiEnvelope, UserSelf } from '../api/types';
@@ -8,6 +8,10 @@ import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { makePasswordValidator } from '../utils/password';
 import { useAuth } from '../auth/useAuth';
+import TrafficChart from '../components/TrafficChart';
+import SiteAnnouncement from '../components/SiteAnnouncement';
+import { useSiteNotice } from '../hooks/useSiteNotice';
+import RedeemHistory from '../components/RedeemHistory';
 
 const { Text } = Typography;
 
@@ -30,6 +34,7 @@ export default function Account() {
   const { t } = useI18n();
   const navigate = useNavigate();
   const { logout: authLogout } = useAuth();
+  const notice = useSiteNotice();
   const [me, setMe] = useState<UserSelf | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
@@ -38,6 +43,34 @@ export default function Account() {
   const [changePwOpen, setChangePwOpen] = useState(false);
   const [pwForm] = Form.useForm();
   const [pwSubmitting, setPwSubmitting] = useState(false);
+
+  // v1.2.0: redeem-code top-up.
+  const [redeemOpen, setRedeemOpen] = useState(false);
+  const [redeemForm] = Form.useForm();
+  const [redeeming, setRedeeming] = useState(false);
+
+  const handleRedeem = async (values: { code: string }) => {
+    setRedeeming(true);
+    try {
+      const res = await api.post<unknown, ApiEnvelope<{ amount: string; balance: string }>>(
+        '/user/redeem',
+        { code: values.code },
+      );
+      if (res.code !== 0) { message.error(res.message); return; }
+      message.success(
+        t('redeemSuccess')
+          .replace('{amount}', res.data?.amount ?? '')
+          .replace('{balance}', res.data?.balance ?? ''),
+      );
+      setRedeemOpen(false);
+      redeemForm.resetFields();
+      load(); // refresh the balance shown above
+    } catch {
+      message.error(t('redeemFailed'));
+    } finally {
+      setRedeeming(false);
+    }
+  };
 
   const load = async () => {
     setLoading(true);
@@ -102,6 +135,9 @@ export default function Account() {
 
   return (
     <>
+      {/* v1.2.4: operator announcement. Regular users land here rather than on
+          the dashboard, so without this they would never see one. */}
+      <SiteAnnouncement />
       {/* v1.0.8: suspended banner — the user can still log in and buy a plan
           (buying does NOT auto-unsuspend), but forwarding is gated off. */}
       {me.suspended && (
@@ -150,7 +186,25 @@ export default function Account() {
             )}
           </Descriptions.Item>
           <Descriptions.Item label={t('accountBalance')}>
-            <span className="rp-mono">{me.balance}</span>
+            <Space wrap>
+              <span className="rp-mono">{me.balance}</span>
+              {/* v1.2.0: self-service top-up. It lives on the balance row
+                  because that is exactly where a user looks when they find
+                  they can't afford a plan.
+
+                  Ghost-primary with an icon, not a bare text link: as a `link`
+                  button beside a number it read as a label rather than a
+                  control, and users reported finding no way to top up at all. */}
+              <Button
+                size="small"
+                type="primary"
+                ghost
+                icon={<WalletOutlined />}
+                onClick={() => { redeemForm.resetFields(); setRedeemOpen(true); }}
+              >
+                {t('redeem')}
+              </Button>
+            </Space>
           </Descriptions.Item>
           <Descriptions.Item label={t('accountRulesLimit')}>
             {me.current_rules} / {me.max_rules}
@@ -173,8 +227,30 @@ export default function Account() {
           <Descriptions.Item label={t('accountMemberSince')}>
             <span className="rp-mono">{me.registered_at || '-'}</span>
           </Descriptions.Item>
+          {/* v1.2.4: only rendered when the operator filled it in — an empty
+              "Support" row would just look like something is broken. */}
+          {notice.contact && (
+            <Descriptions.Item label={t('siteContact')}>
+              <span style={{ whiteSpace: 'pre-wrap' }}>{notice.contact}</span>
+            </Descriptions.Item>
+          )}
         </Descriptions>
       </Card>
+
+      {/* v1.2.0: the user's own traffic trend. No rule filter here — the API
+          pins non-admins to their own uid, so the total IS their usage.
+
+          Hidden for admins: they already get the fleet-wide chart (with a
+          per-rule drill-down) on the dashboard, and an admin's "personal"
+          traffic is a near-meaningless number. The same card on two pages is
+          just noise. */}
+      {/* v1.2.4: the user's own top-up history. Above the traffic chart —
+          "where did my balance come from" is the question that brings people to
+          this page, and it should not sit below a chart. Purchase history is
+          not duplicated here; it stays on the shop page. */}
+      <RedeemHistory />
+
+      {!me.admin && <TrafficChart />}
 
       <Modal
         title={t('changePassword')}
@@ -224,6 +300,31 @@ export default function Account() {
             ]}
           >
             <Input.Password autoComplete="new-password" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* v1.2.0: redeem a top-up code. The backend normalizes input (case,
+          dashes, whitespace, O/0 and I/L/1 confusions), so the field is
+          deliberately permissive — no client-side format policing that would
+          reject a code the server would have accepted. */}
+      <Modal
+        title={t('redeem')}
+        open={redeemOpen}
+        onCancel={() => setRedeemOpen(false)}
+        onOk={() => redeemForm.submit()}
+        okText={t('redeemConfirm')}
+        cancelText={t('cancel')}
+        confirmLoading={redeeming}
+      >
+        <Form form={redeemForm} onFinish={handleRedeem} layout="vertical">
+          <Form.Item
+            name="code"
+            label={t('redeemCode')}
+            extra={t('redeemCodeHint')}
+            rules={[{ required: true, message: t('redeemCodeRequired') }]}
+          >
+            <Input placeholder="XXXX-XXXX-XXXX-XXXX" autoComplete="off" />
           </Form.Item>
         </Form>
       </Modal>

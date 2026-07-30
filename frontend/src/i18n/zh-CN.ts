@@ -683,6 +683,439 @@ export const zhCN = {
   unsuspendConfirm: '确定恢复该用户？转发将自动恢复。',
   userSuspended: '已暂停该用户',
   userUnsuspended: '已恢复该用户',
+  // Common features integrated from upstream.
+  autoRefresh10s: '自动刷新 10s',
+
+  nodeMetricsHistory: '节点指标趋势',
+
+  metricCpu: 'CPU',
+
+  metricMem: '内存',
+
+  metricConn: '连接数',
+
+  metricAvg: '均值',
+
+  metricPeak: '峰值',
+
+  noNodeMetricsYet: '暂无节点指标。节点上报后会开始记录,数据保留 7 天。',
+
+  searchRulePlaceholder: '搜索名称 / 端口 / 目标',
+
+  entryTransportUdpOnlyRaw: 'UDP 规则仅支持原始连接',
+
+  importHint: '粘贴极简规则 JSON。格式：[{"dest":["ip:端口"],"listen_port":端口,"name":"名称"}]',
+
+  rateLimitsHint: '规则级上限，所有连接共享（0 = 不限）。每台节点独立执行。',
+
+  rotateToken: '重置令牌',
+
+  rotateTokenHint: '生成新的节点令牌并立即作废旧的。该分组下所有节点会被断开，需逐台重新执行对接命令。',
+
+  rotateTokenConfirmTitle: '重置节点令牌',
+
+  rotateTokenConfirmOk: '确认重置',
+
+  rotateTokenWarnTitle: '该分组下 {count} 个节点会立即断开',
+
+  rotateTokenWarnDesc: '旧令牌立刻失效，节点拿旧令牌重连会被拒绝。必须在每台节点上重新执行对接命令才能恢复转发 —— 面板无法代劳，因为节点正是靠令牌认证的。仅在令牌泄漏时使用。',
+
+  rotateTokenTypeName: '确认请输入分组名称：{name}',
+
+  tokenRotated: '令牌已重置',
+
+  tokenRotatedHint: '旧令牌已失效，该分组的节点现在全部离线。请在每台节点上执行下面的对接命令。这个新令牌请先复制保存。',
+
+  tokenRotateFailed: '重置令牌失败',
+
+  rateHint: '用户额度按倍率扣减，规则/节点统计存真实字节。1.0 = 用多少扣多少。',
+
+  groupHiddenHint: '开启后该分组仅在普通用户的「节点状态」页隐藏，管理员不受影响；规则照常使用（新建规则仍可选、已有规则正常转发与显示）。',
+
+  searchUserPlaceholder: '搜索用户名或 ID',
+  // v1.0.7: admin edit-user-plan panel
+
+  assignPlanHint: '选择一个套餐为该用户开通，按套餐价格从其余额扣费（与用户自助购买规则一致）。',
+
+  renewSamePlanHint: '选中的是当前套餐，将按续费处理：限时套餐延长有效期、流量套餐增加额度,不替换授权。',
+
+  expiryOnlyForTimePlan: '仅限时套餐可修改到期时间；流量套餐为无限时长。',
+
+  createUserRoleNote: '管理员只能创建普通用户。',
+
+  diagnoseScopeHint: '诊断仅展示 relay-node 自身执行的 TCP 诊断：监听器是否正常，以及 relay-node 到目标地址的 TCP 连通性与建连耗时。延迟表示 relay-node 到目标地址的 TCP 建连耗时，不是客户端经过完整转发链路后的端到端延迟。纯 UDP 规则不支持诊断；TCP+UDP 规则只诊断 TCP。',
+
+  loadFailedRetry: '数据加载失败，请稍后重试。',
+  // v0.4.11 PR2: nodes page
+
+  basicSettings: '基础设置',
+
+  userAndBilling: '用户与计费',
+
+  allowedPlansHint: '用户注册时可选择的套餐。',
+
+  registrationSettingsHint: '开启后，用户可自行注册账户并绑定默认套餐。',
+  // v0.4.10 PR4: password reset + forced change
+
+  trafficHistory: '流量趋势',
+
+  range1d: '24 小时',
+
+  range7d: '7 天',
+
+  range30d: '30 天',
+
+  allRules: '全部规则',
+
+  billedTraffic: '计费流量',
+
+  realUpload: '真实上行',
+
+  realDownload: '真实下行',
+
+  noTrafficYet: '该时间段内暂无流量记录(升级面板后开始记录)',
+
+  otherLines: '其他线路',
+
+  // ── v1.2.0: 节点掉线通知 ──
+
+  notifySettings: '通知设置',
+
+  notifyIntro: '节点掉线告警',
+
+  notifyIntroDesc: '节点连续离线超过设定时长时推送告警,恢复时再推送一次。告警阈值和界面上的「在线」判定是分开的——界面用 30 秒是为了状态灯反应快,但按 30 秒告警会被网络抖动刷屏,反而让人把通知静音。',
+
+  notifyEnabled: '启用通知',
+
+  offlineAlertSecs: '离线告警阈值',
+
+  offlineAlertSecsHint: '节点连续离线超过这么久才告警。最小 {min} 秒。默认 180 秒(约漏 6 次上报),避免抖动误报。',
+
+  offlineAlertSecsTooSmall: '最小 {min} 秒',
+
+  seconds: '秒',
+
+  notifyRecovery: '恢复时也通知',
+
+  notifyRecoveryHint: '节点重新上报后推送一条恢复消息。关掉的话,你只会收到告警、不知道什么时候好的。',
+
+  enableChannel: '启用该渠道',
+
+  email: '邮件',
+
+  smtpHost: 'SMTP 主机',
+
+  smtpPort: '端口',
+
+  smtpPortHint: '常见:465(SSL/TLS)、587(STARTTLS)。',
+
+  smtpTls: '使用 SSL/TLS',
+
+  smtpTlsHint: '开启 = 隐式 TLS(通常 465);关闭 = STARTTLS(通常 587)。',
+
+  smtpUsername: '用户名',
+
+  smtpPassword: '密码',
+
+  smtpFrom: '发件人',
+
+  smtpFromHint: '留空则用「用户名」。很多服务商要求发件人必须是已认证的邮箱。',
+
+  smtpTo: '收件人',
+
+  smtpToHint: '多个收件人用英文逗号分隔。',
+
+  telegramChatIdHint: '给 Bot 发条消息,再访问 https://api.telegram.org/bot<TOKEN>/getUpdates 即可看到 chat id。群组的 id 是负数。',
+
+  credentialKeepHint: '留空 = 不修改已保存的值。',
+
+  credentialConfigured: '已配置(留空则不修改)',
+
+  credentialEmpty: '未配置',
+
+  saveAndTest: '保存并发送测试',
+
+  notifyTestSent: '测试消息已发送,请查收',
+
+  notifyTestFailed: '测试发送失败',
+
+  notifyCredentialNote: '说明:Bot Token 和 SMTP 密码以明文存储在数据库中(与节点令牌一致),接口不会把它们返回给浏览器。',
+
+  // ── v1.2.4: 个人中心账目记录 ──
+
+  rechargeHistory: '卡密充值记录',
+
+  rechargeAmount: '充值金额',
+
+  rechargeTime: '充值时间',
+
+  noRecharges: '暂无充值记录',
+  // ── v1.2.4: 公告 ──
+
+  announcements: '公告',
+
+  announcementAdmin: '公告管理',
+
+  announcementTitle: '标题',
+
+  newAnnouncement: '发布公告',
+
+  editAnnouncement: '编辑公告',
+
+  announcementContentRequired: '请输入公告内容',
+
+  noAnnouncements: '暂无公告',
+
+  viewAllAnnouncements: '查看全部公告',
+
+  viewAnnouncementDetail: '查看详情',
+
+  publishedAt: '发布时间',
+
+  expiresAt: '到期时间',
+
+  pinned: '置顶',
+
+  pinnedHint: '横幅默认显示最新一条;置顶后这条会一直占着横幅。',
+
+  expired: '已过期',
+
+  actions: '操作',
+
+  confirmDelete: '确定删除?',
+  // 标签用短名(表格里颜色已由 Tag 本身表达,再写"(蓝)"是噪音);
+  // 表单选择器仍用带颜色的长名,因为那里选的就是颜色。
+
+  announcementKindInfo: '信息',
+
+  announcementKindSuccess: '成功',
+
+  announcementKindWarning: '提醒',
+
+  announcementKindError: '警告',
+
+  allOrders: '全部购买记录',
+
+  orderUser: '用户',
+
+  noOrdersAll: '暂无购买记录',
+
+  audit_update_site_settings: '修改站点设置',
+
+  audit_create_announcement: '发布公告',
+
+  audit_update_announcement: '编辑公告',
+
+  audit_delete_announcement: '删除公告',
+  // 对象类型:审计表存的是 user/rule/... 这类线上值,列表里要读成中文。
+
+  auditTargetUser: '用户',
+
+  auditTargetRule: '规则',
+
+  auditTargetGroup: '分组',
+
+  auditTargetNode: '节点',
+
+  auditTargetAnnouncement: '公告',
+
+  auditTargetRedeemCode: '卡密',
+
+  auditTargetRedeemBatch: '卡密批次',
+
+  auditTargetSettings: '设置',
+
+  auditTargetSettingsNotify: '通知设置',
+
+  auditTargetSettingsSite: '站点设置',
+  // ── v1.2.4: 站点设置 ──
+
+  siteSettings: '站点设置',
+
+  siteNameHint: '显示在登录页、左侧边栏和浏览器标签标题。留空则使用 RelayPanel。',
+
+  siteSubtitle: '副标题',
+
+  siteSubtitleHint: '登录页站点名称下方的小字。留空则使用默认文案。',
+
+  siteAnnouncement: '公告',
+
+  siteAnnouncementHint: '显示在仪表盘和个人中心顶部,留空则不显示。仅登录用户可见。',
+
+  siteAnnouncementSyntax: '支持这些格式:**粗体**、*斜体*、`代码`、[链接](https://…)、- 列表。链接仅接受 http/https,其余原样显示。',
+
+  siteAnnouncementType: '公告样式',
+
+  siteAnnouncementTypeHint: '决定公告横幅的颜色。维护通知用「提醒」,故障用「警告」,活动用「信息」。',
+
+  siteAnnouncementPreview: '预览',
+
+  announcementTypeInfo: '信息(蓝)',
+
+  announcementTypeSuccess: '成功(绿)',
+
+  announcementTypeWarning: '提醒(黄)',
+
+  announcementTypeError: '警告(红)',
+
+  siteContact: '客服联系方式',
+
+  siteContactHint: '显示在个人中心,例如 Telegram 或邮箱。留空则不显示该行。',
+
+  siteFieldTooLong: '内容过长',
+
+  siteSettingsHint: '保存后立即生效。公告和客服方式需要登录才能读取,不会出现在登录页。',
+  // ── v1.2.4: 操作审计 ──
+
+  auditLog: '操作审计',
+
+  auditTime: '时间 (UTC)',
+
+  auditActor: '操作人',
+
+  auditAction: '操作',
+
+  auditTarget: '对象',
+
+  auditDetail: '详情',
+
+  auditAllActions: '全部操作',
+
+  auditSystemActor: '系统',
+
+  auditRetentionHint: '保留最近一年',
+
+  audit_create_user: '创建用户',
+
+  audit_delete_user: '删除用户',
+
+  audit_reset_password: '重置密码',
+
+  audit_reset_traffic: '重置流量',
+
+  audit_admin_buy_plan: '分配套餐',
+
+  audit_admin_set_plan: '调整套餐',
+
+  audit_delete_rule: '删除规则',
+
+  audit_restart_rule: '重启规则',
+
+  audit_delete_group: '删除分组',
+
+  audit_rotate_group_token: '轮换节点密钥',
+
+  audit_upgrade_node: '升级节点',
+
+  audit_create_redeem_codes: '生成卡密',
+
+  audit_void_redeem_code: '作废卡密',
+
+  audit_delete_redeem_codes: '删除卡密',
+
+  audit_redeem_code: '使用卡密',
+
+  audit_update_notify_settings: '修改通知设置',
+  // ── v1.2.0: 卡密充值 ──
+
+  redeemCodes: '卡密管理',
+
+  generateCodes: '生成卡密',
+
+  codeCount: '生成数量',
+
+  codeCountRequired: '请输入生成数量',
+
+  faceValue: '面额',
+
+  faceValueHint: '每张卡密的充值金额,最多两位小数。',
+
+  faceValueRequired: '请输入面额',
+
+  code: '卡密',
+
+  batch: '批次',
+
+  remarkPlaceholder: '可选,便于区分用途',
+
+  codeExpiresAt: '过期时间',
+
+  expiresAtHint: '留空 = 永不过期。格式 YYYY-MM-DD HH:MM:SS(UTC)。过期的卡密会被拒绝但不作废,可以改期后继续用。',
+
+  codeUnused: '未使用',
+
+  codeUsed: '已使用',
+
+  codeVoid: '已作废',
+
+  usedBy: '使用者',
+
+  usedAt: '使用时间',
+
+  deletedUser: '(用户已删除)',
+
+  void: '作废',
+
+  voidCodeConfirm: '确定作废这张卡密?作废后无法再兑换。',
+
+  codeVoided: '卡密已作废',
+
+  codeVoidFailed: '作废失败',
+
+  codesCreated: '已生成 {count} 张卡密',
+
+  codesCreateFailed: '生成失败',
+
+  justGenerated: '本次生成 {count} 张(批次 {batch})—— 请立即复制保存',
+
+  copyAll: '复制全部',
+
+  exportTxt: '导出 TXT',
+
+  dismiss: '关闭',
+
+  copied: '已复制',
+
+  deleteCodesConfirm: '确定删除选中的 {count} 张卡密?',
+
+  deleteCodesDesc: '已使用的卡密不会被删除 —— 它是资金入账的凭证,必须保留。',
+
+  codesDeleted: '已删除 {count} 张',
+
+  codesDeletedPartial: '已删除 {ok} 张,跳过 {skipped} 张(已使用的卡密不可删除)',
+
+  codesDeleteFailed: '删除失败',
+  // 用户端充值
+
+  redeem: '卡密充值',
+
+  redeemConfirm: '确认充值',
+
+  redeemCode: '卡密',
+
+  redeemCodeHint: '大小写、有没有横杠都可以,直接粘贴即可。',
+
+  redeemCodeRequired: '请输入卡密',
+
+  redeemSuccess: '充值成功 +{amount},当前余额 {balance}',
+
+  redeemFailed: '充值失败',
+
+  // ── v1.2.0: 规则重启 + 连接数上限 + 定时自动重启 ──
+
+  maxConnectionsHint: '0 = 不限。仅对 TCP 生效，且按「每个节点」独立计数——规则跑在 3 个节点上时总量是这里的 3 倍。超出后新连接会被直接拒绝。修改上限不会断开已有连接，新上限从此刻起对新连接生效。',
+
+  maxConnectionsUdpUnsupported: 'UDP 规则不适用：上限在 accept 时判断，而 UDP 没有「连接」这个东西（会话按 60 秒空闲自动回收，不会无限堆积）。TCP+UDP 规则可以设，只管其中的 TCP 部分。',
+
+  autoRestartHint: '0 = 关闭。开启后每隔这么久自动断开该规则的全部连接一次，用于清理堆积的连接。最小 {min} 分钟。面板重启后重新计时。',
+
+  planTrafficGbHint: '0 = 无限流量',
+
+  planResetTrafficHint: '购买后清零已用流量',
+
+  planGrantAllHint: '开启后购买此套餐将授权用户使用全部入口分组（含日后新建的）。',
+
+  planGrantGroupsHint: '购买/开通此套餐将用这些分组替换用户当前的授权（不是追加）；到期不自动撤销。设备分组授权完全由套餐管理（编辑用户里已无手动分配入口）。',
 };
 
 export type Dict = typeof zhCN;

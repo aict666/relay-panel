@@ -5,14 +5,19 @@ use axum::Router;
 use std::sync::Arc;
 
 pub mod admin;
+pub mod announcements;
+pub mod audit;
 pub mod auth;
 pub mod diagnose;
 pub mod geoip;
 pub mod groups;
 pub mod middleware;
 pub mod node;
+pub mod notify;
+pub mod redeem;
 pub mod restart;
 pub mod security_headers;
+pub mod site;
 pub mod stats;
 pub mod system;
 pub mod ws;
@@ -44,6 +49,31 @@ pub fn routes() -> Router<AppState> {
             "/auth/registration-status",
             axum::routing::get(auth::registration_status),
         )
+        .route(
+            "/user/announcements",
+            axum::routing::get(announcements::list_for_user),
+        )
+        .route(
+            "/user/announcements/active",
+            axum::routing::get(announcements::active_for_user),
+        )
+        .route(
+            "/user/announcements/latest-id",
+            axum::routing::get(announcements::latest_id),
+        )
+        .route(
+            "/admin/announcements",
+            axum::routing::get(announcements::list_for_admin).post(announcements::create),
+        )
+        .route(
+            "/admin/announcements/{id}",
+            axum::routing::put(announcements::update).delete(announcements::delete),
+        )
+        .route("/site", axum::routing::get(site::get_public_site))
+        .route(
+            "/user/site-notice",
+            axum::routing::get(site::get_site_notice),
+        )
         // Any authenticated user can change their own password
         .route("/user/password", axum::routing::put(admin::change_password))
         // Any authenticated user can read their own account info (no password)
@@ -51,6 +81,12 @@ pub fn routes() -> Router<AppState> {
         // v1.0.8: self-service plan purchase + order history.
         .route("/user/buy-plan", axum::routing::post(admin::buy_plan))
         .route("/user/orders", axum::routing::get(admin::list_my_orders))
+        .route("/admin/orders", axum::routing::get(admin::list_all_orders))
+        .route("/user/redeem", axum::routing::post(redeem::redeem_code))
+        .route(
+            "/user/redeem-records",
+            axum::routing::get(redeem::list_my_redeem_records),
+        )
         // v1.0.8: public plan list (hidden excluded) for the shop.
         .route("/plans", axum::routing::get(admin::list_public_plans))
         // Admin
@@ -194,6 +230,16 @@ pub fn routes() -> Router<AppState> {
             axum::routing::post(admin::diagnose_tunnel),
         )
         .route(
+            "/admin/redeem-codes",
+            axum::routing::get(redeem::list_codes)
+                .post(redeem::create_codes)
+                .delete(redeem::delete_codes),
+        )
+        .route(
+            "/admin/redeem-codes/{id}/void",
+            axum::routing::post(redeem::void_code),
+        )
+        .route(
             "/admin/plans",
             axum::routing::get(admin::list_plans).post(admin::create_plan),
         )
@@ -207,12 +253,33 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(admin::get_registration_settings)
                 .put(admin::update_registration_settings),
         )
+        .route(
+            "/admin/settings/site",
+            axum::routing::get(site::get_site_settings).put(site::update_site_settings),
+        )
+        .route(
+            "/admin/settings/notify",
+            axum::routing::get(notify::get_notify_settings).put(notify::update_notify_settings),
+        )
+        .route(
+            "/admin/settings/notify/test",
+            axum::routing::post(notify::test_notify),
+        )
         // Stats & monitoring
         .route("/stats", axum::routing::get(stats::get_stats))
         .route(
             "/dashboard/history",
             axum::routing::get(stats::get_dashboard_history),
         )
+        .route(
+            "/stats/traffic",
+            axum::routing::get(stats::get_traffic_history),
+        )
+        .route(
+            "/stats/node-metrics",
+            axum::routing::get(stats::get_node_metrics),
+        )
+        .route("/admin/audit-log", axum::routing::get(audit::get_audit_log))
         // Full node diagnostics are administrator-only. Regular users use the
         // typed, field-filtered /nodes/shared availability endpoint.
         .route("/nodes", axum::routing::get(stats::get_node_status))

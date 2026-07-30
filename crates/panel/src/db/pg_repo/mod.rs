@@ -26,10 +26,12 @@
 
 use sqlx::PgPool;
 
+mod announcements;
 mod groups;
 mod kvs;
 mod orders;
 mod profiles;
+mod redeem;
 mod rules;
 mod settings;
 mod stats;

@@ -6,7 +6,7 @@ import api from '../api/client';
 import type { ApiEnvelope, LoginResponse, RegistrationStatus } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
-import { useSiteConfig } from '../site/useSiteConfig';
+import { useSite } from '../hooks/useSite';
 
 const { Title, Text } = Typography;
 
@@ -14,7 +14,7 @@ export default function Login() {
   const navigate = useNavigate();
   const { t, lang, setLang } = useI18n();
   const { login } = useAuth();
-  const { siteName } = useSiteConfig();
+  const site = useSite();
   // v0.4.10 PR3: whether to show the "create account" link. null = still
   // loading (don't flash the link then remove it); a network failure leaves
   // it hidden rather than guessing.
@@ -77,8 +77,8 @@ export default function Login() {
         <div className="rp-auth-brand">
           <span className="rp-brand-mark"><ThunderboltFilled /></span>
           <div>
-            <Title level={3} style={{ margin: 0, fontWeight: 600 }}>{siteName}</Title>
-            <Text type="secondary" style={{ fontSize: 13 }}>{t('subtitle')}</Text>
+            <Title level={3} style={{ margin: 0, fontWeight: 600 }}>{site.site_name || t('brand')}</Title>
+            <Text type="secondary" style={{ fontSize: 13 }}>{site.subtitle || t('subtitle')}</Text>
           </div>
         </div>
 

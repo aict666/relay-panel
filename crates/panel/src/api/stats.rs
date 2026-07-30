@@ -1,4 +1,4 @@
-use crate::api::middleware::AdminOnly;
+use crate::api::middleware::{AdminOnly, AuthUser};
 use crate::api::AppState;
 use axum::{
     extract::{Query, State},
@@ -361,6 +361,142 @@ pub async fn get_dashboard_history(
                 }),
             )
                 .into_response()
+        }
+    }
+}
+
+/// v1.2.0: query for the traffic-history chart.
+#[derive(Debug, serde::Deserialize)]
+pub struct TrafficHistoryQuery {
+    /// "1d" | "7d" | "30d".
+    pub range: String,
+    /// Optional drill-down to one rule.
+    #[serde(default)]
+    pub rule_id: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TrafficHistoryResponse {
+    /// "hour" | "day" — tells the chart how to format the x axis.
+    pub granularity: String,
+    /// Inclusive UTC lower bound actually used, so the chart can render empty
+    /// leading buckets instead of starting at the first datapoint.
+    pub since: String,
+    pub buckets: Vec<crate::db::repo::TrafficHistoryBucket>,
+}
+
+/// GET /api/v1/stats/traffic?range=1d|7d|30d[&rule_id=N]
+///
+/// Owner-scoped: a regular user's query is FORCED to `uid = caller` regardless
+/// of what they pass — a foreign rule_id then simply matches nothing, which
+/// also means the endpoint can't be used to probe whether a rule id exists.
+/// Admins see everything.
+///
+/// ALWAYS returns hourly buckets, even for 7d/30d (≤ 720 rows — trivial). Day
+/// grouping happens client-side in the VIEWER'S timezone: buckets are stored
+/// in UTC, and a server-side UTC "day" starts at 08:00 for a CST viewer, which
+/// would visibly misfile "yesterday's" traffic for every non-UTC operator.
+/// (The repo's daily aggregation still exists for UTC-day consumers.)
+pub async fn get_traffic_history(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Query(q): Query<TrafficHistoryQuery>,
+) -> Json<ApiResponse<TrafficHistoryResponse>> {
+    let days = match q.range.as_str() {
+        "1d" => 1,
+        "7d" => 7,
+        "30d" => 30,
+        other => {
+            return Json(ApiResponse {
+                code: 400,
+                message: format!("range 只能是 1d / 7d / 30d,收到: {other}"),
+                data: None,
+            });
+        }
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::days(days))
+        .format("%Y-%m-%d %H:00:00")
+        .to_string();
+    // The scope decision, in one place: admin = unrestricted, everyone else =
+    // pinned to their own uid. The repo layer trusts this argument.
+    let uid = if user.admin { None } else { Some(user.user_id) };
+
+    match state
+        .db
+        .query_traffic_history(uid, q.rule_id, &since, false)
+        .await
+    {
+        Ok(buckets) => Json(ApiResponse::success(TrafficHistoryResponse {
+            granularity: "hour".into(),
+            since,
+            buckets,
+        })),
+        Err(e) => {
+            tracing::error!("get_traffic_history: db error: {}", e);
+            Json(ApiResponse {
+                code: 500,
+                message: "数据库错误".into(),
+                data: None,
+            })
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct NodeMetricsQuery {
+    pub range: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct NodeMetricsResponse {
+    pub granularity: String,
+    pub since: String,
+    pub buckets: Vec<crate::db::repo::NodeMetricBucket>,
+}
+
+/// GET /api/v1/stats/node-metrics?range=1d|7d
+///
+/// ADMIN ONLY, unlike the traffic chart. Traffic is owner-scoped because a user
+/// owns their own rules' traffic; node CPU/memory is a property of the operator's
+/// machines, and a tenant has no business reading it.
+///
+/// Hourly buckets, like the traffic endpoint, for the same reason: day grouping
+/// belongs in the viewer's timezone, which only the client knows.
+pub async fn get_node_metrics(
+    _admin: AdminOnly,
+    State(state): State<AppState>,
+    Query(q): Query<NodeMetricsQuery>,
+) -> Json<ApiResponse<NodeMetricsResponse>> {
+    // Capped at 7d because that is the retention — offering 30d would render
+    // an empty left half and look like data loss.
+    let days = match q.range.as_str() {
+        "1d" => 1,
+        "7d" => 7,
+        other => {
+            return Json(ApiResponse {
+                code: 400,
+                message: format!("range 只能是 1d / 7d,收到: {other}"),
+                data: None,
+            });
+        }
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::days(days))
+        .format("%Y-%m-%d %H:00:00")
+        .to_string();
+
+    match state.db.query_node_metrics(&since, false).await {
+        Ok(buckets) => Json(ApiResponse::success(NodeMetricsResponse {
+            granularity: "hour".into(),
+            since,
+            buckets,
+        })),
+        Err(e) => {
+            tracing::error!("get_node_metrics: db error: {}", e);
+            Json(ApiResponse {
+                code: 500,
+                message: "数据库错误".into(),
+                data: None,
+            })
         }
     }
 }
@@ -769,6 +905,15 @@ pub async fn upgrade_node(
         target = %target_version,
         "sent self-upgrade command to node"
     );
+    crate::service::audit::record(
+        &state,
+        Some(_admin.user_id),
+        "upgrade_node",
+        "node",
+        &node_id,
+        &format!("分组 {group_id} → {target_version}"),
+    )
+    .await;
     Json(ApiResponse::success(()))
 }
 

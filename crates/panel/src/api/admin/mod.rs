@@ -1476,6 +1476,94 @@ mod tests {
         );
     }
 
+    /// v1.2.4: the audit trail must never become a place to read a live node
+    /// credential out of. Rotation is exactly the operation that produces one,
+    /// and `detail` is free-form text a future edit could carelessly widen —
+    /// so pin it: the new token must appear in NO column of the audit row.
+    #[tokio::test]
+    async fn rotate_group_token_never_writes_the_token_into_the_audit_log() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 30, 1, "rotate-me").await;
+
+        let Json(resp) =
+            super::rotate_group_token(AdminOnly { user_id: 1 }, State(state.clone()), Path(30))
+                .await;
+        assert_eq!(resp.code, 0, "rotation must succeed: {}", resp.message);
+        // Read the landed token from the DB rather than the response struct:
+        // it is the same value, and the stored credential is the thing that
+        // must not be discoverable through the audit log.
+        let token: String = sqlx::query_scalar("SELECT token FROM device_groups WHERE id = 30")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !token.is_empty(),
+            "a blank token would make this test vacuous"
+        );
+
+        let rows = state.db.query_audit_log(None, 50, 0).await.unwrap();
+        let entry = rows
+            .iter()
+            .find(|e| e.action == "rotate_group_token")
+            .expect("rotation must be audited");
+        for (column, value) in [
+            ("detail", &entry.detail),
+            ("target_id", &entry.target_id),
+            ("actor_name", &entry.actor_name),
+            ("target_type", &entry.target_type),
+        ] {
+            assert!(
+                !value.contains(&token),
+                "audit column {column} leaked the rotated node token"
+            );
+        }
+    }
+
+    /// v1.2.4: the public site endpoint is reachable with NO token, so it must
+    /// carry branding only. The support contact is for this operator's users,
+    /// not for anyone who can reach the port.
+    ///
+    /// (The announcement used to be checked here too. It moved to its own table
+    /// in v1.2.4 and is served by an authenticated endpoint of its own.)
+    #[tokio::test]
+    async fn public_site_endpoint_exposes_branding_but_not_the_contact() {
+        let (state, _pool) = test_state().await;
+        let Json(saved) = crate::api::site::update_site_settings(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(crate::api::site::UpdateSiteRequest {
+                site_name: "我的中转".into(),
+                subtitle: "私有部署".into(),
+                announcement: String::new(),
+                announcement_type: "info".into(),
+                contact: "tg:@someone".into(),
+            }),
+        )
+        .await;
+        assert_eq!(saved.code, 0, "save must succeed: {}", saved.message);
+
+        // The public view: no AuthUser / AdminOnly extractor at all.
+        let Json(public) = crate::api::site::get_public_site(State(state.clone())).await;
+        let body = serde_json::to_string(&public.data.expect("public site data")).unwrap();
+        assert!(body.contains("我的中转"), "branding must be public");
+        assert!(
+            !body.contains("tg:@someone"),
+            "public endpoint leaked the support contact"
+        );
+
+        // The signed-in view does carry it — otherwise this test would pass
+        // vacuously with the field simply missing everywhere.
+        let Json(notice) = crate::api::site::get_site_notice(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state),
+        )
+        .await;
+        assert_eq!(notice.data.expect("notice data").contact, "tg:@someone");
+    }
+
     /// An empty group can be deleted successfully.
     #[tokio::test]
     async fn delete_empty_group_succeeds() {

@@ -45,6 +45,19 @@ const _origGetComputedStyle = window.getComputedStyle.bind(window);
 window.getComputedStyle = ((elt: Element) =>
   _origGetComputedStyle(elt)) as typeof window.getComputedStyle;
 
+// v1.2.0: @ant-design/charts renders on <canvas>, which jsdom does not
+// implement — mounting any page that embeds a chart (Dashboard, Account) would
+// crash with "Not implemented: HTMLCanvasElement.prototype.getContext". A
+// chart is visual output jsdom could never assert on anyway, so stub the
+// library; the page tests keep testing the page around it.
+vi.mock('@ant-design/charts', () => ({
+  Column: () => null,
+  // v1.2.4: NodeMetricsChart uses Line. A chart component missing from this
+  // stub throws at import time and fails every test on the page that embeds
+  // it — add the export here when a page starts using a new chart type.
+  Line: () => null,
+}));
+
 // Unmount rendered components between tests so each test starts from a clean
 // DOM (otherwise multiple StateProbe instances accumulate and getByTestId finds
 // duplicates). @testing-library/react auto-cleans when globals are enabled; we

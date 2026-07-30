@@ -964,6 +964,45 @@ impl SettingsRepository for SqliteRepository {
         Ok(())
     }
 
+    async fn set_site_config_compatible(
+        &self,
+        config_key: &str,
+        config_json: &str,
+        site_name: &str,
+    ) -> Result<(), DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result = async {
+            sqlx::query(
+                "INSERT INTO app_settings (id, site_name) VALUES (1, ?)
+                 ON CONFLICT(id) DO UPDATE SET site_name = excluded.site_name",
+            )
+            .bind(site_name)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
+                "INSERT INTO kvs (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(config_key)
+            .bind(config_json)
+            .execute(&mut *conn)
+            .await?;
+            Ok::<(), sqlx::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error.into())
+            }
+        }
+    }
+
     async fn set_system_settings_checked(
         &self,
         enabled: bool,

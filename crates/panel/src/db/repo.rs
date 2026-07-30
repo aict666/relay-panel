@@ -1112,6 +1112,223 @@ pub trait TrafficRepository: Send + Sync {
         group_id: i64,
         entries: &[TrafficEntry],
     ) -> Result<Vec<TrafficEntryResult>, DbError>;
+
+    // ── v1.2.0: hourly traffic history ──
+
+    /// Aggregated history buckets, oldest first.
+    ///
+    /// `since` is an inclusive 'YYYY-MM-DD HH:00:00' UTC lower bound. `daily`
+    /// collapses hour rows into per-day buckets ('YYYY-MM-DD') — a 30-day
+    /// hourly series is 720 points of noise, so 7d/30d views aggregate by day.
+    ///
+    /// `uid = None` means all users (admin); `rule_id = None` means all rules.
+    /// The API layer is responsible for forcing `uid = Some(caller)` on
+    /// non-admins — this layer trusts its arguments.
+    async fn query_traffic_history(
+        &self,
+        uid: Option<i64>,
+        rule_id: Option<i64>,
+        since: &str,
+        daily: bool,
+    ) -> Result<Vec<TrafficHistoryBucket>, DbError>;
+
+    /// Delete rows with `hour_ts < cutoff`. Returns rows deleted. Called by
+    /// the retention sweeper; the table has no FK so this is the ONLY way rows
+    /// die.
+    async fn prune_traffic_history(&self, cutoff: &str) -> Result<u64, DbError>;
+
+    /// v1.2.4: fold one status report into the node's hourly metrics bucket.
+    ///
+    /// Called on every report (~10s), so it must be a single UPSERT: sums and
+    /// the sample count accumulate, the maxima take whichever is larger. The
+    /// average is derived at read time from sum/samples so it stays exact
+    /// instead of drifting through repeated incremental updates.
+    async fn record_node_metrics(&self, m: &NodeMetricSample) -> Result<(), DbError>;
+
+    /// Hourly (or daily, when `daily`) metric series per node since `since`.
+    /// Admin-only data — this layer trusts its arguments.
+    async fn query_node_metrics(
+        &self,
+        since: &str,
+        daily: bool,
+    ) -> Result<Vec<NodeMetricBucket>, DbError>;
+
+    /// Delete rows with `hour_ts < cutoff`. Returns rows deleted. Same
+    /// contract as prune_traffic_history — no FK, so this is the only way
+    /// rows die.
+    async fn prune_node_metrics(&self, cutoff: &str) -> Result<u64, DbError>;
+
+    /// v1.2.4: append one audit entry. Best-effort at the call site — see
+    /// service::audit for why a failure here must not undo the operation that
+    /// was just performed.
+    async fn record_audit(&self, e: &NewAuditEntry) -> Result<(), DbError>;
+
+    /// Most recent entries first. `action` filters to one action when given.
+    /// Admin-only data — this layer trusts its arguments.
+    async fn query_audit_log(
+        &self,
+        action: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditEntry>, DbError>;
+
+    /// Total matching rows, for pagination.
+    async fn count_audit_log(&self, action: Option<&str>) -> Result<i64, DbError>;
+
+    /// Delete entries older than `cutoff`. The retention sweeper is the only
+    /// thing that removes them.
+    async fn prune_audit_log(&self, cutoff: &str) -> Result<u64, DbError>;
+}
+
+/// v1.2.4: one site announcement.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct Announcement {
+    pub id: i64,
+    pub title: String,
+    pub content: String,
+    /// "info" | "success" | "warning" | "error".
+    pub kind: String,
+    pub pinned: bool,
+    pub published_at: String,
+    /// None = never auto-hides.
+    pub expires_at: Option<String>,
+    pub author_id: Option<i64>,
+    /// Snapshot of who posted it — survives deletion of that admin account.
+    pub author_name: String,
+}
+
+/// The writable half, for create and update.
+#[derive(Debug, Clone)]
+pub struct NewAnnouncement {
+    pub title: String,
+    pub content: String,
+    pub kind: String,
+    pub pinned: bool,
+    pub published_at: String,
+    pub expires_at: Option<String>,
+    pub author_id: Option<i64>,
+    pub author_name: String,
+}
+
+// ── Announcements (v1.2.4) ──
+
+#[async_trait]
+pub trait AnnouncementRepository: Send + Sync {
+    /// The notice the banner shows, or None.
+    ///
+    /// Pinned first, then newest, with expired rows excluded. `now` is passed
+    /// in rather than read here so one clock decides and tests can pin it.
+    async fn active_announcement(&self, now: &str) -> Result<Option<Announcement>, DbError>;
+
+    /// History, newest first. `include_expired` is what separates the user's
+    /// archive (true — reading old notices is the point) from callers that
+    /// only want live ones.
+    async fn list_announcements(
+        &self,
+        include_expired: bool,
+        now: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Announcement>, DbError>;
+
+    async fn count_announcements(&self, include_expired: bool, now: &str) -> Result<i64, DbError>;
+
+    async fn find_announcement(&self, id: i64) -> Result<Option<Announcement>, DbError>;
+
+    async fn create_announcement(&self, a: &NewAnnouncement) -> Result<i64, DbError>;
+
+    /// Returns rows affected: 0 = no such id.
+    async fn update_announcement(&self, id: i64, a: &NewAnnouncement) -> Result<u64, DbError>;
+
+    async fn delete_announcement(&self, id: i64) -> Result<u64, DbError>;
+
+    /// Highest announcement id, or 0 when there are none.
+    ///
+    /// Drives the header bell's unread dot: the client stores the id it last
+    /// looked at and compares. Deliberately the id and not a timestamp —
+    /// editing an old notice must not re-notify everyone, and only a new row
+    /// raises the maximum.
+    async fn latest_announcement_id(&self) -> Result<i64, DbError>;
+}
+
+/// An audit entry being written.
+///
+/// `detail` MUST NOT contain secrets. Record that a token was rotated, never
+/// the token; that notification settings changed, never the credentials.
+#[derive(Debug, Clone)]
+pub struct NewAuditEntry {
+    pub ts: String,
+    /// None for actions with no authenticated actor (system/scheduler).
+    pub actor_id: Option<i64>,
+    /// Snapshot of the actor's username — survives deletion of the account.
+    pub actor_name: String,
+    pub action: String,
+    pub target_type: String,
+    /// TEXT because targets are not uniformly numeric (rule id vs node id).
+    pub target_id: String,
+    pub detail: String,
+}
+
+/// An audit entry being read back.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub ts: String,
+    pub actor_id: Option<i64>,
+    pub actor_name: String,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub detail: String,
+}
+
+/// One status report, reduced to the fields the history keeps.
+#[derive(Debug, Clone)]
+pub struct NodeMetricSample {
+    pub node_id: String,
+    pub group_id: i64,
+    /// 'YYYY-MM-DD HH:00:00' UTC — the bucket this sample lands in.
+    pub hour_ts: String,
+    pub cpu: f64,
+    pub mem: f64,
+    pub connections: i64,
+}
+
+/// One point of the node-metric series, per (bucket, node).
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct NodeMetricBucket {
+    /// 'YYYY-MM-DD HH:00:00' (hourly) or 'YYYY-MM-DD' (daily), UTC.
+    pub bucket: String,
+    pub node_id: String,
+    pub group_id: i64,
+    /// The group's name at query time, or "#id" once the group is deleted —
+    /// resolved in SQL so the chart legend needs no second round trip.
+    pub group_name: String,
+    pub cpu_avg: f64,
+    pub cpu_max: f64,
+    pub mem_avg: f64,
+    pub mem_max: f64,
+    pub conn_avg: f64,
+    pub conn_max: i64,
+}
+
+/// One point of the traffic-history series, per (bucket, line).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
+pub struct TrafficHistoryBucket {
+    /// 'YYYY-MM-DD HH:00:00' (hourly) or 'YYYY-MM-DD' (daily), UTC.
+    pub bucket: String,
+    /// v1.2.0: the inbound device group (line) this slice belongs to. 0 =
+    /// unknown — pre-column history whose rule has since been deleted, so the
+    /// attribution is unrecoverable.
+    pub group_id: i64,
+    /// The group's name at query time, or "#id" once the group is deleted.
+    /// Resolved in SQL so the chart legend needs no second round trip.
+    pub group_name: String,
+    pub real_upload: i64,
+    pub real_download: i64,
+    /// What was actually charged against quota in this bucket — the chart's
+    /// primary series, so it can never disagree with the quota numbers.
+    pub billed_total: i64,
 }
 
 // ── KVS (generic key-value) ──
@@ -1353,6 +1570,72 @@ pub trait PlanRepository: Send + Sync {
     ) -> Result<(), BuyPlanError>;
 }
 
+/// v1.2.0: redeem codes (balance top-up). Its own trait rather than more
+/// methods on `PlanRepository` — a code isn't a plan, and the existing repo
+/// layer is already split by concern.
+#[async_trait]
+pub trait RedeemRepository: Send + Sync {
+    /// Insert a generated batch in ONE transaction. Returns how many rows
+    /// landed. A duplicate `code` (astronomically unlikely, but possible) is
+    /// skipped rather than failing the whole batch — an admin asking for 100
+    /// codes would rather get 99 than an error.
+    async fn create_redeem_codes(&self, codes: &[NewRedeemCode]) -> Result<u64, DbError>;
+
+    /// Redeem `code` for `user_id`, crediting the balance ATOMICALLY.
+    ///
+    /// The whole thing is one transaction, and the code is claimed with a
+    /// CONDITIONAL update (`WHERE status = 'unused'`) whose affected-row count
+    /// is checked. That combination is what makes a double-redeem impossible:
+    /// two concurrent requests for the same code both try the update, exactly
+    /// one sees `rows_affected == 1`, and the loser's transaction rolls back
+    /// without touching the balance.
+    ///
+    /// `now` is passed in (not read from the clock here) so expiry is evaluated
+    /// against the same instant the caller used, and so tests can pin it.
+    ///
+    /// Returns the credited amount and the user's NEW balance, both canonical
+    /// strings, for the success message.
+    async fn redeem_code(
+        &self,
+        code: &str,
+        user_id: i64,
+        now: &str,
+    ) -> Result<(String, String), RedeemCodeError>;
+
+    /// v1.2.4: the codes a given user redeemed, newest first.
+    ///
+    /// Separate from `list_redeem_codes` rather than another filter on it: this
+    /// one is reachable by a NON-admin (their own account page), so the uid
+    /// filter must be structural, not one more optional field that a future
+    /// caller could forget to set.
+    async fn list_redeem_codes_by_user(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<relay_shared::models::RedeemCode>, DbError>;
+
+    /// List codes for the admin UI, newest first.
+    async fn list_redeem_codes(
+        &self,
+        filter: &RedeemCodeFilter,
+    ) -> Result<Vec<relay_shared::models::RedeemCode>, DbError>;
+
+    /// Count codes matching a filter (for pagination + batch summaries).
+    async fn count_redeem_codes(&self, filter: &RedeemCodeFilter) -> Result<i64, DbError>;
+
+    /// Void an UNUSED code so it can never be redeemed. Returns rows affected;
+    /// 0 means it was already used or voided. A used code is never voidable —
+    /// the money already moved, and rewriting that row would falsify the audit
+    /// trail.
+    async fn void_redeem_code(&self, id: i64) -> Result<u64, DbError>;
+
+    /// Delete codes that were never used. Returns rows deleted.
+    ///
+    /// Deliberately refuses to delete `used` rows: they are the record of money
+    /// entering the system. Cleaning up a mis-generated batch is legitimate;
+    /// erasing a redemption is not.
+    async fn delete_unused_redeem_codes(&self, ids: &[i64]) -> Result<u64, DbError>;
+}
+
 /// v1.0.8: errors from the atomic purchase transaction.
 #[derive(Debug)]
 pub enum BuyPlanError {
@@ -1374,6 +1657,54 @@ impl From<DbError> for BuyPlanError {
     fn from(e: DbError) -> Self {
         BuyPlanError::Database(e)
     }
+}
+
+/// v1.2.0: outcome of redeeming a top-up code.
+#[derive(Debug)]
+pub enum RedeemCodeError {
+    /// No such code, already used, or voided. ONE variant on purpose — see
+    /// `models::RedeemError::NotRedeemable`: distinguishing "doesn't exist"
+    /// from "already used" tells a stranger which guesses were real codes.
+    NotRedeemable,
+    /// Exists and unused, but past `expires_at`.
+    Expired,
+    /// Crediting would exceed `money::MAX_BALANCE_CENTS`.
+    BalanceOverflow,
+    /// DB error. Caller → 500.
+    Database(DbError),
+}
+
+impl From<DbError> for RedeemCodeError {
+    fn from(e: DbError) -> Self {
+        RedeemCodeError::Database(e)
+    }
+}
+
+impl From<sqlx::Error> for RedeemCodeError {
+    fn from(e: sqlx::Error) -> Self {
+        RedeemCodeError::Database(DbError::from(e))
+    }
+}
+
+/// v1.2.0: one code to insert in a generation batch. `code` is the STORED form
+/// (no dashes, upper-case); `amount` is a canonical balance string.
+#[derive(Debug, Clone)]
+pub struct NewRedeemCode {
+    pub code: String,
+    pub amount: String,
+    pub expires_at: Option<String>,
+    pub batch_id: String,
+    pub remark: String,
+}
+
+/// v1.2.0: filter for listing codes in the admin UI.
+#[derive(Debug, Clone, Default)]
+pub struct RedeemCodeFilter {
+    /// "unused" | "used" | "void"; None = all.
+    pub status: Option<String>,
+    pub batch_id: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 impl From<sqlx::Error> for BuyPlanError {
@@ -1451,6 +1782,17 @@ pub trait SettingsRepository: Send + Sync {
         allowed_plan_ids: &[i64],
         site_name: &str,
     ) -> Result<(), DbError>;
+    /// Atomically update the expanded site JSON and the legacy site_name column.
+    ///
+    /// The public registration-status contract still exposes app_settings while
+    /// newer clients read the JSON config. One transaction prevents those two
+    /// compatibility surfaces from observing different committed names.
+    async fn set_site_config_compatible(
+        &self,
+        config_key: &str,
+        config_json: &str,
+        site_name: &str,
+    ) -> Result<(), DbError>;
     /// Validate every referenced plan while holding locks that serialize with
     /// checked plan deletion, then write the complete settings row atomically.
     async fn set_system_settings_checked(
@@ -1469,6 +1811,12 @@ pub trait SettingsRepository: Send + Sync {
 pub trait OrderRepository: Send + Sync {
     /// List a user's orders, newest first.
     async fn list_orders_by_user(&self, user_id: i64) -> Result<Vec<Order>, DbError>;
+    /// v1.2.4: every user's orders, newest first, for the admin view.
+    ///
+    /// Paginated rather than returning the lot: this table only grows, and the
+    /// per-user list it sits beside is naturally small enough not to need it.
+    async fn list_all_orders(&self, limit: i64, offset: i64) -> Result<Vec<Order>, DbError>;
+    async fn count_all_orders(&self) -> Result<i64, DbError>;
     /// Insert an order row (snapshots plan_name + price). Used inside the
     /// purchase transaction.
     async fn insert_order(
@@ -1496,6 +1844,8 @@ pub trait Repository:
     + PlanRepository
     + SettingsRepository
     + OrderRepository
+    + RedeemRepository
+    + AnnouncementRepository
     + Send
     + Sync
 {

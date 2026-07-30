@@ -195,6 +195,13 @@ impl TrafficRepository for SqliteRepository {
         // trips + no double-counting).
         // v1.0.8: forward_rules += REAL bytes (up+down); users += BILLED bytes
         // (billed_delta = round((up+down) * rate)). ──
+        // v1.2.0: one hour bucket for the whole batch. Nodes report every ~10s,
+        // so history MUST accumulate into (rule, hour) rows — an insert per
+        // report would be ~8.6k rows/rule/day. Computed once so every rule in
+        // the batch lands in the same bucket even across an hour rollover
+        // mid-loop.
+        let hour_ts = chrono::Utc::now().format("%Y-%m-%d %H:00:00").to_string();
+
         for r in &resolved {
             let up = r.delta_up as i64;
             let down = r.delta_down as i64;
@@ -211,9 +218,199 @@ impl TrafficRepository for SqliteRepository {
                 .bind(r.uid)
                 .execute(&mut *tx)
                 .await?;
+            // v1.2.0: history accumulates the SAME billed_delta charged to the
+            // user above — inside the same tx, so the chart and the quota can
+            // never disagree, not even by a crashed half-batch.
+            sqlx::query(
+                "INSERT INTO traffic_history \
+                   (rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(rule_id, group_id, hour_ts) DO UPDATE SET \
+                   real_upload = real_upload + excluded.real_upload, \
+                   real_download = real_download + excluded.real_download, \
+                   billed_total = billed_total + excluded.billed_total",
+            )
+            .bind(r.rule_id)
+            .bind(r.uid)
+            // v1.2.0: the batch's group. A rule belongs to exactly one inbound
+            // group, and pass 2 already verified ownership against THIS group,
+            // so it is the rule's group by construction. It is part of the
+            // conflict key so moving a rule does not relabel earlier traffic.
+            .bind(group_id)
+            .bind(&hour_ts)
+            .bind(up)
+            .bind(down)
+            .bind(r.billed_delta)
+            .execute(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
         Ok(vec![TrafficEntryResult::Ok])
+    }
+
+    async fn query_traffic_history(
+        &self,
+        uid: Option<i64>,
+        rule_id: Option<i64>,
+        since: &str,
+        daily: bool,
+    ) -> Result<Vec<TrafficHistoryBucket>, DbError> {
+        // Two statements rather than a parameterised bucket expression — the
+        // GROUP BY column can't be a bind parameter. COALESCE folds the two
+        // optional filters into one prepared statement each (the statistics
+        // query's trick).
+        //
+        // v1.2.0: grouped by (bucket, line). The LEFT JOIN resolves the name
+        // for the legend but never gates the row — a deleted group must still
+        // show its history, labelled "#id", rather than vanishing from the
+        // chart (which is the whole reason group_id is a stored snapshot).
+        let sql = if daily {
+            "SELECT substr(th.hour_ts, 1, 10) AS bucket, \
+                    th.group_id AS group_id, \
+                    COALESCE(dg.name, '#' || th.group_id) AS group_name, \
+                    SUM(th.real_upload) AS real_upload, \
+                    SUM(th.real_download) AS real_download, \
+                    SUM(th.billed_total) AS billed_total \
+             FROM traffic_history th \
+             LEFT JOIN device_groups dg ON dg.id = th.group_id \
+             WHERE th.hour_ts >= ? AND th.uid = COALESCE(?, th.uid) \
+               AND th.rule_id = COALESCE(?, th.rule_id) \
+             GROUP BY bucket, th.group_id, group_name ORDER BY bucket, th.group_id"
+        } else {
+            "SELECT th.hour_ts AS bucket, \
+                    th.group_id AS group_id, \
+                    COALESCE(dg.name, '#' || th.group_id) AS group_name, \
+                    SUM(th.real_upload) AS real_upload, \
+                    SUM(th.real_download) AS real_download, \
+                    SUM(th.billed_total) AS billed_total \
+             FROM traffic_history th \
+             LEFT JOIN device_groups dg ON dg.id = th.group_id \
+             WHERE th.hour_ts >= ? AND th.uid = COALESCE(?, th.uid) \
+               AND th.rule_id = COALESCE(?, th.rule_id) \
+             GROUP BY bucket, th.group_id, group_name ORDER BY bucket, th.group_id"
+        };
+        Ok(sqlx::query_as(sql)
+            .bind(since)
+            .bind(uid)
+            .bind(rule_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn prune_traffic_history(&self, cutoff: &str) -> Result<u64, DbError> {
+        Ok(sqlx::query("DELETE FROM traffic_history WHERE hour_ts < ?")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
+    async fn record_node_metrics(&self, m: &NodeMetricSample) -> Result<(), DbError> {
+        // One UPSERT per report. Sums and the sample count accumulate; the
+        // maxima keep whichever is larger, so a spike survives even when the
+        // hour's average is unremarkable — which is the entire point of storing
+        // both.
+        sqlx::query(
+            "INSERT INTO node_metrics_history                  (node_id, group_id, hour_ts, samples, cpu_sum, cpu_max,                   mem_sum, mem_max, conn_sum, conn_max)              VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)              ON CONFLICT(node_id, hour_ts) DO UPDATE SET                  group_id = excluded.group_id,                  samples  = node_metrics_history.samples + 1,                  cpu_sum  = node_metrics_history.cpu_sum + excluded.cpu_sum,                  cpu_max  = MAX(node_metrics_history.cpu_max, excluded.cpu_max),                  mem_sum  = node_metrics_history.mem_sum + excluded.mem_sum,                  mem_max  = MAX(node_metrics_history.mem_max, excluded.mem_max),                  conn_sum = node_metrics_history.conn_sum + excluded.conn_sum,                  conn_max = MAX(node_metrics_history.conn_max, excluded.conn_max)",
+        )
+        .bind(&m.node_id)
+        .bind(m.group_id)
+        .bind(&m.hour_ts)
+        .bind(m.cpu)
+        .bind(m.cpu)
+        .bind(m.mem)
+        .bind(m.mem)
+        .bind(m.connections)
+        .bind(m.connections)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn query_node_metrics(
+        &self,
+        since: &str,
+        daily: bool,
+    ) -> Result<Vec<NodeMetricBucket>, DbError> {
+        // Averages are computed here from sum/samples rather than stored, so
+        // rolling hours up into a day stays correct: summing the sums and the
+        // counts separately weights each hour by how many samples it actually
+        // had, which averaging the averages would not.
+        //
+        // The LEFT JOIN resolves the group name for the legend but never gates
+        // the row — a deleted group must still show its history as "#id".
+        let sql = if daily {
+            "SELECT substr(nm.hour_ts, 1, 10) AS bucket,                     nm.node_id AS node_id,                     nm.group_id AS group_id,                     COALESCE(dg.name, '#' || nm.group_id) AS group_name,                     SUM(nm.cpu_sum) / MAX(SUM(nm.samples), 1) AS cpu_avg,                     MAX(nm.cpu_max) AS cpu_max,                     SUM(nm.mem_sum) / MAX(SUM(nm.samples), 1) AS mem_avg,                     MAX(nm.mem_max) AS mem_max,                     CAST(SUM(nm.conn_sum) AS REAL) / MAX(SUM(nm.samples), 1) AS conn_avg,                     MAX(nm.conn_max) AS conn_max              FROM node_metrics_history nm              LEFT JOIN device_groups dg ON dg.id = nm.group_id              WHERE nm.hour_ts >= ?              GROUP BY bucket, nm.node_id, nm.group_id, group_name              ORDER BY bucket, nm.node_id"
+        } else {
+            "SELECT nm.hour_ts AS bucket,                     nm.node_id AS node_id,                     nm.group_id AS group_id,                     COALESCE(dg.name, '#' || nm.group_id) AS group_name,                     nm.cpu_sum / MAX(nm.samples, 1) AS cpu_avg,                     nm.cpu_max AS cpu_max,                     nm.mem_sum / MAX(nm.samples, 1) AS mem_avg,                     nm.mem_max AS mem_max,                     CAST(nm.conn_sum AS REAL) / MAX(nm.samples, 1) AS conn_avg,                     nm.conn_max AS conn_max              FROM node_metrics_history nm              LEFT JOIN device_groups dg ON dg.id = nm.group_id              WHERE nm.hour_ts >= ?              ORDER BY nm.hour_ts, nm.node_id"
+        };
+        Ok(sqlx::query_as(sql)
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn prune_node_metrics(&self, cutoff: &str) -> Result<u64, DbError> {
+        Ok(
+            sqlx::query("DELETE FROM node_metrics_history WHERE hour_ts < ?")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    async fn record_audit(&self, e: &NewAuditEntry) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO audit_log                  (ts, actor_id, actor_name, action, target_type, target_id, detail)              VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&e.ts)
+        .bind(e.actor_id)
+        .bind(&e.actor_name)
+        .bind(&e.action)
+        .bind(&e.target_type)
+        .bind(&e.target_id)
+        .bind(&e.detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn query_audit_log(
+        &self,
+        action: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditEntry>, DbError> {
+        // COALESCE folds the optional filter into one prepared statement, the
+        // same trick the statistics and traffic-history queries use.
+        // Ordered by id, not ts: several entries can share a second, and only
+        // the id gives a stable total order for pagination.
+        Ok(sqlx::query_as(
+            "SELECT id, ts, actor_id, actor_name, action, target_type, target_id, detail              FROM audit_log              WHERE action = COALESCE(?, action)              ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(action)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn count_audit_log(&self, action: Option<&str>) -> Result<i64, DbError> {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM audit_log WHERE action = COALESCE(?, action)")
+                .bind(action)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n)
+    }
+
+    async fn prune_audit_log(&self, cutoff: &str) -> Result<u64, DbError> {
+        Ok(sqlx::query("DELETE FROM audit_log WHERE ts < ?")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
     }
 }

@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { RouterProvider } from 'react-router-dom';
 import { ConfigProvider } from 'antd';
 import zhCN_antd from 'antd/locale/zh_CN';
@@ -7,10 +8,14 @@ import { rpTheme } from './styles/antdTheme';
 import { LanguageProvider } from './i18n';
 import { useI18n } from './i18n/context';
 import { AuthProvider } from './auth/AuthContext';
-import { SiteConfigProvider } from './site/SiteConfigProvider';
+import { useSite } from './hooks/useSite';
 
 function AppInner() {
   const { lang } = useI18n();
+  const site = useSite();
+  useEffect(() => {
+    if (site.site_name) document.title = site.site_name;
+  }, [site.site_name]);
   return (
     <ConfigProvider theme={rpTheme} locale={lang === 'zh-CN' ? zhCN_antd : enUS_antd}>
       {/* v0.4.10: AuthProvider wraps the router so every route + the axios
@@ -25,9 +30,7 @@ function AppInner() {
 function App() {
   return (
     <LanguageProvider>
-      <SiteConfigProvider>
-        <AppInner />
-      </SiteConfigProvider>
+      <AppInner />
     </LanguageProvider>
   );
 }

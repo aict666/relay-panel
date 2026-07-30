@@ -1,5 +1,5 @@
 import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Typography, Tag, Tooltip, Alert, Switch, Checkbox } from 'antd';
-import { PlusOutlined, ReloadOutlined, CopyOutlined, EditOutlined, CloudServerOutlined, CodeOutlined, ApiOutlined } from '@ant-design/icons';
+import { PlusOutlined, ReloadOutlined, CopyOutlined, EditOutlined, CloudServerOutlined, CodeOutlined, ApiOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, BlockedProtocol, DeviceGroup, NodeStatus, SharedGroupSummary } from '../api/types';
@@ -49,6 +49,9 @@ export default function Groups() {
   const [cmdModalOpen, setCmdModalOpen] = useState(false);
   const [cmdModalContent, setCmdModalContent] = useState<{ title: ReactNode; body: ReactNode }>({ title: null, body: null });
   const [editing, setEditing] = useState<DeviceGroup | null>(null);
+  const [rotating, setRotating] = useState<DeviceGroup | null>(null);
+  const [confirmName, setConfirmName] = useState('');
+  const [rotateBusy, setRotateBusy] = useState(false);
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
   const createGroupType = Form.useWatch('group_type', createForm);
@@ -75,6 +78,8 @@ export default function Groups() {
       setCreateOpen(false);
       setEditOpen(false);
       setEditing(null);
+      setRotating(null);
+      setConfirmName('');
     }
     setLoading(true);
     setLoadFailed(false);
@@ -115,7 +120,7 @@ export default function Groups() {
   }, [authScope, isAdmin, t]);
 
   useEffect(() => { load(); }, [load]);
-  const mutationsBlocked = loading || loadFailed || saving;
+  const mutationsBlocked = loading || loadFailed || saving || rotateBusy;
 
   // ── Node helpers ──
   const nodesByGroup = useCallback((groupId: number): NodeStatus[] => {
@@ -271,6 +276,52 @@ export default function Groups() {
     setCmdModalContent({ title: null, body: null });
   };
 
+  const handleRotateToken = async () => {
+    if (!isAdmin || !rotating || mutationsBlocked) return;
+    const rotatingGroup = rotating;
+    const requestScope = authScope;
+    setRotateBusy(true);
+    try {
+      const res = await api.post<unknown, ApiEnvelope<{ token: string }>>(
+        `/groups/${rotatingGroup.id}/rotate-token`,
+      );
+      if (res.code !== 0 || !res.data) {
+        message.error(res.message || t('tokenRotateFailed'));
+        return;
+      }
+      const newToken = res.data.token;
+      const panelUrl = await panelUrlRef();
+      if (desiredScopeRef.current !== requestScope) return;
+      const command = buildInstallCommand(INSTALL_SCRIPT_URL, newToken, panelUrl);
+      setRotating(null);
+      setConfirmName('');
+      await load();
+      if (desiredScopeRef.current !== requestScope) return;
+      setCmdModalContent({
+        title: <span>{t('tokenRotated')}</span>,
+        body: (
+          <>
+            <Alert type="warning" showIcon style={{ marginBottom: 12 }} title={t('tokenRotatedHint')} />
+            <div style={{ marginBottom: 6 }}><Text strong>{t('nodeToken')}</Text></div>
+            <Input value={newToken} readOnly style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 12, marginBottom: 12 }} />
+            <div style={{ marginBottom: 6 }}><Text strong>{t('installCommandTitle')}</Text></div>
+            <Input.TextArea value={command} readOnly autoSize={{ minRows: 3, maxRows: 5 }} style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 12 }} />
+            <div style={{ textAlign: 'right', marginTop: 8 }}>
+              <Button type="primary" icon={<CopyOutlined />} onClick={() => doCopy(command, t('installCommandCopied'))}>
+                {t('copyInstallCommand')}
+              </Button>
+            </div>
+          </>
+        ),
+      });
+      setCmdModalOpen(true);
+    } catch {
+      message.error(t('tokenRotateFailed'));
+    } finally {
+      setRotateBusy(false);
+    }
+  };
+
   const typeColor = (gt: string) => {
     switch (gt) {
       case 'in': return 'green';
@@ -360,10 +411,24 @@ export default function Groups() {
         hidden ? <Tag>{t('yes')}</Tag> : <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>,
     },
     {
-      title: t('action'), key: 'action', width: 120, fixed: 'right' as const,
+      title: t('action'), key: 'action', width: 220, fixed: 'right' as const,
       render: (_: unknown, g: DeviceGroup | SharedGroupSummary) => isAdmin && 'token' in g ? (
-        <Space>
+        <Space size={0}>
           <Button size="small" type="text" icon={<EditOutlined />} disabled={mutationsBlocked} onClick={() => handleEdit(g)}>{t('edit')}</Button>
+          <Tooltip title={t('rotateTokenHint')}>
+            <Button
+              size="small"
+              type="text"
+              icon={<SafetyCertificateOutlined />}
+              disabled={mutationsBlocked}
+              onClick={() => {
+                setConfirmName('');
+                setRotating(g);
+              }}
+            >
+              {t('rotateToken')}
+            </Button>
+          </Tooltip>
           <Popconfirm title={t('deleteGroupConfirm')} onConfirm={() => handleDelete(g.id)}>
             <Button danger size="small" type="text" disabled={mutationsBlocked}>{t('delete')}</Button>
           </Popconfirm>
@@ -418,7 +483,7 @@ export default function Groups() {
       <div className="rp-page-header">
         <h2 className="rp-page-title"><CloudServerOutlined /> {t('deviceGroups')}</h2>
         <Space className="rp-page-actions" wrap>
-          <Button icon={<ReloadOutlined />} loading={loading} disabled={saving || createOpen || editOpen || cmdModalOpen} onClick={load}>{t('refresh')}</Button>
+          <Button icon={<ReloadOutlined />} loading={loading} disabled={saving || rotateBusy || createOpen || editOpen || cmdModalOpen || !!rotating} onClick={load}>{t('refresh')}</Button>
           {isAdmin && <Button type="primary" icon={<PlusOutlined />} disabled={mutationsBlocked} onClick={() => setCreateOpen(true)}>{t('addGroup')}</Button>}
         </Space>
       </div>
@@ -498,6 +563,47 @@ export default function Groups() {
 
       <Modal title={cmdModalContent.title} open={cmdModalOpen} onCancel={closeCommand} footer={null} width={580}>
         {cmdModalContent.body}
+      </Modal>
+
+      <Modal
+        title={t('rotateTokenConfirmTitle')}
+        open={!!rotating}
+        onCancel={() => {
+          if (!rotateBusy) {
+            setRotating(null);
+            setConfirmName('');
+          }
+        }}
+        onOk={handleRotateToken}
+        okText={t('rotateTokenConfirmOk')}
+        cancelText={t('cancel')}
+        confirmLoading={rotateBusy}
+        okButtonProps={{
+          danger: true,
+          disabled: rotateBusy || confirmName.trim() !== (rotating?.name ?? ''),
+        }}
+      >
+        {rotating && (
+          <>
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 12 }}
+              title={t('rotateTokenWarnTitle').replace('{count}', String(nodeCount(rotating.id)))}
+              description={t('rotateTokenWarnDesc')}
+            />
+            <div style={{ marginBottom: 6 }}>
+              {t('rotateTokenTypeName').replace('{name}', rotating.name)}
+            </div>
+            <Input
+              value={confirmName}
+              onChange={(event) => setConfirmName(event.target.value)}
+              placeholder={rotating.name}
+              autoComplete="off"
+              disabled={rotateBusy}
+            />
+          </>
+        )}
       </Modal>
     </>
   );

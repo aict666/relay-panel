@@ -241,13 +241,86 @@ CREATE TABLE IF NOT EXISTS statistics (
 -- v1.0.8: purchase history (mirrors SQLite baseline + Migration 34).
 CREATE TABLE IF NOT EXISTS orders (
     id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- Purchase history outlives the account; retain the numeric buyer id.
+    user_id BIGINT NOT NULL,
     plan_id BIGINT,
     plan_name TEXT NOT NULL,
     price TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
 );
 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
+
+CREATE TABLE IF NOT EXISTS redeem_codes (
+    id BIGSERIAL PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    amount TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'unused',
+    used_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    used_at TEXT,
+    expires_at TEXT,
+    batch_id TEXT NOT NULL DEFAULT '',
+    remark TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
+);
+CREATE INDEX IF NOT EXISTS idx_redeem_codes_status ON redeem_codes(status);
+CREATE INDEX IF NOT EXISTS idx_redeem_codes_batch ON redeem_codes(batch_id);
+CREATE INDEX IF NOT EXISTS idx_redeem_codes_used_by ON redeem_codes(used_by);
+
+CREATE TABLE IF NOT EXISTS traffic_history (
+    rule_id BIGINT NOT NULL,
+    uid BIGINT NOT NULL,
+    group_id BIGINT NOT NULL DEFAULT 0,
+    hour_ts TEXT NOT NULL,
+    real_upload BIGINT NOT NULL DEFAULT 0,
+    real_download BIGINT NOT NULL DEFAULT 0,
+    billed_total BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (rule_id, group_id, hour_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts);
+CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts);
+
+CREATE TABLE IF NOT EXISTS node_metrics_history (
+    node_id TEXT NOT NULL,
+    group_id BIGINT NOT NULL DEFAULT 0,
+    hour_ts TEXT NOT NULL,
+    samples BIGINT NOT NULL DEFAULT 0,
+    cpu_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+    cpu_max DOUBLE PRECISION NOT NULL DEFAULT 0,
+    mem_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+    mem_max DOUBLE PRECISION NOT NULL DEFAULT 0,
+    conn_sum BIGINT NOT NULL DEFAULT 0,
+    conn_max BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (node_id, hour_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_node_metrics_hour ON node_metrics_history(hour_ts);
+CREATE INDEX IF NOT EXISTS idx_node_metrics_group ON node_metrics_history(group_id, hour_ts);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    ts TEXT NOT NULL,
+    actor_id BIGINT,
+    actor_name TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL DEFAULT '',
+    target_id TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, ts);
+
+CREATE TABLE IF NOT EXISTS announcements (
+    id BIGSERIAL PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'info',
+    pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    published_at TEXT NOT NULL,
+    expires_at TEXT,
+    author_id BIGINT,
+    author_name TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_announcements_published ON announcements(published_at);
+CREATE INDEX IF NOT EXISTS idx_announcements_pinned ON announcements(pinned, published_at);
 
 -- v1.0.9: plan ↔ device_group grant map (mirrors SQLite baseline + Migration 35).
 CREATE TABLE IF NOT EXISTS plan_device_groups (
@@ -356,7 +429,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 34;
+pub const PG_SCHEMA_VERSION: i32 = 42;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1519,6 +1592,239 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 34: device_groups.blocked_protocols present");
     }
 
+    // Revisions 35-40 intentionally rebase the upstream public-feature
+    // migrations after this fork's already-published revisions 22-34.
+    if current < 35 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS redeem_codes (
+                id BIGSERIAL PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE,
+                amount TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'unused',
+                used_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+                used_at TEXT,
+                expires_at TEXT,
+                batch_id TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_redeem_codes_status ON redeem_codes(status)",
+            "CREATE INDEX IF NOT EXISTS idx_redeem_codes_batch ON redeem_codes(batch_id)",
+            "CREATE INDEX IF NOT EXISTS idx_redeem_codes_used_by ON redeem_codes(used_by)",
+        ] {
+            sqlx::query(idx).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (35) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    if current < 36 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS traffic_history (
+                rule_id BIGINT NOT NULL,
+                uid BIGINT NOT NULL,
+                group_id BIGINT NOT NULL DEFAULT 0,
+                hour_ts TEXT NOT NULL,
+                real_upload BIGINT NOT NULL DEFAULT 0,
+                real_download BIGINT NOT NULL DEFAULT 0,
+                billed_total BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (rule_id, group_id, hour_ts)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts)",
+            "CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts)",
+        ] {
+            sqlx::query(idx).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (36) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    if current < 37 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE traffic_history ADD COLUMN IF NOT EXISTS group_id BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_traffic_history_group ON traffic_history(group_id, hour_ts)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        let backfilled = sqlx::query(
+            "UPDATE traffic_history th SET group_id = fr.device_group_in
+             FROM forward_rules fr
+             WHERE fr.id = th.rule_id AND th.group_id = 0",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (37) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!(
+            "PG migration 37: traffic history line snapshot present ({} row(s) backfilled)",
+            backfilled
+        );
+    }
+
+    if current < 38 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS node_metrics_history (
+                node_id TEXT NOT NULL,
+                group_id BIGINT NOT NULL DEFAULT 0,
+                hour_ts TEXT NOT NULL,
+                samples BIGINT NOT NULL DEFAULT 0,
+                cpu_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                cpu_max DOUBLE PRECISION NOT NULL DEFAULT 0,
+                mem_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                mem_max DOUBLE PRECISION NOT NULL DEFAULT 0,
+                conn_sum BIGINT NOT NULL DEFAULT 0,
+                conn_max BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (node_id, hour_ts)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_node_metrics_hour ON node_metrics_history(hour_ts)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_node_metrics_group ON node_metrics_history(group_id, hour_ts)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (38) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    if current < 39 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS audit_log (
+                id BIGSERIAL PRIMARY KEY,
+                ts TEXT NOT NULL,
+                actor_id BIGINT,
+                actor_name TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL DEFAULT '',
+                target_id TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, ts)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (39) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    if current < 40 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS announcements (
+                id BIGSERIAL PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'info',
+                pinned BOOLEAN NOT NULL DEFAULT FALSE,
+                published_at TEXT NOT NULL,
+                expires_at TEXT,
+                author_id BIGINT,
+                author_name TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_announcements_published ON announcements(published_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_announcements_pinned ON announcements(pinned, published_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (40) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    if current < 41 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_user_id_fkey")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (41) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 41: orders no longer cascade with deleted users");
+    }
+
+    if current < 42 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("ALTER TABLE traffic_history DROP CONSTRAINT IF EXISTS traffic_history_pkey")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "ALTER TABLE traffic_history
+             ADD CONSTRAINT traffic_history_pkey PRIMARY KEY (rule_id, group_id, hour_ts)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (42) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 42: traffic history key includes group_id");
+    }
+
     Ok(())
 }
 
@@ -1531,7 +1837,7 @@ mod tests {
         // Keep the early-return guard in run_pg_migrations aligned with the
         // highest ordered migration below. A lower value silently skips newer
         // migrations on existing PostgreSQL databases.
-        assert_eq!(PG_SCHEMA_VERSION, 34);
+        assert_eq!(PG_SCHEMA_VERSION, 42);
     }
 
     // A `;` inside a -- line comment must NOT split a statement. This is the

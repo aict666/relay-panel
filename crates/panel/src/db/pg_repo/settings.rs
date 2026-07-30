@@ -1025,6 +1025,32 @@ impl SettingsRepository for PgRepository {
         Ok(())
     }
 
+    async fn set_site_config_compatible(
+        &self,
+        config_key: &str,
+        config_json: &str,
+        site_name: &str,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO app_settings (id, site_name) VALUES (1, $1)
+             ON CONFLICT(id) DO UPDATE SET site_name = EXCLUDED.site_name",
+        )
+        .bind(site_name)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO kvs (key, value) VALUES ($1, $2)
+             ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(config_key)
+        .bind(config_json)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn set_system_settings_checked(
         &self,
         enabled: bool,

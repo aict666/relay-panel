@@ -19,6 +19,8 @@ import { useI18n } from '../i18n/context';
 import { aggregateNodesByGroup } from '../components/nodes/aggregate';
 import { formatBps, formatBytes } from '../utils/format';
 import DashboardCharts from '../components/dashboard/DashboardCharts';
+import TrafficChart from '../components/TrafficChart';
+import NodeMetricsChart from '../components/NodeMetricsChart';
 
 const { Text } = Typography;
 
@@ -374,6 +376,9 @@ export default function Dashboard() {
           </Col>
         ))}
       </Row>
+
+      <TrafficChart rules={rules.map((rule) => ({ id: rule.id, name: rule.name }))} />
+      <NodeMetricsChart />
 
       <DashboardCharts
         history={history}

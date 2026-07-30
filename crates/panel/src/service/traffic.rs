@@ -10,6 +10,7 @@
 use crate::db::error::DbError;
 use crate::db::repo::TrafficEntryResult;
 use crate::db::Repository;
+use crate::service::notify::{NotifyConfig, ALERT_OBSERVATION_GRACE_SECS, NOTIFY_CONFIG_KEY};
 use relay_shared::protocol::TrafficEntry;
 
 /// Stale-status threshold in seconds. The frontend marks a node offline after
@@ -137,7 +138,14 @@ pub async fn cleanup_legacy_status(db: &dyn Repository, group_id: i64, ip: &str)
     }
 }
 
-/// Remove node_status entries older than [`STALE_STATUS_THRESHOLD_SECS`].
+/// Remove node_status entries after both the UI stale window and the configured
+/// alert threshold have elapsed.
+///
+/// The alert watcher consumes the same rows. Cleaning them at the fixed UI
+/// threshold used to make the default 180-second alert impossible because the
+/// row disappeared after 120 seconds. The extra observation grace guarantees
+/// that the independently scheduled watcher gets at least one chance to see the
+/// threshold crossing.
 /// Parses last_seen from the stored JSON; entries without last_seen are left
 /// alone (conservative — don't delete what we can't age).
 ///
@@ -153,6 +161,11 @@ pub(crate) async fn sweep_stale_status_at(
     db: &dyn Repository,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), DbError> {
+    let notify_raw = db.get(NOTIFY_CONFIG_KEY).await.ok().flatten();
+    let alert_retention = NotifyConfig::from_json(notify_raw.as_deref())
+        .alert_after()
+        .saturating_add(ALERT_OBSERVATION_GRACE_SECS);
+    let retention_secs = STALE_STATUS_THRESHOLD_SECS.max(alert_retention);
     let rows: Vec<(String, String)> = db.scan_prefix("node_status:").await?;
     for (key, value) in &rows {
         let stale = serde_json::from_str::<serde_json::Value>(value)
@@ -163,9 +176,7 @@ pub(crate) async fn sweep_stale_status_at(
                     .map(|s| s.to_string())
             })
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-            .map(|t| {
-                (now - t.with_timezone(&chrono::Utc)).num_seconds() > STALE_STATUS_THRESHOLD_SECS
-            })
+            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() > retention_secs)
             .unwrap_or(false);
         if stale {
             let _ = db
@@ -290,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn stale_status_is_swept_fresh_kept() {
         let pool = kvs_pool().await;
-        let old = (chrono::Utc::now() - chrono::Duration::seconds(900)).to_rfc3339(); // 15 min ago > 2 min threshold
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(900)).to_rfc3339();
         let fresh = chrono::Utc::now().to_rfc3339();
         put_status(&pool, "node_status:1:old", Some("1.1.1.1"), &old).await;
         put_status(&pool, "node_status:1:new", Some("2.2.2.2"), &fresh).await;
@@ -302,6 +313,37 @@ mod tests {
         assert!(
             exists(&pool, "node_status:1:new").await,
             "fresh entry must be kept"
+        );
+    }
+
+    /// Cleanup must not remove the only evidence the alert watcher can consume.
+    /// With the default 180-second alert threshold, a row at 181 seconds is
+    /// already alertable but still needs the independent 30-second watcher to
+    /// observe it before cleanup.
+    #[tokio::test]
+    async fn stale_status_waits_past_notification_threshold() {
+        let pool = kvs_pool().await;
+        let now = chrono::Utc::now();
+        let just_alertable = (now - chrono::Duration::seconds(181)).to_rfc3339();
+        let past_grace = (now - chrono::Duration::seconds(241)).to_rfc3339();
+        put_status(
+            &pool,
+            "node_status:1:alertable",
+            Some("1.1.1.1"),
+            &just_alertable,
+        )
+        .await;
+        put_status(&pool, "node_status:1:expired", Some("2.2.2.2"), &past_grace).await;
+
+        sweep_stale_status_at(&repo(&pool), now).await.unwrap();
+
+        assert!(
+            exists(&pool, "node_status:1:alertable").await,
+            "status must survive through alert threshold plus watcher grace"
+        );
+        assert!(
+            !exists(&pool, "node_status:1:expired").await,
+            "status may be swept after the watcher observation grace"
         );
     }
 

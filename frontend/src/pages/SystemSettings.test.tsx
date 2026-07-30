@@ -1,19 +1,14 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { mockGet, mockPut, mockSetSiteName } = vi.hoisted(() => ({
+const { mockGet, mockPut } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockPut: vi.fn(),
-  mockSetSiteName: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
   default: { get: mockGet, put: mockPut },
 }));
-vi.mock('../site/useSiteConfig', () => ({
-  useSiteConfig: () => ({ siteName: 'RelayPanel', setSiteName: mockSetSiteName }),
-}));
-
 import SystemSettings from './SystemSettings';
 
 const settings = {
@@ -26,7 +21,6 @@ const settings = {
 beforeEach(() => {
   mockGet.mockReset();
   mockPut.mockReset();
-  mockSetSiteName.mockReset();
   mockGet.mockImplementation((url: string) => {
     if (url === '/admin/settings/registration') {
       return Promise.resolve({ code: 0, data: settings });
@@ -39,19 +33,19 @@ beforeEach(() => {
   mockPut.mockResolvedValue({ code: 0, data: { ...settings, site_name: 'My Relay' } });
 });
 
-describe('SystemSettings site name', () => {
-  it('loads, saves, and immediately publishes the configured name', async () => {
+describe('SystemSettings registration policy', () => {
+  it('saves registration policy without overwriting the dedicated site settings', async () => {
     render(<SystemSettings />);
-    const input = await screen.findByLabelText('siteName');
-    expect(input).toHaveValue('RelayPanel');
-
-    fireEvent.change(input, { target: { value: '  My Relay  ' } });
+    expect((await screen.findAllByText('free (5 rules)')).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole('button', { name: 'save' }));
 
     await waitFor(() => expect(mockPut).toHaveBeenCalledWith(
       '/admin/settings/registration',
-      expect.objectContaining({ site_name: 'My Relay' }),
+      {
+        enabled: false,
+        default_plan_id: 1,
+        allowed_plan_ids: [1],
+      },
     ));
-    expect(mockSetSiteName).toHaveBeenCalledWith('My Relay');
   });
 });

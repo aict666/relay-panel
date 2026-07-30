@@ -20,6 +20,12 @@ vi.mock('@ant-design/charts', () => ({
   Pie: () => <div data-testid="pie-chart" />,
   Bar: () => <div data-testid="bar-chart" />,
 }));
+vi.mock('../components/TrafficChart', () => ({
+  default: () => <div data-testid="traffic-history-chart" />,
+}));
+vi.mock('../components/NodeMetricsChart', () => ({
+  default: () => <div data-testid="node-metrics-chart" />,
+}));
 vi.mock('react-router-dom', async () => {
   const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
   return { ...actual, useNavigate: () => mockNavigate };

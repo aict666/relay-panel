@@ -290,13 +290,93 @@ CREATE TABLE IF NOT EXISTS statistics (
 -- the history stays accurate after a plan is later renamed/retired/deleted.
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- Purchase history is an accounting record and intentionally outlives the
+    -- account. Keep the numeric buyer id without a cascading foreign key.
+    user_id INTEGER NOT NULL,
     plan_id INTEGER,
     plan_name TEXT NOT NULL,
     price TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
+
+-- Balance top-up codes. Used rows intentionally outlive a deleted account.
+CREATE TABLE IF NOT EXISTS redeem_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    amount TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'unused',
+    used_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    used_at TEXT,
+    expires_at TEXT,
+    batch_id TEXT NOT NULL DEFAULT '',
+    remark TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_redeem_codes_status ON redeem_codes(status);
+CREATE INDEX IF NOT EXISTS idx_redeem_codes_batch ON redeem_codes(batch_id);
+CREATE INDEX IF NOT EXISTS idx_redeem_codes_used_by ON redeem_codes(used_by);
+
+-- Hourly billed and real traffic snapshots. No parent foreign keys: deleting a
+-- rule or user must not erase already-recorded usage.
+CREATE TABLE IF NOT EXISTS traffic_history (
+    rule_id INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    group_id INTEGER NOT NULL DEFAULT 0,
+    hour_ts TEXT NOT NULL,
+    real_upload INTEGER NOT NULL DEFAULT 0,
+    real_download INTEGER NOT NULL DEFAULT 0,
+    billed_total INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (rule_id, group_id, hour_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts);
+CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts);
+
+-- Hourly per-node CPU, memory and connection rollups.
+CREATE TABLE IF NOT EXISTS node_metrics_history (
+    node_id TEXT NOT NULL,
+    group_id INTEGER NOT NULL DEFAULT 0,
+    hour_ts TEXT NOT NULL,
+    samples INTEGER NOT NULL DEFAULT 0,
+    cpu_sum REAL NOT NULL DEFAULT 0,
+    cpu_max REAL NOT NULL DEFAULT 0,
+    mem_sum REAL NOT NULL DEFAULT 0,
+    mem_max REAL NOT NULL DEFAULT 0,
+    conn_sum INTEGER NOT NULL DEFAULT 0,
+    conn_max INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (node_id, hour_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_node_metrics_hour ON node_metrics_history(hour_ts);
+CREATE INDEX IF NOT EXISTS idx_node_metrics_group ON node_metrics_history(group_id, hour_ts);
+
+-- Queryable administrative audit trail. Names and target identifiers are
+-- snapshots so history remains meaningful after a user or resource is removed.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    actor_id INTEGER,
+    actor_name TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL DEFAULT '',
+    target_id TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, ts);
+
+CREATE TABLE IF NOT EXISTS announcements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'info',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    published_at TEXT NOT NULL,
+    expires_at TEXT,
+    author_id INTEGER,
+    author_name TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_announcements_published ON announcements(published_at);
+CREATE INDEX IF NOT EXISTS idx_announcements_pinned ON announcements(pinned, published_at);
 
 -- v1.0.9: plan ↔ device_group grant map. Buying a plan (with grant_all_groups=0)
 -- REPLACES the user's user_device_groups with these groups (v1.0.8: purchase is
@@ -1767,6 +1847,246 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 50: device_groups.blocked_protocols present");
 
+    // ── Migration 51: balance top-up codes ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS redeem_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            amount TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unused',
+            used_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            used_at TEXT,
+            expires_at TEXT,
+            batch_id TEXT NOT NULL DEFAULT '',
+            remark TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_redeem_codes_status ON redeem_codes(status)",
+        "CREATE INDEX IF NOT EXISTS idx_redeem_codes_batch ON redeem_codes(batch_id)",
+        "CREATE INDEX IF NOT EXISTS idx_redeem_codes_used_by ON redeem_codes(used_by)",
+    ] {
+        sqlx::query(idx).execute(pool).await?;
+    }
+
+    // ── Migrations 52-53: hourly traffic history and line snapshot ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS traffic_history (
+            rule_id INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            group_id INTEGER NOT NULL DEFAULT 0,
+            hour_ts TEXT NOT NULL,
+            real_upload INTEGER NOT NULL DEFAULT 0,
+            real_download INTEGER NOT NULL DEFAULT 0,
+            billed_total INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (rule_id, group_id, hour_ts)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    add_column_if_missing(
+        pool,
+        "traffic_history",
+        "group_id",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_traffic_history_group ON traffic_history(group_id, hour_ts)",
+    ] {
+        sqlx::query(idx).execute(pool).await?;
+    }
+    let backfilled = sqlx::query(
+        "UPDATE traffic_history SET group_id = (
+             SELECT fr.device_group_in FROM forward_rules fr
+             WHERE fr.id = traffic_history.rule_id)
+         WHERE group_id = 0
+           AND EXISTS (SELECT 1 FROM forward_rules fr WHERE fr.id = traffic_history.rule_id)",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    tracing::info!(
+        "Migrations 52-53: traffic_history present ({} row(s) backfilled)",
+        backfilled
+    );
+
+    // ── Migration 54: hourly node metrics ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS node_metrics_history (
+            node_id TEXT NOT NULL,
+            group_id INTEGER NOT NULL DEFAULT 0,
+            hour_ts TEXT NOT NULL,
+            samples INTEGER NOT NULL DEFAULT 0,
+            cpu_sum REAL NOT NULL DEFAULT 0,
+            cpu_max REAL NOT NULL DEFAULT 0,
+            mem_sum REAL NOT NULL DEFAULT 0,
+            mem_max REAL NOT NULL DEFAULT 0,
+            conn_sum INTEGER NOT NULL DEFAULT 0,
+            conn_max INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (node_id, hour_ts)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_node_metrics_hour ON node_metrics_history(hour_ts)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_node_metrics_group ON node_metrics_history(group_id, hour_ts)",
+    )
+    .execute(pool)
+    .await?;
+
+    // ── Migration 55: persistent administrative audit log ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            actor_id INTEGER,
+            actor_name TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL DEFAULT '',
+            target_id TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT ''
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, ts)")
+        .execute(pool)
+        .await?;
+
+    // ── Migration 56: announcement history ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'info',
+            pinned INTEGER NOT NULL DEFAULT 0,
+            published_at TEXT NOT NULL,
+            expires_at TEXT,
+            author_id INTEGER,
+            author_name TEXT NOT NULL DEFAULT ''
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_announcements_published ON announcements(published_at)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_announcements_pinned ON announcements(pinned, published_at)",
+    )
+    .execute(pool)
+    .await?;
+
+    // ── Migration 57: purchase records outlive deleted accounts ──
+    //
+    // SQLite cannot drop a foreign-key constraint in place. Rebuild only old
+    // tables that still have the users FK; fresh databases already use the
+    // non-cascading baseline above.
+    let order_user_fk: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('orders') WHERE \"from\" = 'user_id'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if order_user_fk > 0 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE orders_m57 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                plan_id INTEGER,
+                plan_name TEXT NOT NULL,
+                price TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO orders_m57 (id, user_id, plan_id, plan_name, price, created_at)
+             SELECT id, user_id, plan_id, plan_name, price, created_at FROM orders",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DROP TABLE orders").execute(&mut *tx).await?;
+        sqlx::query("ALTER TABLE orders_m57 RENAME TO orders")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("CREATE INDEX idx_orders_user_id ON orders(user_id)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!("Migration 57: orders no longer cascade with deleted users");
+    }
+
+    // ── Migration 58: preserve per-line ownership within an hour ──
+    //
+    // An existing row may already contain traffic from more than one historic
+    // group because the old key could not distinguish them. That cannot be
+    // reconstructed, but rebuilding the key prevents any further coalescing.
+    let traffic_group_in_pk: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('traffic_history')
+         WHERE name = 'group_id' AND pk > 0",
+    )
+    .fetch_one(pool)
+    .await?;
+    if traffic_group_in_pk == 0 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE traffic_history_m58 (
+                rule_id INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                group_id INTEGER NOT NULL DEFAULT 0,
+                hour_ts TEXT NOT NULL,
+                real_upload INTEGER NOT NULL DEFAULT 0,
+                real_download INTEGER NOT NULL DEFAULT 0,
+                billed_total INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (rule_id, group_id, hour_ts)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO traffic_history_m58
+                (rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total)
+             SELECT rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total
+             FROM traffic_history",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DROP TABLE traffic_history")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("ALTER TABLE traffic_history_m58 RENAME TO traffic_history")
+            .execute(&mut *tx)
+            .await?;
+        for idx in [
+            "CREATE INDEX idx_traffic_history_uid ON traffic_history(uid, hour_ts)",
+            "CREATE INDEX idx_traffic_history_hour ON traffic_history(hour_ts)",
+            "CREATE INDEX idx_traffic_history_group ON traffic_history(group_id, hour_ts)",
+        ] {
+            sqlx::query(idx).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        tracing::info!("Migration 58: traffic history key includes group_id");
+    }
+
     Ok(())
 }
 
@@ -1859,6 +2179,97 @@ mod tests {
             "expected column {}.{} to exist after migration",
             table, column
         );
+    }
+
+    #[tokio::test]
+    async fn migrations_57_58_preserve_rows_and_replace_legacy_constraints() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO users (id, username, password, admin) VALUES (99, 'buyer', 'x', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DROP TABLE orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                plan_id INTEGER,
+                plan_name TEXT NOT NULL,
+                price TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO orders (id, user_id, plan_name, price, created_at)
+             VALUES (7, 99, 'legacy', '1.00', '2026-07-30 00:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DROP TABLE traffic_history")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE traffic_history (
+                rule_id INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                group_id INTEGER NOT NULL DEFAULT 0,
+                hour_ts TEXT NOT NULL,
+                real_upload INTEGER NOT NULL DEFAULT 0,
+                real_download INTEGER NOT NULL DEFAULT 0,
+                billed_total INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (rule_id, hour_ts)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO traffic_history
+             (rule_id, uid, group_id, hour_ts, billed_total)
+             VALUES (7, 99, 10, '2026-07-30 00:00:00', 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        sqlx::query("DELETE FROM users WHERE id = 99")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let order: (i64, i64) = sqlx::query_as("SELECT id, user_id FROM orders WHERE id = 7")
+            .fetch_one(&pool)
+            .await
+            .expect("legacy order must survive buyer deletion");
+        assert_eq!(order, (7, 99));
+
+        sqlx::query(
+            "INSERT INTO traffic_history
+             (rule_id, uid, group_id, hour_ts, billed_total)
+             VALUES (7, 99, 11, '2026-07-30 00:00:00', 200)",
+        )
+        .execute(&pool)
+        .await
+        .expect("same rule/hour in another group must be a separate row");
+        let history_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM traffic_history WHERE rule_id = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(history_rows, 2);
     }
 
     #[tokio::test]

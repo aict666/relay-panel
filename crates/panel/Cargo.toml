@@ -1,6 +1,6 @@
 [package]
 name = "relay-panel"
-version = "1.3.16"
+version = "1.3.17"
 edition = "2021"
 license.workspace = true
 
@@ -24,6 +24,9 @@ once_cell = "1"
 semver = "1"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# SMTP transport for node offline/recovery notifications. Keep rustls so the
+# panel continues to build without a native OpenSSL dependency.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls", "hostname"] }
 
 [dev-dependencies]
 # tower::ServiceExt (.oneshot) for the security-headers router tests. Already in
