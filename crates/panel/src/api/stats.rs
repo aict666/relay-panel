@@ -419,7 +419,7 @@ pub async fn get_node_status(
 /// binds the exact constructed key, so it can only ever touch a node_status:*
 /// row — never an arbitrary kvs entry, never another group/node.
 pub async fn delete_node_status(
-    _admin: AdminOnly,
+    admin: AdminOnly,
     State(state): State<AppState>,
     axum::extract::Path((group_id,)): axum::extract::Path<(i64,)>,
     axum::extract::Query(q): axum::extract::Query<DeleteStatusQuery>,
@@ -549,6 +549,15 @@ pub async fn delete_node_status(
         }),
         Ok(_) => {
             tracing::info!("admin deleted node status record {}", key);
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                "delete_node_status",
+                "node",
+                q.node_id.as_deref().unwrap_or("legacy"),
+                &format!("分组 {group_id}，状态键 {key}"),
+            )
+            .await;
             Json(ApiResponse::success(()))
         }
         Err(e) => {

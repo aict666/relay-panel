@@ -84,4 +84,15 @@ describe('AuditLog', () => {
     const url = mockGet.mock.calls[0][0] as string;
     expect(url).not.toContain('action=');
   });
+
+  it('renders node-status cleanup as a destructive audited action', async () => {
+    mockGet.mockResolvedValue(ok({
+      items: [entry({ action: 'delete_node_status', target_type: 'node', target_id: 'node-abc' })],
+      total: 1,
+    }));
+    await renderPage();
+    const tag = screen.getByText('delete_node_status').closest('.ant-tag');
+    expect(tag).toHaveClass('ant-tag-red');
+    expect(screen.getByText('node node-abc')).toBeInTheDocument();
+  });
 });

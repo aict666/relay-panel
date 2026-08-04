@@ -36,7 +36,7 @@ cd / 2>/dev/null || true
 
 # Bump this when releasing a new version. The binary is downloaded from
 # GitHub Releases assets.
-SCRIPT_VERSION="1.3.9"
+SCRIPT_VERSION="1.3.10"
 REPO="aict666/relay-panel"
 
 GREEN='\033[0;32m'
@@ -588,6 +588,15 @@ if [ ! -f "$ENV_FILE" ]; then
 # The example values below are ILLUSTRATIVE — use your own server's NIC/address.
 #   OUTBOUND_INTERFACE=ens18         # node resolves this NIC's IPv4 to bind
 #   OUTBOUND_BIND_IPV4=10.0.2.61     # or pin the exact source IPv4 (overrides above)
+
+# ── Public-IP detection endpoints ──
+# The node asks an external service which source address the Internet sees.
+# Detection failure only leaves the IP/region blank; it never affects
+# forwarding. The built-in defaults are family-pinned and reachable from
+# mainland China. Override them only when a provider is unreachable here.
+# Each endpoint must return one bare IP from the requested family.
+#   PUBLIC_IPV4_CHECK_URL=https://ipv4.icanhazip.com
+#   PUBLIC_IPV6_CHECK_URL=https://ipv6.icanhazip.com
 
 # ── TLS Simple certificate configuration (v0.4.1) ──
 # Uncomment and set these to enable TLS Simple ingress on this node.

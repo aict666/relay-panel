@@ -3,19 +3,20 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DeviceGroup } from '../api/types';
 
-const { authState, mockGet, mockPut } = vi.hoisted(() => ({
+const { authState, mockGet, mockPost, mockPut } = vi.hoisted(() => ({
   authState: {
     isAdmin: false,
     user: { id: 2, username: 'member' },
   },
   mockGet: vi.fn(),
+  mockPost: vi.fn(),
   mockPut: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
   default: {
     get: mockGet,
-    post: vi.fn(),
+    post: mockPost,
     put: mockPut,
     delete: vi.fn(),
   },
@@ -68,7 +69,9 @@ const group: DeviceGroup = {
 
 beforeEach(() => {
   mockGet.mockReset();
+  mockPost.mockReset();
   mockPut.mockReset();
+  mockPost.mockResolvedValue(ok(group));
   mockPut.mockResolvedValue(ok(null));
   authState.isAdmin = false;
   authState.user = { id: 2, username: 'member' };
@@ -96,6 +99,7 @@ describe('Groups permissions', () => {
     expect(await screen.findByText('member-group')).toBeInTheDocument();
     expect(screen.getByText('httpBlocked')).toBeInTheDocument();
     expect(screen.getByText('tlsBlocked')).toBeInTheDocument();
+    expect(screen.getByText('inboundListener')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /addGroup/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /edit/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /delete/ })).not.toBeInTheDocument();
@@ -103,6 +107,71 @@ describe('Groups permissions', () => {
     await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(1));
     expect(mockGet).not.toHaveBeenCalledWith('/admin/users');
     expect(mockGet).not.toHaveBeenCalledWith('/nodes/shared');
+  });
+
+  it('creates a monitor-only group with neutral forwarding fields', async () => {
+    authState.isAdmin = true;
+    const user = userEvent.setup();
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/groups') return Promise.resolve(ok([group]));
+      if (url === '/nodes') return Promise.resolve(ok([]));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    render(<Groups />);
+    await user.click(await screen.findByRole('button', { name: /addGroup/ }));
+    await user.type(await screen.findByLabelText('name'), 'watch-only');
+    await user.click(screen.getByLabelText('type'));
+    await user.click(await screen.findByTitle('typeMonitor'));
+
+    expect(screen.queryByLabelText('connectHost')).not.toBeInTheDocument();
+    expect(screen.getByText('monitorOnlyNoForwardTitle')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /create/ }));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    expect(mockPost.mock.calls[0][1]).toMatchObject({
+      name: 'watch-only',
+      group_type: 'monitor',
+      connect_host: '',
+      port_range: '',
+      rate: 1,
+      hidden: false,
+      blocked_protocols: [],
+    });
+  });
+
+  it('preserves stored forwarding fields when converting to monitor-only', async () => {
+    authState.isAdmin = true;
+    const user = userEvent.setup();
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/groups') return Promise.resolve(ok([group]));
+      if (url === '/nodes') return Promise.resolve(ok([]));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    render(<Groups />);
+    await user.click(await screen.findByRole('button', { name: /edit/ }));
+    await user.click(screen.getByLabelText('type'));
+    await user.click(await screen.findByTitle('typeMonitor'));
+    expect(screen.queryByLabelText('connectHost')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /save/ }));
+
+    await waitFor(() => expect(mockPut).toHaveBeenCalled());
+    expect(mockPut.mock.calls[0][1]).toEqual({ group_type: 'monitor' });
+  });
+
+  it('hides inert forwarding values on a monitor-only row', async () => {
+    authState.isAdmin = true;
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/groups') return Promise.resolve(ok([{ ...group, group_type: 'monitor' }]));
+      if (url === '/nodes') return Promise.resolve(ok([]));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    render(<Groups />);
+    expect(await screen.findByText('typeMonitor')).toBeInTheDocument();
+    expect(screen.queryByText('group.example.com')).not.toBeInTheDocument();
+    expect(screen.queryByText('10000-65535')).not.toBeInTheDocument();
   });
 
   it('lets an administrator clear TLS while retaining the HTTP policy', async () => {

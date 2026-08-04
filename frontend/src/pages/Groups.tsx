@@ -22,6 +22,13 @@ interface GroupFormValues {
   blocked_protocols?: BlockedProtocol[];
 }
 
+/** Monitor-only groups report health to administrators but carry no traffic. */
+function isMonitorOnly(group: { group_type: string }): boolean {
+  return group.group_type === 'monitor';
+}
+
+const dash = <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>;
+
 function selectedBlockedProtocols(
   ingressCapable: boolean,
   blockedProtocols: BlockedProtocol[] | undefined,
@@ -56,6 +63,8 @@ export default function Groups() {
   const [editForm] = Form.useForm();
   const createGroupType = Form.useWatch('group_type', createForm);
   const editGroupType = Form.useWatch('group_type', editForm);
+  const createIsMonitor = (createGroupType ?? 'in') === 'monitor';
+  const editIsMonitor = (editGroupType ?? editing?.group_type) === 'monitor';
   const loadGenerationRef = useRef(0);
   const loadScopeRef = useRef<string | null>(null);
   const desiredScopeRef = useRef(authScope);
@@ -143,12 +152,22 @@ export default function Groups() {
       // v1.0.8: rate defaults to 1.0 on the server when omitted; send it
       // explicitly so the value the admin picked is what gets persisted.
       const ingressCapable = values.group_type === 'in' || values.group_type === 'both';
-      const payload = {
+      const payload: GroupFormValues = {
         ...values,
         rate: values.rate ?? 1.0,
         hidden: values.hidden ?? false,
         blocked_protocols: selectedBlockedProtocols(ingressCapable, values.blocked_protocols),
       };
+      // These fields are required by the API schema, but inert for a monitor
+      // group. Neutralise them explicitly because the corresponding Form.Items
+      // are not mounted and therefore do not participate in submission.
+      if (values.group_type === 'monitor') {
+        payload.connect_host = '';
+        payload.port_range = '';
+        payload.rate = 1.0;
+        payload.hidden = false;
+        payload.blocked_protocols = [];
+      }
       const res = await api.post<unknown, ApiEnvelope<DeviceGroup>>('/groups', payload);
       if (res.code !== 0) { message.error(res.message); return; }
       message.success(t('groupCreated'));
@@ -188,13 +207,18 @@ export default function Groups() {
     // v1.0.7: only send hidden when it actually changed.
     if (values.hidden !== undefined && values.hidden !== !!editing.hidden) payload.hidden = values.hidden;
     const effectiveType = values.group_type ?? editing.group_type;
-    const nextBlockedProtocols = selectedBlockedProtocols(
-      effectiveType === 'in' || effectiveType === 'both',
-      values.blocked_protocols,
-    );
-    const previousBlockedProtocols = [...(editing.blocked_protocols ?? [])].sort();
-    if (nextBlockedProtocols.join(',') !== previousBlockedProtocols.join(',')) {
-      payload.blocked_protocols = nextBlockedProtocols;
+    // Converting to monitor mode preserves forwarding configuration so a
+    // later switch back is lossless. For every active forwarding type, keep
+    // the existing ingress-capability normalization.
+    if (effectiveType !== 'monitor') {
+      const nextBlockedProtocols = selectedBlockedProtocols(
+        effectiveType === 'in' || effectiveType === 'both',
+        values.blocked_protocols,
+      );
+      const previousBlockedProtocols = [...(editing.blocked_protocols ?? [])].sort();
+      if (nextBlockedProtocols.join(',') !== previousBlockedProtocols.join(',')) {
+        payload.blocked_protocols = nextBlockedProtocols;
+      }
     }
     if (Object.keys(payload).length === 0) { setEditOpen(false); return; }
     setSaving(true);
@@ -332,6 +356,16 @@ export default function Groups() {
     }
   };
 
+  const typeLabel = (groupType: string) => {
+    switch (groupType) {
+      case 'in': return t('inboundListener');
+      case 'out': return t('outboundEgress');
+      case 'both': return t('inboundOutbound');
+      case 'monitor': return t('typeMonitor');
+      default: return groupType;
+    }
+  };
+
   // Chain intermediate/exit nodes use type `out` (egress/mid-hop).
   const groupTypeOptions = [
     { value: 'in', label: t('inboundListener') },
@@ -345,7 +379,7 @@ export default function Groups() {
     { title: t('name'), dataIndex: 'name', key: 'name' },
     {
       title: t('type'), dataIndex: 'group_type', key: 'group_type',
-      render: (gt: string) => <Tag color={typeColor(gt)}>{gt.toUpperCase()}</Tag>,
+      render: (gt: string) => <Tag color={typeColor(gt)}>{typeLabel(gt)}</Tag>,
     },
     {
       title: t('nodes'), key: 'nodes', width: 100,
@@ -366,11 +400,11 @@ export default function Groups() {
         </Space>
       ),
     },
-    { title: t('connectHost'), dataIndex: 'connect_host', key: 'connect_host', render: (v: string) => <span className="rp-mono">{v}</span> },
-    { title: t('portRange'), dataIndex: 'port_range', key: 'port_range', render: (v: string) => <span className="rp-mono">{v}</span> },
+    { title: t('connectHost'), dataIndex: 'connect_host', key: 'connect_host', render: (v: string, g: DeviceGroup | SharedGroupSummary) => isMonitorOnly(g) ? dash : <span className="rp-mono">{v}</span> },
+    { title: t('portRange'), dataIndex: 'port_range', key: 'port_range', render: (v: string, g: DeviceGroup | SharedGroupSummary) => isMonitorOnly(g) ? dash : <span className="rp-mono">{v}</span> },
     {
       title: t('protocolBlocking'), dataIndex: 'blocked_protocols', key: 'blocked_protocols', width: 120,
-      render: (protocols?: string[]) => protocols?.length ? (
+      render: (protocols: string[] | undefined, g: DeviceGroup | SharedGroupSummary) => isMonitorOnly(g) ? dash : protocols?.length ? (
         <Space size={4} wrap>
           {protocols.includes('http') && <Tag color="orange">{t('httpBlocked')}</Tag>}
           {protocols.includes('tls') && <Tag color="red">{t('tlsBlocked')}</Tag>}
@@ -381,6 +415,7 @@ export default function Groups() {
       title: <Tooltip title={t('blockedSinceNodeStart')}>{t('blockedHttpConnections')}</Tooltip>,
       key: 'blocked_http_connections', width: 100,
       render: (_: unknown, g: DeviceGroup | SharedGroupSummary) => {
+        if (isMonitorOnly(g)) return dash;
         const count = blockedHttpCount(g.id);
         return count > 0 ? count.toLocaleString() : <span style={{ color: 'var(--rp-text-tertiary)' }}>0</span>;
       },
@@ -389,6 +424,7 @@ export default function Groups() {
       title: <Tooltip title={t('blockedSinceNodeStart')}>{t('blockedTlsConnections')}</Tooltip>,
       key: 'blocked_tls_connections', width: 100,
       render: (_: unknown, g: DeviceGroup | SharedGroupSummary) => {
+        if (isMonitorOnly(g)) return dash;
         const count = blockedTlsCount(g.id);
         return count > 0 ? count.toLocaleString() : <span style={{ color: 'var(--rp-text-tertiary)' }}>0</span>;
       },
@@ -398,7 +434,8 @@ export default function Groups() {
       // column on every row is noise. The tag color reflects the multiplier
       // direction (gold = premium line, no tag = bill-as-used).
       title: t('rate'), dataIndex: 'rate', key: 'rate', width: 80,
-      render: (rate: number) => {
+      render: (rate: number, g: DeviceGroup | SharedGroupSummary) => {
+        if (isMonitorOnly(g)) return dash;
         const r = typeof rate === 'number' ? rate : 1.0;
         if (Math.abs(r - 1.0) < 1e-9) return <span style={{ color: 'var(--rp-text-tertiary)' }}>1x</span>;
         return <Tag color="gold">{r}x</Tag>;
@@ -407,8 +444,8 @@ export default function Groups() {
     {
       // v1.0.7: hidden flag — only tag when hidden, to keep the column quiet.
       title: t('groupHidden'), dataIndex: 'hidden', key: 'hidden', width: 80,
-      render: (hidden: boolean) =>
-        hidden ? <Tag>{t('yes')}</Tag> : <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>,
+      render: (hidden: boolean, g: DeviceGroup | SharedGroupSummary) =>
+        hidden && !isMonitorOnly(g) ? <Tag>{t('yes')}</Tag> : dash,
     },
     {
       title: t('action'), key: 'action', width: 220, fixed: 'right' as const,
@@ -510,29 +547,29 @@ export default function Groups() {
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input placeholder="tokyo-node-1" /></Form.Item>
           <Form.Item name="group_type" label={t('type')} rules={[{ required: true }]} initialValue="in">
             <Select options={groupTypeOptions} onChange={(value) => {
-              if (value !== 'in' && value !== 'both') {
+              if (value === 'out') {
                 createForm.setFieldValue('blocked_protocols', []);
               }
             }} />
           </Form.Item>
-          <Form.Item name="connect_host" label={t('connectHost')} rules={[{ required: true }]}><Input placeholder="1.2.3.4 or node.example.com" /></Form.Item>
-          <Form.Item name="port_range" label={t('portRange')} rules={[{ required: true }]} initialValue="10000-65535"><Input placeholder="10000-65535" /></Form.Item>
-          {/* v1.0.8: billing rate. Users are charged real bytes × rate; the
-              rule/user byte counters keep real bytes. 1.0 = bill as used. */}
-          <Form.Item name="rate" label={t('rate')} initialValue={1.0} rules={[{ required: true }]}>
-            <InputNumber min={0.1} max={100} step={0.1} style={{ width: '100%' }} />
-          </Form.Item>
-          {/* v1.0.7: hide this group from regular users' node-status / available
-              lines. Admins always see it. */}
-          <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" initialValue={false}>
-            <Switch />
-          </Form.Item>
-          <Form.Item name="blocked_protocols" label={t('protocolBlocking')} initialValue={[]}>
-            <Checkbox.Group
-              disabled={createGroupType !== 'in' && createGroupType !== 'both'}
-              options={[{ label: 'HTTP', value: 'http' }, { label: 'TLS', value: 'tls' }]}
-            />
-          </Form.Item>
+          {createIsMonitor ? (
+            <Alert type="info" showIcon title={t('monitorOnlyNoForwardTitle')} description={t('monitorOnlyNoForwardDesc')} />
+          ) : (
+            <>
+              <Form.Item name="connect_host" label={t('connectHost')} rules={[{ required: true }]}><Input placeholder="1.2.3.4 or node.example.com" /></Form.Item>
+              <Form.Item name="port_range" label={t('portRange')} rules={[{ required: true }]} initialValue="10000-65535"><Input placeholder="10000-65535" /></Form.Item>
+              {/* v1.0.8: users are charged real bytes × rate. */}
+              <Form.Item name="rate" label={t('rate')} initialValue={1.0} rules={[{ required: true }]}>
+                <InputNumber min={0.1} max={100} step={0.1} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" initialValue={false}>
+                <Switch />
+              </Form.Item>
+              <Form.Item name="blocked_protocols" label={t('protocolBlocking')} initialValue={[]}>
+                <Checkbox.Group options={[{ label: 'HTTP', value: 'http' }, { label: 'TLS', value: 'tls' }]} />
+              </Form.Item>
+            </>
+          )}
         </Form>
       </Modal>
 
@@ -540,24 +577,30 @@ export default function Groups() {
         <Form form={editForm} onFinish={handleUpdate} layout="vertical" disabled={saving || loading || loadFailed}>
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
           <Form.Item name="group_type" label={t('type')}><Select options={groupTypeOptions} onChange={(value) => {
-            if (value !== 'in' && value !== 'both') {
+            if (value === 'out') {
               editForm.setFieldValue('blocked_protocols', []);
             }
           }} /></Form.Item>
-          <Form.Item name="connect_host" label={t('connectHost')}><Input /></Form.Item>
-          <Form.Item name="port_range" label={t('portRange')}><Input /></Form.Item>
-          <Form.Item name="rate" label={t('rate')}>
-            <InputNumber min={0.1} max={100} step={0.1} style={{ width: '100%' }} />
-          </Form.Item>
-          <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item name="blocked_protocols" label={t('protocolBlocking')}>
-            <Checkbox.Group
-              disabled={editGroupType !== 'in' && editGroupType !== 'both'}
-              options={[{ label: 'HTTP', value: 'http' }, { label: 'TLS', value: 'tls' }]}
+          {editIsMonitor ? (
+            <Alert
+              type="info"
+              showIcon
+              title={t('monitorOnlyNoForwardTitle')}
+              description={`${t('monitorOnlyNoForwardDesc')} ${t('monitorOnlyEditKeepsFields')}`}
             />
-          </Form.Item>
+          ) : (
+            <>
+              <Form.Item name="connect_host" label={t('connectHost')}><Input /></Form.Item>
+              <Form.Item name="port_range" label={t('portRange')}><Input /></Form.Item>
+              <Form.Item name="rate" label={t('rate')}>
+                <InputNumber min={0.1} max={100} step={0.1} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked"><Switch /></Form.Item>
+              <Form.Item name="blocked_protocols" label={t('protocolBlocking')}>
+                <Checkbox.Group options={[{ label: 'HTTP', value: 'http' }, { label: 'TLS', value: 'tls' }]} />
+              </Form.Item>
+            </>
+          )}
         </Form>
       </Modal>
 

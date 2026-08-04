@@ -1690,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "relay-node"
-version = "1.3.9"
+version = "1.3.10"
 dependencies = [
  "dashmap",
  "futures-util",
@@ -1717,13 +1717,14 @@ dependencies = [
 
 [[package]]
 name = "relay-panel"
-version = "1.3.19"
+version = "1.3.20"
 dependencies = [
  "async-trait",
  "axum",
  "bcrypt",
  "chrono",
  "futures-util",
+ "getrandom 0.2.17",
  "jsonwebtoken",
  "lettre",
  "once_cell",

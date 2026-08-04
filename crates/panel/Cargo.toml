@@ -1,6 +1,6 @@
 [package]
 name = "relay-panel"
-version = "1.3.19"
+version = "1.3.20"
 edition = "2021"
 license.workspace = true
 
@@ -19,6 +19,8 @@ futures-util = "0.3"
 bcrypt = "0.16"
 jsonwebtoken = "9"
 uuid = { version = "1", features = ["v4"] }
+# Direct dependency for recovery-password generation from the OS CSPRNG.
+getrandom = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 once_cell = "1"
 semver = "1"

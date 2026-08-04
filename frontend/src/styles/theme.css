@@ -27,7 +27,12 @@
   /* Text */
   --rp-text: #101828;
   --rp-text-secondary: #5a6472;
-  --rp-text-tertiary: #98a2b3;
+  --rp-text-tertiary: #667085;
+
+  /* Offline node treatment: muted but still WCAG-readable. */
+  --rp-node-offline-text: #667085;
+  --rp-node-offline-bg: #f7f8fa;
+  --rp-node-offline-bar: #c7cdd4;
 
   /* Accent — teal */
   --rp-primary: #0d9488;
@@ -913,6 +918,30 @@ html, body, #root {
 }
 .rp-node-table .ant-table-tbody > tr.ant-table-row:hover > td {
   background: var(--rp-table-row-hover) !important;
+}
+
+/* Offline nodes stay visible for post-incident inspection, but should not
+ * compete visually with live capacity. Keep text readable and neutralise
+ * resource bars without fading the whole row (which would also fade actions). */
+.rp-node-table .ant-table-tbody > tr.rp-node-offline > td {
+  color: var(--rp-node-offline-text);
+  background: var(--rp-node-offline-bg);
+}
+.rp-node-table .ant-table-tbody > tr.rp-node-offline:hover > td {
+  background: #f1f3f5 !important;
+}
+.rp-node-offline .ant-progress-track,
+.rp-node-offline-card .ant-progress-track,
+.rp-node-offline .ant-progress-bg,
+.rp-node-offline-card .ant-progress-bg {
+  background: var(--rp-node-offline-bar) !important;
+}
+.rp-node-offline-card {
+  color: var(--rp-node-offline-text);
+  background: var(--rp-node-offline-bg);
+}
+.rp-node-meta {
+  color: var(--rp-text-tertiary);
 }
 
 .rp-rules-table .ant-table-cell-fix-right {

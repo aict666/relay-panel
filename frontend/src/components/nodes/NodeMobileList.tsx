@@ -1,6 +1,6 @@
 
-import { Typography, Button, Space, Tag, Tooltip } from 'antd';
-import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined } from '@ant-design/icons';
+import { Typography, Button, Space, Tag, Tooltip, Popconfirm } from 'antd';
+import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { NodeResourceBar } from './NodeResourceBar';
@@ -25,12 +25,14 @@ interface Props {
    *  shows the node version + an upgrade affordance mirroring the desktop
    *  ladder (PR4), compared against the latest NODE release (PR5). */
   onUpgrade?: (row: NodeDisplayRow) => void;
+  /** Admin-only manual cleanup. Only rendered for real offline rows. */
+  onDelete?: (row: NodeDisplayRow) => Promise<void> | void;
 }
 
 /** Mobile-friendly compact list — one card per node. No wide table, no
  *  horizontal scroll. Shows: status + version + upgrade + network + speed +
  *  resource bars + uptime + a details button. */
-export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade }: Props) {
+export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade, onDelete }: Props) {
   const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
 
   return (
@@ -46,6 +48,7 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
         return (
           <div
             key={`${r.group_id}:${r.node_id || 'none'}`}
+            className={!r.online ? 'rp-node-offline-card' : undefined}
             role={isPlaceholder ? undefined : 'button'}
             tabIndex={isPlaceholder ? undefined : 0}
             onClick={() => { if (!isPlaceholder) openDetail(r); }}
@@ -84,6 +87,19 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
                     />
                   </span>
                 ) : null}
+                {onDelete && !r.online ? (
+                  <span onClick={(event) => event.stopPropagation()}>
+                    <Popconfirm title={t('nodeStatusDeleteConfirm')} onConfirm={() => onDelete(r)}>
+                      <Button
+                        danger
+                        size="small"
+                        type="text"
+                        icon={<DeleteOutlined />}
+                        aria-label={t('nodeStatusDelete')}
+                      />
+                    </Popconfirm>
+                  </span>
+                ) : null}
                 <Button
                   size="small"
                   type="link"
@@ -99,7 +115,7 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
               </span>
             </div>
             <NetworkCell row={r} t={t} />
-            <div style={{ fontSize: 12, color: '#888', marginTop: 4, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+            <div className="rp-node-meta" style={{ fontSize: 12, marginTop: 4, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
               <span>{t('connections')}: <ConnectionsCell row={r} t={t} /></span>
               <span>↑ {formatBps(r.upload_bps)} ↓ {formatBps(r.download_bps)}</span>
               <span>{t('systemUptime')}: {formatUptime(r.uptime, labels)}</span>

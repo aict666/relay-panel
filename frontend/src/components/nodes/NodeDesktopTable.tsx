@@ -1,6 +1,6 @@
  
-import { Table, Tag, Typography, Button, Tooltip } from 'antd';
-import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined } from '@ant-design/icons';
+import { Table, Tag, Typography, Button, Tooltip, Popconfirm } from 'antd';
+import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { NodeResourceBar, NodeDiskBar } from './NodeResourceBar';
@@ -23,12 +23,14 @@ interface Props {
    *  icon (active when the node is behind the latest node release). Absent for
    *  the regular-user view. */
   onUpgrade?: (row: NodeDisplayRow) => void;
+  /** Admin-only manual cleanup. Only rendered for real offline rows. */
+  onDelete?: (row: NodeDisplayRow) => Promise<void> | void;
 }
 
 /** Desktop table for one group's nodes. Both admin and user share the same
  *  columns — the permission difference is in the data source (admin reads
  *  /nodes, user reads /nodes/shared) and the detail drawer. */
-export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, onUpgrade }: Props) {
+export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, onUpgrade, onDelete }: Props) {
   const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
 
   const columns = [
@@ -156,6 +158,22 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
         </Button>
       ),
     },
+    ...(onDelete ? [{
+      title: t('action'), key: 'delete', width: 70, fixed: 'right' as const,
+      render: (_: unknown, r: NodeDisplayRow) => (!r.online ? (
+        <span onClick={(event) => event.stopPropagation()}>
+          <Popconfirm title={t('nodeStatusDeleteConfirm')} onConfirm={() => onDelete(r)}>
+            <Button
+              danger
+              size="small"
+              type="text"
+              icon={<DeleteOutlined />}
+              aria-label={t('nodeStatusDelete')}
+            />
+          </Popconfirm>
+        </span>
+      ) : null),
+    }] : []),
   ];
 
   return (
@@ -167,6 +185,7 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
       pagination={false}
       size="small"
       scroll={{ x: 'max-content' }}
+      rowClassName={(r) => (!r.online ? 'rp-node-offline' : '')}
       onRow={(r) => ({
         onClick: () => {
           if (r.node_id) openDetail(r);

@@ -30,7 +30,7 @@ export const enUS: Dict = {
   tunnelManagement: 'Tunnel Management',
   nodeStatus: 'Node Status',
   nodeStatusDelete: 'Clear status record',
-  nodeStatusDeleteConfirm: 'Clear this node\'s status record?',
+  nodeStatusDeleteConfirm: 'This only clears the panel status record; it does not uninstall or stop the node. A running node will reappear. Continue?',
   nodeStatusDeleted: 'Cleared',
   nodeStatusDeleteFailed: 'Clear failed',
   users: 'Users',
@@ -219,6 +219,9 @@ export const enUS: Dict = {
   inboundListener: 'Inbound (listener node)',
   outboundEgress: 'Outbound (egress node)',
   inboundOutbound: 'Inbound + outbound (dual role)',
+  monitorOnlyNoForwardTitle: 'Monitor-only groups do not forward traffic',
+  monitorOnlyNoForwardDesc: 'These groups only report node status to administrators. They carry no rules and are hidden from regular users, so host, ports, rate, visibility, and protocol blocking do not apply.',
+  monitorOnlyEditKeepsFields: 'Saved forwarding settings are preserved and become active again after switching back to a forwarding type.',
   groupCreated: 'Group created. Copy the node token below.',
   groupDeleted: 'Group deleted',
   deleteGroupConfirm: 'Delete this group?',
@@ -989,6 +992,7 @@ export const enUS: Dict = {
   audit_rotate_group_token: 'Rotate node token',
 
   audit_upgrade_node: 'Upgrade node',
+  audit_delete_node_status: 'Clear node status',
 
   audit_create_redeem_codes: 'Generate codes',
 

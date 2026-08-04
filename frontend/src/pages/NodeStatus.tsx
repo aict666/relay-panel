@@ -151,6 +151,26 @@ export default function NodeStatus() {
     });
   };
 
+  const handleDelete = async (row: AnyNodeRow) => {
+    if (!isAdmin || row.online) return;
+    const query = row.node_id ? `?node_id=${encodeURIComponent(row.node_id)}` : '';
+    const url = `/nodes/${row.group_id}${query}`;
+    try {
+      const res = await api.delete<unknown, ApiEnvelope<null>>(url);
+      if (res.code !== 0) {
+        message.error(res.message || t('nodeStatusDeleteFailed'));
+        return;
+      }
+      message.success(t('nodeStatusDeleted'));
+      if (detailRow?.group_id === row.group_id && detailRow.node_id === row.node_id) {
+        setDetailRow(null);
+      }
+      await refresh();
+    } catch {
+      message.error(t('nodeStatusDeleteFailed'));
+    }
+  };
+
   const rows: AnyNodeRow[] | null = isAdmin ? adminRows : userRows;
   const groups = useMemo(() => (rows ? stableGroupedRows(rows) : null), [rows]);
 
@@ -203,6 +223,7 @@ export default function NodeStatus() {
           t={t}
           openDetail={setDetailRow}
           onUpgrade={isAdmin ? handleUpgrade : undefined}
+          onDelete={isAdmin ? handleDelete : undefined}
         />
       ))}
       <NodeDetailDrawer

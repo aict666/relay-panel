@@ -207,7 +207,7 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
         )}
         </>
       )}
-      {isAdmin && row && (
+      {isAdmin && row && !row.online && (
         <div style={{ marginTop: 16 }}>
           <Popconfirm title={t('nodeStatusDeleteConfirm')} onConfirm={handleDelete}>
             <Button danger icon={<DeleteOutlined />}>{t('nodeStatusDelete')}</Button>

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import type { Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { statusTag } from './shared';
@@ -61,6 +62,49 @@ describe('NodeGroupSection mobile vs desktop', () => {
       <NodeGroupSection rows={rows} panelProtocol={0} latestNodeVersion="1.1.0" nodeVersionCheckFailed={false} isMobile={true} t={t} openDetail={vi.fn()} />,
     );
     expect(container.querySelector('.ant-table')).toBeNull();
+  });
+
+  it('greys offline rows and exposes cleanup only for an offline admin row', async () => {
+    const user = userEvent.setup();
+    const onDelete = vi.fn();
+    const offline = row({ node_id: 'offline-node', online: false });
+    const online = row({ node_id: 'online-node', online: true });
+    const { container } = render(
+      <NodeGroupSection
+        rows={[offline, online]}
+        panelProtocol={0}
+        latestNodeVersion="1.1.0"
+        nodeVersionCheckFailed={false}
+        isMobile={false}
+        t={t}
+        openDetail={vi.fn()}
+        onDelete={onDelete}
+      />,
+    );
+
+    expect(container.querySelectorAll('tr.rp-node-offline')).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: 'nodeStatusDelete' })).toHaveLength(1);
+    await user.click(screen.getByRole('button', { name: 'nodeStatusDelete' }));
+    await user.click(await screen.findByRole('button', { name: 'OK' }));
+    expect(onDelete).toHaveBeenCalledWith(offline);
+  });
+
+  it('uses the offline card treatment and cleanup entry on mobile', () => {
+    const offline = row({ node_id: 'offline-node', online: false });
+    const { container } = render(
+      <NodeGroupSection
+        rows={[offline]}
+        panelProtocol={0}
+        latestNodeVersion="1.1.0"
+        nodeVersionCheckFailed={false}
+        isMobile
+        t={t}
+        openDetail={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    expect(container.querySelector('.rp-node-offline-card')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'nodeStatusDelete' })).toBeInTheDocument();
   });
 
   it('shows a "no node reporting" hint for a placeholder-only group', () => {

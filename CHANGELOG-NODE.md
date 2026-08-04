@@ -13,6 +13,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.10] - 2026-08-04
+
+### Changed
+
+- 节点公网 IP 检测默认从 ipify 切换到家族固定的
+  `api-ipv4.ip.sb` / `api-ipv6.ip.sb`，避免中国大陆节点长期检测超时；
+  安装脚本同步补充可选覆盖配置。
+
 ## [1.3.9] - 2026-07-29
 
 ### Added

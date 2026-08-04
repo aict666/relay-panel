@@ -19,6 +19,67 @@ pub fn validate_password(password: &str) -> Result<(), PasswordValidationError> 
     Ok(())
 }
 
+const GENERATED_LOWER: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
+const GENERATED_UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+const GENERATED_DIGITS: &[u8] = b"23456789";
+const GENERATED_SYMBOLS: &[u8] = b"!@#%^&*-_=+?";
+pub const GENERATED_PASSWORD_LEN: usize = 16;
+
+fn random_bytes(size: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; size];
+    getrandom::getrandom(&mut bytes).expect("OS randomness unavailable");
+    bytes
+}
+
+/// Uniform selection without modulo bias.
+fn pick(set: &[u8]) -> u8 {
+    let limit = 256 - (256 % set.len());
+    loop {
+        let byte = random_bytes(1)[0] as usize;
+        if byte < limit {
+            return set[byte % set.len()];
+        }
+    }
+}
+
+/// Generate a shell-friendly recovery password from the OS CSPRNG.
+///
+/// Every output contains all four character classes. Ambiguous glyphs and
+/// shell-quoting hazards are deliberately excluded because operators commonly
+/// copy this value from `docker exec` into a browser.
+pub fn generate_password() -> String {
+    let mut chars = vec![
+        pick(GENERATED_LOWER),
+        pick(GENERATED_UPPER),
+        pick(GENERATED_DIGITS),
+        pick(GENERATED_SYMBOLS),
+    ];
+    let all: Vec<u8> = [
+        GENERATED_LOWER,
+        GENERATED_UPPER,
+        GENERATED_DIGITS,
+        GENERATED_SYMBOLS,
+    ]
+    .concat();
+    while chars.len() < GENERATED_PASSWORD_LEN {
+        chars.push(pick(&all));
+    }
+
+    // Fisher-Yates shuffle using rejection sampling for each shrinking range.
+    for index in (1..chars.len()).rev() {
+        let limit = 256 - (256 % (index + 1));
+        let target = loop {
+            let byte = random_bytes(1)[0] as usize;
+            if byte < limit {
+                break byte % (index + 1);
+            }
+        };
+        chars.swap(index, target);
+    }
+
+    String::from_utf8(chars).expect("generated password charset is ASCII")
+}
+
 /// All bcrypt work shares one small blocking-pool admission budget. Public
 /// callers are rate-limited before reaching this queue; awaiting a slot
 /// avoids making legitimate concurrent requests fail nondeterministically while
@@ -89,5 +150,21 @@ mod tests {
             validate_password(&"a".repeat(73)),
             Err(PasswordValidationError::TooLong)
         );
+    }
+
+    #[test]
+    fn generated_passwords_satisfy_every_contract() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let password = generate_password();
+            assert_eq!(password.len(), GENERATED_PASSWORD_LEN);
+            assert!(validate_password(&password).is_ok());
+            assert!(password.bytes().any(|b| GENERATED_LOWER.contains(&b)));
+            assert!(password.bytes().any(|b| GENERATED_UPPER.contains(&b)));
+            assert!(password.bytes().any(|b| GENERATED_DIGITS.contains(&b)));
+            assert!(password.bytes().any(|b| GENERATED_SYMBOLS.contains(&b)));
+            assert!(!password.chars().any(|c| "0O1lI'\"\\`$ ".contains(c)));
+            assert!(seen.insert(password), "generated a duplicate password");
+        }
     }
 }

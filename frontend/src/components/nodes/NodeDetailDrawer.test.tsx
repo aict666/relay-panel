@@ -28,7 +28,12 @@ describe('NodeDetailDrawer desensitization', () => {
     expect(screen.getByText('node-abc')).toBeInTheDocument();
     expect(screen.getByText('configProtocolVersion')).toBeInTheDocument();
     expect(screen.getByText('networkInterface')).toBeInTheDocument();
-    // delete-status action is admin-only
+    // Online nodes cannot be manually removed from either admin entry point.
+    expect(screen.queryByText('nodeStatusDelete')).not.toBeInTheDocument();
+  });
+
+  it('shows cleanup to an administrator only after the node is offline', () => {
+    render(<NodeDetailDrawer row={{ ...baseRow, online: false }} open onClose={vi.fn()} isAdmin panelProtocol={2} />);
     expect(screen.getByText('nodeStatusDelete')).toBeInTheDocument();
   });
 

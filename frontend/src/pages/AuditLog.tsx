@@ -28,6 +28,7 @@ const ACTIONS = [
   'delete_group',
   'rotate_group_token',
   'upgrade_node',
+  'delete_node_status',
   'create_redeem_codes',
   'void_redeem_code',
   'delete_redeem_codes',
@@ -51,6 +52,7 @@ const DESTRUCTIVE = new Set<string>([
   'reset_traffic',
   'void_redeem_code',
   'delete_announcement',
+  'delete_node_status',
 ]);
 
 const PAGE_SIZE = 20;

@@ -28,7 +28,7 @@ export const zhCN = {
   tunnelManagement: '隧道管理',
   nodeStatus: '节点状态',
   nodeStatusDelete: '清除状态记录',
-  nodeStatusDeleteConfirm: '确定清除该节点的状态记录？',
+  nodeStatusDeleteConfirm: '只移除面板中的状态记录，不会卸载或停止节点；如果节点仍在运行，记录会重新出现。确定继续？',
   nodeStatusDeleted: '已清除',
   nodeStatusDeleteFailed: '清除失败',
   users: '用户管理',
@@ -217,6 +217,9 @@ export const zhCN = {
   inboundListener: '入口（监听节点）',
   outboundEgress: '出口（出口节点）',
   inboundOutbound: '入口 + 出口（双角色节点）',
+  monitorOnlyNoForwardTitle: '仅监控分组不承载转发',
+  monitorOnlyNoForwardDesc: '这类分组只向管理员上报节点状态，不绑定转发规则，也不会出现在普通用户的线路和节点状态中；连接地址、端口范围、倍率、隐藏和协议屏蔽均不生效。',
+  monitorOnlyEditKeepsFields: '已保存的转发配置会原样保留，切回转发类型后立即恢复。',
   groupCreated: '分组已创建，请复制下方节点令牌',
   groupDeleted: '分组已删除',
   deleteGroupConfirm: '确定删除此分组？',
@@ -984,6 +987,7 @@ export const zhCN = {
   audit_rotate_group_token: '轮换节点密钥',
 
   audit_upgrade_node: '升级节点',
+  audit_delete_node_status: '清除节点状态',
 
   audit_create_redeem_codes: '生成卡密',
 

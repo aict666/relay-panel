@@ -1178,18 +1178,28 @@ enum IpFamily {
     V6,
 }
 
+/// Default public-IP probes, pinned to one address family each.
+///
+/// The parser below rejects a response from the wrong family. A dual-stack
+/// endpoint can therefore make the IPv4 probe connect over IPv6 and discard a
+/// perfectly valid IPv6 response. Family-pinned hosts make that failure mode
+/// impossible. These defaults also remain reachable from mainland China,
+/// unlike the previous ipify endpoints.
+const DEFAULT_IPV4_CHECK_URL: &str = "https://api-ipv4.ip.sb/ip";
+const DEFAULT_IPV6_CHECK_URL: &str = "https://api-ipv6.ip.sb/ip";
+
 /// v0.4.15: spawn TWO independent background tasks — one for IPv4, one for
 /// IPv6. Each checks once at start then every 30 min. A failure in one family
 /// never clears the other. Env overrides (later wins):
-///   IPv4: PUBLIC_IPV4_CHECK_URL → PUBLIC_IP_CHECK_URL → default ipify.org
-///   IPv6: PUBLIC_IPV6_CHECK_URL → default api6.ipify.org
+///   IPv4: PUBLIC_IPV4_CHECK_URL → PUBLIC_IP_CHECK_URL → DEFAULT_IPV4_CHECK_URL
+///   IPv6: PUBLIC_IPV6_CHECK_URL → DEFAULT_IPV6_CHECK_URL
 /// IPv6 failures are quiet (no IPv6 is normal on many hosts).
 pub fn spawn_public_ip_refresher(metrics: Arc<NodeMetrics>) {
     let v4_url = std::env::var("PUBLIC_IPV4_CHECK_URL")
         .or_else(|_| std::env::var("PUBLIC_IP_CHECK_URL"))
-        .unwrap_or_else(|_| "https://api.ipify.org".to_string());
+        .unwrap_or_else(|_| DEFAULT_IPV4_CHECK_URL.to_string());
     let v6_url = std::env::var("PUBLIC_IPV6_CHECK_URL")
-        .unwrap_or_else(|_| "https://api6.ipify.org".to_string());
+        .unwrap_or_else(|_| DEFAULT_IPV6_CHECK_URL.to_string());
 
     let m4 = metrics.clone();
     tokio::spawn(async move { run_family_refresher(m4, v4_url, IpFamily::V4, false).await });
@@ -1524,5 +1534,29 @@ mod tests {
         // An HTML error page or rate-limit text must not parse as an IP.
         assert_eq!(parse_ip_for_family("<html>429</html>", &IpFamily::V4), None);
         assert_eq!(parse_ip_for_family("not-an-ip", &IpFamily::V6), None);
+    }
+
+    #[test]
+    fn default_check_urls_are_https_and_family_pinned() {
+        assert_ne!(DEFAULT_IPV4_CHECK_URL, DEFAULT_IPV6_CHECK_URL);
+        let host = |url: &str| {
+            url.trim_start_matches("https://")
+                .split('/')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let host4 = host(DEFAULT_IPV4_CHECK_URL);
+        let host6 = host(DEFAULT_IPV6_CHECK_URL);
+        assert!(
+            host4.contains("ipv4") || host4.contains("-v4") || host4.contains("4."),
+            "IPv4 default must name its family, got {host4}"
+        );
+        assert!(
+            host6.contains("ipv6") || host6.contains("-v6") || host6.contains("6."),
+            "IPv6 default must name its family, got {host6}"
+        );
+        assert!(DEFAULT_IPV4_CHECK_URL.starts_with("https://"));
+        assert!(DEFAULT_IPV6_CHECK_URL.starts_with("https://"));
     }
 }

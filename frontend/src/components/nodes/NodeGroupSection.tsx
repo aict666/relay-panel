@@ -22,6 +22,8 @@ interface Props {
   openDetail: (row: NodeDisplayRow) => void;
   /** v1.0.10: admin-only per-node upgrade trigger (desktop table only). */
   onUpgrade?: (row: NodeDisplayRow) => void;
+  /** Admin-only manual cleanup for real offline rows. */
+  onDelete?: (row: NodeDisplayRow) => Promise<void> | void;
 }
 
 /** Per-group summary: online/total (placeholders excluded) + aggregate live
@@ -41,7 +43,7 @@ function groupSummary(rows: NodeDisplayRow[]) {
 /** One group block: header bar (name · ID · online/total · aggregate ↑↓) +
  *  either a desktop table or mobile list. Collapsible. A group with only a
  *  placeholder row shows "no node reporting". */
-export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade }: Props) {
+export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onDelete }: Props) {
   const head = rows[0];
   const { total, online, connections, up, down } = groupSummary(rows);
   const region = head.region;
@@ -81,10 +83,11 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
         t={t}
         openDetail={openDetail}
         onUpgrade={onUpgrade}
+        onDelete={onDelete}
       />
     </div>
   ) : (
-    <NodeDesktopTable rows={rows} panelProtocol={panelProtocol} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} t={t} openDetail={openDetail} onUpgrade={onUpgrade} />
+    <NodeDesktopTable rows={rows} panelProtocol={panelProtocol} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} t={t} openDetail={openDetail} onUpgrade={onUpgrade} onDelete={onDelete} />
   );
 
   return (

@@ -10,7 +10,7 @@ import type { ThemeConfig } from 'antd';
 // Palette anchors (keep in sync with theme.css :root):
 //   teal   600 #0d9488  700 #0f766e  50 #f0fdfa  200 #99f6e4
 //   canvas #f6f7f9   card #ffffff   hairline #ecedf1   border #dfe3e8
-//   text   #101828 / #5a6472 / #98a2b3
+//   text   #101828 / #5a6472 / #667085
 export const rpTheme: ThemeConfig = {
   token: {
     colorPrimary: '#0d9488',
@@ -23,7 +23,8 @@ export const rpTheme: ThemeConfig = {
 
     colorText: '#101828',
     colorTextSecondary: '#5a6472',
-    colorTextTertiary: '#98a2b3',
+    colorTextTertiary: '#667085',
+    colorTextDescription: '#5a6472',
     colorTextQuaternary: '#b6bec9',
 
     colorBgLayout: '#f6f7f9',
@@ -69,7 +70,7 @@ export const rpTheme: ThemeConfig = {
       itemBorderRadius: 8,
       iconSize: 16,
       collapsedIconSize: 18,
-      groupTitleColor: '#98a2b3',
+      groupTitleColor: '#667085',
       groupTitleFontSize: 11,
     },
     // Flat buttons — drop antd's default control shadow for a cleaner look.
