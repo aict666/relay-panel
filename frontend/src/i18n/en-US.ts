@@ -765,11 +765,21 @@ export const enUS: Dict = {
 
   notifySettings: 'Notifications',
 
+  notifyRules: 'Alert rules',
+
+  notificationChannels: 'Notification channels',
+
+  deliveryHistory: 'Delivery history',
+
   notifyIntro: 'Node offline alerts',
 
   notifyIntroDesc: 'Alerts when a node stays offline past the threshold, and again when it recovers. The alert threshold is deliberately separate from the "online" dot in the UI: 30s is right for a status light, but alerting that fast gets you paged by every network blip — and a noisy channel is one you end up muting.',
 
   notifyEnabled: 'Enable notifications',
+
+  notifyOffline: 'Node offline',
+
+  notifyOfflineHint: 'Send an alert when a node first exceeds the offline threshold.',
 
   offlineAlertSecs: 'Offline alert threshold',
 
@@ -782,6 +792,56 @@ export const enUS: Dict = {
   notifyRecovery: 'Notify on recovery',
 
   notifyRecoveryHint: 'Send a follow-up when the node reports in again. Without it you get told something broke but never that it was fixed.',
+
+  notifyVersionOutdated: 'Node version outdated',
+
+  notifyVersionOutdatedHint: 'Alert once when a node is behind the latest release. Unknown versions are never flagged.',
+
+  repeatAlertMinutes: 'Repeat offline alert',
+
+  repeatAlertMinutesHint: '0 = no repeat. A positive interval sends a reminder while the node remains offline.',
+
+  channelConfiguredEnabled: 'Configured & enabled',
+
+  channelConfiguredDisabled: 'Configured, disabled',
+
+  channelNotConfigured: 'Not configured',
+
+  channelEnabledMissingConfig: 'Configuration incomplete',
+
+  channelEnableLabel: 'Enable this channel',
+
+  notifyNoChannelsHint: 'Notifications are on, but no channel is enabled. Configure Telegram or email first.',
+
+  notifyHistoryTime: 'Time',
+
+  notifyHistoryEvent: 'Event',
+
+  notifyHistoryNode: 'Node',
+
+  notifyHistoryChannel: 'Channel',
+
+  notifyHistoryResult: 'Result',
+
+  notifyHistoryDetail: 'Detail',
+
+  notifyHistoryEmpty: 'No delivery records yet',
+
+  notifyHistoryLoadFailed: 'Could not load delivery history',
+
+  notifyHistorySent: 'Sent',
+
+  notifyHistoryFailed: 'Failed',
+
+  notifyEventOffline: 'Node offline',
+
+  notifyEventOfflineReminder: 'Node still offline',
+
+  notifyEventRecovery: 'Node recovered',
+
+  notifyEventVersionOutdated: 'Node version outdated',
+
+  notifyEventTest: 'Test message',
 
   enableChannel: 'Enable this channel',
 

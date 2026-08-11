@@ -1220,6 +1220,12 @@ html, body, #root {
   font-variant-numeric: tabular-nums;
 }
 
+/* Transfer values are one measurement. Keep the number and unit together;
+   the desktop table already scrolls horizontally on narrow viewports. */
+.rp-node-throughput {
+  white-space: nowrap;
+}
+
 /* v0.4.17: country-flag pill wrapper. Outer layer sizes & rounds the slot;
  *  the inner .fi (from flag-icons) is pinned to a fixed flag size so the
  *  library's own .fi rules never disturb the surrounding table layout. */

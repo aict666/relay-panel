@@ -8,6 +8,7 @@ import { formatBps, formatBytes, formatUptime, formatPercent } from '../../utils
 import { versionRelation, versionTagColor } from '../../utils/version';
 import { ConnectionsCell, NetworkCell, statusTag } from './shared';
 import { resolveNodeUpgrade } from './upgrade';
+import { nodeDesktopColumnWidths } from './tableLayout';
 
 interface Props {
   rows: NodeDisplayRow[];
@@ -38,14 +39,14 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
       // v1.3.16: was an inline copy of statusTag's logic; now shares it with the
       // mobile list so the control-channel warning can't appear on one view and
       // not the other.
-      title: t('status'), key: 'status', width: 100, fixed: 'left' as const,
+      title: t('status'), key: 'status', width: nodeDesktopColumnWidths.status, fixed: 'left' as const,
       render: (_: unknown, r: NodeDisplayRow) => statusTag(r, t, panelProtocol),
     },
     // v1.0.10: node version moved forward, with the upgrade action right after it.
     // v1.2: compared against the latest NODE release (latestNodeVersion), not
     // the panel version.
     {
-      title: t('nodeVersion'), dataIndex: 'node_version', key: 'node_version', width: 100,
+      title: t('nodeVersion'), dataIndex: 'node_version', key: 'node_version', width: nodeDesktopColumnWidths.nodeVersion,
       render: (v: string | null) => {
         if (!v) return <Typography.Text type="secondary">-</Typography.Text>;
         // v1.2: if the node-version check failed, we can't vouch for any
@@ -62,7 +63,7 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
     // neutral state (PR5). Protocol-incompatible and a failed lookup both take
     // priority over version status.
     ...(onUpgrade ? [{
-      title: t('nodeUpgrade'), key: 'upgrade', width: 72,
+      title: t('nodeUpgrade'), key: 'upgrade', width: nodeDesktopColumnWidths.nodeUpgrade,
       render: (_: unknown, r: NodeDisplayRow) => {
         const { state } = resolveNodeUpgrade(r, latestNodeVersion, panelProtocol, nodeVersionCheckFailed);
         switch (state) {
@@ -116,27 +117,27 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
       render: (_: unknown, r: NodeDisplayRow) => <ConnectionsCell row={r} t={t} />,
     },
     {
-      title: 'CPU', key: 'cpu', width: 84,
+      title: 'CPU', key: 'cpu', width: nodeDesktopColumnWidths.cpu,
       render: (_: unknown, r: NodeDisplayRow) => <NodeResourceBar value={r.cpu} tooltip={`CPU: ${formatPercent(r.cpu)}`} />,
     },
     {
-      title: t('mem'), key: 'mem', width: 100,
+      title: t('mem'), key: 'mem', width: nodeDesktopColumnWidths.mem,
       render: (_: unknown, r: NodeDisplayRow) => <NodeResourceBar value={r.mem} tooltip={`${t('mem')}: ${formatPercent(r.mem)}`} />,
     },
     {
-      title: t('disk'), key: 'disk', width: 100,
+      title: t('disk'), key: 'disk', width: nodeDesktopColumnWidths.disk,
       render: (_: unknown, r: NodeDisplayRow) => <NodeDiskBar usagePercent={r.disk_usage_percent} used={r.disk_used} total={r.disk_total} mount={r.disk_mount} t={t} />,
     },
     {
-      title: `${t('uploadRate')}/${t('downloadRate')}`, key: 'rate', width: 140,
+      title: `${t('uploadRate')}/${t('downloadRate')}`, key: 'rate', width: nodeDesktopColumnWidths.rate,
       render: (_: unknown, r: NodeDisplayRow) => (
-        <span className="rp-mono">{formatBps(r.upload_bps)} / {formatBps(r.download_bps)}</span>
+        <span className="rp-mono rp-node-throughput">{formatBps(r.upload_bps)} / {formatBps(r.download_bps)}</span>
       ),
     },
     {
-      title: `${t('totalUpload')}/${t('totalDownload')}`, key: 'traffic', width: 150,
+      title: `${t('totalUpload')}/${t('totalDownload')}`, key: 'traffic', width: nodeDesktopColumnWidths.traffic,
       render: (_: unknown, r: NodeDisplayRow) => (
-        <span className="rp-mono">{formatBytes(r.boot_upload_bytes)} / {formatBytes(r.boot_download_bytes)}</span>
+        <span className="rp-mono rp-node-throughput">{formatBytes(r.boot_upload_bytes)} / {formatBytes(r.boot_download_bytes)}</span>
       ),
     },
     {

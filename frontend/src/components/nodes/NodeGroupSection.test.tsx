@@ -5,6 +5,7 @@ import type { Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { statusTag } from './shared';
 import { NodeGroupSection } from './NodeGroupSection';
+import { nodeDesktopColumnWidths } from './tableLayout';
 
 // A fake t() that echoes the key — assertions match on the i18n KEY, not on a
 // translated string, so the tests don't break when wording changes.
@@ -136,6 +137,29 @@ describe('NodeGroupSection mobile vs desktop', () => {
     // Online-only sum: 3 + 5. Offline 99 must not contribute.
     expect(screen.getByText(/groupConnections/)).toBeInTheDocument();
     expect(screen.getByText(/8/)).toBeInTheDocument();
+  });
+});
+
+describe('Node desktop table throughput layout', () => {
+  it('reserves enough width for transfer values', () => {
+    expect(nodeDesktopColumnWidths.rate).toBeGreaterThanOrEqual(192);
+    expect(nodeDesktopColumnWidths.traffic).toBeGreaterThanOrEqual(172);
+  });
+
+  it('keeps transfer values on one line', () => {
+    const { container } = render(
+      <NodeGroupSection
+        rows={[row({ online: true, upload_bps: 1018430, download_bps: 60110, boot_upload_bytes: 123456789, boot_download_bytes: 987654321 })]}
+        panelProtocol={0}
+        latestNodeVersion="1.1.0"
+        nodeVersionCheckFailed={false}
+        isMobile={false}
+        t={t}
+        openDetail={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelectorAll('.rp-node-throughput')).toHaveLength(2);
   });
 });
 

@@ -43,23 +43,32 @@ const TICK: Duration = Duration::from_secs(30);
 /// — a node silent for 10s of a 180s threshold is simply not offline yet, and
 /// treating it as Online is exactly right (it has nothing to recover FROM, so
 /// coming back stays silent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NodeState {
     /// Healthy, or silent for less than the alert threshold.
     Online,
     /// Past the threshold and already announced — do not announce again.
-    OfflineAlerted,
+    OfflineAlerted {
+        last_alert_at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
-/// node key ("group_id:node_id") → last known state.
-type Watch = HashMap<String, NodeState>;
+/// In-memory state for availability and node-version alerts. Version targets
+/// are kept separately so a newer release can produce one fresh reminder.
+#[derive(Default)]
+struct Watch {
+    nodes: HashMap<String, NodeState>,
+    version_alerted_target: HashMap<String, String>,
+}
 
 /// Drop transient online entries whose source row disappeared, but retain an
 /// announced outage until the node reports again. The stale-row sweeper is
 /// expected to remove long-dead status rows; forgetting the alert state at the
 /// same time would make the later recovery indistinguishable from a new node.
-fn retain_transition_state(watch: &mut Watch, seen: &HashSet<String>) {
-    watch.retain(|key, state| seen.contains(key) || *state == NodeState::OfflineAlerted);
+fn retain_transition_state(watch: &mut HashMap<String, NodeState>, seen: &HashSet<String>) {
+    watch.retain(|key, state| {
+        seen.contains(key) || matches!(state, NodeState::OfflineAlerted { .. })
+    });
 }
 
 /// What a transition should announce.
@@ -67,6 +76,7 @@ fn retain_transition_state(watch: &mut Watch, seen: &HashSet<String>) {
 enum Announce {
     Nothing,
     Offline,
+    OfflineReminder,
     Recovery,
 }
 
@@ -102,7 +112,12 @@ fn state_after_delivery(
 ///
 /// `tick` calls this and the tests call this — deliberately not two copies of
 /// the same `match`, which would drift the moment one side is edited.
-fn decide(previous: Option<NodeState>, is_offline: bool) -> (NodeState, Announce) {
+fn decide(
+    previous: Option<NodeState>,
+    is_offline: bool,
+    now: chrono::DateTime<chrono::Utc>,
+    repeat_alert_minutes: i64,
+) -> (NodeState, Announce) {
     match (previous, is_offline) {
         // Healthy, staying healthy. Also covers a node silent for less than the
         // threshold — a blip is entirely silent, which is what the long
@@ -110,26 +125,53 @@ fn decide(previous: Option<NodeState>, is_offline: bool) -> (NodeState, Announce
         (None | Some(NodeState::Online), false) => (NodeState::Online, Announce::Nothing),
 
         // Crossed the threshold into a real outage.
-        (Some(NodeState::Online), true) => (NodeState::OfflineAlerted, Announce::Offline),
+        (Some(NodeState::Online), true) => (
+            NodeState::OfflineAlerted { last_alert_at: now },
+            Announce::Offline,
+        ),
 
         // First sight of a node that is ALREADY past the threshold: it died
         // while the panel wasn't watching (a restart/upgrade). Alert once —
         // silently baselining it would mean an outage that began during an
         // upgrade is never reported, exactly when the operator needs to know.
-        (None, true) => (NodeState::OfflineAlerted, Announce::Offline),
+        (None, true) => (
+            NodeState::OfflineAlerted { last_alert_at: now },
+            Announce::Offline,
+        ),
 
         // Ongoing announced outage: stay quiet. Re-alerting every tick is how
         // an alert channel gets muted, and a muted channel is worse than none.
-        (Some(NodeState::OfflineAlerted), true) => (NodeState::OfflineAlerted, Announce::Nothing),
+        (Some(NodeState::OfflineAlerted { last_alert_at }), true)
+            if repeat_alert_minutes > 0
+                && now - last_alert_at >= chrono::Duration::minutes(repeat_alert_minutes) =>
+        {
+            (
+                NodeState::OfflineAlerted { last_alert_at: now },
+                Announce::OfflineReminder,
+            )
+        }
+
+        (Some(NodeState::OfflineAlerted { last_alert_at }), true) => (
+            NodeState::OfflineAlerted { last_alert_at },
+            Announce::Nothing,
+        ),
 
         // Came back from an announced outage.
-        (Some(NodeState::OfflineAlerted), false) => (NodeState::Online, Announce::Recovery),
+        (Some(NodeState::OfflineAlerted { .. }), false) => (NodeState::Online, Announce::Recovery),
     }
+}
+
+/// Missing or malformed versions are not evidence that a node is stale.
+fn is_version_outdated(node_version: Option<&str>, latest_version: Option<&str>) -> bool {
+    let parse = |version: Option<&str>| {
+        version.and_then(|v| semver::Version::parse(v.trim().trim_start_matches('v')).ok())
+    };
+    matches!((parse(node_version), parse(latest_version)), (Some(node), Some(latest)) if node < latest)
 }
 
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
-        let mut watch: Watch = HashMap::new();
+        let mut watch = Watch::default();
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tracing::info!("node-watch started (tick {}s)", TICK.as_secs());
@@ -156,6 +198,17 @@ async fn tick(state: &AppState, watch: &mut Watch, now: chrono::DateTime<chrono:
     };
 
     let threshold = cfg.alert_after();
+    let latest_node_version = if cfg.notify_version_outdated {
+        match state.release_cache.resolve_latest_node_version().await {
+            Ok(version) => version,
+            Err(e) => {
+                tracing::warn!("node-watch: version check skipped: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut seen: HashSet<String> = HashSet::with_capacity(rows.len());
 
     for (key, value) in &rows {
@@ -169,29 +222,69 @@ async fn tick(state: &AppState, watch: &mut Watch, now: chrono::DateTime<chrono:
             .unwrap_or(i64::MAX);
         let is_offline = offline_secs > threshold;
 
-        let previous = watch.get(&node_key).copied();
-        let (next, announce) = decide(previous, is_offline);
+        let previous = watch.nodes.get(&node_key).cloned();
+        let (next, announce) = decide(
+            previous.clone(),
+            is_offline,
+            now,
+            cfg.repeat_alert_minutes.max(0),
+        );
         let delivery = match announce {
-            Announce::Offline => announce_offline(&cfg, &node_key, value, offline_secs).await,
+            Announce::Offline if cfg.notify_offline => {
+                announce_offline(state, &cfg, &node_key, value, offline_secs, false).await
+            }
+            Announce::OfflineReminder if cfg.notify_offline => {
+                announce_offline(state, &cfg, &node_key, value, offline_secs, true).await
+            }
             // The recovery toggle is applied here rather than inside `decide`
             // so the state machine stays about STATE and the config only gates
             // delivery.
             Announce::Recovery if cfg.notify_recovery => {
-                announce_recovery(&cfg, &node_key, value).await
+                announce_recovery(state, &cfg, &node_key, value).await
             }
             _ => DeliveryOutcome::Skipped,
         };
         match state_after_delivery(previous, next, delivery) {
             Some(committed) => {
-                watch.insert(node_key, committed);
+                watch.nodes.insert(node_key.clone(), committed);
             }
             None => {
-                watch.remove(&node_key);
+                watch.nodes.remove(&node_key);
             }
+        }
+
+        let reported_version = serde_json::from_str::<serde_json::Value>(value)
+            .ok()
+            .and_then(|v| {
+                v.get("node_version")
+                    .and_then(|version| version.as_str())
+                    .map(str::to_owned)
+            });
+        if is_version_outdated(reported_version.as_deref(), latest_node_version.as_deref()) {
+            let latest = latest_node_version.as_deref().unwrap_or_default();
+            if watch
+                .version_alerted_target
+                .get(&node_key)
+                .map(String::as_str)
+                != Some(latest)
+            {
+                let outcome =
+                    announce_version_outdated(state, &cfg, &node_key, value, latest).await;
+                if outcome == DeliveryOutcome::Delivered {
+                    watch
+                        .version_alerted_target
+                        .insert(node_key.clone(), latest.to_string());
+                }
+            }
+        } else {
+            watch.version_alerted_target.remove(&node_key);
         }
     }
 
-    retain_transition_state(watch, &seen);
+    retain_transition_state(&mut watch.nodes, &seen);
+    watch
+        .version_alerted_target
+        .retain(|key, _| seen.contains(key));
 }
 
 /// Pull display fields out of a node_status JSON blob for the message body.
@@ -206,10 +299,12 @@ fn describe(node_key: &str, status_json: &str) -> String {
 }
 
 async fn announce_offline(
+    state: &AppState,
     cfg: &NotifyConfig,
     node_key: &str,
     status_json: &str,
     offline_secs: i64,
+    reminder: bool,
 ) -> DeliveryOutcome {
     // Offline detection runs regardless of the notification config so the state
     // machine stays accurate; only DELIVERY is gated. That way enabling alerts
@@ -222,16 +317,28 @@ async fn announce_offline(
         return DeliveryOutcome::Skipped;
     }
     let mins = (offline_secs / 60).max(1);
+    let title = if reminder {
+        "🔴 节点仍离线"
+    } else {
+        "🔴 节点离线"
+    };
     let text = format!(
-        "🔴 节点离线\n\n{}\n已离线约 {} 分钟。\n\n该节点上的转发规则可能已经中断。",
+        "{title}\n\n{}\n已离线约 {} 分钟。\n\n该节点上的转发规则可能已经中断。",
         describe(node_key, status_json),
         mins
     );
+    let event = if reminder {
+        "offline_reminder"
+    } else {
+        "offline"
+    };
     let report = notify::send_all(cfg, "RelayPanel 节点离线告警", &text).await;
-    log_report(node_key, "offline", &report)
+    notify::record_report(state.db.as_ref(), event, Some(node_key), &report).await;
+    log_report(node_key, event, &report)
 }
 
 async fn announce_recovery(
+    state: &AppState,
     cfg: &NotifyConfig,
     node_key: &str,
     status_json: &str,
@@ -245,7 +352,34 @@ async fn announce_recovery(
         describe(node_key, status_json)
     );
     let report = notify::send_all(cfg, "RelayPanel 节点恢复", &text).await;
+    notify::record_report(state.db.as_ref(), "recovery", Some(node_key), &report).await;
     log_report(node_key, "recovery", &report)
+}
+
+async fn announce_version_outdated(
+    state: &AppState,
+    cfg: &NotifyConfig,
+    node_key: &str,
+    status_json: &str,
+    latest_version: &str,
+) -> DeliveryOutcome {
+    if !cfg.any_channel_enabled() {
+        return DeliveryOutcome::Skipped;
+    }
+    let text = format!(
+        "🟠 节点版本过旧\n\n{}\n当前节点版本低于最新版本 {}，建议在节点状态页面安排升级。",
+        describe(node_key, status_json),
+        latest_version,
+    );
+    let report = notify::send_all(cfg, "RelayPanel 节点版本过旧", &text).await;
+    notify::record_report(
+        state.db.as_ref(),
+        "version_outdated",
+        Some(node_key),
+        &report,
+    )
+    .await;
+    log_report(node_key, "version_outdated", &report)
 }
 
 /// A failed notification is logged, never propagated: the alert loop must keep
@@ -275,14 +409,50 @@ fn log_report(node_key: &str, kind: &str, report: &notify::SendReport) -> Delive
 mod tests {
     use super::*;
 
+    fn test_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-08-07T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
     /// A healthy node never generates traffic on the alert channel.
     #[test]
     fn healthy_node_never_alerts() {
-        assert_eq!(decide(None, false), (NodeState::Online, Announce::Nothing));
         assert_eq!(
-            decide(Some(NodeState::Online), false),
+            decide(None, false, test_now(), 0),
             (NodeState::Online, Announce::Nothing)
         );
+        assert_eq!(
+            decide(Some(NodeState::Online), false, test_now(), 0),
+            (NodeState::Online, Announce::Nothing)
+        );
+    }
+
+    #[test]
+    fn outage_repeats_only_after_the_configured_interval() {
+        let first = test_now();
+        let (state, announce) = decide(None, true, first, 30);
+        assert_eq!(announce, Announce::Offline);
+
+        let before_repeat = first + chrono::Duration::minutes(29);
+        assert_eq!(
+            decide(Some(state.clone()), true, before_repeat, 30).1,
+            Announce::Nothing
+        );
+
+        let at_repeat = first + chrono::Duration::minutes(30);
+        assert_eq!(
+            decide(Some(state), true, at_repeat, 30).1,
+            Announce::OfflineReminder
+        );
+    }
+
+    #[test]
+    fn version_alerts_only_for_parseable_versions_behind_the_latest_release() {
+        assert!(is_version_outdated(Some("v1.0.0"), Some("1.1.0")));
+        assert!(!is_version_outdated(Some("1.1.0"), Some("1.1.0")));
+        assert!(!is_version_outdated(Some("not-a-version"), Some("1.1.0")));
+        assert!(!is_version_outdated(Some("1.0.0"), None));
     }
 
     /// An ongoing outage alerts EXACTLY once, no matter how many ticks pass.
@@ -290,12 +460,13 @@ mod tests {
     /// channel is worse than no channel.
     #[test]
     fn outage_alerts_once_not_every_tick() {
-        let (mut state, announce) = decide(Some(NodeState::Online), true);
-        assert_eq!(state, NodeState::OfflineAlerted);
+        let now = test_now();
+        let (mut state, announce) = decide(Some(NodeState::Online), true, now, 0);
+        assert!(matches!(state, NodeState::OfflineAlerted { .. }));
         assert_eq!(announce, Announce::Offline, "the transition alerts");
 
         for tick in 0..20 {
-            let (next, announce) = decide(Some(state), true);
+            let (next, announce) = decide(Some(state), true, now, 0);
             assert_eq!(
                 announce,
                 Announce::Nothing,
@@ -308,13 +479,19 @@ mod tests {
     /// Recovery is announced exactly once, on the transition back.
     #[test]
     fn recovery_alerts_once() {
-        let (state, announce) = decide(Some(NodeState::OfflineAlerted), false);
+        let now = test_now();
+        let (state, announce) = decide(
+            Some(NodeState::OfflineAlerted { last_alert_at: now }),
+            false,
+            now,
+            0,
+        );
         assert_eq!(state, NodeState::Online);
         assert_eq!(announce, Announce::Recovery, "coming back is announced");
 
         // Steady online afterwards — no repeat.
         assert_eq!(
-            decide(Some(state), false),
+            decide(Some(state), false, now, 0),
             (NodeState::Online, Announce::Nothing)
         );
     }
@@ -325,10 +502,9 @@ mod tests {
     /// needs to know.
     #[test]
     fn node_first_seen_offline_still_alerts() {
-        assert_eq!(
-            decide(None, true),
-            (NodeState::OfflineAlerted, Announce::Offline)
-        );
+        let (state, announce) = decide(None, true, test_now(), 0);
+        assert!(matches!(state, NodeState::OfflineAlerted { .. }));
+        assert_eq!(announce, Announce::Offline);
     }
 
     /// A node silent for LESS than the threshold is not offline as far as this
@@ -340,19 +516,24 @@ mod tests {
     fn blip_below_threshold_is_silent_in_both_directions() {
         // `is_offline` is false for a sub-threshold gap (tick folds the
         // threshold in before calling decide).
-        let (state, announce) = decide(Some(NodeState::Online), false);
+        let now = test_now();
+        let (state, announce) = decide(Some(NodeState::Online), false, now, 0);
         assert_eq!(state, NodeState::Online);
         assert_eq!(announce, Announce::Nothing, "going quiet briefly is silent");
 
-        let (_, announce) = decide(Some(state), false);
+        let (_, announce) = decide(Some(state), false, now, 0);
         assert_eq!(announce, Announce::Nothing, "and so is coming back");
     }
 
     #[test]
     fn stale_cleanup_keeps_announced_outage_for_recovery() {
-        let mut watch = Watch::from([
+        let now = test_now();
+        let mut watch = HashMap::from([
             ("gone-online".into(), NodeState::Online),
-            ("gone-offline".into(), NodeState::OfflineAlerted),
+            (
+                "gone-offline".into(),
+                NodeState::OfflineAlerted { last_alert_at: now },
+            ),
             ("present".into(), NodeState::Online),
         ]);
         let seen = HashSet::from(["present".into()]);
@@ -362,7 +543,7 @@ mod tests {
         assert!(!watch.contains_key("gone-online"));
         assert_eq!(
             watch.get("gone-offline"),
-            Some(&NodeState::OfflineAlerted),
+            Some(&NodeState::OfflineAlerted { last_alert_at: now }),
             "an announced outage must survive status-row cleanup so recovery is observable"
         );
         assert_eq!(watch.get("present"), Some(&NodeState::Online));
@@ -370,14 +551,15 @@ mod tests {
 
     #[test]
     fn failed_offline_delivery_keeps_the_transition_retryable() {
+        let now = test_now();
         for previous in [None, Some(NodeState::Online)] {
-            let (next, announce) = decide(previous, true);
+            let (next, announce) = decide(previous.clone(), true, now, 0);
             assert_eq!(announce, Announce::Offline);
 
-            let committed = state_after_delivery(previous, next, DeliveryOutcome::Failed);
+            let committed = state_after_delivery(previous.clone(), next, DeliveryOutcome::Failed);
             assert_eq!(committed, previous);
             assert_eq!(
-                decide(committed, true).1,
+                decide(committed, true, now, 0).1,
                 Announce::Offline,
                 "the next tick must retry an offline alert that reached no channel"
             );
@@ -386,14 +568,15 @@ mod tests {
 
     #[test]
     fn failed_recovery_delivery_keeps_the_transition_retryable() {
-        let previous = Some(NodeState::OfflineAlerted);
-        let (next, announce) = decide(previous, false);
+        let now = test_now();
+        let previous = Some(NodeState::OfflineAlerted { last_alert_at: now });
+        let (next, announce) = decide(previous.clone(), false, now, 0);
         assert_eq!(announce, Announce::Recovery);
 
-        let committed = state_after_delivery(previous, next, DeliveryOutcome::Failed);
+        let committed = state_after_delivery(previous.clone(), next, DeliveryOutcome::Failed);
         assert_eq!(committed, previous);
         assert_eq!(
-            decide(committed, false).1,
+            decide(committed, false, now, 0).1,
             Announce::Recovery,
             "the next tick must retry a recovery alert that reached no channel"
         );
@@ -401,21 +584,24 @@ mod tests {
 
     #[test]
     fn successful_or_skipped_delivery_commits_the_transition() {
+        let alerted = NodeState::OfflineAlerted {
+            last_alert_at: test_now(),
+        };
         assert_eq!(
             state_after_delivery(
                 Some(NodeState::Online),
-                NodeState::OfflineAlerted,
+                alerted.clone(),
                 DeliveryOutcome::Delivered,
             ),
-            Some(NodeState::OfflineAlerted)
+            Some(alerted.clone())
         );
         assert_eq!(
             state_after_delivery(
                 Some(NodeState::Online),
-                NodeState::OfflineAlerted,
+                alerted.clone(),
                 DeliveryOutcome::Skipped,
             ),
-            Some(NodeState::OfflineAlerted),
+            Some(alerted),
             "disabled alerts must not replay an outage when enabled later"
         );
     }

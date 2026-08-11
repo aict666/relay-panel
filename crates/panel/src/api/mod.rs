@@ -262,6 +262,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(notify::get_notify_settings).put(notify::update_notify_settings),
         )
         .route(
+            "/admin/settings/notify/history",
+            axum::routing::get(notify::get_notify_history),
+        )
+        .route(
             "/admin/settings/notify/test",
             axum::routing::post(notify::test_notify),
         )
