@@ -418,6 +418,9 @@ pub async fn admin_buy_plan_for_user(
     if plan.plan_type == "time" && plan.duration_days <= 0 {
         return Json(err(400, "该套餐无有效时长"));
     }
+    if plan.plan_type == "monthly" && (plan.duration_days != 30 || !plan.reset_traffic) {
+        return Json(err(400, "该月付套餐配置无效"));
+    }
 
     let price_cents = match relay_shared::money::balance_to_cents(&plan.price) {
         Some(c) => c,
@@ -431,7 +434,7 @@ pub async fn admin_buy_plan_for_user(
         }
     };
 
-    let duration_days = if plan.plan_type == "time" {
+    let duration_days = if matches!(plan.plan_type.as_str(), "time" | "monthly") {
         plan.duration_days
     } else {
         0
@@ -479,6 +482,8 @@ pub async fn admin_buy_plan_for_user(
             plan.grant_all_groups,
             &device_group_ids,
             &new_authorized_group_ids,
+            &plan.plan_type,
+            req.auto_renew && plan.plan_type == "monthly",
             false,
             Some(expected_current_plan_id),
         )
@@ -523,7 +528,8 @@ pub async fn admin_buy_plan_for_user(
 /// PUT /admin/users/{id}/plan — admin edits a user's plan association + expiry
 /// WITHOUT charging. Used to remove a plan (clear=true → both NULL) or adjust
 /// the expiry (clear=false → keep the user's current plan_id, set the expiry,
-/// where a null plan_expire_at means "never expires"). Admin targets are
+/// where a null plan_expire_at means "never expires" for legacy time plans;
+/// monthly plans always require a concrete cycle end). Admin targets are
 /// rejected (admin_set_user_plan also guards WHERE admin=false).
 pub async fn admin_set_user_plan(
     _admin: AdminOnly,
@@ -568,7 +574,10 @@ pub async fn admin_set_user_plan(
             return Json(err(409, "用户套餐已变更，请刷新后重新确认"));
         }
         Ok(AdminUserPlanEditOutcome::ExpiryNotApplicable) => {
-            return Json(err(400, "只有时长套餐可以设置到期时间"));
+            return Json(err(
+                400,
+                "只有时长/月付套餐可以设置到期时间，月付套餐不能设为永不过期",
+            ));
         }
         Err(e) => {
             tracing::error!(

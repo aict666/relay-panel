@@ -253,10 +253,10 @@ pub async fn get_me(user: AuthUser, State(state): State<AppState>) -> Json<ApiRe
     // returns 500 rather than masquerading as "0 rules" or "no plan", which
     // would hide a real outage from the account page.
     let plan_id = u.plan_id;
-    let (current_rules, plan_name) =
+    let (current_rules, current_plan) =
         match tokio::try_join!(state.db.count_by_uid(user.user_id), async {
             match plan_id {
-                Some(pid) => state.db.find_plan_name_by_id(pid).await,
+                Some(pid) => state.db.find_plan_by_id(pid).await,
                 None => Ok(None),
             }
         },)
@@ -334,7 +334,10 @@ pub async fn get_me(user: AuthUser, State(state): State<AppState>) -> Json<ApiRe
         admin: u.admin,
         balance: u.balance,
         plan_id: u.plan_id,
-        plan_name,
+        plan_name: current_plan.as_ref().map(|plan| plan.name.clone()),
+        plan_type: current_plan.as_ref().map(|plan| plan.plan_type.clone()),
+        plan_price: current_plan.as_ref().map(|plan| plan.price.clone()),
+        plan_billing_revision: current_plan.as_ref().map(|plan| plan.billing_revision),
         max_rules: u.max_rules,
         current_rules,
         traffic_used: u.traffic_used,
@@ -342,6 +345,7 @@ pub async fn get_me(user: AuthUser, State(state): State<AppState>) -> Json<ApiRe
         registered_at: u.created_at,
         must_change_password: u.must_change_password,
         plan_expire_at: u.plan_expire_at,
+        plan_auto_renew: u.plan_auto_renew,
         suspended: u.suspended,
         all_groups,
         available_groups,

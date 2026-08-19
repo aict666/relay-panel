@@ -1357,14 +1357,15 @@ pub struct UpdateGroupRequest {
 
 // === Admin API — Plans (v1.0.8) ===
 /// Create a plan. price is a decimal string (canonicalized via parse_balance).
-/// plan_type 'data' = traffic-quota plan, 'time' = time-limited (duration_days).
+/// plan_type 'data' = traffic-quota, 'time' = fixed-duration, 'monthly' = a
+/// recurring 30-day billing cycle with a fresh quota each cycle.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreatePlanRequest {
     pub name: String,
     pub max_rules: i32,
     pub traffic: i64,
     pub price: String,
-    /// 'data' or 'time'. Defaults to 'data' when omitted.
+    /// 'data', 'time', or 'monthly'. Defaults to 'data' when omitted.
     #[serde(default = "default_plan_type")]
     pub plan_type: String,
     /// Validity in days (0 = unlimited). Required > 0 for time plans.
@@ -1426,6 +1427,10 @@ pub struct BuyPlanRequest {
     /// duration, visibility, or device-group grants even when price is stable.
     #[serde(default)]
     pub expected_revision: Option<String>,
+    /// User opt-in for recurring charges. Honored only for monthly plans and
+    /// defaults to false so older clients cannot silently enable billing.
+    #[serde(default)]
+    pub auto_renew: bool,
 }
 
 /// v1.0.7: admin assigns a plan to a user, charging the user's balance (same
@@ -1442,6 +1447,23 @@ pub struct AdminBuyPlanRequest {
     pub expected_price: Option<String>,
     #[serde(default)]
     pub expected_revision: Option<String>,
+    /// Administrator-selected recurring-charge preference for a monthly plan.
+    #[serde(default)]
+    pub auto_renew: bool,
+}
+
+/// Change the calling user's recurring-charge preference. Enabling is valid
+/// only while their current plan is monthly; disabling is always accepted.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetPlanAutoRenewRequest {
+    pub enabled: bool,
+    /// Exact price displayed in the confirmation dialog. Required when
+    /// enabling so a stale page cannot authorize a different amount.
+    #[serde(default)]
+    pub expected_price: Option<String>,
+    /// Billing revision displayed together with `expected_price`.
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
 }
 
 /// v1.0.7: admin edits a user's plan association + expiry WITHOUT charging.

@@ -59,6 +59,9 @@ pub struct UserPublic {
     /// v1.0.8: plan expiry (NULL = no expiry).
     #[serde(default)]
     pub plan_expire_at: Option<String>,
+    /// User opt-in for recurring monthly charges.
+    #[serde(default)]
+    pub plan_auto_renew: bool,
     /// v1.0.8: admin suspension.
     #[serde(default)]
     pub suspended: bool,
@@ -80,6 +83,11 @@ pub struct UserSelf {
     /// label, resolved via a separate lookup (no plan → plan_name NULL too).
     pub plan_id: Option<i64>,
     pub plan_name: Option<String>,
+    pub plan_type: Option<String>,
+    /// Current monthly charge and its revision. Returned so recurring billing
+    /// can be authorized against an exact, visible contract.
+    pub plan_price: Option<String>,
+    pub plan_billing_revision: Option<i64>,
     pub max_rules: i32,
     /// v0.4.10: how many rules the user currently owns (for the account center's
     /// "current / limit" display). Counted live via count_by_uid.
@@ -96,6 +104,9 @@ pub struct UserSelf {
     /// v1.0.8: plan expiry (NULL = no expiry).
     #[serde(default)]
     pub plan_expire_at: Option<String>,
+    /// User opt-in for recurring monthly charges.
+    #[serde(default)]
+    pub plan_auto_renew: bool,
     /// v1.0.8: admin suspension (login allowed; forwarding gated).
     #[serde(default)]
     pub suspended: bool,

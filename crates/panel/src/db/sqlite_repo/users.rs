@@ -100,8 +100,10 @@ impl UserRepository for SqliteRepository {
         // yields no row → 0 rows_affected (caller fails the registration).
         // Note the column mapping: plans.traffic → users.traffic_limit.
         let result = sqlx::query(
-            "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit) \
-             SELECT ?, ?, ?, max_rules, traffic, speed_limit, ip_limit \
+            "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit, plan_expire_at) \
+             SELECT ?, ?, ?, max_rules, traffic, speed_limit, ip_limit, \
+                    CASE WHEN plan_type IN ('time','monthly') AND duration_days>0 \
+                         THEN datetime('now', printf('+%d days', duration_days)) ELSE NULL END \
              FROM plans WHERE id = ?",
         )
         .bind(username)
@@ -173,8 +175,10 @@ impl UserRepository for SqliteRepository {
 
         let inserted = try_sql!(
             sqlx::query(
-                "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit) \
-                 SELECT ?, ?, ?, max_rules, traffic, speed_limit, ip_limit \
+                "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit, plan_expire_at) \
+                 SELECT ?, ?, ?, max_rules, traffic, speed_limit, ip_limit, \
+                        CASE WHEN plan_type IN ('time','monthly') AND duration_days>0 \
+                             THEN datetime('now', printf('+%d days', duration_days)) ELSE NULL END \
                  FROM plans WHERE id = ?",
             )
             .bind(username)
@@ -224,8 +228,10 @@ impl UserRepository for SqliteRepository {
         .unwrap_or(1);
         let inserted = try_sql!(
             sqlx::query(
-                "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit) \
-                 SELECT ?, ?, ?, max_rules, traffic, speed_limit, ip_limit \
+                "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit, plan_expire_at) \
+                 SELECT ?, ?, ?, max_rules, traffic, speed_limit, ip_limit, \
+                        CASE WHEN plan_type IN ('time','monthly') AND duration_days>0 \
+                             THEN datetime('now', printf('+%d days', duration_days)) ELSE NULL END \
                  FROM plans WHERE id = ?",
             )
             .bind(username)
@@ -400,7 +406,10 @@ impl UserRepository for SqliteRepository {
         if current_plan_id != Some(expected_plan_id) {
             reject!(AdminUserPlanEditOutcome::PlanChanged);
         }
-        if !clear && plan_type.as_deref() != Some("time") {
+        if !clear && !matches!(plan_type.as_deref(), Some("time" | "monthly")) {
+            reject!(AdminUserPlanEditOutcome::ExpiryNotApplicable);
+        }
+        if !clear && plan_type.as_deref() == Some("monthly") && plan_expire_at.is_none() {
             reject!(AdminUserPlanEditOutcome::ExpiryNotApplicable);
         }
 
@@ -408,6 +417,8 @@ impl UserRepository for SqliteRepository {
             try_sql!(
                 sqlx::query(
                     "UPDATE users SET plan_id = NULL, plan_expire_at = NULL, \
+                     plan_auto_renew = 0, plan_auto_renew_price = NULL, \
+                     plan_auto_renew_revision = NULL, plan_auto_renew_retry_at = NULL, \
                      all_device_groups = 0 WHERE id = ?",
                 )
                 .bind(user_id)
@@ -441,6 +452,50 @@ impl UserRepository for SqliteRepository {
 
         try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
         Ok(AdminUserPlanEditOutcome::Updated)
+    }
+
+    async fn set_plan_auto_renew_guarded(
+        &self,
+        user_id: i64,
+        enabled: bool,
+        expected_price: Option<&str>,
+        expected_revision: Option<i64>,
+    ) -> Result<PlanAutoRenewUpdateOutcome, DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row: Option<(bool, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT u.admin, p.plan_type, p.price, p.billing_revision FROM users u \
+             LEFT JOIN plans p ON p.id=u.plan_id WHERE u.id=?",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((admin, plan_type, price, billing_revision)) = row else {
+            tx.rollback().await?;
+            return Ok(PlanAutoRenewUpdateOutcome::UserNotFound);
+        };
+        if admin || (enabled && plan_type.as_deref() != Some("monthly")) {
+            tx.rollback().await?;
+            return Ok(PlanAutoRenewUpdateOutcome::NotMonthly);
+        }
+        if enabled
+            && (expected_price.is_some() || expected_revision.is_some())
+            && (price.as_deref() != expected_price || billing_revision != expected_revision)
+        {
+            tx.rollback().await?;
+            return Ok(PlanAutoRenewUpdateOutcome::ContractChanged);
+        }
+        sqlx::query(
+            "UPDATE users SET plan_auto_renew=?, plan_auto_renew_price=?, \
+             plan_auto_renew_revision=?, plan_auto_renew_retry_at=NULL WHERE id=?",
+        )
+        .bind(enabled)
+        .bind(enabled.then_some(price).flatten())
+        .bind(enabled.then_some(billing_revision).flatten())
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(PlanAutoRenewUpdateOutcome::Updated)
     }
 
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError> {

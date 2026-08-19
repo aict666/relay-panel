@@ -122,6 +122,11 @@ async fn main() {
     // sweeper is the only thing that ever deletes its rows.
     service::history_prune::spawn(state.clone());
 
+    // Explicit opt-in recurring billing for monthly plans. The repository
+    // rechecks expiry and locks each user, so multiple panel instances cannot
+    // double-charge the same cycle.
+    service::monthly_renewal::spawn(state.clone());
+
     let app = app.with_state(state);
 
     let addr: SocketAddr = config.listen.parse().expect("Invalid listen address");

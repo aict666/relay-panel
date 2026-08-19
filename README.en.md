@@ -35,6 +35,7 @@
 - 🛒 **Plan shop & billing** — self-service purchase (balance charge) with order history; admin plan CRUD, plans grant lines and auto-authorize on purchase
 - 💳 **Up + down billing + per-line rate** — charged as `(upload + download) × line rate (0.1–100)` against the plan quota
 - 🔁 **Single current plan** — one plan per user: buying the **same** plan renews it (stack traffic / extend a time plan), buying a **different** plan switches (full replace, with a confirm); rules on lost lines auto-pause and auto-resume once re-authorized
+- 🗓️ **Standard monthly plans** — fixed 30-day cycles with explicit auto-renew opt-in; renewals use the accepted price and atomically restore quota, counters, and line grants; billing changes require fresh consent and underfunded renewals use a fair retry delay
 - 📈 **Traffic & quotas** — per-rule and per-user tracking with configurable limits (rule count, bandwidth, traffic cap)
 - 📋 **Multi-plan registration** — admins configure allowed plans; users choose on sign-up
 - 👤 **User management** — manage any user's rules, plan (assign / renew / switch / expiry / remove), reset traffic, reset password, ban/unban

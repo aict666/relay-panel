@@ -118,8 +118,11 @@ export default function Plans() {
     setSaving(true);
     try {
       const { traffic_gb, ...rest } = values;
+      const monthly = values.plan_type === 'monthly';
       const res = await api.post<unknown, ApiEnvelope<number>>('/admin/plans', {
         ...rest,
+        duration_days: monthly ? 30 : values.duration_days,
+        reset_traffic: monthly ? true : values.reset_traffic,
         traffic: gbToBytes(traffic_gb),
         grant_all_groups: !!values.grant_all_groups,
         // When granting all, the explicit list is moot — send [] to keep it clean.
@@ -156,6 +159,10 @@ export default function Plans() {
     if (!editing) return;
     if (loading || loadFailed || saving) return;
     const payload: Record<string, unknown> = {};
+    if (values.plan_type === 'monthly') {
+      values.duration_days = 30;
+      values.reset_traffic = true;
+    }
     if (values.name !== undefined && values.name !== editing.name) payload.name = values.name;
     if (values.max_rules !== undefined && values.max_rules !== editing.max_rules) payload.max_rules = values.max_rules;
     if (values.traffic_gb !== undefined && trafficGbChanged(editing.traffic, values.traffic_gb)) payload.traffic = gbToBytes(values.traffic_gb);
@@ -214,7 +221,7 @@ export default function Plans() {
     { title: t('name'), dataIndex: 'name', key: 'name' },
     {
       title: t('type'), dataIndex: 'plan_type', key: 'plan_type', width: 90,
-      render: (pt: string) => <Tag color={pt === 'time' ? 'purple' : 'blue'}>{pt === 'time' ? t('planTypeTime') : t('planTypeData')}</Tag>,
+      render: (pt: string) => <Tag color={pt === 'monthly' ? 'magenta' : pt === 'time' ? 'purple' : 'blue'}>{pt === 'monthly' ? t('planTypeMonthly') : pt === 'time' ? t('planTypeTime') : t('planTypeData')}</Tag>,
     },
     {
       title: t('planTraffic'), dataIndex: 'traffic', key: 'traffic',
@@ -280,8 +287,14 @@ export default function Plans() {
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input placeholder="Pro 100GB" /></Form.Item>
           <Form.Item name="plan_type" label={t('type')} rules={[{ required: true }]}>
             <Select
-              options={[{ value: 'data', label: t('planTypeData') }, { value: 'time', label: t('planTypeTime') }]}
-              onChange={(v) => { if (v === 'data') createForm.setFieldValue('duration_days', 0); }}
+              options={[{ value: 'data', label: t('planTypeData') }, { value: 'time', label: t('planTypeTime') }, { value: 'monthly', label: t('planTypeMonthly') }]}
+              onChange={(v) => {
+                if (v === 'data') createForm.setFieldValue('duration_days', 0);
+                if (v === 'monthly') {
+                  createForm.setFieldValue('duration_days', 30);
+                  createForm.setFieldValue('reset_traffic', true);
+                }
+              }}
             />
           </Form.Item>
           <Space align="start" style={{ display: 'flex' }}>
@@ -296,9 +309,9 @@ export default function Plans() {
             <Form.Item name="price" label={t('planPrice')} rules={[{ required: true }]} style={{ flex: 1 }}>
               <Input placeholder="9.99" />
             </Form.Item>
-            {createPlanType === 'time' && (
+            {(createPlanType === 'time' || createPlanType === 'monthly') && (
               <Form.Item name="duration_days" label={t('planDuration')} rules={[{ required: true, type: 'number', min: 1, message: t('planDurationHint') }]} style={{ flex: 1 }}>
-                <InputNumber min={1} precision={0} style={{ width: '100%' }} />
+                <InputNumber min={1} precision={0} disabled={createPlanType === 'monthly'} style={{ width: '100%' }} />
               </Form.Item>
             )}
           </Space>
@@ -323,7 +336,7 @@ export default function Plans() {
               <Switch />
             </Form.Item>
             <Form.Item name="reset_traffic" label={t('planResetTraffic')} valuePropName="checked" style={{ flex: 1 }}>
-              <Switch />
+              <Switch disabled={createPlanType === 'monthly'} />
             </Form.Item>
           </Space>
           <Form.Item name="description" label={t('planDescription')}><Input.TextArea rows={2} /></Form.Item>
@@ -335,8 +348,14 @@ export default function Plans() {
           <Form.Item name="name" label={t('name')} rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
           <Form.Item name="plan_type" label={t('type')}>
             <Select
-              options={[{ value: 'data', label: t('planTypeData') }, { value: 'time', label: t('planTypeTime') }]}
-              onChange={(v) => { if (v === 'data') editForm.setFieldValue('duration_days', 0); }}
+              options={[{ value: 'data', label: t('planTypeData') }, { value: 'time', label: t('planTypeTime') }, { value: 'monthly', label: t('planTypeMonthly') }]}
+              onChange={(v) => {
+                if (v === 'data') editForm.setFieldValue('duration_days', 0);
+                if (v === 'monthly') {
+                  editForm.setFieldValue('duration_days', 30);
+                  editForm.setFieldValue('reset_traffic', true);
+                }
+              }}
             />
           </Form.Item>
           <Space align="start" style={{ display: 'flex' }}>
@@ -349,9 +368,9 @@ export default function Plans() {
           </Space>
           <Space align="start" style={{ display: 'flex' }}>
             <Form.Item name="price" label={t('planPrice')} style={{ flex: 1 }}><Input /></Form.Item>
-            {editPlanType === 'time' && (
+            {(editPlanType === 'time' || editPlanType === 'monthly') && (
               <Form.Item name="duration_days" label={t('planDuration')} rules={[{ required: true, type: 'number', min: 1, message: t('planDurationHint') }]} style={{ flex: 1 }}>
-                <InputNumber min={1} precision={0} style={{ width: '100%' }} />
+                <InputNumber min={1} precision={0} disabled={editPlanType === 'monthly'} style={{ width: '100%' }} />
               </Form.Item>
             )}
           </Space>
@@ -373,7 +392,7 @@ export default function Plans() {
           </Form.Item>
           <Space align="start" style={{ display: 'flex' }}>
             <Form.Item name="hidden" label={t('planHidden')} valuePropName="checked" style={{ flex: 1 }}><Switch /></Form.Item>
-            <Form.Item name="reset_traffic" label={t('planResetTraffic')} valuePropName="checked" style={{ flex: 1 }}><Switch /></Form.Item>
+            <Form.Item name="reset_traffic" label={t('planResetTraffic')} valuePropName="checked" style={{ flex: 1 }}><Switch disabled={editPlanType === 'monthly'} /></Form.Item>
           </Space>
           <Form.Item name="description" label={t('planDescription')}><Input.TextArea rows={2} /></Form.Item>
         </Form>

@@ -80,6 +80,10 @@ pub fn routes() -> Router<AppState> {
         .route("/user/me", axum::routing::get(admin::get_me))
         // v1.0.8: self-service plan purchase + order history.
         .route("/user/buy-plan", axum::routing::post(admin::buy_plan))
+        .route(
+            "/user/plan/auto-renew",
+            axum::routing::put(admin::set_plan_auto_renew),
+        )
         .route("/user/orders", axum::routing::get(admin::list_my_orders))
         .route("/admin/orders", axum::routing::get(admin::list_all_orders))
         .route("/user/redeem", axum::routing::post(redeem::redeem_code))

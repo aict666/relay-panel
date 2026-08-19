@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS users (
     -- token_version (so the user stays signed in); it gates forwarding via
     -- list_active_for_config. Admins can never be suspended.
     plan_expire_at TEXT,
+    -- Monthly recurring charges are always an explicit per-user opt-in.
+    plan_auto_renew INTEGER NOT NULL DEFAULT 0,
+    -- Immutable billing contract accepted when auto-renew is enabled. A plan
+    -- billing edit invalidates these fields and requires a fresh opt-in.
+    plan_auto_renew_price TEXT,
+    plan_auto_renew_revision INTEGER,
+    -- Failed charges are delayed briefly so one underfunded cohort cannot
+    -- monopolize every bounded scheduler batch.
+    plan_auto_renew_retry_at TEXT,
     suspended INTEGER NOT NULL DEFAULT 0
 );
 
@@ -49,7 +58,8 @@ CREATE TABLE IF NOT EXISTS plans (
     ip_limit INTEGER NOT NULL DEFAULT 3,
     price TEXT NOT NULL DEFAULT '0',
     -- v1.0.8: plan lifecycle + visibility.
-    -- plan_type: 'data' = traffic quota, 'time' = time-limited (duration_days).
+    -- plan_type: 'data' = quota, 'time' = fixed-duration, 'monthly' = recurring
+    -- 30-day billing with a fresh quota each cycle.
     -- duration_days: 0 = unlimited (only meaningful for time plans).
     -- hidden: 1 = hidden from the public plan list + not self-purchasable.
     -- reset_traffic: 1 = buying resets traffic_used to 0.
@@ -65,6 +75,8 @@ CREATE TABLE IF NOT EXISTS plans (
     -- (the plan's grant becomes the user's entire authorized set — old grants
     -- are cleared), not appended.
     grant_all_groups INTEGER NOT NULL DEFAULT 0,
+    -- Incremented for every purchase-affecting edit, including grant changes.
+    billing_revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -2086,6 +2098,39 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         tx.commit().await?;
         tracing::info!("Migration 58: traffic history key includes group_id");
     }
+
+    // ── Migration 59: recurring monthly billing contract + fair retry ──
+    add_column_if_missing(
+        pool,
+        "users",
+        "plan_auto_renew",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(pool, "users", "plan_auto_renew_price", "TEXT").await?;
+    add_column_if_missing(pool, "users", "plan_auto_renew_revision", "INTEGER").await?;
+    add_column_if_missing(pool, "users", "plan_auto_renew_retry_at", "TEXT").await?;
+    add_column_if_missing(
+        pool,
+        "plans",
+        "billing_revision",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE users SET plan_auto_renew = 0, plan_auto_renew_price = NULL, \
+         plan_auto_renew_revision = NULL, plan_auto_renew_retry_at = NULL \
+         WHERE plan_auto_renew = 1 \
+           AND (plan_auto_renew_price IS NULL OR plan_auto_renew_revision IS NULL)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_users_monthly_renewal \
+         ON users(plan_auto_renew, plan_auto_renew_retry_at, plan_expire_at, id)",
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }

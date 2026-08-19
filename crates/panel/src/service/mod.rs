@@ -3,6 +3,7 @@ pub mod audit;
 pub mod auto_restart;
 pub mod groups;
 pub mod history_prune;
+pub mod monthly_renewal;
 pub mod node_config;
 pub mod node_watch;
 pub mod notify;

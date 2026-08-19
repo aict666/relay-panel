@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS plans (
     description TEXT NOT NULL DEFAULT '',
     -- v1.0.9: grant ALL inbound groups on purchase (mirrors SQLite Migration 35).
     grant_all_groups BOOLEAN NOT NULL DEFAULT FALSE,
+    billing_revision BIGINT NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
 );
 
@@ -68,6 +69,10 @@ CREATE TABLE IF NOT EXISTS users (
     -- v1.0.8: plan expiry (TEXT 'YYYY-MM-DD HH:MM:SS' UTC, NULL = no expiry)
     -- and admin suspension. Mirrors SQLite baseline + Migration 34.
     plan_expire_at TEXT,
+    plan_auto_renew BOOLEAN NOT NULL DEFAULT FALSE,
+    plan_auto_renew_price TEXT,
+    plan_auto_renew_revision BIGINT,
+    plan_auto_renew_retry_at TEXT,
     suspended BOOLEAN NOT NULL DEFAULT FALSE
 );
 
@@ -429,7 +434,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 42;
+pub const PG_SCHEMA_VERSION: i32 = 44;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1825,6 +1830,43 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 42: traffic history key includes group_id");
     }
 
+    if current < 43 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_auto_renew BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (43) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 43: users.plan_auto_renew present");
+    }
+
+    if current < 44 {
+        let mut tx = pool.begin().await?;
+        for statement in [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_auto_renew_price TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_auto_renew_revision BIGINT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_auto_renew_retry_at TEXT",
+            "ALTER TABLE plans ADD COLUMN IF NOT EXISTS billing_revision BIGINT NOT NULL DEFAULT 1",
+            "UPDATE users SET plan_auto_renew = FALSE, plan_auto_renew_price = NULL, plan_auto_renew_revision = NULL, plan_auto_renew_retry_at = NULL WHERE plan_auto_renew = TRUE AND (plan_auto_renew_price IS NULL OR plan_auto_renew_revision IS NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_users_monthly_renewal ON users(plan_auto_renew, plan_auto_renew_retry_at, plan_expire_at, id)",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (44) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 44: monthly billing contract and retry state present");
+    }
+
     Ok(())
 }
 
@@ -1837,7 +1879,7 @@ mod tests {
         // Keep the early-return guard in run_pg_migrations aligned with the
         // highest ordered migration below. A lower value silently skips newer
         // migrations on existing PostgreSQL databases.
-        assert_eq!(PG_SCHEMA_VERSION, 42);
+        assert_eq!(PG_SCHEMA_VERSION, 44);
     }
 
     // A `;` inside a -- line comment must NOT split a statement. This is the

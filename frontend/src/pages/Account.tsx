@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Card, Descriptions, Spin, Button, Space, Modal, Form, Input, message, Typography, Result, Progress, Alert, Tag } from 'antd';
+import { Card, Descriptions, Spin, Button, Space, Modal, Form, Input, message, Typography, Result, Progress, Alert, Tag, Switch } from 'antd';
 import { LockOutlined, LogoutOutlined, WalletOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
@@ -38,6 +38,8 @@ export default function Account() {
   const [me, setMe] = useState<UserSelf | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [autoRenewSaving, setAutoRenewSaving] = useState(false);
+  const [autoRenewConfirmOpen, setAutoRenewConfirmOpen] = useState(false);
 
   // Change-password modal state (mirrors MainLayout's modal).
   const [changePwOpen, setChangePwOpen] = useState(false);
@@ -97,6 +99,45 @@ export default function Account() {
   const logout = () => {
     authLogout();
     navigate('/login');
+  };
+
+  const saveAutoRenew = async (enabled: boolean) => {
+    if (!me || me.plan_type !== 'monthly' || autoRenewSaving) return;
+    setAutoRenewSaving(true);
+    try {
+      const res = await api.put<unknown, ApiEnvelope<null>>('/user/plan/auto-renew', {
+        enabled,
+        ...(enabled ? {
+          expected_price: me.plan_price,
+          expected_revision: me.plan_billing_revision,
+        } : {}),
+      });
+      if (res.code !== 0) {
+        message.error(res.message);
+        setAutoRenewConfirmOpen(false);
+        await load();
+        return;
+      }
+      setMe({ ...me, plan_auto_renew: enabled });
+      setAutoRenewConfirmOpen(false);
+      message.success(enabled ? t('autoRenewEnabled') : t('autoRenewDisabled'));
+    } catch {
+      message.error(t('saveFailed'));
+    } finally {
+      setAutoRenewSaving(false);
+    }
+  };
+
+  const handleAutoRenewChange = (enabled: boolean) => {
+    if (!enabled) {
+      void saveAutoRenew(false);
+      return;
+    }
+    if (!me?.plan_price || me.plan_billing_revision == null) {
+      message.error(t('autoRenewContractUnavailable'));
+      return;
+    }
+    setAutoRenewConfirmOpen(true);
   };
 
   const handleChangePassword = async (values: { current_password: string; new_password: string }) => {
@@ -172,6 +213,21 @@ export default function Account() {
           <Descriptions.Item label={t('accountPlanExpiry')}>
             {me.plan_expire_at ? <span className="rp-mono">{me.plan_expire_at}</span> : t('unlimited')}
           </Descriptions.Item>
+          {me.plan_type === 'monthly' && (
+            <Descriptions.Item label={t('autoRenew')}>
+              <Space>
+                <Switch
+                  checked={!!me.plan_auto_renew}
+                  loading={autoRenewSaving}
+                  onChange={handleAutoRenewChange}
+                />
+                <Space orientation="vertical" size={0}>
+                  <Text strong>{t('autoRenewPriceHint').replace('{price}', me.plan_price ?? '-')}</Text>
+                  <Text type="secondary">{me.plan_auto_renew ? t('autoRenewOnHint') : t('autoRenewOffHint')}</Text>
+                </Space>
+              </Space>
+            </Descriptions.Item>
+          )}
           {/* v1.0.8: available lines — "全部" when unrestricted (admin or
               all_device_groups), otherwise the specific authorized group names. */}
           <Descriptions.Item label={t('accountAvailableGroups')}>
@@ -251,6 +307,27 @@ export default function Account() {
       <RedeemHistory />
 
       {!me.admin && <TrafficChart />}
+
+      <Modal
+        title={t('confirmAutoRenewTitle')}
+        open={autoRenewConfirmOpen}
+        onCancel={() => { if (!autoRenewSaving) setAutoRenewConfirmOpen(false); }}
+        onOk={() => saveAutoRenew(true)}
+        okText={t('confirmAutoRenew')}
+        cancelText={t('cancel')}
+        confirmLoading={autoRenewSaving}
+        closable={!autoRenewSaving}
+        mask={{ closable: !autoRenewSaving }}
+        keyboard={!autoRenewSaving}
+        cancelButtonProps={{ disabled: autoRenewSaving }}
+      >
+        <Alert
+          type="warning"
+          showIcon
+          title={t('confirmAutoRenewCharge').replace('{price}', me.plan_price ?? '-')}
+          description={t('autoRenewChargeHint')}
+        />
+      </Modal>
 
       <Modal
         title={t('changePassword')}

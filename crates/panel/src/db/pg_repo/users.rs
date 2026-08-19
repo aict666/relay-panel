@@ -102,8 +102,11 @@ impl UserRepository for PgRepository {
         // SQLite's positional ? which must be bound once per occurrence).
         // 0 rows_affected = plan missing → caller fails the registration.
         let result = sqlx::query(
-            "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit) \
-             SELECT $1, $2, $3, max_rules, traffic, speed_limit, ip_limit \
+            "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit, plan_expire_at) \
+             SELECT $1, $2, $3, max_rules, traffic, speed_limit, ip_limit, \
+                    CASE WHEN plan_type IN ('time','monthly') AND duration_days>0 \
+                         THEN to_char(now() AT TIME ZONE 'UTC' + make_interval(days => duration_days), 'YYYY-MM-DD HH24:MI:SS') \
+                         ELSE NULL END \
              FROM plans WHERE id = $3",
         )
         .bind(username)
@@ -159,8 +162,11 @@ impl UserRepository for PgRepository {
         }
 
         let inserted = sqlx::query(
-            "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit) \
-             SELECT $1, $2, $3, max_rules, traffic, speed_limit, ip_limit \
+            "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit, plan_expire_at) \
+             SELECT $1, $2, $3, max_rules, traffic, speed_limit, ip_limit, \
+                    CASE WHEN plan_type IN ('time','monthly') AND duration_days>0 \
+                         THEN to_char(now() AT TIME ZONE 'UTC' + make_interval(days => duration_days), 'YYYY-MM-DD HH24:MI:SS') \
+                         ELSE NULL END \
              FROM plans WHERE id = $3",
         )
         .bind(username)
@@ -192,8 +198,11 @@ impl UserRepository for PgRepository {
                 .await?
                 .unwrap_or(1);
         let inserted = sqlx::query(
-            "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit) \
-             SELECT $1, $2, $3, max_rules, traffic, speed_limit, ip_limit \
+            "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit, plan_expire_at) \
+             SELECT $1, $2, $3, max_rules, traffic, speed_limit, ip_limit, \
+                    CASE WHEN plan_type IN ('time','monthly') AND duration_days>0 \
+                         THEN to_char(now() AT TIME ZONE 'UTC' + make_interval(days => duration_days), 'YYYY-MM-DD HH24:MI:SS') \
+                         ELSE NULL END \
              FROM plans WHERE id = $3",
         )
         .bind(username)
@@ -343,6 +352,13 @@ impl UserRepository for PgRepository {
         plan_expire_at: Option<&str>,
     ) -> Result<AdminUserPlanEditOutcome, DbError> {
         let mut tx = self.pool.begin().await?;
+        // Global order: plan -> user. Purchases, renewals and plan edits use
+        // the same order, avoiding a plan/user lock cycle.
+        let plan_type: Option<String> =
+            sqlx::query_scalar("SELECT plan_type FROM plans WHERE id = $1 FOR SHARE")
+                .bind(expected_plan_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let target: Option<(bool, Option<i64>)> =
             sqlx::query_as("SELECT admin, plan_id FROM users WHERE id = $1 FOR UPDATE")
                 .bind(user_id)
@@ -362,13 +378,11 @@ impl UserRepository for PgRepository {
         }
 
         if !clear {
-            // Keep the plan's type stable while validating and writing expiry.
-            let plan_type: Option<String> =
-                sqlx::query_scalar("SELECT plan_type FROM plans WHERE id = $1 FOR SHARE")
-                    .bind(expected_plan_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if plan_type.as_deref() != Some("time") {
+            if !matches!(plan_type.as_deref(), Some("time" | "monthly")) {
+                tx.rollback().await?;
+                return Ok(AdminUserPlanEditOutcome::ExpiryNotApplicable);
+            }
+            if plan_type.as_deref() == Some("monthly") && plan_expire_at.is_none() {
                 tx.rollback().await?;
                 return Ok(AdminUserPlanEditOutcome::ExpiryNotApplicable);
             }
@@ -382,7 +396,10 @@ impl UserRepository for PgRepository {
         }
 
         sqlx::query(
-            "UPDATE users SET plan_id = NULL, plan_expire_at = NULL, all_device_groups = FALSE \
+            "UPDATE users SET plan_id = NULL, plan_expire_at = NULL, \
+             plan_auto_renew = FALSE, plan_auto_renew_price = NULL, \
+             plan_auto_renew_revision = NULL, plan_auto_renew_retry_at = NULL, \
+             all_device_groups = FALSE \
              WHERE id = $1",
         )
         .bind(user_id)
@@ -401,6 +418,89 @@ impl UserRepository for PgRepository {
         .await?;
         tx.commit().await?;
         Ok(AdminUserPlanEditOutcome::Updated)
+    }
+
+    async fn set_plan_auto_renew_guarded(
+        &self,
+        user_id: i64,
+        enabled: bool,
+        expected_price: Option<&str>,
+        expected_revision: Option<i64>,
+    ) -> Result<PlanAutoRenewUpdateOutcome, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let initial: Option<(bool, Option<i64>)> =
+            sqlx::query_as("SELECT admin, plan_id FROM users WHERE id=$1")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((initial_admin, initial_plan_id)) = initial else {
+            tx.rollback().await?;
+            return Ok(PlanAutoRenewUpdateOutcome::UserNotFound);
+        };
+        if initial_admin {
+            tx.rollback().await?;
+            return Ok(PlanAutoRenewUpdateOutcome::NotMonthly);
+        }
+
+        let contract: Option<(String, String, i64)> = if enabled {
+            let Some(plan_id) = initial_plan_id else {
+                tx.rollback().await?;
+                return Ok(PlanAutoRenewUpdateOutcome::NotMonthly);
+            };
+            sqlx::query_as(
+                "SELECT plan_type, price, billing_revision FROM plans \
+                 WHERE id=$1 FOR SHARE",
+            )
+            .bind(plan_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+        let current: Option<(bool, Option<i64>)> =
+            sqlx::query_as("SELECT admin, plan_id FROM users WHERE id=$1 FOR UPDATE")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((admin, current_plan_id)) = current else {
+            tx.rollback().await?;
+            return Ok(PlanAutoRenewUpdateOutcome::UserNotFound);
+        };
+        if admin || (enabled && current_plan_id != initial_plan_id) {
+            tx.rollback().await?;
+            return Ok(PlanAutoRenewUpdateOutcome::NotMonthly);
+        }
+        let (price, revision) = match contract {
+            Some((kind, price, revision)) if kind == "monthly" => (Some(price), Some(revision)),
+            Some(_) if enabled => {
+                tx.rollback().await?;
+                return Ok(PlanAutoRenewUpdateOutcome::NotMonthly);
+            }
+            None if enabled => {
+                tx.rollback().await?;
+                return Ok(PlanAutoRenewUpdateOutcome::NotMonthly);
+            }
+            _ => (None, None),
+        };
+        if enabled
+            && (expected_price.is_some() || expected_revision.is_some())
+            && (price.as_deref() != expected_price || revision != expected_revision)
+        {
+            tx.rollback().await?;
+            return Ok(PlanAutoRenewUpdateOutcome::ContractChanged);
+        }
+        sqlx::query(
+            "UPDATE users SET plan_auto_renew=$1, plan_auto_renew_price=$2, \
+             plan_auto_renew_revision=$3, plan_auto_renew_retry_at=NULL WHERE id=$4",
+        )
+        .bind(enabled)
+        .bind(price)
+        .bind(revision)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(PlanAutoRenewUpdateOutcome::Updated)
     }
 
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError> {

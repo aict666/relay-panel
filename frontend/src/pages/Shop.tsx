@@ -1,4 +1,4 @@
-import { Card, Row, Col, Button, Spin, Tag, Modal, Table, Typography, message, Result, Alert, Space, Form, Input } from 'antd';
+import { Card, Row, Col, Button, Spin, Tag, Modal, Table, Typography, message, Result, Alert, Space, Form, Input, Checkbox } from 'antd';
 import { ShoppingOutlined, ReloadOutlined, WalletOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import api from '../api/client';
@@ -24,6 +24,7 @@ export default function Shop() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [buying, setBuying] = useState<Plan | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [autoRenew, setAutoRenew] = useState(false);
   const [redeemOpen, setRedeemOpen] = useState(false);
   const [redeeming, setRedeeming] = useState(false);
   const [redeemForm] = Form.useForm();
@@ -73,6 +74,7 @@ export default function Shop() {
         plan_id: buying.id,
         expected_price: buying.price,
         expected_revision: buying.purchase_revision,
+        ...(buying.plan_type === 'monthly' ? { auto_renew: autoRenew } : {}),
       });
       if (res.code !== 0) {
         message.error(res.message);
@@ -197,7 +199,7 @@ export default function Shop() {
         {plans.map((p) => (
           <Col xs={24} sm={12} md={8} key={p.id}>
             <Card
-              title={<Space><Text strong>{p.name}</Text>{p.plan_type === 'time' && <Tag color="purple">{t('planTypeTime')}</Tag>}</Space>}
+              title={<Space><Text strong>{p.name}</Text>{p.plan_type === 'time' && <Tag color="purple">{t('planTypeTime')}</Tag>}{p.plan_type === 'monthly' && <Tag color="magenta">{t('planTypeMonthly')}</Tag>}</Space>}
               extra={p.description ? <Text type="secondary" style={{ fontSize: 12 }}>{p.description}</Text> : null}
             >
               {/* The price used to be a <Title> wrapping .rp-mono, whose 12px
@@ -222,7 +224,7 @@ export default function Shop() {
                 )}
                 {p.reset_traffic && <div><Tag color="green">{t('planResetTraffic')}</Tag></div>}
               </div>
-              <Button type="primary" block disabled={loading || submitting || !canAfford(p)} title={!canAfford(p) ? t('insufficientBalance') : undefined} style={{ marginTop: 16 }} onClick={() => setBuying(p)}>
+              <Button type="primary" block disabled={loading || submitting || !canAfford(p)} title={!canAfford(p) ? t('insufficientBalance') : undefined} style={{ marginTop: 16 }} onClick={() => { setAutoRenew(p.plan_type === 'monthly' && p.id === me?.plan_id && !!me.plan_auto_renew); setBuying(p); }}>
                 {t('buyNow')}
               </Button>
               {!canAfford(p) && <Text type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>{t('insufficientBalance')}</Text>}
@@ -267,7 +269,15 @@ export default function Shop() {
             {/* v1.0.9: buying a DIFFERENT plan is a switch — the current plan's
                 remaining traffic and expiry are wiped. Warn explicitly. Buying
                 the SAME plan (or having none) just renews/stacks. */}
-            {me?.plan_id != null && buying.id !== me.plan_id ? (
+            {buying.plan_type === 'monthly' ? (
+              <>
+                <Alert type="info" showIcon style={{ marginTop: 8 }} title={t('monthlyPurchaseHint')} />
+                <Checkbox checked={autoRenew} onChange={(event) => setAutoRenew(event.target.checked)} style={{ marginTop: 12 }}>
+                  {t('enableAutoRenew')}
+                </Checkbox>
+                <div><Text type="secondary">{t('autoRenewChargeHint')}</Text></div>
+              </>
+            ) : me?.plan_id != null && buying.id !== me.plan_id ? (
               <Alert type="warning" showIcon style={{ marginTop: 8 }} title={t('shopSwitchPlanWarning')} />
             ) : (
               <Alert type="info" showIcon style={{ marginTop: 8 }} title={t('shopTrafficStacksHint')} />

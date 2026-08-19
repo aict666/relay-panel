@@ -26,6 +26,8 @@ export interface User {
   created_at: string;
   /** v1.0.8: plan expiry ('YYYY-MM-DD HH:MM:SS' UTC, null = no expiry). */
   plan_expire_at?: string | null;
+  /** User opt-in for automatic recurring monthly charges. */
+  plan_auto_renew?: boolean;
   /** v1.0.8: admin suspension (login allowed; forwarding gated). */
   suspended?: boolean;
 }
@@ -447,7 +449,7 @@ export interface Plan {
   /** @deprecated PLACEHOLDER — stored but never enforced. Do not surface in UI. */
   ip_limit: number;
   price: string;
-  /** v1.0.8: 'data' = traffic-quota plan, 'time' = time-limited plan. */
+  /** 'data' = traffic quota, 'time' = fixed duration, 'monthly' = recurring 30-day billing. */
   plan_type?: string;
   /** v1.0.8: validity in days (0 = unlimited). */
   duration_days?: number;
@@ -459,6 +461,8 @@ export interface Plan {
   description?: string;
   /** v1.0.9: buying grants ALL inbound groups (sets all_device_groups). */
   grant_all_groups?: boolean;
+  /** Changes whenever a purchase-affecting plan field is edited. */
+  billing_revision?: number;
   /** v1.0.9: device groups this plan grants on purchase (when not grant_all).
    *  Populated by GET /admin/plans and the shop list; sent on create/update. */
   device_group_ids?: number[];
@@ -589,6 +593,10 @@ export interface UserSelf {
   balance: string;
   plan_id: number | null;
   plan_name: string | null;
+  plan_type?: string | null;
+  /** Exact current charge shown when authorizing recurring monthly billing. */
+  plan_price?: string | null;
+  plan_billing_revision?: number | null;
   max_rules: number;
   current_rules: number;
   traffic_used: number;
@@ -599,6 +607,8 @@ export interface UserSelf {
   must_change_password: boolean;
   /** v1.0.8: plan expiry (null = no expiry). */
   plan_expire_at?: string | null;
+  /** User opt-in for automatic recurring monthly charges. */
+  plan_auto_renew?: boolean;
   /** v1.0.8: admin suspension (login allowed; forwarding gated). */
   suspended?: boolean;
   /** v1.0.8: true when unrestricted (admin, or all_device_groups) — every

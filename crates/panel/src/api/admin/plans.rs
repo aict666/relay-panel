@@ -67,6 +67,7 @@ fn validate_plan_fields(
     price: Option<&str>,
     plan_type: Option<&str>,
     duration_days: Option<i32>,
+    reset_traffic: Option<bool>,
 ) -> Result<Option<String>, String> {
     if let Some(n) = name {
         let trimmed = n.trim();
@@ -88,8 +89,8 @@ fn validate_plan_fields(
         }
     }
     if let Some(pt) = plan_type {
-        if pt != "data" && pt != "time" {
-            return Err("套餐类型必须是 data 或 time".into());
+        if pt != "data" && pt != "time" && pt != "monthly" {
+            return Err("套餐类型必须是 data、time 或 monthly".into());
         }
     }
     if let Some(dd) = duration_days {
@@ -101,6 +102,12 @@ fn validate_plan_fields(
         if plan_type == Some("time") && dd == 0 {
             return Err("限时套餐的时长天数必须大于 0".into());
         }
+        if plan_type == Some("monthly") && dd != 30 {
+            return Err("月付套餐固定为 30 天周期".into());
+        }
+    }
+    if plan_type == Some("monthly") && reset_traffic != Some(true) {
+        return Err("月付套餐必须在新周期重置已用流量".into());
     }
     // price is a decimal string — canonicalize via the balance parser (same
     // rules: non-negative, ≤ 2 fraction digits, ≤ 9999999999.99). None on the
@@ -178,6 +185,7 @@ pub async fn create_plan(
         Some(&req.price),
         Some(&req.plan_type),
         Some(req.duration_days),
+        Some(req.reset_traffic),
     ) {
         Ok(Some(price)) => price,
         Ok(None) => return Json(err(400, "价格不能为空")),
@@ -237,63 +245,33 @@ pub async fn update_plan(
         return Json(err(400, "无需要更新的字段"));
     }
 
-    // v1.0.8: when plan_type is being changed to 'time' in this same request,
-    // the duration_days > 0 rule must be evaluated against the NEW type. If
-    // plan_type isn't being changed, we can't know the existing type here
-    // cheaply, so we only enforce the cross-field rule when plan_type is
-    // present in the request.
-    let effective_plan_type = req.plan_type.as_deref();
+    // Cross-field validation must use the complete effective row. This covers
+    // partial updates such as flipping a data plan to monthly without also
+    // supplying the required 30-day duration and reset flag.
+    let existing = match state.db.find_plan_by_id(id).await {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return Json(err(404, "套餐不存在")),
+        Err(e) => {
+            tracing::error!("update_plan {}: lookup failed: {}", id, e);
+            return Json(err(500, "数据库错误"));
+        }
+    };
+    let effective_plan_type = req.plan_type.as_deref().unwrap_or(&existing.plan_type);
+    let effective_duration = req.duration_days.unwrap_or(existing.duration_days);
+    let effective_reset = req.reset_traffic.unwrap_or(existing.reset_traffic);
     let canonical_name = req.name.as_deref().map(str::trim);
     let canonical_price = match validate_plan_fields(
         canonical_name,
         req.max_rules,
         req.traffic,
         req.price.as_deref(),
-        effective_plan_type,
-        req.duration_days,
+        Some(effective_plan_type),
+        Some(effective_duration),
+        Some(effective_reset),
     ) {
         Ok(p) => p,
         Err(msg) => return Json(err(400, msg)),
     };
-
-    // Reject the (plan_type=time, duration_days=0) combination when BOTH are
-    // supplied together — validate_plan_fields only checks it when plan_type is
-    // present, so cover the case where the caller flips to time but leaves
-    // duration_days untouched (None) by reading the existing row.
-    if let Some("time") = effective_plan_type {
-        if req.duration_days == Some(0) {
-            return Json(err(400, "限时套餐的时长天数必须大于 0"));
-        }
-        if req.duration_days.is_none() {
-            // Caller set plan_type=time without duration_days — verify the
-            // existing row's duration_days is > 0 before flipping.
-            match state.db.find_plan_by_id(id).await {
-                Ok(Some(p)) if p.duration_days > 0 => {}
-                Ok(Some(_)) => return Json(err(400, "限时套餐的时长天数必须大于 0")),
-                Ok(None) => return Json(err(404, "套餐不存在")),
-                Err(e) => {
-                    tracing::error!("update_plan {}: lookup failed: {}", id, e);
-                    return Json(err(500, "数据库错误"));
-                }
-            }
-        }
-    } else if req.duration_days == Some(0) && req.plan_type.is_none() {
-        // v1.0.9: the reverse gap — setting duration_days=0 WITHOUT touching
-        // plan_type. validate_plan_fields only checks the time+0 rule when
-        // plan_type is present, so a caller could quietly zero out an existing
-        // TIME plan's duration. Read the stored type and reject if it's time.
-        match state.db.find_plan_by_id(id).await {
-            Ok(Some(p)) if p.plan_type == "time" => {
-                return Json(err(400, "限时套餐的时长天数必须大于 0"));
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => return Json(err(404, "套餐不存在")),
-            Err(e) => {
-                tracing::error!("update_plan {}: lookup failed: {}", id, e);
-                return Json(err(500, "数据库错误"));
-            }
-        }
-    }
 
     // Scalar fields and the optional grant-set replacement must succeed or
     // fail together. This also handles a request containing only group ids:
@@ -319,7 +297,7 @@ pub async fn update_plan(
         Ok(0) => return Json(err(404, "套餐不存在")),
         Ok(_) => {}
         Err(DbError::PlanInvariant) => {
-            return Json(err(400, "限时套餐的时长天数必须大于 0"));
+            return Json(err(400, "套餐周期配置无效"));
         }
         Err(DbError::ForeignKeyViolation | DbError::PlanDeviceGroupInvalid) => {
             return Json(err(400, "套餐只能包含管理员拥有的入站设备分组"));
@@ -372,7 +350,7 @@ mod field_validation_tests {
 
     #[test]
     fn update_rejects_a_blank_name() {
-        let result = validate_plan_fields(Some("  \t"), None, None, None, None, None);
+        let result = validate_plan_fields(Some("  \t"), None, None, None, None, None, None);
         assert_eq!(result.unwrap_err(), "名称不能为空");
     }
 
@@ -386,9 +364,10 @@ mod field_validation_tests {
             None,
             None,
             None,
+            None,
         )
         .is_ok());
         let too_long = "套".repeat(101);
-        assert!(validate_plan_fields(Some(&too_long), None, None, None, None, None).is_err());
+        assert!(validate_plan_fields(Some(&too_long), None, None, None, None, None, None).is_err());
     }
 }

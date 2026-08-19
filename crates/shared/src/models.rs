@@ -83,6 +83,20 @@ pub struct User {
     /// v1.0.8: plan expiry (TEXT 'YYYY-MM-DD HH:MM:SS' UTC, NULL = no expiry).
     #[serde(default)]
     pub plan_expire_at: Option<String>,
+    /// Monthly subscriptions renew only when this user-level opt-in is true.
+    /// It is forced off whenever the current plan is not a monthly plan.
+    #[serde(default)]
+    pub plan_auto_renew: bool,
+    /// Price accepted when recurring billing was enabled. Internal billing
+    /// contract data; never expose it through serialized user responses.
+    #[serde(skip)]
+    pub plan_auto_renew_price: Option<String>,
+    /// Plan billing revision accepted together with the recurring price.
+    #[serde(skip)]
+    pub plan_auto_renew_revision: Option<i64>,
+    /// Earliest UTC timestamp at which a failed recurring charge is retried.
+    #[serde(skip)]
+    pub plan_auto_renew_retry_at: Option<String>,
     /// v1.0.8: admin suspension. true = forwarding gated off via
     /// list_active_for_config (login still allowed; no token_version bump).
     /// Admins can never be suspended.
@@ -492,7 +506,8 @@ pub struct Plan {
     pub speed_limit: i32,
     pub ip_limit: i32,
     pub price: String,
-    /// v1.0.8: 'data' = traffic-quota plan, 'time' = time-limited plan.
+    /// 'data' = traffic-quota, 'time' = fixed-duration, 'monthly' = recurring
+    /// 30-day billing cycle with a fresh quota each cycle.
     #[serde(default = "default_plan_type")]
     pub plan_type: String,
     /// v1.0.8: validity in days (0 = unlimited). Only meaningful for time plans.
@@ -512,11 +527,18 @@ pub struct Plan {
     /// groups in plan_device_groups (appended to the user's existing set).
     #[serde(default)]
     pub grant_all_groups: bool,
+    /// Incremented whenever a field that affects the purchased service changes.
+    #[serde(default = "default_billing_revision")]
+    pub billing_revision: i64,
     pub created_at: String,
 }
 
 fn default_plan_type() -> String {
     "data".to_string()
+}
+
+fn default_billing_revision() -> i64 {
+    1
 }
 
 /// v1.0.8: a purchase order. plan_name + price are SNAPSHOTS at buy time so

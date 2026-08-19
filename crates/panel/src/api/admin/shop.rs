@@ -2,7 +2,7 @@ use super::err;
 use super::{purchase_revision, PlanWithGroups};
 use crate::api::middleware::AuthUser;
 use crate::api::AppState;
-use crate::db::repo::BuyPlanError;
+use crate::db::repo::{BuyPlanError, PlanAutoRenewUpdateOutcome};
 use axum::{extract::State, Json};
 use relay_shared::models::*;
 use relay_shared::protocol::*;
@@ -10,9 +10,9 @@ use relay_shared::protocol::*;
 // === Shop (v1.0.8) ===
 //
 // Self-service plan purchase. GET /plans lists ONLY non-hidden plans. POST
-// /user/buy-plan atomically charges the user's balance, stacks the plan's
-// traffic onto their quota, sets max_rules / plan_id, computes a stacking
-// expiry, and records an order row — all in one transaction (防双花).
+// /user/buy-plan atomically charges the user's balance, applies the plan's
+// quota/lifecycle semantics, sets max_rules / plan_id, computes expiry, and
+// records an order row — all in one transaction (防双花).
 
 /// GET /plans — public list of purchasable plans (hidden excluded). v1.0.9:
 /// each plan carries its `device_group_ids` so the shop can show "包含线路".
@@ -121,6 +121,9 @@ pub async fn buy_plan(
     if plan.plan_type == "time" && plan.duration_days <= 0 {
         return Json(err(400, "该套餐无有效时长"));
     }
+    if plan.plan_type == "monthly" && (plan.duration_days != 30 || !plan.reset_traffic) {
+        return Json(err(400, "该月付套餐配置无效"));
+    }
 
     // Decimal money: compare + deduct in integer cents (no floats). price is
     // stored canonical, so balance_to_cents succeeds; a None here is a data
@@ -137,9 +140,9 @@ pub async fn buy_plan(
         }
     };
 
-    // duration_days drives the expiry. Non-time plans (or duration_days=0)
-    // → no expiry (NULL), per the spec's "不限时=NULL".
-    let duration_days = if plan.plan_type == "time" {
+    // duration_days drives the expiry. Data plans use NULL; fixed-duration and
+    // monthly plans carry an actual expiry.
+    let duration_days = if matches!(plan.plan_type.as_str(), "time" | "monthly") {
         plan.duration_days
     } else {
         0
@@ -192,6 +195,8 @@ pub async fn buy_plan(
             plan.grant_all_groups,
             &device_group_ids,
             &new_authorized_group_ids,
+            &plan.plan_type,
+            req.auto_renew && plan.plan_type == "monthly",
             true,
             None,
         )
@@ -213,6 +218,42 @@ pub async fn buy_plan(
         Err(BuyPlanError::QuotaOverflow) => Json(err(409, "累计流量额度超出系统上限")),
         Err(BuyPlanError::Database(e)) => {
             tracing::error!("buy_plan {}: db error: {}", plan.id, e);
+            Json(err(500, "数据库错误"))
+        }
+    }
+}
+
+/// PUT /user/plan/auto-renew — explicit recurring-charge preference. The
+/// repository validates the current plan atomically; a stale account page
+/// cannot enable billing after another request switched the plan.
+pub async fn set_plan_auto_renew(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<SetPlanAutoRenewRequest>,
+) -> Json<ApiResponse<()>> {
+    if req.enabled && (req.expected_price.is_none() || req.expected_revision.is_none()) {
+        return Json(err(400, "开启自动续费前必须确认当前套餐价格"));
+    }
+    match state
+        .db
+        .set_plan_auto_renew_guarded(
+            user.user_id,
+            req.enabled,
+            req.expected_price.as_deref(),
+            req.expected_revision,
+        )
+        .await
+    {
+        Ok(PlanAutoRenewUpdateOutcome::Updated) => Json(ApiResponse::success(())),
+        Ok(PlanAutoRenewUpdateOutcome::UserNotFound) => Json(err(404, "用户不存在")),
+        Ok(PlanAutoRenewUpdateOutcome::NotMonthly) => {
+            Json(err(409, "当前套餐不是月付套餐，无法开启自动续费"))
+        }
+        Ok(PlanAutoRenewUpdateOutcome::ContractChanged) => {
+            Json(err(409, "套餐计费信息已变更，请刷新后重新确认"))
+        }
+        Err(e) => {
+            tracing::error!("set_plan_auto_renew {}: db error: {}", user.user_id, e);
             Json(err(500, "数据库错误"))
         }
     }

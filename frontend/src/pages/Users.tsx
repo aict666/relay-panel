@@ -65,6 +65,7 @@ export default function Users() {
   const [plans, setPlans] = useState<Plan[]>([]);
   const [planChoice, setPlanChoice] = useState<number | undefined>(undefined);
   const [planExpire, setPlanExpire] = useState<Dayjs | null>(null);
+  const [planAutoRenew, setPlanAutoRenew] = useState(false);
   const [planBusy, setPlanBusy] = useState(false);
   const userBusy = loading || loadFailed || saving || planBusy || actionBusyId !== null;
   const [form] = Form.useForm<UserFormValues>();
@@ -118,7 +119,9 @@ export default function Users() {
   // duration", so the expiry editor is disabled), and "remove plan" only makes
   // sense when the user actually has a plan.
   const editingPlan = editing ? plans.find(p => p.id === editing.plan_id) : undefined;
-  const isTimePlan = editingPlan?.plan_type === 'time';
+  const hasExpiringPlan = editingPlan?.plan_type === 'time' || editingPlan?.plan_type === 'monthly';
+  const isMonthlyPlan = editingPlan?.plan_type === 'monthly';
+  const selectedPlan = plans.find(plan => plan.id === planChoice);
   const hasPlan = editing?.plan_id != null;
   // Selecting the user's current plan again is a RENEW (extend time / add
   // traffic), not a no-op — it's allowed. Show a hint so the admin knows the
@@ -143,6 +146,7 @@ export default function Users() {
           expected_current_plan_id: target.plan_id ?? 0,
           expected_price: selectedPlan.price,
           expected_revision: selectedPlan.purchase_revision,
+          ...(selectedPlan.plan_type === 'monthly' ? { auto_renew: planAutoRenew } : {}),
         });
         if (res.code !== 0) {
           message.error(res.message);
@@ -229,6 +233,7 @@ export default function Users() {
     // v1.0.7: preload the embedded plan panel (assign choice + expiry picker).
     setPlanChoice(undefined);
     setPlanExpire(u.plan_expire_at ? dayjs(u.plan_expire_at) : null);
+    setPlanAutoRenew(!!u.plan_auto_renew);
     form.setFieldsValue({
       // InputNumber with stringMode wants a string. Existing rows already have
       // a canonical TEXT-form value (e.g. "12.30"); pass it through unchanged.
@@ -634,6 +639,11 @@ export default function Users() {
               <span style={{ marginLeft: 16 }}>
                 <strong>{t('planExpiry')}:</strong> {editing.plan_expire_at || t('neverExpires')}
               </span>
+              {editingPlan?.plan_type === 'monthly' && (
+                <Tag color={editing.plan_auto_renew ? 'green' : 'default'} style={{ marginLeft: 12 }}>
+                  {editing.plan_auto_renew ? t('autoRenewEnabled') : t('autoRenewDisabled')}
+                </Tag>
+              )}
             </p>
 
             <div style={{ marginBottom: 4 }}><strong>{t('assignPlan')}</strong></div>
@@ -642,11 +652,15 @@ export default function Users() {
                 style={{ flex: 1 }}
                 placeholder={t('selectPlan')}
                 value={planChoice}
-                onChange={setPlanChoice}
+                onChange={(value) => {
+                  setPlanChoice(value);
+                  const nextPlan = plans.find(plan => plan.id === value);
+                  setPlanAutoRenew(nextPlan?.plan_type === 'monthly' && value === editing.plan_id && !!editing.plan_auto_renew);
+                }}
                 disabled={userBusy}
                 options={plans.map(p => ({
                   value: p.id,
-                  label: `${p.name} · ${p.price} · ${p.plan_type === 'time' ? `${p.duration_days}${t('days')}` : t('planTypeData')}`,
+                  label: `${p.name} · ${p.price} · ${p.plan_type === 'monthly' ? t('planTypeMonthly') : p.plan_type === 'time' ? `${p.duration_days}${t('days')}` : t('planTypeData')}`,
                 }))}
               />
               <Button type="primary" loading={planBusy} disabled={userBusy || planChoice == null} onClick={handleBuyPlanForUser}>
@@ -654,7 +668,14 @@ export default function Users() {
               </Button>
             </Space.Compact>
 
-            {isTimePlan && (
+            {selectedPlan?.plan_type === 'monthly' && (
+              <div style={{ marginTop: 10 }}>
+                <Switch checked={planAutoRenew} onChange={setPlanAutoRenew} disabled={userBusy} />
+                <span style={{ marginLeft: 8 }}>{t('enableAutoRenew')}</span>
+              </div>
+            )}
+
+            {hasExpiringPlan && (
               <>
                 <Divider style={{ margin: '12px 0' }} />
                 <div style={{ marginBottom: 8 }}>
@@ -662,13 +683,15 @@ export default function Users() {
                   <span style={{ color: '#999', fontSize: 12, marginLeft: 6 }}>(UTC)</span>
                 </div>
                 <Space wrap>
-                  <DatePicker showTime disabled={userBusy} value={planExpire} onChange={setPlanExpire} placeholder={t('neverExpires')} />
-                  <Button loading={planBusy} disabled={userBusy} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
+                  <DatePicker showTime disabled={userBusy} value={planExpire} onChange={setPlanExpire} placeholder={isMonthlyPlan ? t('planExpiry') : t('neverExpires')} />
+                  <Button loading={planBusy} disabled={userBusy || (isMonthlyPlan && !planExpire)} onClick={() => handleSetUserPlan(false, planExpire ? planExpire.format('YYYY-MM-DD HH:mm:ss') : null)}>
                     {t('saveExpiry')}
                   </Button>
-                  <Button loading={planBusy} disabled={userBusy} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
-                    {t('setNeverExpires')}
-                  </Button>
+                  {!isMonthlyPlan && (
+                    <Button loading={planBusy} disabled={userBusy} onClick={() => { setPlanExpire(null); handleSetUserPlan(false, null); }}>
+                      {t('setNeverExpires')}
+                    </Button>
+                  )}
                 </Space>
               </>
             )}

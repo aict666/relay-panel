@@ -4,6 +4,15 @@ use crate::db::repo::*;
 use async_trait::async_trait;
 use relay_shared::models::Plan;
 
+fn valid_plan_lifecycle(plan_type: &str, duration_days: i32, reset_traffic: bool) -> bool {
+    match plan_type {
+        "data" => duration_days >= 0,
+        "time" => duration_days > 0,
+        "monthly" => duration_days == 30 && reset_traffic,
+        _ => false,
+    }
+}
+
 // ── PlanRepository ──
 
 #[async_trait]
@@ -52,6 +61,9 @@ impl PlanRepository for SqliteRepository {
         description: &str,
         grant_all_groups: bool,
     ) -> Result<i64, DbError> {
+        if !valid_plan_lifecycle(plan_type, duration_days, reset_traffic) {
+            return Err(DbError::PlanInvariant);
+        }
         // INSERT-then-last_insert_rowid (SQLite). speed_limit/ip_limit keep
         // their defaults (placeholders, never enforced) — not exposed here.
         let result = sqlx::query(
@@ -89,6 +101,9 @@ impl PlanRepository for SqliteRepository {
         grant_all_groups: bool,
         device_group_ids: &[i64],
     ) -> Result<i64, DbError> {
+        if !valid_plan_lifecycle(plan_type, duration_days, reset_traffic) {
+            return Err(DbError::PlanInvariant);
+        }
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "INSERT INTO plans \
@@ -150,14 +165,16 @@ impl PlanRepository for SqliteRepository {
         grant_all_groups: Option<bool>,
         device_group_ids: Option<&[i64]>,
     ) -> Result<u64, DbError> {
-        if duration_days.is_some_and(|days| days < 0)
-            || (plan_type == Some("time") && duration_days.is_some_and(|days| days == 0))
-        {
-            return Err(DbError::PlanInvariant);
-        }
-        let require_positive_duration = plan_type == Some("time") && duration_days.is_none();
-        let require_non_time_plan = plan_type.is_none() && duration_days == Some(0);
-        let has_invariant_guard = require_positive_duration || require_non_time_plan;
+        let billing_changed = name.is_some()
+            || max_rules.is_some()
+            || traffic.is_some()
+            || price.is_some()
+            || plan_type.is_some()
+            || duration_days.is_some()
+            || hidden.is_some()
+            || reset_traffic.is_some()
+            || grant_all_groups.is_some()
+            || device_group_ids.is_some();
         let mut sets: Vec<&str> = Vec::new();
         if name.is_some() {
             sets.push("name = ?");
@@ -194,29 +211,31 @@ impl PlanRepository for SqliteRepository {
         // SQLite's writer reservation up front so it cannot fail while
         // upgrading a stale read snapshot under a concurrent purchase/edit.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let rows_affected = if sets.is_empty() {
-            let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM plans WHERE id = ?")
+        let existing: Option<(String, i32, bool)> =
+            sqlx::query_as("SELECT plan_type, duration_days, reset_traffic FROM plans WHERE id=?")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
-            if exists.is_some() {
-                1
-            } else {
-                0
-            }
+        let Some((stored_type, stored_duration, stored_reset)) = existing else {
+            tx.rollback().await?;
+            return Ok(0);
+        };
+        let effective_type = plan_type.unwrap_or(&stored_type);
+        if !valid_plan_lifecycle(
+            effective_type,
+            duration_days.unwrap_or(stored_duration),
+            reset_traffic.unwrap_or(stored_reset),
+        ) {
+            tx.rollback().await?;
+            return Err(DbError::PlanInvariant);
+        }
+        if billing_changed {
+            sets.push("billing_revision = billing_revision + 1");
+        }
+        let rows_affected = if sets.is_empty() {
+            1
         } else {
-            let invariant_sql = if require_positive_duration {
-                " AND duration_days > 0"
-            } else if require_non_time_plan {
-                " AND plan_type <> 'time'"
-            } else {
-                ""
-            };
-            let sql = format!(
-                "UPDATE plans SET {} WHERE id = ?{}",
-                sets.join(", "),
-                invariant_sql
-            );
+            let sql = format!("UPDATE plans SET {} WHERE id = ?", sets.join(", "));
             let mut q = sqlx::query(&sql);
             if let Some(v) = name {
                 q = q.bind(v);
@@ -252,18 +271,21 @@ impl PlanRepository for SqliteRepository {
         };
 
         if rows_affected == 0 {
-            if has_invariant_guard {
-                let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM plans WHERE id = ?")
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                if exists.is_some() {
-                    tx.rollback().await?;
-                    return Err(DbError::PlanInvariant);
-                }
-            }
             tx.rollback().await?;
             return Ok(0);
+        }
+
+        // Any purchase-affecting edit invalidates the accepted recurring
+        // billing contract and requires an explicit fresh opt-in.
+        if billing_changed {
+            sqlx::query(
+                "UPDATE users SET plan_auto_renew = 0, \
+                 plan_auto_renew_price = NULL, plan_auto_renew_revision = NULL, \
+                 plan_auto_renew_retry_at = NULL WHERE plan_id = ?",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
 
         if let Some(group_ids) = device_group_ids {
@@ -390,6 +412,234 @@ impl PlanRepository for SqliteRepository {
         Ok(row.0)
     }
 
+    async fn list_expired_monthly_auto_renew_user_ids(
+        &self,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<i64>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT u.id FROM users u JOIN plans p ON p.id=u.plan_id \
+             WHERE u.admin=0 AND u.plan_auto_renew=1 AND p.plan_type='monthly' \
+               AND u.plan_expire_at IS NOT NULL AND u.plan_expire_at<=? \
+               AND (u.plan_auto_renew_retry_at IS NULL OR u.plan_auto_renew_retry_at<=?) \
+             ORDER BY COALESCE(u.plan_auto_renew_retry_at, u.plan_expire_at), u.id LIMIT ?",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn renew_expired_monthly_plan(
+        &self,
+        user_id: i64,
+        now: &str,
+    ) -> Result<MonthlyRenewalOutcome, DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row: Option<(
+            String,
+            i64,
+            String,
+            String,
+            i64,
+            i32,
+            i32,
+            bool,
+            i64,
+            Option<String>,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT u.balance, p.id, p.name, p.price, p.traffic, p.max_rules, \
+                    p.duration_days, p.grant_all_groups, p.billing_revision, \
+                    u.plan_auto_renew_price, u.plan_auto_renew_revision \
+             FROM users u JOIN plans p ON p.id=u.plan_id \
+             WHERE u.id=? AND u.admin=0 AND u.plan_auto_renew=1 \
+               AND p.plan_type='monthly' AND p.reset_traffic=1 AND p.duration_days=30 \
+               AND u.plan_expire_at IS NOT NULL AND u.plan_expire_at<=? \
+               AND (u.plan_auto_renew_retry_at IS NULL OR u.plan_auto_renew_retry_at<=?)",
+        )
+        .bind(user_id)
+        .bind(now)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((
+            balance,
+            plan_id,
+            plan_name,
+            price,
+            traffic,
+            max_rules,
+            duration_days,
+            grant_all_groups,
+            billing_revision,
+            accepted_price,
+            accepted_revision,
+        )) = row
+        else {
+            tx.rollback().await?;
+            return Ok(MonthlyRenewalOutcome::NotEligible);
+        };
+        if accepted_price.as_deref() != Some(price.as_str())
+            || accepted_revision != Some(billing_revision)
+        {
+            sqlx::query(
+                "UPDATE users SET plan_auto_renew=0, plan_auto_renew_price=NULL, \
+                 plan_auto_renew_revision=NULL, plan_auto_renew_retry_at=NULL WHERE id=?",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(MonthlyRenewalOutcome::ContractChanged);
+        }
+        let group_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT device_group_id FROM plan_device_groups \
+             WHERE plan_id=? ORDER BY device_group_id",
+        )
+        .bind(plan_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !grant_all_groups {
+            for group_id in &group_ids {
+                let valid: Option<i64> = sqlx::query_scalar(
+                    "SELECT dg.id FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+                     WHERE dg.id=? AND dg.group_type IN ('in','both') AND owner.admin=1",
+                )
+                .bind(group_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if valid.is_none() {
+                    sqlx::query(
+                        "UPDATE users SET plan_auto_renew=0, plan_auto_renew_price=NULL, \
+                         plan_auto_renew_revision=NULL, plan_auto_renew_retry_at=NULL WHERE id=?",
+                    )
+                    .bind(user_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    return Ok(MonthlyRenewalOutcome::ContractChanged);
+                }
+            }
+        }
+        let balance_cents = relay_shared::money::balance_to_cents(&balance)
+            .ok_or(DbError::InvalidData("non-canonical user balance"))?;
+        let price_cents = relay_shared::money::balance_to_cents(
+            accepted_price
+                .as_deref()
+                .expect("accepted price checked above"),
+        )
+        .ok_or(DbError::InvalidData("non-canonical monthly plan price"))?;
+        if balance_cents < price_cents {
+            sqlx::query(
+                "UPDATE users SET plan_auto_renew_retry_at=datetime(?, '+60 seconds') WHERE id=?",
+            )
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(MonthlyRenewalOutcome::InsufficientBalance);
+        }
+        let next_expire: String = sqlx::query_scalar("SELECT datetime(?, ? || ' days')")
+            .bind(now)
+            .bind(format!("+{duration_days}"))
+            .fetch_one(&mut *tx)
+            .await?;
+        let new_balance = relay_shared::money::cents_to_balance(balance_cents - price_cents);
+        sqlx::query(
+            "UPDATE users SET balance=?, traffic_limit=?, traffic_used=0, max_rules=?, \
+             plan_expire_at=?, plan_auto_renew_retry_at=NULL, all_device_groups=? WHERE id=?",
+        )
+        .bind(&new_balance)
+        .bind(traffic)
+        .bind(max_rules)
+        .bind(&next_expire)
+        .bind(grant_all_groups)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE forward_rules SET traffic_used=0 WHERE uid=?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM user_device_groups WHERE user_id=?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        if !grant_all_groups {
+            for group_id in &group_ids {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO user_device_groups (user_id, device_group_id) VALUES (?, ?)",
+                )
+                .bind(user_id)
+                .bind(group_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        if grant_all_groups {
+            sqlx::query(
+                "UPDATE forward_rules SET paused=1, auto_paused=1 \
+                 WHERE uid=? AND paused=0 AND device_group_in NOT IN (\
+                   SELECT dg.id FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+                   WHERE dg.group_type IN ('in','both') AND owner.admin=1)",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE forward_rules SET paused=0, auto_paused=0 \
+                 WHERE uid=? AND paused=1 AND auto_paused=1 AND device_group_in IN (\
+                   SELECT dg.id FROM device_groups dg JOIN users owner ON owner.id=dg.uid \
+                   WHERE dg.group_type IN ('in','both') AND owner.admin=1)",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        } else if group_ids.is_empty() {
+            sqlx::query(
+                "UPDATE forward_rules SET paused=1, auto_paused=1 WHERE uid=? AND paused=0",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            let placeholders = std::iter::repeat_n("?", group_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let pause_sql = format!(
+                "UPDATE forward_rules SET paused=1, auto_paused=1 \
+                 WHERE uid=? AND paused=0 AND device_group_in NOT IN ({placeholders})"
+            );
+            let mut pause = sqlx::query(&pause_sql).bind(user_id);
+            for group_id in &group_ids {
+                pause = pause.bind(group_id);
+            }
+            pause.execute(&mut *tx).await?;
+            let resume_sql = format!(
+                "UPDATE forward_rules SET paused=0, auto_paused=0 \
+                 WHERE uid=? AND paused=1 AND auto_paused=1 \
+                   AND device_group_in IN ({placeholders})"
+            );
+            let mut resume = sqlx::query(&resume_sql).bind(user_id);
+            for group_id in &group_ids {
+                resume = resume.bind(group_id);
+            }
+            resume.execute(&mut *tx).await?;
+        }
+        sqlx::query("INSERT INTO orders (user_id, plan_id, plan_name, price) VALUES (?, ?, ?, ?)")
+            .bind(user_id)
+            .bind(plan_id)
+            .bind(&plan_name)
+            .bind(relay_shared::money::cents_to_balance(price_cents))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(MonthlyRenewalOutcome::Renewed { plan_id, plan_name })
+    }
+
     // Atomic plan purchase. BEGIN IMMEDIATE reserves the single SQLite writer
     // before any plan/balance reads. A concurrent purchase waits, then reads
     // the committed balance instead of trying to upgrade a stale WAL snapshot
@@ -412,26 +662,40 @@ impl PlanRepository for SqliteRepository {
         // Explicit authorization snapshot for per-group plans. Grant-all is
         // derived from current group state inside this transaction.
         new_authorized_group_ids: &[i64],
+        plan_type: &str,
+        auto_renew: bool,
         require_visible: bool,
         check_plan_snapshot: bool,
         expected_current_plan_id: Option<Option<i64>>,
     ) -> Result<(), BuyPlanError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut accepted_billing_price: Option<String> = None;
+        let mut accepted_billing_revision: Option<i64> = None;
 
         // Lock the purchase to one coherent plan snapshot. The handler resolves
         // display/validation fields before entering this transaction; compare
         // them again here so an intervening admin edit cannot mix a new plan id
         // with an old price, quota, duration, or grant set.
         if check_plan_snapshot {
-            let current_plan: Option<(String, String, i64, i32, String, i32, bool, bool, bool)> =
-                sqlx::query_as(
-                    "SELECT name, price, traffic, max_rules, plan_type, duration_days, \
-                        reset_traffic, grant_all_groups, hidden \
+            let current_plan: Option<(
+                String,
+                String,
+                i64,
+                i32,
+                String,
+                i32,
+                bool,
+                bool,
+                bool,
+                i64,
+            )> = sqlx::query_as(
+                "SELECT name, price, traffic, max_rules, plan_type, duration_days, \
+                        reset_traffic, grant_all_groups, hidden, billing_revision \
                  FROM plans WHERE id = ?",
-                )
-                .bind(plan_id)
-                .fetch_optional(&mut *tx)
-                .await?;
+            )
+            .bind(plan_id)
+            .fetch_optional(&mut *tx)
+            .await?;
             let Some((
                 current_name,
                 current_price,
@@ -442,6 +706,7 @@ impl PlanRepository for SqliteRepository {
                 current_reset_traffic,
                 current_grant_all,
                 current_hidden,
+                current_billing_revision,
             )) = current_plan
             else {
                 let _ = tx.rollback().await;
@@ -456,7 +721,8 @@ impl PlanRepository for SqliteRepository {
                     );
                     BuyPlanError::Database(DbError::NotFound)
                 })?;
-            let effective_current_duration = if current_type == "time" {
+            let effective_current_duration = if matches!(current_type.as_str(), "time" | "monthly")
+            {
                 current_duration_days
             } else {
                 0
@@ -497,6 +763,7 @@ impl PlanRepository for SqliteRepository {
                 || current_price_cents != price_cents
                 || current_traffic != traffic_to_add
                 || current_max_rules != plan_max_rules
+                || current_type != plan_type
                 || effective_current_duration != duration_days
                 || current_reset_traffic != reset_traffic
                 || current_grant_all != grant_all_groups
@@ -505,6 +772,8 @@ impl PlanRepository for SqliteRepository {
                 let _ = tx.rollback().await;
                 return Err(BuyPlanError::PlanChanged);
             }
+            accepted_billing_price = Some(current_price);
+            accepted_billing_revision = Some(current_billing_revision);
         }
 
         // Read the user's current balance (canonical TEXT) + expiry + plan_id.
@@ -554,7 +823,8 @@ impl PlanRepository for SqliteRepository {
         //     the expiry extends from max(now, current) — 加流量/延期.
         // A missing current plan (None) is treated as a switch (fresh start).
         let is_switch = current_plan_id != Some(plan_id);
-        let new_traffic_limit = if is_switch {
+        let is_monthly = plan_type == "monthly";
+        let new_traffic_limit = if is_switch || is_monthly {
             if traffic_to_add < 0 {
                 let _ = tx.rollback().await;
                 return Err(BuyPlanError::QuotaOverflow);
@@ -595,19 +865,31 @@ impl PlanRepository for SqliteRepository {
         };
 
         // Apply the user update per the renew/switch split above.
-        if is_switch {
+        if is_switch || is_monthly {
             // Switch: traffic_limit = new quota, traffic_used reset to 0.
             sqlx::query(
                 "UPDATE users SET \
                  balance = ?, traffic_limit = ?, traffic_used = 0, max_rules = ?, \
-                 plan_id = ?, plan_expire_at = ? \
-                 WHERE id = ?",
+                 plan_id = ?, plan_expire_at = ?, plan_auto_renew = ?, \
+                 plan_auto_renew_price = ?, plan_auto_renew_revision = ?, \
+                 plan_auto_renew_retry_at = NULL WHERE id = ?",
             )
             .bind(&new_balance)
             .bind(new_traffic_limit)
             .bind(plan_max_rules)
             .bind(plan_id)
             .bind(&new_expire)
+            .bind(is_monthly && auto_renew)
+            .bind(
+                (is_monthly && auto_renew)
+                    .then_some(accepted_billing_price)
+                    .flatten(),
+            )
+            .bind(
+                (is_monthly && auto_renew)
+                    .then_some(accepted_billing_revision)
+                    .flatten(),
+            )
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
@@ -616,7 +898,9 @@ impl PlanRepository for SqliteRepository {
             sqlx::query(
                 "UPDATE users SET \
                  balance = ?, traffic_limit = ?, traffic_used = 0, \
-                 max_rules = ?, plan_id = ?, plan_expire_at = ? \
+                 max_rules = ?, plan_id = ?, plan_expire_at = ?, plan_auto_renew = 0, \
+                 plan_auto_renew_price = NULL, plan_auto_renew_revision = NULL, \
+                 plan_auto_renew_retry_at = NULL \
                  WHERE id = ?",
             )
             .bind(&new_balance)
@@ -632,7 +916,9 @@ impl PlanRepository for SqliteRepository {
             sqlx::query(
                 "UPDATE users SET \
                  balance = ?, traffic_limit = ?, max_rules = ?, \
-                 plan_id = ?, plan_expire_at = ? \
+                 plan_id = ?, plan_expire_at = ?, plan_auto_renew = 0, \
+                 plan_auto_renew_price = NULL, plan_auto_renew_revision = NULL, \
+                 plan_auto_renew_retry_at = NULL \
                  WHERE id = ?",
             )
             .bind(&new_balance)
@@ -643,6 +929,16 @@ impl PlanRepository for SqliteRepository {
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
+        }
+
+        // A fresh cycle is one coherent reset: both the billing counter and
+        // the per-rule current counters return to zero. Historical buckets are
+        // deliberately retained for charts and auditability.
+        if is_switch || is_monthly || reset_traffic {
+            sqlx::query("UPDATE forward_rules SET traffic_used = 0 WHERE uid = ?")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
         }
 
         // Insert the order row (snapshots plan_name + the canonical price).
@@ -849,6 +1145,18 @@ impl PlanRepository for SqliteRepository {
             .execute(&mut *tx)
             .await?;
         }
+        sqlx::query("UPDATE plans SET billing_revision = billing_revision + 1 WHERE id = ?")
+            .bind(plan_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE users SET plan_auto_renew = 0, \
+             plan_auto_renew_price = NULL, plan_auto_renew_revision = NULL, \
+             plan_auto_renew_retry_at = NULL WHERE plan_id = ?",
+        )
+        .bind(plan_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

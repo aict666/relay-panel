@@ -323,6 +323,28 @@ pub trait UserRepository: Send + Sync {
         clear: bool,
         plan_expire_at: Option<&str>,
     ) -> Result<AdminUserPlanEditOutcome, DbError>;
+    /// Toggle recurring billing for the user's current monthly plan. Disabling
+    /// is always allowed; enabling fails closed unless the current plan is
+    /// still a monthly plan at the time of the update.
+    async fn set_plan_auto_renew(
+        &self,
+        user_id: i64,
+        enabled: bool,
+    ) -> Result<PlanAutoRenewUpdateOutcome, DbError> {
+        self.set_plan_auto_renew_guarded(user_id, enabled, None, None)
+            .await
+    }
+    /// HTTP-facing variant that atomically compares the price and billing
+    /// revision shown to the user before recording a new recurring-charge
+    /// authorization. Internal callers may use `set_plan_auto_renew` when no
+    /// stale-view guard is required.
+    async fn set_plan_auto_renew_guarded(
+        &self,
+        user_id: i64,
+        enabled: bool,
+        expected_price: Option<&str>,
+        expected_revision: Option<i64>,
+    ) -> Result<PlanAutoRenewUpdateOutcome, DbError>;
     /// Increment user traffic_used (called inside traffic batch tx).
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError>;
     /// Reset traffic_used to 0 for user AND their rules (atomic).
@@ -1454,6 +1476,25 @@ pub trait PlanRepository: Send + Sync {
         device_group_ids: &[i64],
     ) -> Result<(), DbError>;
 
+    /// Bounded scheduler scan. The per-user renewal method below rechecks every
+    /// predicate under a write lock, so this read is only a candidate list.
+    async fn list_expired_monthly_auto_renew_user_ids(
+        &self,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<i64>, DbError>;
+
+    /// Atomically renew one expired monthly subscription: lock grants -> plan
+    /// -> user, verify the accepted price/revision, deduct balance, reset the
+    /// fixed-cycle quota and counters, replace line authorization, advance
+    /// expiry from `now`, and record one order. Underfunded rows receive a
+    /// retry timestamp so they cannot starve a bounded candidate batch.
+    async fn renew_expired_monthly_plan(
+        &self,
+        user_id: i64,
+        now: &str,
+    ) -> Result<MonthlyRenewalOutcome, DbError>;
+
     /// v1.0.8: atomically purchase a plan in ONE transaction (防双花):
     ///   - lock + read the user's balance
     ///   - refuse if balance < price_cents (returns `BuyPlanError::InsufficientBalance`)
@@ -1503,6 +1544,8 @@ pub trait PlanRepository: Send + Sync {
             grant_all_groups,
             device_group_ids,
             new_authorized_group_ids,
+            if duration_days > 0 { "time" } else { "data" },
+            false,
             false,
             false,
             None,
@@ -1527,6 +1570,8 @@ pub trait PlanRepository: Send + Sync {
         grant_all_groups: bool,
         device_group_ids: &[i64],
         new_authorized_group_ids: &[i64],
+        plan_type: &str,
+        auto_renew: bool,
         require_visible: bool,
         expected_current_plan_id: Option<Option<i64>>,
     ) -> Result<(), BuyPlanError> {
@@ -1542,6 +1587,8 @@ pub trait PlanRepository: Send + Sync {
             grant_all_groups,
             device_group_ids,
             new_authorized_group_ids,
+            plan_type,
+            auto_renew,
             require_visible,
             true,
             expected_current_plan_id,
@@ -1564,6 +1611,8 @@ pub trait PlanRepository: Send + Sync {
         grant_all_groups: bool,
         device_group_ids: &[i64],
         new_authorized_group_ids: &[i64],
+        plan_type: &str,
+        auto_renew: bool,
         require_visible: bool,
         check_plan_snapshot: bool,
         expected_current_plan_id: Option<Option<i64>>,
@@ -1651,6 +1700,22 @@ pub enum BuyPlanError {
     QuotaOverflow,
     /// DB error. Caller → 500.
     Database(DbError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanAutoRenewUpdateOutcome {
+    Updated,
+    UserNotFound,
+    NotMonthly,
+    ContractChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonthlyRenewalOutcome {
+    Renewed { plan_id: i64, plan_name: String },
+    InsufficientBalance,
+    ContractChanged,
+    NotEligible,
 }
 
 impl From<DbError> for BuyPlanError {

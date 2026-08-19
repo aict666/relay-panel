@@ -4913,6 +4913,8 @@ async fn pg_guarded_buy_rejects_a_plan_changed_after_the_caller_snapshot() {
             false,
             &[],
             &[],
+            "data",
+            false,
             false,
             None,
         )
@@ -4952,6 +4954,8 @@ async fn pg_guarded_buy_rejects_a_plan_changed_after_the_caller_snapshot() {
             false,
             &[],
             &[],
+            "data",
+            false,
             false,
             Some(None),
         )
@@ -5003,6 +5007,8 @@ async fn pg_guarded_buy_rejects_historical_unusable_plan_grants_before_charging(
             false,
             &[9901],
             &[9901],
+            "data",
+            false,
             false,
             None,
         )
@@ -5504,6 +5510,558 @@ async fn pg_update_plan_fields_enforces_type_duration_invariant_atomically() {
         (stored.plan_type.as_str(), stored.duration_days),
         ("time", 10)
     );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_monthly_plan_lifecycle_invariants_and_type_change_disables_auto_renew() {
+    let Some(db) = repo("monthly_invariants").await else {
+        return;
+    };
+    let pid = db
+        .insert_plan(
+            "monthly", 10, 5_000, "10.00", "monthly", 30, false, true, "", false,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.insert_plan(
+            "bad-duration",
+            10,
+            5_000,
+            "10.00",
+            "monthly",
+            31,
+            false,
+            true,
+            "",
+            false,
+        )
+        .await,
+        Err(DbError::PlanInvariant)
+    ));
+    assert!(matches!(
+        db.insert_plan(
+            "bad-reset",
+            10,
+            5_000,
+            "10.00",
+            "monthly",
+            30,
+            false,
+            false,
+            "",
+            false,
+        )
+        .await,
+        Err(DbError::PlanInvariant)
+    ));
+
+    assert_eq!(db.insert_user_from_plan("bob", "h", pid).await.unwrap(), 1);
+    let (registered_expire, registered_auto): (Option<String>, bool) =
+        sqlx::query_as("SELECT plan_expire_at, plan_auto_renew FROM users WHERE username='bob'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(
+        registered_expire.is_some(),
+        "registration on a monthly plan must start a real first cycle (PG)"
+    );
+    assert!(
+        !registered_auto,
+        "registration must not silently opt into recurring charges (PG)"
+    );
+
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query("UPDATE users SET plan_id=$1, plan_expire_at='2026-09-01 00:00:00' WHERE id=$2")
+        .bind(pid)
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let initial_revision: i64 =
+        sqlx::query_scalar("SELECT billing_revision FROM plans WHERE id=$1")
+            .bind(pid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        db.set_plan_auto_renew_guarded(alice, true, Some("9.00"), Some(initial_revision))
+            .await
+            .unwrap(),
+        PlanAutoRenewUpdateOutcome::ContractChanged,
+        "a stale displayed price must not authorize recurring billing (PG)"
+    );
+    assert_eq!(
+        db.set_plan_auto_renew_guarded(alice, true, Some("10.00"), Some(initial_revision))
+            .await
+            .unwrap(),
+        PlanAutoRenewUpdateOutcome::Updated
+    );
+    db.update_plan_fields(
+        pid,
+        None,
+        None,
+        None,
+        Some("12.00"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let contract: (bool, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT plan_auto_renew, plan_auto_renew_price, plan_auto_renew_revision \
+         FROM users WHERE id=$1",
+    )
+    .bind(alice)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(contract, (false, None, None));
+    assert_eq!(
+        db.set_plan_auto_renew(alice, true).await.unwrap(),
+        PlanAutoRenewUpdateOutcome::Updated
+    );
+    sqlx::query("UPDATE plans SET price='13.00' WHERE id=$1")
+        .bind(pid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.renew_expired_monthly_plan(alice, "2026-10-01 00:00:00")
+            .await
+            .unwrap(),
+        MonthlyRenewalOutcome::ContractChanged,
+        "a stale accepted price must fail closed after an out-of-band edit (PG)"
+    );
+    assert_eq!(
+        db.admin_edit_user_plan(alice, pid, false, None)
+            .await
+            .unwrap(),
+        AdminUserPlanEditOutcome::ExpiryNotApplicable,
+        "a monthly plan cannot be converted to never-expiring (PG)"
+    );
+
+    db.update_plan_fields(
+        pid,
+        None,
+        None,
+        None,
+        None,
+        Some("data"),
+        Some(0),
+        None,
+        Some(false),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let enabled: bool = sqlx::query_scalar("SELECT plan_auto_renew FROM users WHERE id=$1")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !enabled,
+        "changing away from monthly must clear auto-renew (PG)"
+    );
+    assert_eq!(
+        db.set_plan_auto_renew(alice, true).await.unwrap(),
+        PlanAutoRenewUpdateOutcome::NotMonthly
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_monthly_purchase_starts_fixed_cycle_and_resets_current_usage() {
+    let Some(db) = repo("monthly_purchase").await else {
+        return;
+    };
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    let pid = db
+        .insert_plan(
+            "monthly", 20, 5_000, "10.00", "monthly", 30, false, true, "", false,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE users SET balance='100.00', plan_id=$1, plan_expire_at='2099-12-31 00:00:00', \
+         traffic_limit=9000, traffic_used=800 WHERE id=$2",
+    )
+    .bind(pid)
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    seed_device_group(&db, 70, 1).await;
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id,name,uid,listen_port,device_group_in,target_addr,target_port,traffic_used) \
+         VALUES (400,'monthly-rule',$1,24000,70,'127.0.0.1',80,700)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.buy_plan_guarded(
+        alice,
+        pid,
+        "monthly",
+        1_000,
+        5_000,
+        20,
+        30,
+        true,
+        false,
+        &[],
+        &[],
+        "monthly",
+        true,
+        false,
+        Some(Some(pid)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT plan_auto_renew_price FROM users WHERE id=$1"
+        )
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .as_deref(),
+        Some("10.00"),
+        "the purchase must preserve the exact accepted price representation (PG)"
+    );
+
+    let (balance, limit, used, max_rules, expire, auto): (
+        String,
+        i64,
+        i64,
+        i32,
+        Option<String>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT balance, traffic_limit, traffic_used, max_rules, plan_expire_at, \
+         plan_auto_renew FROM users WHERE id=$1",
+    )
+    .bind(alice)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (balance.as_str(), limit, used, max_rules, auto),
+        ("90", 5_000, 0, 20, true)
+    );
+    assert!(
+        expire.unwrap().starts_with("2100-"),
+        "an early manual renewal extends the current cycle (PG)"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM forward_rules WHERE id=400")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(db.list_orders_by_user(alice).await.unwrap().len(), 1);
+    sqlx::query("UPDATE users SET plan_expire_at='2026-08-01 00:00:00' WHERE id=$1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.renew_expired_monthly_plan(alice, "2026-08-19 12:00:00")
+            .await
+            .unwrap(),
+        MonthlyRenewalOutcome::Renewed { plan_id, .. } if plan_id == pid
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT balance FROM users WHERE id=$1")
+            .bind(alice)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        "80"
+    );
+    assert_eq!(db.list_orders_by_user(alice).await.unwrap().len(), 2);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_monthly_auto_renew_success_is_atomic_and_idempotent() {
+    let Some(db) = repo("monthly_renew_success").await else {
+        return;
+    };
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    let pid = db
+        .insert_plan(
+            "monthly", 20, 5_000, "10.00", "monthly", 30, false, true, "", false,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE users SET balance='25.00', plan_id=$1, plan_expire_at='2026-08-01 00:00:00', \
+         traffic_limit=9000, traffic_used=800, max_rules=1 WHERE id=$2",
+    )
+    .bind(pid)
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    seed_device_group(&db, 71, 1).await;
+    seed_device_group(&db, 72, 1).await;
+    db.set_plan_device_groups(pid, &[71]).await.unwrap();
+    sqlx::query("UPDATE users SET all_device_groups=TRUE WHERE id=$1")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO user_device_groups (user_id,device_group_id) VALUES ($1,72)")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.set_plan_auto_renew(alice, true).await.unwrap(),
+        PlanAutoRenewUpdateOutcome::Updated
+    );
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id,name,uid,listen_port,device_group_in,target_addr,target_port,traffic_used,paused,auto_paused) \
+         VALUES (401,'monthly-rule',$1,24001,71,'127.0.0.1',80,700,TRUE,TRUE), \
+                (402,'old-plan-rule',$1,24002,72,'127.0.0.1',80,600,FALSE,FALSE)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO traffic_history \
+         (rule_id,uid,group_id,hour_ts,real_upload,real_download,billed_total) \
+         VALUES (401,$1,71,'2026-08-01 00:00:00',100,200,300)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let now = "2026-08-19 12:00:00";
+    assert_eq!(
+        db.list_expired_monthly_auto_renew_user_ids(now, 200)
+            .await
+            .unwrap(),
+        vec![alice]
+    );
+
+    assert_eq!(
+        db.renew_expired_monthly_plan(alice, now).await.unwrap(),
+        MonthlyRenewalOutcome::Renewed {
+            plan_id: pid,
+            plan_name: "monthly".to_string(),
+        }
+    );
+    let state: (String, i64, i64, i32, Option<String>, bool) = sqlx::query_as(
+        "SELECT balance, traffic_limit, traffic_used, max_rules, plan_expire_at, \
+         plan_auto_renew FROM users WHERE id=$1",
+    )
+    .bind(alice)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        state,
+        (
+            "15".to_string(),
+            5_000,
+            0,
+            20,
+            Some("2026-09-18 12:00:00".to_string()),
+            true
+        )
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM forward_rules WHERE id=401")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    let authorization: (bool, i64) = sqlx::query_as(
+        "SELECT all_device_groups, \
+                (SELECT COUNT(*) FROM user_device_groups WHERE user_id=users.id AND device_group_id=71) \
+         FROM users WHERE id=$1",
+    )
+    .bind(alice)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(authorization, (false, 1));
+    let rule_states: Vec<(i64, bool, bool)> = sqlx::query_as(
+        "SELECT id,paused,auto_paused FROM forward_rules WHERE id IN (401,402) ORDER BY id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rule_states, vec![(401, false, false), (402, true, true)]);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM traffic_history WHERE rule_id=401")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1,
+        "renewal resets current counters but retains historical usage (PG)"
+    );
+    assert_eq!(db.list_orders_by_user(alice).await.unwrap().len(), 1);
+
+    assert_eq!(
+        db.renew_expired_monthly_plan(alice, now).await.unwrap(),
+        MonthlyRenewalOutcome::NotEligible,
+        "a second worker/tick must not charge the same cycle twice (PG)"
+    );
+    assert_eq!(db.list_orders_by_user(alice).await.unwrap().len(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT balance FROM users WHERE id=$1")
+            .bind(alice)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        "15"
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_monthly_auto_renew_insufficient_balance_is_noop_and_retryable() {
+    let Some(db) = repo("monthly_renew_insufficient").await else {
+        return;
+    };
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    let pid = db
+        .insert_plan(
+            "monthly", 20, 5_000, "10.00", "monthly", 30, false, true, "", false,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE users SET balance='5.00', plan_id=$1, plan_expire_at='2026-08-01 00:00:00', \
+         traffic_limit=9000, traffic_used=800 WHERE id=$2",
+    )
+    .bind(pid)
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        db.set_plan_auto_renew(alice, true).await.unwrap(),
+        PlanAutoRenewUpdateOutcome::Updated
+    );
+    let now = "2026-08-19 12:00:00";
+    assert_eq!(
+        db.renew_expired_monthly_plan(alice, now).await.unwrap(),
+        MonthlyRenewalOutcome::InsufficientBalance
+    );
+    let state: (String, i64, i64, Option<String>, bool) = sqlx::query_as(
+        "SELECT balance, traffic_limit, traffic_used, plan_expire_at, plan_auto_renew \
+         FROM users WHERE id=$1",
+    )
+    .bind(alice)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        state,
+        (
+            "5.00".to_string(),
+            9_000,
+            800,
+            Some("2026-08-01 00:00:00".to_string()),
+            true
+        )
+    );
+    assert!(db.list_orders_by_user(alice).await.unwrap().is_empty());
+    assert_eq!(
+        db.list_expired_monthly_auto_renew_user_ids(now, 200)
+            .await
+            .unwrap(),
+        Vec::<i64>::new(),
+        "a failed charge must leave the bounded candidate queue until its retry window (PG)"
+    );
+    assert_eq!(
+        db.list_expired_monthly_auto_renew_user_ids("2026-08-19 12:01:00", 200)
+            .await
+            .unwrap(),
+        vec![alice],
+        "the expired subscription becomes eligible again after the retry delay (PG)"
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_monthly_auto_renew_retry_does_not_starve_later_users() {
+    let Some(db) = repo("monthly_renew_fairness").await else {
+        return;
+    };
+    let pid = db
+        .insert_plan(
+            "monthly", 20, 5_000, "10.00", "monthly", 30, false, true, "", false,
+        )
+        .await
+        .unwrap();
+    let mut users = Vec::new();
+    for (username, balance) in [("first", "0"), ("second", "0"), ("third", "20.00")] {
+        db.insert_user(username, "h", 1).await.unwrap();
+        let user_id = db.find_by_username(username).await.unwrap().unwrap().id;
+        sqlx::query(
+            "UPDATE users SET balance=$1, plan_id=$2, plan_expire_at='2026-08-01 00:00:00' \
+             WHERE id=$3",
+        )
+        .bind(balance)
+        .bind(pid)
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.set_plan_auto_renew(user_id, true).await.unwrap();
+        users.push(user_id);
+    }
+    let now = "2026-08-19 12:00:00";
+    assert_eq!(
+        db.list_expired_monthly_auto_renew_user_ids(now, 2)
+            .await
+            .unwrap(),
+        users[..2]
+    );
+    for user_id in &users[..2] {
+        assert_eq!(
+            db.renew_expired_monthly_plan(*user_id, now).await.unwrap(),
+            MonthlyRenewalOutcome::InsufficientBalance
+        );
+    }
+    assert_eq!(
+        db.list_expired_monthly_auto_renew_user_ids(now, 2)
+            .await
+            .unwrap(),
+        vec![users[2]],
+        "deferred underfunded users must not monopolize the bounded batch (PG)"
+    );
+    assert!(matches!(
+        db.renew_expired_monthly_plan(users[2], now).await.unwrap(),
+        MonthlyRenewalOutcome::Renewed { .. }
+    ));
     cleanup(&db).await;
 }
 
