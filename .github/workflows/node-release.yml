@@ -201,7 +201,9 @@ jobs:
   # Catches truncated uploads, wrong-arch binaries, and version/tag mismatches.
   verify:
     permissions:
-      contents: read
+      # GitHub hides draft releases from read-only tokens, even in public
+      # repositories. Verification must read the still-private draft assets.
+      contents: write
       packages: read
     name: Verify ${{ matrix.arch }} release assets
     needs: [build-and-upload, docker-node]

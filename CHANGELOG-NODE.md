@@ -13,6 +13,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.12] - 2026-10-15
+
+### Fixed
+
+- 修正发行资产验收任务读取草稿 Release 所需的 GitHub 权限。双架构校验和、原生执行与镜像版本验收全部通过后才发布正式 Release 和移动 latest，不跳过验收。
+- 本版包含 1.3.11 的全部计量、outbox 和转发修复；1.3.11 在草稿验收阶段阻断，未正式发布，请直接使用 1.3.12。
+
 ## [1.3.11] - 2026-10-15
 
 ### Fixed

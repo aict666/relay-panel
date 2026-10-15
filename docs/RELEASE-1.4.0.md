@@ -1,4 +1,4 @@
-# Panel 1.4.0 / Node 1.3.11 发布运行手册
+# Panel 1.4.0 / Node 1.3.12 发布运行手册
 
 ## 交付边界
 
@@ -16,7 +16,7 @@
 | 项目 | 候选版本 |
 |---|---|
 | Panel / 配套前端 | 1.4.0 |
-| Node / 安装脚本 | 1.3.11 |
+| Node / 安装脚本 | 1.3.12 |
 | SQLite 追加迁移 | 60–63 |
 | PostgreSQL 追加修订 | 45–48 |
 | 节点配置协议 | v11，不变 |
@@ -68,7 +68,7 @@ bash scripts/relay-node-install-check.sh
 docker build --target panel -t relay-panel-candidate:local .
 python3 tests/container_release_test.py relay-panel-candidate:local
 bash scripts/release-check.sh panel 1.4.0
-bash scripts/release-check.sh node 1.3.11
+bash scripts/release-check.sh node 1.3.12
 ```
 
 容器测试创建独立临时资源，验证 root 拥有的旧卷升级、非 root 应用、健康检查、字体 CSP、实际旧库备份与恢复。`panel-release` 同样在两种架构推送前执行；Node musl 产物在各自原生架构执行并确认静态链接。
@@ -88,4 +88,6 @@ HTTP 闭环测试覆盖收费注册待开通、充值、并发购买、流量去
 
 本轮只准备代码与本地候选产物，不自动提交、打标签、推送、发布镜像或操作生产。
 
-授权发布后，用 `v1.4.0`、`node-v1.3.11` 两条独立标签触发流水线。流水线先执行完整 CI，再构建/验收产物；验证失败不移动 latest、不发布正式 Release。两架构都通过后，先对生产副本验收，再进行小流量灰度，核对余额、订单、流水、周期重置及入口单次计量。
+授权发布后，用 `v1.4.0`、`node-v1.3.12` 两条独立标签触发流水线。流水线先执行完整 CI，再构建/验收产物；验证失败不移动 latest、不发布正式 Release。两架构都通过后，先对生产副本验收，再进行小流量灰度，核对余额、订单、流水、周期重置及入口单次计量。
+
+Node 1.3.11 的首次远程发行在读取草稿资产时因任务权限不足被阻断，未正式发布；修正权限后使用新标签 1.3.12，不覆盖原标签。
