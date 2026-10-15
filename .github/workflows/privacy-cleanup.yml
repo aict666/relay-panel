@@ -1,0 +1,42 @@
+name: Privacy Cleanup
+
+# One-time, explicitly scoped cleanup of an audited historical run. Running
+# again is harmless; 404 means the already-backed-up record is gone.
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/privacy-cleanup.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  cleanup:
+    if: github.repository == 'aict666/relay-panel' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Remove the audited historical build records
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.error
+          import urllib.request
+          root = 'https://api.github.com/repos/aict666/relay-panel/actions/'
+          targets = ['artifacts/8427974623', 'artifacts/8427976119', 'runs/29638769777']
+          for target in targets:
+              request = urllib.request.Request(root + target, method='DELETE', headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28'})
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      assert response.status == 204
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise RuntimeError('Scoped privacy cleanup failed with HTTP ' + str(error.code)) from None
+              print('Removed audited record: ' + target)
+          PY

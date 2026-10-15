@@ -18,6 +18,28 @@ traffic-outbox-*.lock
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
+!.env.*.example
+
+# Private deployment handoffs, credentials and database backups.
+/HANDOFF*.md
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+id_ecdsa
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.dump
+*.sql.gz
+*.backup
+*.bak
+*.log
 
 # Windows reserved device name accidentally materialised as a file by
 # `> nul` redirects under git-bash. Never a real source file.

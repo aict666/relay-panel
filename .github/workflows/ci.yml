@@ -16,7 +16,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  privacy:
+    uses: ./.github/workflows/privacy-check.yml
+
   quality:
+    needs: privacy
     name: fmt + clippy + test + lint + build + e2e
     runs-on: ubuntu-24.04
 

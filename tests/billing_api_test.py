@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -36,7 +37,7 @@ def main():
             port = probe.getsockname()[1]
         base = f"http://127.0.0.1:{port}"
         env = {**os.environ, "DATABASE_URL": f"sqlite:{directory / 'data.db'}?mode=rwc", "LISTEN": f"127.0.0.1:{port}",
-               "JWT_SECRET": "synthetic-billing-api-test-secret-32-bytes", "GEOIP_ENABLED": "false",
+               "JWT_SECRET": secrets.token_hex(32), "GEOIP_ENABLED": "false",
                "PUBLIC_DIR": str(ROOT / "frontend/dist")}
         with open(directory / "panel.log", "wb") as log:
             process = subprocess.Popen([str(binary)], cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT)
