@@ -14,7 +14,7 @@ const INSECURE_JWT_SECRET: &str = "change-me-jwt-secret";
 /// Overridable at runtime via the `APP_VERSION` env var — used by CI to inject
 /// the version into the Docker image without rebuilding. If the env var is
 /// unset, the compiled-in default below is used.
-const COMPILED_APP_VERSION: &str = "1.3.22";
+const COMPILED_APP_VERSION: &str = "1.4.0";
 
 /// Resolve the effective app version: the `APP_VERSION` env var if set,
 /// otherwise the compiled-in default. Cached for the process lifetime.
@@ -125,9 +125,9 @@ impl Config {
     /// must be replaced. The random fallback above is fine for local dev
     /// because it is generated fresh each run and never equals the sentinel.
     fn validate(&self) {
-        if self.jwt_secret.is_empty() || self.jwt_secret == INSECURE_JWT_SECRET {
+        if !valid_jwt_secret(&self.jwt_secret) {
             eprintln!(
-                "FATAL: JWT_SECRET is empty or still set to the insecure\n  \
+                "FATAL: JWT_SECRET must contain at least 32 bytes and not be the insecure\n  \
                  placeholder \"{}\".\n  \
                  Generate one with:  openssl rand -hex 32\n  \
                  Then set JWT_SECRET in your environment / docker-compose.yaml.",
@@ -135,6 +135,26 @@ impl Config {
             );
             std::process::exit(1);
         }
+    }
+}
+
+fn valid_jwt_secret(secret: &str) -> bool {
+    secret.len() >= 32 && secret.trim().len() >= 32 && secret != INSECURE_JWT_SECRET
+}
+
+#[cfg(test)]
+mod jwt_tests {
+    #[test]
+    fn weak_jwt_secrets_fail_closed() {
+        for secret in [
+            String::new(),
+            "x".repeat(31),
+            " ".repeat(64),
+            super::INSECURE_JWT_SECRET.into(),
+        ] {
+            assert!(!super::valid_jwt_secret(&secret));
+        }
+        assert!(super::valid_jwt_secret(&"x".repeat(32)));
     }
 }
 

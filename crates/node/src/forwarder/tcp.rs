@@ -336,10 +336,15 @@ async fn handle_tcp_connection(
     // Protocol sniffing consumes at most one bounded request-line prefix. Replay it before
     // entering the regular forwarding loop, and account for them exactly once.
     // The remainder can still use Linux splice(2).
+    let meter = if count_traffic {
+        Some(counter.handle(rule_id).await)
+    } else {
+        None
+    };
     let prefixed_upload = sniffed_prefix.len() as u64;
     if !sniffed_prefix.is_empty() {
         rate_limit.acquire_upload(prefixed_upload).await;
-        outbound.write_all(&sniffed_prefix).await?;
+        super::meter::write_counted(&mut outbound, &sniffed_prefix, meter.as_ref(), true).await?;
     }
 
     // getpeername may transiently report ENOTCONN on a cookie-hit TFO socket
@@ -359,21 +364,15 @@ async fn handle_tcp_connection(
     // into userspace, which slashes CPU on high-throughput links. A rate-limited
     // rule CANNOT use splice (the bytes must reach userspace to be throttled),
     // but that's fine: a capped rule isn't running at max throughput, so the
-    // userspace copy's CPU cost is negligible. Byte counts still come back from
-    // the splice return values, so billing is unaffected. Non-Linux always uses
+    // userspace copy's CPU cost is negligible. Splice accounts each successful
+    // pipe-to-socket write while the connection is open. Non-Linux always uses
     // the userspace copy below.
     #[cfg(target_os = "linux")]
     if matches!(rate_limit, RateLimit::Unlimited) {
-        match super::splice::zero_copy_bidirectional(inbound, outbound).await {
-            // (up = client→target, down = target→client) — same attribution as
-            // the userspace path's counter.add(rule_id, up, down).
-            Ok((up, down)) => {
-                if count_traffic {
-                    counter
-                        .add(rule_id, up.saturating_add(prefixed_upload), down)
-                        .await;
-                }
-            }
+        match super::splice::zero_copy_bidirectional_counted(inbound, outbound, meter.as_ref())
+            .await
+        {
+            Ok(_) => {}
             Err(e) => {
                 tracing::warn!("TCP splice forward failed (rule {}): {}", rule_id, e);
                 return Err(e.into());
@@ -393,13 +392,12 @@ async fn handle_tcp_connection(
     let (mut ri, mut wi) = inbound.into_split();
     let (mut ro, mut wo) = outbound.into_split();
 
-    let counter_up = counter.clone();
-    let counter_down = counter.clone();
+    let counter_up = meter.clone();
+    let counter_down = meter;
     let rl_up = rate_limit.clone();
     let rl_down = rate_limit;
 
     let upload = Box::pin(async move {
-        let mut total = prefixed_upload;
         // v1.0.8: 32 KiB copy buffer (this userspace path is only used by
         // rate-limited rules, which are capped anyway; the unlimited fast path
         // uses splice above). Heap-allocated as part of this Box::pin'd future,
@@ -412,18 +410,16 @@ async fn handle_tcp_connection(
                 Err(_) => break,
             };
             rl_up.acquire_upload(n as u64).await;
-            if wo.write_all(&buf[..n]).await.is_err() {
+            if super::meter::write_counted(&mut wo, &buf[..n], counter_up.as_ref(), true)
+                .await
+                .is_err()
+            {
                 break;
             }
-            total += n as u64;
-        }
-        if count_traffic {
-            counter_up.add(rule_id, total, 0).await;
         }
         let _ = wo.shutdown().await;
     });
     let download = Box::pin(async move {
-        let mut total = 0u64;
         // v1.0.8: 32 KiB copy buffer (see the upload side above).
         let mut buf = [0u8; 32 * 1024];
         loop {
@@ -433,13 +429,12 @@ async fn handle_tcp_connection(
                 Err(_) => break,
             };
             rl_down.acquire_download(n as u64).await;
-            if wi.write_all(&buf[..n]).await.is_err() {
+            if super::meter::write_counted(&mut wi, &buf[..n], counter_down.as_ref(), false)
+                .await
+                .is_err()
+            {
                 break;
             }
-            total += n as u64;
-        }
-        if count_traffic {
-            counter_down.add(rule_id, 0, total).await;
         }
         let _ = wi.shutdown().await;
     });
@@ -687,8 +682,11 @@ mod tests {
         tokio::spawn(async move {
             if let Ok((mut s, _)) = target.accept().await {
                 let mut b = vec![0u8; 1024];
-                if let Ok(n) = s.read(&mut b).await {
-                    let _ = s.write_all(&b[..n]).await;
+                loop {
+                    let n = s.read(&mut b).await.unwrap_or(0);
+                    if n == 0 || s.write_all(&b[..n]).await.is_err() {
+                        break;
+                    }
                 }
             }
         });
@@ -732,6 +730,17 @@ mod tests {
             b"ping-through-relay",
             "relay must echo the target"
         );
+        // Both peers are still open: long connections must already be billed,
+        // including the Linux splice fast path selected by this test.
+        let snap = counter.snapshot().await;
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!((snap.entries[0].upload, snap.entries[0].download), (18, 18));
+        snap.commit().await;
+        client.write_all(b"next").await.unwrap();
+        let mut next = [0; 4];
+        client.read_exact(&mut next).await.unwrap();
+        let snap = counter.snapshot().await;
+        assert_eq!((snap.entries[0].upload, snap.entries[0].download), (4, 4));
     }
 
     #[tokio::test]

@@ -40,8 +40,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 E2E_PROFILE = os.environ.get("RELAY_E2E_PROFILE", "debug")
 if E2E_PROFILE not in ("debug", "release"):
     raise ValueError("RELAY_E2E_PROFILE must be 'debug' or 'release'")
-PANEL_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-panel")
-NODE_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-node")
+TARGET_DIR = os.environ.get("CARGO_TARGET_DIR", os.path.join(PROJECT_ROOT, "target"))
+PANEL_BIN = os.path.join(TARGET_DIR, E2E_PROFILE, "relay-panel")
+NODE_BIN = os.path.join(TARGET_DIR, E2E_PROFILE, "relay-node")
 if sys.platform == "win32":
     PANEL_BIN += ".exe"
     NODE_BIN += ".exe"

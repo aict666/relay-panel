@@ -1113,6 +1113,49 @@ impl RuleRepository for PgRepository {
             q = q.bind(uid);
         }
 
+        if paused == Some(false) {
+            let mut tx = self.pool.begin().await?;
+            let uid: Option<i64> = sqlx::query_scalar(
+                "SELECT uid FROM forward_rules WHERE id=$1 AND ($2::bigint IS NULL OR uid=$2)",
+            )
+            .bind(id)
+            .bind(scope.owner_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(uid) = uid else {
+                tx.rollback().await?;
+                return Ok(0);
+            };
+            let (max_rules, admin): (i32, bool) =
+                sqlx::query_as("SELECT max_rules,admin FROM users WHERE id=$1 FOR UPDATE")
+                    .bind(uid)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let is_paused: Option<bool> = sqlx::query_scalar(
+                "SELECT paused FROM forward_rules WHERE id=$1 AND uid=$2 FOR UPDATE",
+            )
+            .bind(id)
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(is_paused) = is_paused else {
+                tx.rollback().await?;
+                return Ok(0);
+            };
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM forward_rules WHERE uid=$1 AND paused=FALSE",
+            )
+            .bind(uid)
+            .fetch_one(&mut *tx)
+            .await?;
+            if is_paused && !admin && max_rules > 0 && active >= i64::from(max_rules) {
+                tx.rollback().await?;
+                return Err(DbError::QuotaExceeded);
+            }
+            let result = q.execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(result.rows_affected());
+        }
         let result = q.execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
@@ -1315,6 +1358,27 @@ impl RuleRepository for PgRepository {
         let effective_out = update.device_group_out.unwrap_or(old_out);
         let effective_tunnel_id = update.tunnel_id.unwrap_or(old_tunnel_id);
         let effective_paused = update.paused.unwrap_or(old_paused);
+        if old_paused && !effective_paused {
+            // Owner is already locked above, serializing create/resume/buy.
+            let (max_rules, admin): (i32, bool) = try_!(
+                sqlx::query_as("SELECT max_rules,admin FROM users WHERE id=$1")
+                    .bind(rule_owner_id)
+                    .fetch_one(&mut *tx)
+                    .await
+            );
+            let active: i64 = try_!(
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM forward_rules WHERE uid=$1 AND paused=FALSE"
+                )
+                .bind(rule_owner_id)
+                .fetch_one(&mut *tx)
+                .await
+            );
+            if !admin && max_rules > 0 && active >= i64::from(max_rules) {
+                tx.rollback().await?;
+                return Err(DbError::QuotaExceeded);
+            }
+        }
         let effective_route_mode = update.route_mode.as_deref().unwrap_or(&old_route_mode);
         let route_update_requested = update.protocol.is_some()
             || update.tunnel_id.is_some()

@@ -28,6 +28,22 @@ const CODE_LEN: usize = 16;
 /// Characters between dashes in the display form (`XXXX-XXXX-XXXX-XXXX`).
 const GROUP: usize = 4;
 
+pub fn canonical_expiry(raw: &str) -> Option<String> {
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+/// Read legacy non-padded dates chronologically; malformed stored values fail
+/// closed instead of producing a reusable card. The boundary itself is expired.
+pub fn expiry_is_due(expiry: &str, now: &str) -> bool {
+    let parse = |raw: &str| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S");
+    match (parse(expiry), parse(now)) {
+        (Ok(expiry), Ok(now)) => now >= expiry,
+        _ => true,
+    }
+}
+
 /// Generate one code in display form.
 pub fn generate_code() -> String {
     // 16 symbols × 5 bits = 80 bits; a v4 UUID carries 122 random bits, so one
@@ -104,6 +120,18 @@ pub fn to_display(stored: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn expiry_normalizes_padding_and_compares_legacy_dates_chronologically() {
+        assert_eq!(
+            canonical_expiry("2026-9-1 00:00:00").as_deref(),
+            Some("2026-09-01 00:00:00")
+        );
+        assert!(expiry_is_due("2026-9-1 00:00:00", "2026-10-15 00:00:00"));
+        assert!(expiry_is_due("2026-10-15 00:00:00", "2026-10-15 00:00:00"));
+        assert!(expiry_is_due("malformed", "2026-10-15 00:00:00"));
+        assert!(!expiry_is_due("2026-12-01 00:00:00", "2026-10-15 00:00:00"));
+    }
 
     #[test]
     fn generated_code_has_the_expected_shape() {

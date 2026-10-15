@@ -11,6 +11,12 @@ node_modules/
 dist/
 frontend/package-lock.json  
 config-cache.json
+node-id
+traffic-outbox-*.json
+traffic-outbox-*.lock
+/backups/
+__pycache__/
+*.pyc
 .env
 
 # Windows reserved device name accidentally materialised as a file by

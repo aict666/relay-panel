@@ -7,6 +7,7 @@ use relay_shared::protocol::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,6 +17,38 @@ use tokio::sync::{Mutex, RwLock};
 /// Per-rule (upload, download) byte counters. Shared behind an Arc so the
 /// per-packet add() path can clone-free `fetch_add` after a shared read lock.
 type RuleCounters = Arc<(AtomicU64, AtomicU64)>;
+
+/// A connection keeps its exact counter generation alive across report commits.
+#[derive(Clone)]
+pub struct RuleCounterHandle(RuleCounters);
+
+impl RuleCounterHandle {
+    pub fn add_upload(&self, bytes: u64) {
+        self.0 .0.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn add_download(&self, bytes: u64) {
+        self.0 .1.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct ReportState {
+    pending: Option<PendingBatch>,
+    last_acked: Option<String>,
+}
+
+struct PendingBatch {
+    report: TrafficReport,
+    captured: Vec<RuleCounterSnapshot>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DurableTrafficState {
+    version: u32,
+    pending: Option<TrafficReport>,
+    last_acked: Option<String>,
+}
 
 pub struct TrafficCounter {
     // rule_id -> (upload, download) as lock-free atomic counters. Keyed by rule
@@ -27,13 +60,123 @@ pub struct TrafficCounter {
     // lock and do a lock-free atomic fetch_add, so they never serialize on each
     // other — this is the per-packet path for both TCP and UDP forwarding.
     data: Arc<RwLock<HashMap<i64, RuleCounters>>>,
+    report_state: Mutex<ReportState>,
+    outbox: Option<PathBuf>,
+    _outbox_lock: Option<std::fs::File>,
 }
 
 impl TrafficCounter {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            report_state: Mutex::new(ReportState::default()),
+            outbox: None,
+            _outbox_lock: None,
         }
+    }
+
+    /// Bind persistence to panel + credential so changing group credentials can
+    /// never replay old bytes into another group's accounting namespace. Old
+    /// credential files are retained for reconciliation, not silently deleted.
+    pub fn durable(config: &NodeConfig) -> std::io::Result<Self> {
+        use sha2::{Digest, Sha256};
+        let scope = Sha256::digest(format!(
+            "{}\n{}",
+            config.panel_url.trim_end_matches('/'),
+            config.token
+        ));
+        let name = format!("traffic-outbox-{scope:x}.json");
+        let directory = crate::poller::data_dir();
+        std::fs::create_dir_all(&directory)?;
+        Self::durable_at(directory.join(name))
+    }
+
+    fn durable_at(path: PathBuf) -> std::io::Result<Self> {
+        let mut lock_options = std::fs::OpenOptions::new();
+        lock_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let lock = lock_options.open(path.with_extension("lock"))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: flock only uses this valid, owned file descriptor. The
+            // descriptor remains open for the counter's entire lifetime.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(std::io::Error::other("traffic outbox is already owned by another node; use a distinct RELAY_NODE_DATA_DIR"));
+            }
+        }
+        let state = match std::fs::read(&path) {
+            Ok(raw) => {
+                if raw.len() > 32 * 1024 * 1024 {
+                    return Err(std::io::Error::other("traffic outbox exceeds safety limit"));
+                }
+                let saved: DurableTrafficState =
+                    serde_json::from_slice(&raw).map_err(std::io::Error::other)?;
+                if saved.version != 1
+                    || saved.pending.as_ref().is_some_and(|report| {
+                        report
+                            .batch_id
+                            .as_deref()
+                            .is_none_or(|id| !relay_shared::protocol::valid_traffic_batch_id(id))
+                    })
+                {
+                    return Err(std::io::Error::other(
+                        "invalid traffic outbox; reconcile before restarting",
+                    ));
+                }
+                ReportState {
+                    pending: saved.pending.map(|report| PendingBatch {
+                        report,
+                        captured: Vec::new(),
+                    }),
+                    last_acked: saved.last_acked,
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReportState::default(),
+            Err(error) => return Err(error),
+        };
+        persist_traffic_state(
+            &path,
+            state.pending.as_ref().map(|batch| &batch.report),
+            state.last_acked.as_deref(),
+        )?;
+        Ok(Self {
+            data: Arc::new(RwLock::new(HashMap::new())),
+            report_state: Mutex::new(state),
+            outbox: Some(path),
+            _outbox_lock: Some(lock),
+        })
+    }
+
+    fn persist(&self, pending: Option<&TrafficReport>, acked: Option<&str>) -> std::io::Result<()> {
+        if let Some(path) = &self.outbox {
+            persist_traffic_state(path, pending, acked)?;
+        }
+        Ok(())
+    }
+
+    pub async fn handle(&self, rule_id: i64) -> RuleCounterHandle {
+        {
+            let map = self.data.read().await;
+            if let Some(counter) = map.get(&rule_id) {
+                return RuleCounterHandle(counter.clone());
+            }
+        }
+        let mut map = self.data.write().await;
+        RuleCounterHandle(
+            map.entry(rule_id)
+                .or_insert_with(|| Arc::new((AtomicU64::new(0), AtomicU64::new(0))))
+                .clone(),
+        )
     }
 
     pub async fn add(&self, rule_id: i64, upload: u64, download: u64) {
@@ -117,6 +260,26 @@ impl TrafficCounter {
     }
 }
 
+fn persist_traffic_state(
+    path: &Path,
+    pending: Option<&TrafficReport>,
+    acked: Option<&str>,
+) -> std::io::Result<()> {
+    #[derive(serde::Serialize)]
+    struct State<'a> {
+        version: u32,
+        pending: Option<&'a TrafficReport>,
+        last_acked: Option<&'a str>,
+    }
+    let raw = serde_json::to_vec(&State {
+        version: 1,
+        pending,
+        last_acked: acked,
+    })
+    .map_err(std::io::Error::other)?;
+    crate::poller::write_private_atomic(path, &raw)
+}
+
 /// Snapshot of [`TrafficCounter`] at one instant. Drop without calling
 /// [`commit`](Self::commit) to retry the same bytes; call `commit` once the
 /// panel has persisted the report.
@@ -148,32 +311,47 @@ impl TrafficSnapshot<'_> {
             let e = &snapshot.entry;
             let drained = if let Some(c) = map.get(&e.rule_id) {
                 if Arc::ptr_eq(c, &snapshot.counters) {
-                    // The map write lock excludes add(), which always takes the map
-                    // read/write lock before touching these atomics. Check both
-                    // dimensions before storing either one so even an accidental
-                    // overlapping commit cannot partially consume a snapshot.
-                    let current_up = c.0.load(Ordering::Relaxed);
-                    let current_down = c.1.load(Ordering::Relaxed);
-                    if current_up < e.upload || current_down < e.download {
-                        false
-                    } else {
-                        let remaining_up = current_up - e.upload;
-                        let remaining_down = current_down - e.download;
-                        c.0.store(remaining_up, Ordering::Relaxed);
-                        c.1.store(remaining_down, Ordering::Relaxed);
-                        remaining_up == 0 && remaining_down == 0
-                    }
+                    // Handles may add without the map lock, so subtraction
+                    // must be atomic rather than load/store.
+                    subtract_snapshot(c, e)
                 } else {
                     false
                 }
             } else {
                 false
             };
-            if drained {
+            // map + this snapshot are the only owners. A live handle must
+            // remain mapped even when the last acknowledged delta was zero.
+            if drained
+                && map
+                    .get(&e.rule_id)
+                    .is_some_and(|c| Arc::strong_count(c) == 2)
+            {
                 map.remove(&e.rule_id);
             }
         }
     }
+}
+
+fn subtract_snapshot(counters: &RuleCounters, entry: &TrafficEntry) -> bool {
+    // Commits hold the map write lock; live handles only add. Validate both
+    // dimensions before modifying either, including overlapping snapshots.
+    if counters.0.load(Ordering::Relaxed) < entry.upload
+        || counters.1.load(Ordering::Relaxed) < entry.download
+    {
+        return false;
+    }
+    let up = counters
+        .0
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_sub(entry.upload)
+        });
+    let down = counters
+        .1
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_sub(entry.download)
+        });
+    matches!((up, down), (Ok(up), Ok(down)) if up == entry.upload && down == entry.download)
 }
 
 /// How long a UDP session is considered active after its last datagram.
@@ -403,29 +581,49 @@ impl Drop for TcpConnectionGuard {
 }
 
 pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter) {
-    // Snapshot (non-destructive) first: the snapshotted bytes are only deducted
-    // from the counters after the panel ACKs the upload (see TrafficSnapshot).
-    // A failed/lost upload drops the guard without commit, so those bytes stay
-    // and are retried on the next cycle instead of being permanently dropped.
-    let snap = counter.snapshot().await;
-    // debug, not info: this runs every poll cycle (default 10s) and would
-    // flood the log at info level on a healthy node. Only the per-request
-    // HTTP status below is worth keeping visible.
-    tracing::debug!("report_traffic: {} entries to report", snap.entries.len());
-    if snap.entries.is_empty() {
+    // Retain the same id AND bytes after an uncertain outcome. Taking a new
+    // snapshot after a lost ACK would charge the old bytes a second time.
+    let mut state = counter.report_state.lock().await;
+    if state.pending.is_none() {
+        let snap = counter.snapshot().await;
+        let reports: Vec<_> = snap
+            .entries
+            .iter()
+            .filter(|entry| entry.upload != 0 || entry.download != 0)
+            .cloned()
+            .collect();
+        if reports.is_empty() {
+            snap.commit().await;
+            return;
+        }
+        let mut random = [0u8; 16];
+        if let Err(error) = getrandom::fill(&mut random) {
+            tracing::error!("cannot generate traffic batch identity: {error}");
+            return;
+        }
+        state.pending = Some(PendingBatch {
+            report: TrafficReport {
+                reports,
+                batch_id: Some(random.iter().map(|b| format!("{b:02x}")).collect()),
+                acked_batch_id: state.last_acked.clone(),
+            },
+            captured: snap.captured,
+        });
+    }
+    let batch = state.pending.as_ref().expect("pending batch created above");
+    // Write + fsync BEFORE sending. An ACK lost across a process restart must
+    // replay the same identity, never turn into an untracked new transaction.
+    if let Err(error) = counter.persist(Some(&batch.report), state.last_acked.as_deref()) {
+        tracing::error!("cannot persist traffic outbox; report not sent: {error}");
         return;
     }
-
-    let report = TrafficReport {
-        reports: snap.entries.clone(),
-    };
 
     let url = format!("{}/api/v1/node/report_traffic", config.panel_url);
     let client = reqwest::Client::new();
     match client
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.token))
-        .json(&report)
+        .json(&batch.report)
         // Keep traffic retries bounded. A half-open panel connection must not
         // stall the HTTP config loop indefinitely while counters continue to
         // accumulate locally.
@@ -449,12 +647,49 @@ pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter) {
             }
             match r.json::<ApiResponse<()>>().await {
                 Ok(resp) if resp.code == 0 => {
-                    snap.commit().await;
+                    // Acquire the map before taking pending: cancellation must
+                    // leave either the entire pending batch or a full commit.
+                    let mut map = counter.data.write().await;
+                    let batch = state.pending.as_ref().expect("pending batch");
+                    if let Err(error) = counter.persist(None, batch.report.batch_id.as_deref()) {
+                        tracing::error!(
+                            "cannot persist traffic ACK; original batch retained: {error}"
+                        );
+                        return;
+                    }
+                    let batch = state.pending.take().expect("pending batch");
+                    for captured in batch.captured {
+                        subtract_snapshot(&captured.counters, &captured.entry);
+                        let id = captured.entry.rule_id;
+                        let mapped = map
+                            .get(&id)
+                            .is_some_and(|c| Arc::ptr_eq(c, &captured.counters));
+                        drop(captured);
+                        if mapped
+                            && map.get(&id).is_some_and(|c| {
+                                Arc::strong_count(c) == 1
+                                    && c.0.load(Ordering::Relaxed) == 0
+                                    && c.1.load(Ordering::Relaxed) == 0
+                            })
+                        {
+                            map.remove(&id);
+                        }
+                    }
+                    state.last_acked = batch.report.batch_id;
                     tracing::info!("report_traffic HTTP {} code 0", status);
                 }
                 Ok(resp) => {
-                    // Business-level rejection. Keep the bytes for retry next
-                    // cycle (the panel did NOT persist them).
+                    // 400/403 are validated against this batch before commit.
+                    // A 401 cannot tell whether an EARLIER attempt committed
+                    // before credentials changed; retain the original identity.
+                    // 500, proxy errors and parse failures retain it as well.
+                    if matches!(resp.code, 400 | 403) {
+                        if let Err(error) = counter.persist(None, state.last_acked.as_deref()) {
+                            tracing::error!("cannot persist rejected traffic state: {error}");
+                            return;
+                        }
+                        state.pending = None;
+                    }
                     tracing::warn!(
                         "report_traffic rejected: HTTP {} code {} msg={}",
                         status,
@@ -1212,6 +1447,162 @@ pub fn spawn_public_ip_refresher(metrics: Arc<NodeMetrics>) {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4};
+
+    #[tokio::test]
+    async fn live_counter_handle_survives_zero_balance_and_ack() {
+        let counter = TrafficCounter::new();
+        let handle = counter.handle(7).await;
+        handle.add_upload(100);
+        handle.add_download(200);
+        counter.snapshot().await.commit().await;
+        assert!(counter.has_rule(7).await);
+        handle.add_upload(3);
+        handle.add_download(4);
+        let snap = counter.snapshot().await;
+        assert_eq!((snap.entries[0].upload, snap.entries[0].download), (3, 4));
+        drop(handle);
+        snap.commit().await;
+        assert!(!counter.has_rule(7).await);
+    }
+
+    async fn read_http_batch(socket: &mut tokio::net::TcpStream) -> TrafficReport {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        let (header_end, length) = loop {
+            let mut buf = [0; 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0 && request.len() < 64 * 1024);
+            request.extend_from_slice(&buf[..n]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                break (end + 4, length);
+            }
+        };
+        while request.len() < header_end + length {
+            let mut buf = [0; 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buf[..n]);
+        }
+        serde_json::from_slice(&request[header_end..header_end + length]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn traffic_report_lost_ack_retries_identical_batch_then_sends_only_new_bytes() {
+        traffic_round_trip(false).await;
+    }
+
+    #[tokio::test]
+    async fn durable_traffic_outbox_replays_lost_ack_after_restart_without_consuming_new_bytes() {
+        traffic_round_trip(true).await;
+    }
+
+    async fn traffic_round_trip(restart: bool) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = NodeConfig {
+            panel_url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test".into(),
+            poll_interval: 1,
+            tls_cert_path: None,
+            tls_key_path: None,
+            network_interface: "auto".into(),
+            listen_ipv4: "127.0.0.1".into(),
+            listen_ipv6: String::new(),
+            outbound_interface: "auto".into(),
+            outbound_bind_ipv4: None,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "relay-outbox-{}-{}.json",
+            std::process::id(),
+            listener.local_addr().unwrap().port()
+        ));
+        let server = tokio::spawn(async move {
+            let mut batches = Vec::new();
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                batches.push(read_http_batch(&mut socket).await);
+                if index == 0 {
+                    continue;
+                } // Persisted, but the ACK was lost.
+                let body = if index == 1 {
+                    r#"{"code":401,"message":"credentials temporarily rejected","data":null}"#
+                } else {
+                    r#"{"code":0,"message":"ok","data":null}"#
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            batches
+        });
+        let mut counter = if restart {
+            TrafficCounter::durable_at(path.clone()).unwrap()
+        } else {
+            TrafficCounter::new()
+        };
+        counter.add(7, 100, 200).await;
+        report_traffic(&config, &counter).await;
+        if restart {
+            drop(counter);
+            counter = TrafficCounter::durable_at(path.clone()).unwrap();
+        }
+        counter.add(7, 3, 4).await;
+        report_traffic(&config, &counter).await;
+        report_traffic(&config, &counter).await;
+        report_traffic(&config, &counter).await;
+        let batches = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&batches[0]).unwrap(),
+            serde_json::to_value(&batches[1]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&batches[0]).unwrap(),
+            serde_json::to_value(&batches[2]).unwrap()
+        );
+        assert_ne!(batches[0].batch_id, batches[3].batch_id);
+        assert_eq!(batches[3].acked_batch_id, batches[0].batch_id);
+        assert_eq!(
+            (batches[3].reports[0].upload, batches[3].reports[0].download),
+            (3, 4)
+        );
+        assert!(counter.snapshot().await.entries.is_empty());
+        if restart {
+            #[cfg(unix)]
+            assert!(
+                TrafficCounter::durable_at(path.clone()).is_err(),
+                "two nodes must not overwrite one outbox"
+            );
+            let saved: DurableTrafficState =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(saved.pending.is_none());
+            assert_eq!(saved.last_acked, batches[3].batch_id);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            drop(counter);
+            std::fs::write(&path, b"corrupted").unwrap();
+            assert!(
+                TrafficCounter::durable_at(path.clone()).is_err(),
+                "corrupt state must fail closed, not generate a new batch"
+            );
+            std::fs::remove_file(path.with_extension("lock")).unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 
     fn addr(p: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p))

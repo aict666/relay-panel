@@ -482,6 +482,10 @@ export interface Order {
   plan_id: number | null;
   plan_name: string;
   price: string;
+  kind?: string;
+  transaction_id?: string | null;
+  cycle_start?: string | null;
+  cycle_end?: string | null;
   created_at: string;
 }
 
@@ -587,6 +591,11 @@ export interface LoginResponse {
  *  current_rules (owned rule count), and registered_at (renamed from
  *  created_at). must_change_password is added in PR4. */
 export interface UserSelf {
+  plan_source?: string;
+  current_cycle_start?: string | null;
+  current_cycle_end?: string | null;
+  prepaid_cycles?: number;
+  account_status?: string;
   id: number;
   username: string;
   admin: boolean;

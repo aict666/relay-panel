@@ -2,10 +2,57 @@ use super::err;
 use super::{purchase_revision, PlanWithGroups};
 use crate::api::middleware::AuthUser;
 use crate::api::AppState;
-use crate::db::repo::{BuyPlanError, PlanAutoRenewUpdateOutcome};
+use crate::db::repo::{BuyPlanError, PlanAutoRenewUpdateOutcome, PurchaseIdentity};
 use axum::{extract::State, Json};
 use relay_shared::models::*;
 use relay_shared::protocol::*;
+
+#[derive(serde::Deserialize, Default)]
+pub struct LedgerQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+pub async fn user_balance_ledger(
+    user: AuthUser,
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<LedgerQuery>,
+) -> Json<ApiResponse<Vec<crate::service::billing::BalanceEntry>>> {
+    match state
+        .db
+        .list_balance_entries(
+            user.user_id,
+            query.limit.unwrap_or(50),
+            query.offset.unwrap_or(0),
+        )
+        .await
+    {
+        Ok(rows) => Json(ApiResponse::success(rows)),
+        Err(error) => {
+            tracing::error!("balance ledger: {error}");
+            Json(err(500, "数据库错误"))
+        }
+    }
+}
+
+pub async fn admin_balance_ledger(
+    _admin: crate::api::middleware::AdminOnly,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    axum::extract::Query(query): axum::extract::Query<LedgerQuery>,
+) -> Json<ApiResponse<Vec<crate::service::billing::BalanceEntry>>> {
+    match state
+        .db
+        .list_balance_entries(id, query.limit.unwrap_or(50), query.offset.unwrap_or(0))
+        .await
+    {
+        Ok(rows) => Json(ApiResponse::success(rows)),
+        Err(error) => {
+            tracing::error!("admin balance ledger: {error}");
+            Json(err(500, "数据库错误"))
+        }
+    }
+}
 
 // === Shop (v1.0.8) ===
 //
@@ -95,6 +142,31 @@ pub async fn buy_plan(
     State(state): State<AppState>,
     Json(req): Json<BuyPlanRequest>,
 ) -> Json<ApiResponse<()>> {
+    let Some(request_id) = req
+        .request_id
+        .as_deref()
+        .filter(|id| relay_shared::protocol::valid_traffic_batch_id(id))
+    else {
+        return Json(err(400, "购买需要有效的 request_id，请刷新页面后重试"));
+    };
+    let fingerprint = format!(
+        "self:{}",
+        serde_json::to_string(&req).expect("purchase body serializes")
+    );
+    let identity = PurchaseIdentity {
+        request_id,
+        fingerprint: &fingerprint,
+        actor_id: Some(user.user_id),
+    };
+    if let Some(response) = replay_purchase(&state, user.user_id, identity).await {
+        return Json(response);
+    }
+    let Some(expected_current) = req.expected_current_plan_id.filter(|id| *id >= 0) else {
+        return Json(err(400, "购买前必须确认当前套餐"));
+    };
+    if req.expected_price.is_none() || req.expected_revision.is_none() {
+        return Json(err(400, "购买前必须确认套餐价格和内容"));
+    }
     // Resolve the plan row first (outside the buy tx — read-only lookup).
     // Hidden plans are not self-purchasable even if the caller knows the id.
     let plan = match state.db.find_plan_by_id(req.plan_id).await {
@@ -183,7 +255,7 @@ pub async fn buy_plan(
 
     match state
         .db
-        .buy_plan_guarded(
+        .buy_plan_idempotent(
             user.user_id,
             plan.id,
             &plan.name,
@@ -198,7 +270,12 @@ pub async fn buy_plan(
             &plan.plan_type,
             req.auto_renew && plan.plan_type == "monthly",
             true,
-            None,
+            Some(if expected_current == 0 {
+                None
+            } else {
+                Some(expected_current)
+            }),
+            identity,
         )
         .await
     {
@@ -213,12 +290,45 @@ pub async fn buy_plan(
             Json(ApiResponse::success(()))
         }
         Err(BuyPlanError::InsufficientBalance) => Json(err(400, "余额不足")),
+        Err(BuyPlanError::PrepaidCyclesPresent) => Json(err(
+            409,
+            "还有未使用的预付周期，不能直接切换套餐，请联系管理员先处理剩余权益",
+        )),
+        Err(BuyPlanError::AutoRenewUnavailable) => {
+            Json(err(409, "封禁或暂停的账户不能开启自动续费"))
+        }
+        Err(BuyPlanError::IdempotencyConflict) => {
+            Json(err(409, "交易标识已用于其他购买，请勿更改重试内容"))
+        }
         Err(BuyPlanError::PlanChanged) => Json(err(409, "套餐已变更，请刷新后重新确认")),
         Err(BuyPlanError::UserPlanChanged) => Json(err(409, "当前套餐已变更，请刷新后重新确认")),
         Err(BuyPlanError::QuotaOverflow) => Json(err(409, "累计流量额度超出系统上限")),
         Err(BuyPlanError::Database(e)) => {
             tracing::error!("buy_plan {}: db error: {}", plan.id, e);
             Json(err(500, "数据库错误"))
+        }
+    }
+}
+
+/// Check replay BEFORE catalog validation: a lost-ACK purchase still succeeds
+/// on retry even after its product was changed or hidden. The transaction also
+/// rechecks this identity, so simultaneous requests cannot bypass the guard.
+pub(super) async fn replay_purchase(
+    state: &AppState,
+    user_id: i64,
+    identity: PurchaseIdentity<'_>,
+) -> Option<ApiResponse<()>> {
+    match state
+        .db
+        .find_purchase_fingerprint(user_id, identity.request_id)
+        .await
+    {
+        Ok(Some(saved)) if saved == identity.fingerprint => Some(ApiResponse::success(())),
+        Ok(Some(_)) => Some(err(409, "交易标识已用于其他购买，请勿更改重试内容")),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!("purchase replay lookup failed: {e}");
+            Some(err(500, "数据库错误"))
         }
     }
 }
@@ -231,7 +341,11 @@ pub async fn set_plan_auto_renew(
     State(state): State<AppState>,
     Json(req): Json<SetPlanAutoRenewRequest>,
 ) -> Json<ApiResponse<()>> {
-    if req.enabled && (req.expected_price.is_none() || req.expected_revision.is_none()) {
+    if req.enabled
+        && (req.expected_price.is_none()
+            || req.expected_revision.is_none()
+            || req.expected_plan_id.is_none())
+    {
         return Json(err(400, "开启自动续费前必须确认当前套餐价格"));
     }
     match state
@@ -241,6 +355,7 @@ pub async fn set_plan_auto_renew(
             req.enabled,
             req.expected_price.as_deref(),
             req.expected_revision,
+            req.expected_plan_id,
         )
         .await
     {

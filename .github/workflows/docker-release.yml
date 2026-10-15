@@ -25,8 +25,7 @@ on:
         default: '1.1.1'
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -37,6 +36,9 @@ env:
   IMAGE: ghcr.io/aict666/relay-panel-panel
 
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+
   build-frontend:
     name: Build frontend (shared)
     runs-on: ubuntu-latest
@@ -47,7 +49,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -65,29 +67,56 @@ jobs:
           retention-days: 1
 
   build-and-push:
+    permissions:
+      contents: read
+      packages: write
     name: Build + push ${{ matrix.arch }} image
     runs-on: ${{ matrix.runner }}
-    needs: build-frontend
+    needs: [build-frontend, quality]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest        # amd64
+          - runner: ubuntu-24.04         # amd64
             arch: amd64
           - runner: ubuntu-24.04-arm     # arm64, native GitHub runner
             arch: arm64
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: relaytest
+          POSTGRES_PASSWORD: relaytest
+          POSTGRES_DB: relaytest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relaytest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_PG_URL: postgres://relaytest:relaytest@127.0.0.1:5432/relaytest
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Determine version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid version'; exit 1; }
+          bash scripts/release-check.sh --verify-only panel "$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building panel image $VERSION for ${{ matrix.arch }}"
@@ -114,18 +143,39 @@ jobs:
       - name: Install dependencies (pkg-config, libssl-dev, ca-certificates)
         run: |
           sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev ca-certificates && \
+            pkg-config libssl-dev ca-certificates postgresql-client-16 && \
           sudo rm -rf /var/lib/apt/lists/*
 
-      - name: Build relay-panel binary (native, no cross-compilation)
-        run: cargo build --release -p relay-panel
+      - name: Build relay-panel natively against the runtime Debian ABI
+        run: |
+          # Ubuntu runner binaries can require a newer glibc than bookworm.
+          # The container is native on each matrix runner, not emulated.
+          docker run --rm -e RUSTUP_TOOLCHAIN=1.96.1 -v "$PWD:/app" -w /app rust:1.96.1-bookworm bash -c '
+            apt-get update -qq &&
+            apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates &&
+            cargo build --locked --release -p relay-panel'
 
       - name: Prepare release dist layout
         run: |
           mkdir -p release-dist/panel
           cp target/release/relay-panel release-dist/panel/relay-panel
 
-      - name: Build and push ${{ matrix.arch }} image
+      - name: Build local ${{ matrix.arch }} candidate
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: panel-release
+          load: true
+          tags: relay-panel-candidate:local
+          provenance: false
+
+      - name: Candidate container, migration and backup smoke test
+        run: python3 tests/container_release_test.py relay-panel-candidate:local
+
+      - name: External PostgreSQL deployment backup and restore
+        run: python3 tests/container_pg_backup_test.py relay-panel-candidate:local
+
+      - name: Push tested ${{ matrix.arch }} image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -146,6 +196,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=panel-${{ matrix.arch }}
 
   publish-manifest:
+    permissions:
+      contents: read
+      packages: write
     name: Merge multi-arch manifest
     needs: build-and-push
     runs-on: ubuntu-latest
@@ -153,12 +206,15 @@ jobs:
     steps:
       - name: Determine version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
@@ -178,17 +234,14 @@ jobs:
             "$IMAGE:${VERSION}-arm64"
           echo "::notice::Multi-arch manifest $IMAGE:$VERSION created"
 
-          echo "Promoting $IMAGE:latest to point at $IMAGE:$VERSION"
-          docker buildx imagetools create -t "$IMAGE:latest" \
-            "$IMAGE:${VERSION}-amd64" \
-            "$IMAGE:${VERSION}-arm64"
-          echo "::notice::$IMAGE:latest promoted to $IMAGE:$VERSION"
-
   # Post-release verification: inspect the manifest and confirm it contains
   # both architectures. This is the panel equivalent of node-release.yml's
   # `verify` job — without it, a broken arm64 leg could leave CI green
   # while the manifest is incomplete.
   verify:
+    permissions:
+      contents: read
+      packages: write
     name: Verify manifest
     needs: publish-manifest
     runs-on: ubuntu-latest
@@ -196,12 +249,15 @@ jobs:
     steps:
       - name: Determine version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
@@ -221,11 +277,18 @@ jobs:
           echo "$OUTPUT" | grep -q "linux/arm64"   || { echo "::error::Manifest missing linux/arm64"; exit 1; }
           echo "::notice::Manifest verified: both linux/amd64 and linux/arm64 present."
 
+      - name: Promote verified manifest
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
+
   # Create the GitHub Release AFTER the manifest is built and verified.
   # The old shape created the release immediately after the single build,
   # meaning a broken image could never be caught before the release appeared
   # in GitHub's public listing.
   create-release:
+    permissions:
+      contents: write
     name: Create GitHub Release
     needs: verify
     runs-on: ubuntu-latest
@@ -235,12 +298,15 @@ jobs:
 
       - name: Determine version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -258,6 +324,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: ${{ steps.ver.outputs.tag }}
           body_path: RELEASE_BODY.md
           prerelease: false

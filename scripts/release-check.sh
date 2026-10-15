@@ -51,6 +51,11 @@ section() { echo ""; echo "== $1 =="; }
 # v1.2: optional first arg is the track: `panel` or `node`. A bare version (no
 # recognized track keyword) defaults to panel for backwards compatibility.
 TRACK="panel"
+VERIFY_ONLY=0
+if [ "${1:-}" = "--verify-only" ]; then
+    VERIFY_ONLY=1
+    shift
+fi
 if [ $# -ge 2 ]; then
     case "$1" in
         panel|node) TRACK="$1"; shift ;;
@@ -96,12 +101,16 @@ echo "Repo root: $ROOT"
 # already present locally or on origin; previously this script could report
 # "OK to tag" for an existing release and the final push would fail too late.
 section "Tag availability"
-if git show-ref --verify --quiet "refs/tags/${TAG}"; then
+if [ "$VERIFY_ONLY" = 1 ]; then
+    ok "artifact verification mode: tag availability is not a precondition"
+elif git show-ref --verify --quiet "refs/tags/${TAG}"; then
     fail "tag ${TAG} already exists locally"
 else
     ok "tag ${TAG} does not exist locally"
 fi
-if git remote get-url origin >/dev/null 2>&1; then
+if [ "$VERIFY_ONLY" = 1 ]; then
+    :
+elif git remote get-url origin >/dev/null 2>&1; then
     if REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/${TAG}" 2>/dev/null); then
         if [ -n "$REMOTE_TAG" ]; then
             fail "tag ${TAG} already exists on origin"
@@ -571,6 +580,12 @@ if [ "$WARN" -gt 0 ]; then
 fi
 
 echo ""
-echo "OK to tag: git tag ${TAG} && git push origin ${TAG}"
+if [ "$VERIFY_ONLY" = 1 ]; then
+    echo "Artifact version/content checks passed (tag availability not checked)."
+elif [ -n "$(git status --porcelain)" ]; then
+    echo "Version/content checks passed. Commit the verified changes before tagging: current HEAD does not contain this working tree."
+else
+    echo "OK to tag: git tag ${TAG} && git push origin ${TAG}"
+fi
 echo "(track: ${TRACK})"
 exit 0

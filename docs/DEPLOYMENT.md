@@ -1,5 +1,7 @@
 # Deployment
 
+> **Panel 1.4.0 upgrade:** Billing, registration entitlements and API confirmation fields have compatibility changes. Read the [1.4.0 release runbook](RELEASE-1.4.0.md) first; upgrade Panel + frontend before Node 1.3.11 and verify your pre-upgrade backup. The charging workflow is redemption codes + balance purchases, not third-party online payments.
+
 RelayPanel targets **Linux (Debian 11 / 12 / 13)** and is deployed via
 **Docker Compose**. There is no bare-metal deployment path — Docker is the
 only supported runtime.
@@ -12,7 +14,7 @@ only supported runtime.
 
 ## One-line install
 
-The easiest path — a single command that installs `git`/`curl`/`ca-certificates`/`openssl`,
+The easiest path — a single command that installs `git`/`curl`/`ca-certificates`/`openssl`/`python3`,
 clones the repo into `/opt/relay-panel`, then runs `deploy.sh` (which installs
 Docker, generates secrets, builds, and verifies):
 

@@ -27,12 +27,29 @@ use relay_shared::protocol::TrafficEntry;
 //   - only after COMMIT succeeds do we return Ok(vec![Ok]).
 #[async_trait]
 impl TrafficRepository for SqliteRepository {
-    async fn apply_traffic_batch(
+    async fn apply_traffic_batch_with_id(
         &self,
         group_id: i64,
+        batch_id: Option<&str>,
+        acked_batch_id: Option<&str>,
         entries: &[TrafficEntry],
     ) -> Result<Vec<TrafficEntryResult>, DbError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        // Check before rule ownership: a successfully billed retry must still
+        // be acknowledged after a rule was deleted or moved.
+        if let Some(id) = batch_id {
+            let inserted = sqlx::query("INSERT OR IGNORE INTO traffic_batches (group_id, batch_id, created_at) VALUES (?, ?, datetime('now'))")
+                .bind(group_id).bind(id).execute(&mut *tx).await?.rows_affected();
+            if inserted == 0 {
+                tx.rollback().await?;
+                return Ok(vec![TrafficEntryResult::AlreadyApplied]);
+            }
+            if let Some(acked) = acked_batch_id.filter(|acked| *acked != id) {
+                sqlx::query("UPDATE traffic_batches SET confirmed_at=datetime('now') WHERE group_id=? AND batch_id=? AND confirmed_at IS NULL")
+                    .bind(group_id).bind(acked).execute(&mut *tx).await?;
+            }
+        }
 
         // ── v1.0.8: read this group's billing rate once for the whole batch
         // (every entry in a batch is for the SAME group_id — the node reports
@@ -218,6 +235,7 @@ impl TrafficRepository for SqliteRepository {
                 .bind(r.uid)
                 .execute(&mut *tx)
                 .await?;
+            super::billing::sync_usage(&mut tx, r.uid).await?;
             // v1.2.0: history accumulates the SAME billed_delta charged to the
             // user above — inside the same tx, so the chart and the quota can
             // never disagree, not even by a crashed half-batch.
@@ -247,6 +265,16 @@ impl TrafficRepository for SqliteRepository {
 
         tx.commit().await?;
         Ok(vec![TrafficEntryResult::Ok])
+    }
+
+    async fn prune_traffic_batches(&self, confirmed_before: &str) -> Result<u64, DbError> {
+        Ok(
+            sqlx::query("DELETE FROM traffic_batches WHERE confirmed_at < ?")
+                .bind(confirmed_before)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
     }
 
     async fn query_traffic_history(

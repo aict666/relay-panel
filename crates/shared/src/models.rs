@@ -59,6 +59,18 @@ pub struct User {
     pub password: String,
     pub balance: String,
     pub plan_id: Option<i64>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub registration_plan_id: Option<i64>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub subscription_id: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub current_cycle_id: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub plan_source: String,
     /// v1.0.7: replaces the old `group_id` permission-group link. When true the
     /// user may use ALL device groups (admins are always treated as true). When
     /// false the user is limited to the device groups in `user_device_groups`;
@@ -550,6 +562,27 @@ pub struct Order {
     pub plan_id: Option<i64>,
     pub plan_name: String,
     pub price: String,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub transaction_id: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub kind: String,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub cycle_start: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub cycle_end: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub entitlement_snapshot: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub actor_id: Option<i64>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub reason: String,
     pub created_at: String,
 }
 

@@ -75,6 +75,11 @@ pub struct UserPublic {
 /// projection.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct UserSelf {
+    pub plan_source: String,
+    pub current_cycle_start: Option<String>,
+    pub current_cycle_end: Option<String>,
+    pub prepaid_cycles: usize,
+    pub account_status: String,
     pub id: i64,
     pub username: String,
     pub admin: bool,
@@ -177,6 +182,9 @@ mod tests {
             .execute(&pool)
             .await
             .expect("create schema");
+        crate::db::schema::run_migrations(&pool)
+            .await
+            .expect("apply production migrations");
         let state = AppState {
             db: Arc::new(SqliteRepository::new(pool.clone())),
             config: Config {
@@ -284,6 +292,7 @@ mod tests {
             Path(2),
             Json(UpdateUserRequest {
                 balance: Some("12.34".into()),
+                expected_balance: Some("0".into()),
                 max_rules: Some(42),
                 traffic_limit: Some(1024),
                 banned: Some(true),
@@ -305,6 +314,108 @@ mod tests {
         assert!(row.3);
         assert_eq!(row.4, original_hash, "admin edit must not touch password");
         assert!(!row.5, "admin edit must not grant admin role");
+    }
+
+    #[tokio::test]
+    async fn purchase_api_replays_a_lost_ack_before_catalog_validation() {
+        let (state, pool) = test_state().await;
+        crate::db::schema::run_migrations(&pool).await.unwrap();
+        add_user(&pool, 2, "buyer", false).await;
+        state
+            .db
+            .update_user_fields(2, Some("80"), None, None, None, None)
+            .await
+            .unwrap();
+        let pid = state
+            .db
+            .insert_plan("api-plan", 5, 1000, "10", "data", 0, false, false, "", true)
+            .await
+            .unwrap();
+        let plan = state.db.find_plan_by_id(pid).await.unwrap().unwrap();
+        let body = serde_json::json!({ "plan_id": pid, "request_id": "api-intent", "expected_current_plan_id": 0,
+            "expected_price": "10", "expected_revision": super::plans::purchase_revision(&plan, &[]) });
+        let send = |body: serde_json::Value| {
+            super::buy_plan(
+                AuthUser {
+                    user_id: 2,
+                    admin: false,
+                },
+                State(state.clone()),
+                Json(serde_json::from_value(body).unwrap()),
+            )
+        };
+        let mut legacy = body.clone();
+        legacy.as_object_mut().unwrap().remove("request_id");
+        assert_eq!(send(legacy).await.0.code, 400);
+        assert_eq!(send(body.clone()).await.0.code, 0);
+        state
+            .db
+            .update_plan_fields(
+                pid,
+                None,
+                None,
+                None,
+                Some("20"),
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(send(body.clone()).await.0.code, 0);
+        let mut changed = body;
+        changed["auto_renew"] = serde_json::json!(true);
+        assert_eq!(send(changed).await.0.code, 409);
+        let balance: String = sqlx::query_scalar("SELECT balance FROM users WHERE id=2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(balance, "70");
+        assert_eq!(state.db.list_orders_by_user(2).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_admin_balance_edit_is_an_atomic_conflict() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "buyer", false).await;
+        state
+            .db
+            .update_user_fields(2, Some("70"), None, None, None, None)
+            .await
+            .unwrap();
+        let Json(response) = update_user(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(2),
+            Json(UpdateUserRequest {
+                balance: Some("80".into()),
+                expected_balance: Some("80".into()),
+                banned: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.code, 409);
+        let row: (String, bool) = sqlx::query_as("SELECT balance,banned FROM users WHERE id=2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row, ("70".into(), false));
+        let Json(response) = update_user(
+            AdminOnly { user_id: 1 },
+            State(state),
+            Path(2),
+            Json(UpdateUserRequest {
+                balance: Some("80".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.code, 409);
     }
 
     /// v0.3.5: balance is strictly validated (non-negative decimal, ≤ 2 fraction
@@ -344,6 +455,7 @@ mod tests {
                 Path(2),
                 Json(UpdateUserRequest {
                     balance: Some((*input).into()),
+                    expected_balance: Some("0".into()),
                     ..Default::default()
                 }),
             )
@@ -2516,6 +2628,7 @@ mod tests {
                 all_device_groups: Some(true),
                 max_rules: Some(99),
                 balance: Some("50.00".into()),
+                expected_balance: Some("0".into()),
                 ..Default::default()
             }),
         )
@@ -2549,6 +2662,7 @@ mod tests {
             Path(2),
             Json(UpdateUserRequest {
                 balance: Some("99.00".into()),
+                expected_balance: Some("0".into()),
                 max_rules: Some(42),
                 banned: Some(true),
                 suspended: Some(true),
@@ -2599,6 +2713,7 @@ mod tests {
             Path(2),
             Json(UpdateUserRequest {
                 balance: Some("12.30".into()),
+                expected_balance: Some("0".into()),
                 all_device_groups: Some(true),
                 // The protocol says this field is ignored when the same
                 // request enables all groups. It must neither fail validation
@@ -2642,6 +2757,7 @@ mod tests {
                 Path(2),
                 Json(UpdateUserRequest {
                     balance: Some("99.00".into()),
+                    expected_balance: Some("0".into()),
                     device_group_ids: Some(vec![invalid_group_id]),
                     ..Default::default()
                 }),
@@ -4167,7 +4283,7 @@ mod tests {
     /// v0.4.21 PR2: registering with plan_id=2 inherits plan 2's quota,
     /// NOT plan 1's.
     #[tokio::test]
-    async fn register_with_plan_2_inherits_plan_2_quota() {
+    async fn register_with_priced_plan_keeps_only_purchase_intent() {
         let (state, pool) = test_state().await;
         sqlx::query(
             "INSERT INTO plans (id, name, max_rules, traffic, speed_limit, ip_limit, price) \
@@ -4197,9 +4313,13 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(user.plan_id, Some(2), "user.plan_id must be 2");
-        assert_eq!(user.max_rules, 10, "max_rules must come from plan 2");
-        assert_eq!(user.traffic_limit, 0, "traffic_limit must come from plan 2");
+        assert_eq!(
+            user.plan_id, None,
+            "registration must not open an unpaid priced plan"
+        );
+        assert_eq!(user.registration_plan_id, Some(2));
+        assert_eq!(user.plan_source, "pending");
+        assert!(!user.all_device_groups);
     }
 
     // ── v0.4.10 PR4: admin password reset + self change ──

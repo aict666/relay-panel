@@ -79,6 +79,7 @@ pub struct GroupUpdateResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminUserPlanEditOutcome {
+    PrepaidCyclesPresent,
     Updated,
     NotFound,
     AdminTarget,
@@ -331,11 +332,11 @@ pub trait UserRepository: Send + Sync {
         user_id: i64,
         enabled: bool,
     ) -> Result<PlanAutoRenewUpdateOutcome, DbError> {
-        self.set_plan_auto_renew_guarded(user_id, enabled, None, None)
+        self.set_plan_auto_renew_guarded(user_id, enabled, None, None, None)
             .await
     }
-    /// HTTP-facing variant that atomically compares the price and billing
-    /// revision shown to the user before recording a new recurring-charge
+    /// HTTP-facing variant that atomically compares the plan id, price and
+    /// billing revision shown to the user before recording a recurring-charge
     /// authorization. Internal callers may use `set_plan_auto_renew` when no
     /// stale-view guard is required.
     async fn set_plan_auto_renew_guarded(
@@ -344,6 +345,7 @@ pub trait UserRepository: Send + Sync {
         enabled: bool,
         expected_price: Option<&str>,
         expected_revision: Option<i64>,
+        expected_plan_id: Option<i64>,
     ) -> Result<PlanAutoRenewUpdateOutcome, DbError>;
     /// Increment user traffic_used (called inside traffic batch tx).
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError>;
@@ -813,7 +815,9 @@ pub trait GroupRepository: Send + Sync {
 /// committed (or rolled back) together.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdminUserUpdate<'a> {
+    pub actor_id: Option<i64>,
     pub balance: Option<&'a str>,
+    pub expected_balance: Option<&'a str>,
     pub max_rules: Option<i32>,
     pub traffic_limit: Option<i64>,
     pub banned: Option<bool>,
@@ -1092,6 +1096,7 @@ pub trait TunnelRepository: Send + Sync {
 /// foreign) is logged server-side only.
 #[derive(Debug)]
 pub enum TrafficEntryResult {
+    AlreadyApplied,
     /// The batch was applied successfully.
     Ok,
     /// At least one entry referenced a rule that is NOT available to this node
@@ -1129,11 +1134,26 @@ pub trait TrafficRepository: Send + Sync {
     /// Returns `Ok(vec![result])` even on the rejected paths (the single
     /// result element tells the caller which rejection happened); `Err` only
     /// for a genuine DB failure.
+    async fn apply_traffic_batch_with_id(
+        &self,
+        group_id: i64,
+        batch_id: Option<&str>,
+        acked_batch_id: Option<&str>,
+        entries: &[TrafficEntry],
+    ) -> Result<Vec<TrafficEntryResult>, DbError>;
+
     async fn apply_traffic_batch(
         &self,
         group_id: i64,
         entries: &[TrafficEntry],
-    ) -> Result<Vec<TrafficEntryResult>, DbError>;
+    ) -> Result<Vec<TrafficEntryResult>, DbError> {
+        self.apply_traffic_batch_with_id(group_id, None, None, entries)
+            .await
+    }
+
+    /// Unconfirmed batches never expire: an offline node may retry much later.
+    /// Confirmed ids retain a grace window for delayed concurrent HTTP retries.
+    async fn prune_traffic_batches(&self, confirmed_before: &str) -> Result<u64, DbError>;
 
     // ── v1.2.0: hourly traffic history ──
 
@@ -1394,6 +1414,12 @@ pub trait StatisticsRepository: Send + Sync {
 
 #[async_trait]
 pub trait PlanRepository: Send + Sync {
+    async fn list_due_subscription_user_ids(
+        &self,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<i64>, DbError>;
+    async fn activate_subscription_cycle(&self, user_id: i64, now: &str) -> Result<bool, DbError>;
     async fn list_plans(&self) -> Result<Vec<Plan>, DbError>;
     /// v1.0.8: plans visible to regular users for self-purchase (hidden = 0).
     async fn list_visible_plans(&self) -> Result<Vec<Plan>, DbError>;
@@ -1549,6 +1575,7 @@ pub trait PlanRepository: Send + Sync {
             false,
             false,
             None,
+            None,
         )
         .await
     }
@@ -1592,6 +1619,57 @@ pub trait PlanRepository: Send + Sync {
             require_visible,
             true,
             expected_current_plan_id,
+            None,
+        )
+        .await
+    }
+
+    /// Same purchase contract, with a durable id scoped to the charged user.
+    /// The immutable fingerprint includes the actor and full confirmed intent.
+    async fn find_purchase_fingerprint(
+        &self,
+        user_id: i64,
+        request_id: &str,
+    ) -> Result<Option<String>, DbError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn buy_plan_idempotent(
+        &self,
+        user_id: i64,
+        plan_id: i64,
+        plan_name: &str,
+        price_cents: i64,
+        traffic_to_add: i64,
+        plan_max_rules: i32,
+        duration_days: i32,
+        reset_traffic: bool,
+        grant_all_groups: bool,
+        device_group_ids: &[i64],
+        new_authorized_group_ids: &[i64],
+        plan_type: &str,
+        auto_renew: bool,
+        require_visible: bool,
+        expected_current_plan_id: Option<Option<i64>>,
+        identity: PurchaseIdentity<'_>,
+    ) -> Result<(), BuyPlanError> {
+        self.buy_plan_impl(
+            user_id,
+            plan_id,
+            plan_name,
+            price_cents,
+            traffic_to_add,
+            plan_max_rules,
+            duration_days,
+            reset_traffic,
+            grant_all_groups,
+            device_group_ids,
+            new_authorized_group_ids,
+            plan_type,
+            auto_renew,
+            require_visible,
+            true,
+            expected_current_plan_id,
+            Some(identity),
         )
         .await
     }
@@ -1616,6 +1694,7 @@ pub trait PlanRepository: Send + Sync {
         require_visible: bool,
         check_plan_snapshot: bool,
         expected_current_plan_id: Option<Option<i64>>,
+        identity: Option<PurchaseIdentity<'_>>,
     ) -> Result<(), BuyPlanError>;
 }
 
@@ -1688,6 +1767,9 @@ pub trait RedeemRepository: Send + Sync {
 /// v1.0.8: errors from the atomic purchase transaction.
 #[derive(Debug)]
 pub enum BuyPlanError {
+    PrepaidCyclesPresent,
+    IdempotencyConflict,
+    AutoRenewUnavailable,
     /// User balance < plan price. Caller → 400.
     InsufficientBalance,
     /// The plan changed after the caller loaded/confirmed it. Caller → 409.
@@ -1700,6 +1782,13 @@ pub enum BuyPlanError {
     QuotaOverflow,
     /// DB error. Caller → 500.
     Database(DbError),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PurchaseIdentity<'a> {
+    pub request_id: &'a str,
+    pub fingerprint: &'a str,
+    pub actor_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1874,6 +1963,16 @@ pub trait SettingsRepository: Send + Sync {
 /// v1.0.8: purchase-order history.
 #[async_trait]
 pub trait OrderRepository: Send + Sync {
+    async fn list_balance_entries(
+        &self,
+        user_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::service::billing::BalanceEntry>, DbError>;
+    async fn list_subscription_cycles(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<crate::service::billing::SubscriptionCycle>, DbError>;
     /// List a user's orders, newest first.
     async fn list_orders_by_user(&self, user_id: i64) -> Result<Vec<Order>, DbError>;
     /// v1.2.4: every user's orders, newest first, for the admin view.

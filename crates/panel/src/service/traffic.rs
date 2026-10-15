@@ -81,9 +81,20 @@ pub(crate) fn billed_traffic_delta(real_delta: i64, rate: f64) -> Option<i64> {
 ///
 /// Heavy lifting (ownership check, per-rule/per-user cumulative overflow,
 /// duplicate rule_id aggregation) lives in `Repository::apply_traffic_batch`.
+#[cfg(test)]
 pub async fn apply_traffic_report(
     db: &dyn Repository,
     group_id: i64,
+    reports: &[TrafficEntry],
+) -> Result<(), TrafficReportError> {
+    apply_traffic_report_with_id(db, group_id, None, None, reports).await
+}
+
+pub async fn apply_traffic_report_with_id(
+    db: &dyn Repository,
+    group_id: i64,
+    batch_id: Option<&str>,
+    acked_batch_id: Option<&str>,
     reports: &[TrafficEntry],
 ) -> Result<(), TrafficReportError> {
     // Pre-validate obvious overflow before starting a transaction. The message
@@ -102,7 +113,7 @@ pub async fn apply_traffic_report(
     // apply_traffic_batch returns Ok(vec![result]) even on rejection; the
     // element(s) tell us which uniform response to send.
     let results = db
-        .apply_traffic_batch(group_id, reports)
+        .apply_traffic_batch_with_id(group_id, batch_id, acked_batch_id, reports)
         .await
         .map_err(TrafficReportError::Database)?;
 

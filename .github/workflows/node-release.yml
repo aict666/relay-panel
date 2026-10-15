@@ -20,8 +20,7 @@ on:
         default: '1.1.0'
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,15 +30,23 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+
   build-and-upload:
-    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs: quality
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - rust_target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
             asset_name: relay-node-linux-amd64
           - rust_target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
             asset_name: relay-node-linux-arm64
 
     steps:
@@ -50,31 +57,22 @@ jobs:
           rustup show
           rustup target add ${{ matrix.rust_target }}
 
-      - name: Install musl tools (amd64)
-        if: matrix.rust_target == 'x86_64-unknown-linux-musl'
+      - name: Install native musl tools
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      - name: Install aarch64 cross-compiler
-        if: matrix.rust_target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            musl-tools
-          # musl-tools provides musl-gcc for amd64; for arm64 we need the
-          # cross toolchain. Create a musl wrapper that uses the arm64 gcc.
-          sudo ln -sf /usr/bin/aarch64-linux-gnu-gcc /usr/bin/musl-gcc-aarch64 || true
-
       - name: Build relay-node (static musl)
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_musl: aarch64-linux-gnu-g++
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
-          cargo build --release --target ${{ matrix.rust_target }} -p relay-node
+          cargo build --locked --release --target ${{ matrix.rust_target }} -p relay-node
+          # Execute each architecture natively before any upload.
+          target/${{ matrix.rust_target }}/release/relay-node --version
+          file target/${{ matrix.rust_target }}/release/relay-node | grep -Eq 'static(ally linked|[- ]pie linked)'
 
       - name: Rename binary
         run: |
@@ -91,13 +89,17 @@ jobs:
 
       - name: Determine version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             # Strip leading 'node-v' from tag name (node-v1.1.0 -> 1.1.0)
             VERSION="${GITHUB_REF_NAME#node-v}"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          bash scripts/release-check.sh --verify-only node "$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=node-v${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -131,6 +133,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             ${{ matrix.asset_name }}
             ${{ matrix.asset_name }}.sha256
@@ -144,6 +147,10 @@ jobs:
   # Separate job from build-and-upload so a binary-build failure doesn't block
   # the image (and vice versa).
   docker-node:
+    permissions:
+      contents: read
+      packages: write
+    needs: quality
     name: Build + push node image (:X.Y.Z)
     runs-on: ubuntu-latest
     steps:
@@ -151,12 +158,16 @@ jobs:
 
       - name: Determine version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#node-v}"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          bash scripts/release-check.sh --verify-only node "$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing NODE image version $VERSION (version tag only; :latest promoted after verify)"
 
@@ -185,14 +196,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Post-release verification: download the amd64 asset, verify its checksum,
-  # confirm the binary reports the expected version, and confirm the pushed node
-  # image reports the expected version. Catches truncated uploads, wrong-arch
-  # binaries, and version/tag mismatches.
+  # Download BOTH assets, verify their checksums, and execute on native runners.
+  # The amd64 leg also checks the node Docker image (currently amd64-only).
+  # Catches truncated uploads, wrong-arch binaries, and version/tag mismatches.
   verify:
-    name: Verify release assets
+    permissions:
+      contents: read
+      packages: read
+    name: Verify ${{ matrix.arch }} release assets
     needs: [build-and-upload, docker-node]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -200,31 +221,46 @@ jobs:
 
       - name: Determine version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#node-v}"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=node-v${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Download + checksum-verify amd64 asset
+      - name: Download + checksum-verify ${{ matrix.arch }} asset
+        env:
+          ASSET: relay-node-linux-${{ matrix.arch }}
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           TAG="${{ steps.ver.outputs.tag }}"
-          gh release download "$TAG" --pattern "relay-node-linux-amd64*" --dir dl
+          gh release download "$TAG" --pattern "$ASSET*" --dir dl
           cd dl
           # Confirm the asset is intact (re-run the published sha256).
-          sha256sum -c relay-node-linux-amd64.sha256
+          sha256sum -c "$ASSET.sha256"
           # Confirm it's a valid ELF, not a truncated/HTML error page.
-          file relay-node-linux-amd64 | grep -q "ELF"
+          file "$ASSET" | grep -q "ELF"
           # Confirm the binary reports the expected node version.
-          chmod +x relay-node-linux-amd64
-          OUT=$(./relay-node-linux-amd64 --version 2>/dev/null || true)
+          chmod +x "$ASSET"
+          OUT=$(./"$ASSET" --version)
           echo "binary reports: $OUT"
-          echo "$OUT" | grep -q "${{ steps.ver.outputs.version }}" || { echo "::error::binary version does not match ${{ steps.ver.outputs.version }}"; exit 1; }
+          test "$OUT" = "relay-node $VERSION" || { echo "::error::binary version does not match $VERSION"; exit 1; }
+
+      - name: Log in to GHCR for image verification
+        if: matrix.arch == 'amd64'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify node Docker image version matches tag
+        if: matrix.arch == 'amd64'
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
           # docker-node job finished before this one (needs:), but retry the
@@ -238,7 +274,7 @@ jobs:
           echo "image reports: $OUT"
           # The version constant is baked at compile time, so this catches a
           # release built from a branch where Cargo.toml wasn't bumped.
-          echo "$OUT" | grep -q "$VERSION" || { echo "::error::image version does not match tag $VERSION"; exit 1; }
+          test "$OUT" = "relay-node $VERSION" || { echo "::error::image version does not match tag $VERSION"; exit 1; }
 
   # v1.2 (release gate): promote :latest ONLY after verify passes. The previous
   # shape pushed :X.Y.Z and :latest in one build-push step, so a release whose
@@ -246,6 +282,9 @@ jobs:
   # moved :latest at a broken image. Now :latest is re-tagged from the verified
   # :X.Y.Z image, so a failed release can never repoint :latest.
   promote-latest:
+    permissions:
+      contents: read
+      packages: write
     name: Promote :latest (after verify)
     needs: verify
     runs-on: ubuntu-latest
@@ -254,12 +293,15 @@ jobs:
 
       - name: Determine version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#node-v}"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
@@ -288,6 +330,8 @@ jobs:
   # make_latest is explicitly false: a node release must NOT take the repo's
   # "Latest" pointer away from the panel (the README badge links there).
   publish-release:
+    permissions:
+      contents: write
     name: Publish GitHub Release (after verify)
     needs: [verify, promote-latest]
     runs-on: ubuntu-latest
@@ -298,12 +342,15 @@ jobs:
 
       - name: Determine version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#node-v}"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=node-v${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -315,10 +362,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: ${{ steps.ver.outputs.tag }}
           draft: false
           prerelease: false
           make_latest: 'false'
           # body_path is omitted here; build-and-upload already set the body
           # from CHANGELOG-NODE.md when it created the prerelease.
-

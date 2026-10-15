@@ -12,6 +12,7 @@ import TrafficChart from '../components/TrafficChart';
 import SiteAnnouncement from '../components/SiteAnnouncement';
 import { useSiteNotice } from '../hooks/useSiteNotice';
 import RedeemHistory from '../components/RedeemHistory';
+import BalanceHistory from '../components/BalanceHistory';
 
 const { Text } = Typography;
 
@@ -110,6 +111,7 @@ export default function Account() {
         ...(enabled ? {
           expected_price: me.plan_price,
           expected_revision: me.plan_billing_revision,
+          expected_plan_id: me.plan_id,
         } : {}),
       });
       if (res.code !== 0) {
@@ -208,10 +210,19 @@ export default function Account() {
           </Descriptions.Item>
           <Descriptions.Item label={t('accountPlan')}>
             {me.plan_name || '-'}
+            {me.plan_source === 'trial' && <Tag>{t('freeTrial')}</Tag>}
           </Descriptions.Item>
+          {me.account_status && <Descriptions.Item label={t('accountStatus')}>
+            <Tag>{({ active: t('billingActive'), pending: t('billingPending'), expired: t('billingExpired'),
+              exhausted: t('billingExhausted'), unassigned: t('noneAssigned'), suspended: t('accountSuspended') } as Record<string, string>)[me.account_status] ?? me.account_status}</Tag>
+          </Descriptions.Item>}
+          {me.current_cycle_end && <Descriptions.Item label={t('currentCycleEnd')}>
+            <span className="rp-mono">{me.current_cycle_end} UTC</span>
+          </Descriptions.Item>}
+          {!!me.prepaid_cycles && <Descriptions.Item label={t('prepaidCycles')}>{me.prepaid_cycles}</Descriptions.Item>}
           {/* v1.0.8: plan expiry (null = no expiry). */}
           <Descriptions.Item label={t('accountPlanExpiry')}>
-            {me.plan_expire_at ? <span className="rp-mono">{me.plan_expire_at}</span> : t('unlimited')}
+            {me.plan_expire_at ? <span className="rp-mono">{me.plan_expire_at} UTC</span> : me.plan_source === 'pending' ? '-' : t('unlimited')}
           </Descriptions.Item>
           {me.plan_type === 'monthly' && (
             <Descriptions.Item label={t('autoRenew')}>
@@ -263,7 +274,7 @@ export default function Account() {
             </Space>
           </Descriptions.Item>
           <Descriptions.Item label={t('accountRulesLimit')}>
-            {me.current_rules} / {me.max_rules}
+            {me.current_rules} / {me.max_rules > 0 ? me.max_rules : t('unlimited')}
           </Descriptions.Item>
           {/* v1.0.8: traffic usage with a progress bar (used / limit). */}
           <Descriptions.Item label={t('accountTrafficUsed')}>
@@ -292,6 +303,7 @@ export default function Account() {
           )}
         </Descriptions>
       </Card>
+      <BalanceHistory />
 
       {/* v1.2.0: the user's own traffic trend. No rule filter here — the API
           pins non-admins to their own uid, so the total IS their usage.

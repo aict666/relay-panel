@@ -2,7 +2,7 @@ use super::{err, UserPublic};
 use crate::api::middleware::AdminOnly;
 use crate::api::AppState;
 use crate::db::error::DbError;
-use crate::db::repo::{AdminUserPlanEditOutcome, AdminUserUpdate, BuyPlanError};
+use crate::db::repo::{AdminUserPlanEditOutcome, AdminUserUpdate, BuyPlanError, PurchaseIdentity};
 use crate::service::password::PasswordValidationError;
 use crate::service::users::CreateUserError;
 use axum::{
@@ -234,6 +234,18 @@ pub async fn update_user(
             Err(reason) => return Json(err(400, reason)),
         },
     };
+    let expected_balance = if canonical_balance.is_some() {
+        match req
+            .expected_balance
+            .as_deref()
+            .map(relay_shared::money::parse_balance)
+        {
+            Some(Ok(value)) => Some(value),
+            _ => return Json(err(409, "修改余额需要原余额，请刷新用户信息后重试")),
+        }
+    } else {
+        None
+    };
 
     // Cannot ban or suspend an admin user (privilege protection). The role is
     // immutable through this endpoint; the transactional update below still
@@ -264,7 +276,9 @@ pub async fn update_user(
         .update_user_with_authorization(
             id,
             AdminUserUpdate {
+                actor_id: Some(_admin.user_id),
                 balance: canonical_balance.as_deref(),
+                expected_balance: expected_balance.as_deref(),
                 max_rules: req.max_rules,
                 traffic_limit: req.traffic_limit,
                 banned: req.banned,
@@ -277,6 +291,7 @@ pub async fn update_user(
     {
         Ok(Some(outcome)) => outcome,
         Ok(None) => return Json(err(404, "用户不存在")),
+        Err(DbError::BalanceConflict) => return Json(err(409, "余额已发生变化，请刷新后重试")),
         Err(DbError::ForeignKeyViolation | DbError::UserDeviceGroupInvalid) => {
             return Json(err(400, "设备分组列表只能包含管理员拥有的入站分组"));
         }
@@ -312,7 +327,7 @@ pub async fn update_user(
     }
     if outcome.paused_rules > 0 {
         tracing::warn!(
-            "update_user {}: paused {} rule(s) outside new authorization",
+            "update_user {}: paused {} rule(s) outside authorization or rule limit",
             id,
             outcome.paused_rules
         );
@@ -380,6 +395,29 @@ pub async fn admin_buy_plan_for_user(
     Path(id): Path<i64>,
     Json(req): Json<AdminBuyPlanRequest>,
 ) -> Json<ApiResponse<()>> {
+    let Some(request_id) = req
+        .request_id
+        .as_deref()
+        .filter(|id| relay_shared::protocol::valid_traffic_batch_id(id))
+    else {
+        return Json(err(400, "购买需要有效的 request_id，请刷新页面后重试"));
+    };
+    let fingerprint = format!(
+        "admin:{}:{}",
+        _admin.user_id,
+        serde_json::to_string(&req).expect("purchase body serializes")
+    );
+    let identity = PurchaseIdentity {
+        request_id,
+        fingerprint: &fingerprint,
+        actor_id: Some(_admin.user_id),
+    };
+    if let Some(response) = super::shop::replay_purchase(&state, id, identity).await {
+        return Json(response);
+    }
+    if req.expected_price.is_none() || req.expected_revision.is_none() {
+        return Json(err(400, "购买前必须确认套餐价格和内容"));
+    }
     if req.expected_current_plan_id < 0 {
         return Json(err(400, "expected_current_plan_id 不能为负数"));
     }
@@ -470,7 +508,7 @@ pub async fn admin_buy_plan_for_user(
 
     match state
         .db
-        .buy_plan_guarded(
+        .buy_plan_idempotent(
             id,
             plan.id,
             &plan.name,
@@ -486,6 +524,7 @@ pub async fn admin_buy_plan_for_user(
             req.auto_renew && plan.plan_type == "monthly",
             false,
             Some(expected_current_plan_id),
+            identity,
         )
         .await
     {
@@ -513,9 +552,18 @@ pub async fn admin_buy_plan_for_user(
             Json(ApiResponse::success(()))
         }
         Err(BuyPlanError::InsufficientBalance) => Json(err(400, "余额不足")),
+        Err(BuyPlanError::AutoRenewUnavailable) => {
+            Json(err(409, "封禁或暂停的账户不能开启自动续费"))
+        }
+        Err(BuyPlanError::IdempotencyConflict) => {
+            Json(err(409, "交易标识已用于其他购买，请勿更改重试内容"))
+        }
         Err(BuyPlanError::PlanChanged) => Json(err(409, "套餐已变更，请刷新后重新确认")),
         Err(BuyPlanError::UserPlanChanged) => {
             Json(err(409, "用户当前套餐已变更，请刷新后重新确认"))
+        }
+        Err(BuyPlanError::PrepaidCyclesPresent) => {
+            Json(err(409, "还有未使用的预付周期，不能直接切换套餐"))
         }
         Err(BuyPlanError::QuotaOverflow) => Json(err(409, "累计流量额度超出系统上限")),
         Err(BuyPlanError::Database(e)) => {
@@ -566,6 +614,9 @@ pub async fn admin_set_user_plan(
         .await
     {
         Ok(AdminUserPlanEditOutcome::Updated) => {}
+        Ok(AdminUserPlanEditOutcome::PrepaidCyclesPresent) => {
+            return Json(err(409, "还有未使用的预付周期，不能直接改期或清除套餐"))
+        }
         Ok(AdminUserPlanEditOutcome::NotFound) => return Json(err(404, "用户不存在")),
         Ok(AdminUserPlanEditOutcome::AdminTarget) => {
             return Json(err(400, "无法修改管理员用户的套餐"));

@@ -27,6 +27,7 @@
 use sqlx::PgPool;
 
 mod announcements;
+mod billing;
 mod groups;
 mod kvs;
 mod orders;
@@ -50,6 +51,24 @@ impl PgRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
+
+/// Caller locks the owner before any rule rows (the global user -> rule order).
+async fn enforce_rule_limit(
+    conn: &mut sqlx::PgConnection,
+    uid: i64,
+) -> Result<u64, super::error::DbError> {
+    Ok(sqlx::query(
+        "UPDATE forward_rules SET paused=TRUE, auto_paused=TRUE WHERE id IN (
+        SELECT r.id FROM forward_rules r JOIN users u ON u.id=r.uid
+        WHERE r.uid=$1 AND r.paused=FALSE AND u.admin=FALSE AND u.max_rules>0
+        ORDER BY r.id OFFSET (SELECT max_rules FROM users WHERE id=$1)
+    )",
+    )
+    .bind(uid)
+    .execute(conn)
+    .await?
+    .rows_affected())
 }
 
 /// Keep tunnel-level advisory locks in a namespace disjoint from positive

@@ -45,6 +45,15 @@ pub fn spawn(state: AppState) {
                 // Transient DB trouble skips the sweep, never kills the loop.
                 Err(e) => tracing::error!("traffic-history: prune failed: {}", e),
             }
+            // A node confirms its preceding batch only after receiving its ACK.
+            // Keep a seven-day grace for delayed duplicate requests; never age
+            // out unconfirmed ids merely because a node went offline.
+            let batch_cutoff = (chrono::Utc::now() - chrono::Duration::days(7))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            if let Err(e) = state.db.prune_traffic_batches(&batch_cutoff).await {
+                tracing::error!("traffic-batches: prune failed: {}", e);
+            }
 
             // Swept in the same pass, on its own (shorter) cutoff. A failure
             // here is independent — one table failing must not skip the other.

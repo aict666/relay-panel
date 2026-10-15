@@ -328,14 +328,73 @@ pub async fn get_me(user: AuthUser, State(state): State<AppState>) -> Json<ApiRe
         }
     };
 
+    let cycles = match state.db.list_subscription_cycles(user.user_id).await {
+        Ok(cycles) => cycles,
+        Err(error) => {
+            tracing::error!("get_me cycles: {error}");
+            return Json(err(500, "数据库错误"));
+        }
+    };
+    let now = crate::service::billing::now();
+    let current = cycles
+        .iter()
+        .find(|cycle| Some(&cycle.id) == u.current_cycle_id.as_ref());
+    let snapshot = match current
+        .map(|cycle| {
+            crate::service::billing::EntitlementSnapshot::decode(&cycle.entitlement_snapshot)
+        })
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!("get_me snapshot: {error}");
+            return Json(err(500, "数据库错误"));
+        }
+    };
+    let account_status = if u.suspended {
+        "suspended"
+    } else if u.plan_source == "pending" {
+        "pending"
+    } else if u
+        .plan_expire_at
+        .as_deref()
+        .is_some_and(|end| end <= now.as_str())
+    {
+        "expired"
+    } else if u.traffic_limit > 0 && u.traffic_used >= u.traffic_limit {
+        "exhausted"
+    } else if !all_groups && available_groups.is_empty() {
+        "unassigned"
+    } else {
+        "active"
+    }
+    .to_string();
     Json(ApiResponse::success(UserSelf {
+        current_cycle_start: current.map(|cycle| cycle.starts_at.clone()),
+        current_cycle_end: current.and_then(|cycle| cycle.ends_at.clone()),
+        prepaid_cycles: cycles
+            .iter()
+            .filter(|cycle| {
+                !cycle.cancelled
+                    && cycle.starts_at > now
+                    && Some(&cycle.subscription_id) == u.subscription_id.as_ref()
+            })
+            .count(),
+        plan_source: u.plan_source,
+        account_status,
         id: u.id,
         username: u.username,
         admin: u.admin,
         balance: u.balance,
         plan_id: u.plan_id,
-        plan_name: current_plan.as_ref().map(|plan| plan.name.clone()),
-        plan_type: current_plan.as_ref().map(|plan| plan.plan_type.clone()),
+        plan_name: snapshot
+            .as_ref()
+            .map(|plan| plan.plan_name.clone())
+            .or_else(|| current_plan.as_ref().map(|plan| plan.name.clone())),
+        plan_type: snapshot
+            .as_ref()
+            .map(|plan| plan.plan_type.clone())
+            .or_else(|| current_plan.as_ref().map(|plan| plan.plan_type.clone())),
         plan_price: current_plan.as_ref().map(|plan| plan.price.clone()),
         plan_billing_revision: current_plan.as_ref().map(|plan| plan.billing_revision),
         max_rules: u.max_rules,

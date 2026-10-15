@@ -76,14 +76,13 @@ pub async fn create_codes(
     if money::balance_to_cents(&amount).is_none_or(|c| c == 0) {
         return Json(err(400, "面额必须大于 0"));
     }
-    if let Some(exp) = req.expires_at.as_deref() {
-        // Reject a malformed expiry rather than storing a string that would
-        // compare wrong: expiry is a TEXT comparison, so a different format
-        // (e.g. RFC3339 with a 'T') would sort incorrectly against now_utc().
-        if chrono::NaiveDateTime::parse_from_str(exp, "%Y-%m-%d %H:%M:%S").is_err() {
-            return Json(err(400, "过期时间格式应为 YYYY-MM-DD HH:MM:SS (UTC)"));
-        }
-    }
+    let expires_at = match req.expires_at.as_deref() {
+        None => None,
+        Some(exp) => match redeem::canonical_expiry(exp) {
+            Some(exp) => Some(exp),
+            None => return Json(err(400, "过期时间格式应为 YYYY-MM-DD HH:MM:SS (UTC)")),
+        },
+    };
 
     // Timestamp keeps batches readable; the random suffix prevents two admins
     // generating in the same second from being merged by the batch filter.
@@ -98,7 +97,7 @@ pub async fn create_codes(
         .map(|d| NewRedeemCode {
             code: redeem::to_stored(d),
             amount: amount.clone(),
-            expires_at: req.expires_at.clone(),
+            expires_at: expires_at.clone(),
             batch_id: batch_id.clone(),
             remark: req.remark.clone(),
         })

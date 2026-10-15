@@ -4,16 +4,17 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Plan, User } from '../api/types';
 
-const { mockGet, mockPost } = vi.hoisted(() => ({
+const { mockGet, mockPost, mockPut } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockPost: vi.fn(),
+  mockPut: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
   default: {
     get: mockGet,
     post: mockPost,
-    put: vi.fn(),
+    put: mockPut,
     delete: vi.fn(),
   },
 }));
@@ -59,9 +60,12 @@ const plan: Plan = {
 let failLoads = false;
 
 beforeEach(() => {
+  sessionStorage.clear();
   failLoads = false;
   mockGet.mockReset();
   mockPost.mockReset();
+  mockPut.mockReset();
+  mockPut.mockResolvedValue(ok(null));
   mockGet.mockImplementation((url: string) => {
     if (failLoads) return Promise.reject(new Error('refresh failed'));
     if (url === '/admin/users') return Promise.resolve(ok([account]));
@@ -71,6 +75,29 @@ beforeEach(() => {
 });
 
 describe('Users mutation locking', () => {
+  it('includes the original balance only when the balance is deliberately changed', async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter><Users /></MemoryRouter>);
+    await user.click(await screen.findByRole('button', { name: /edit/ }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.change(within(dialog).getByRole('spinbutton', { name: /balance/ }), { target: { value: '25.00' } });
+    await user.click(within(dialog).getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(1));
+    expect(mockPut.mock.calls[0][1]).toMatchObject({ balance: '25', expected_balance: '10.00' });
+  });
+
+  it('does not resubmit an unchanged balance with ordinary user edits', async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter><Users /></MemoryRouter>);
+    await user.click(await screen.findByRole('button', { name: /edit/ }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(1));
+    const payload = mockPut.mock.calls[0][1];
+    expect(payload).not.toHaveProperty('balance');
+    expect(payload).not.toHaveProperty('expected_balance');
+  });
+
   it('keeps stale user data read-only after a refresh failure', async () => {
     const user = userEvent.setup();
     render(<MemoryRouter><Users /></MemoryRouter>);
@@ -99,6 +126,7 @@ describe('Users mutation locking', () => {
 
     await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
     expect(mockPost).toHaveBeenCalledWith('/admin/users/2/buy-plan', {
+      request_id: expect.any(String),
       plan_id: 1,
       expected_current_plan_id: 0,
       expected_price: '6.00',

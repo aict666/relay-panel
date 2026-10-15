@@ -108,6 +108,14 @@ pub fn routes() -> Router<AppState> {
             "/admin/users/{id}/reset-traffic",
             axum::routing::post(admin::reset_user_traffic),
         )
+        .route(
+            "/admin/users/{id}/balance-ledger",
+            axum::routing::get(admin::admin_balance_ledger),
+        )
+        .route(
+            "/user/balance-ledger",
+            axum::routing::get(admin::user_balance_ledger),
+        )
         // v0.4.10 PR4: admin sets a (temporary) password for a user. Separate
         // route so a PUT to /{id} (quota/ban edits) can never touch passwords.
         .route(

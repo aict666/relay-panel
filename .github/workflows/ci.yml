@@ -6,9 +6,10 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-quality-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -17,7 +18,7 @@ env:
 jobs:
   quality:
     name: fmt + clippy + test + lint + build + e2e
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     # v0.4.3 PR2: PostgreSQL service for the PgRepository contract tests.
     # The tests gate on TEST_PG_URL — when present, the pg_repo::tests module
@@ -46,9 +47,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust (rust-toolchain.toml)
         run: rustup show
+
+      - name: Install PostgreSQL 16 restore-test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client-16
 
       - name: Cache cargo registry + build
         uses: actions/cache@v4
@@ -59,18 +67,31 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
-      - name: Install Node 20
+      - name: Install Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache Rust security scanner
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-audit-0.22.2
+
+      - name: Rust dependency security gate
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --version 0.22.2 --locked
+          fi
+          cargo audit --deny warnings
 
       - name: cargo fmt
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Enable and verify Linux TCP Fast Open data path
         run: |
@@ -78,7 +99,9 @@ jobs:
           test "$(sysctl -n net.ipv4.tcp_fastopen)" = "3"
 
       - name: cargo test
-        run: cargo test --workspace
+        run: |
+          ulimit -n 65536
+          cargo test --workspace --locked
         env:
           # The Linux-only test checks TCP_INFO/TCPI_OPT_SYN_DATA on both ends;
           # an ordinary TCP fallback is a failure in CI, not a pass.
@@ -88,13 +111,17 @@ jobs:
         run: bash scripts/check-repo-test-parity.sh
 
       - name: cargo build (release profile)
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
 
       - name: cargo build (debug, for e2e)
-        run: cargo build
+        run: cargo build --workspace --locked
 
       - name: npm ci (frontend)
         run: npm ci --no-audit --no-fund
+        working-directory: frontend
+
+      - name: Frontend dependency security gate
+        run: npm audit --audit-level=moderate
         working-directory: frontend
 
       - name: Clear TypeScript cache
@@ -116,6 +143,15 @@ jobs:
       - name: npm run build (frontend)
         run: npm run build
         working-directory: frontend
+
+      - name: Billing upgrade and restore (SQLite + PostgreSQL)
+        run: python3 tests/billing_upgrade_test.py
+
+      - name: Upgrade backup failure safety
+        run: python3 -m unittest discover -s tests -p '*_unit_test.py'
+
+      - name: Real HTTP billing and ledger permissions
+        run: python3 tests/billing_api_test.py
 
       - name: e2e test (debug profile)
         run: python3 tests/e2e_test.py

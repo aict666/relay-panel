@@ -45,7 +45,11 @@ CREATE TABLE IF NOT EXISTS users (
     -- Failed charges are delayed briefly so one underfunded cohort cannot
     -- monopolize every bounded scheduler batch.
     plan_auto_renew_retry_at TEXT,
-    suspended INTEGER NOT NULL DEFAULT 0
+    suspended INTEGER NOT NULL DEFAULT 0,
+    registration_plan_id INTEGER,
+    subscription_id TEXT,
+    current_cycle_id TEXT,
+    plan_source TEXT NOT NULL DEFAULT 'legacy'
 );
 
 CREATE TABLE IF NOT EXISTS plans (
@@ -311,6 +315,19 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
+
+CREATE TABLE IF NOT EXISTS balance_ledger (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, user_id INTEGER NOT NULL, kind TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL, balance_before TEXT NOT NULL, balance_after TEXT NOT NULL,
+    reference_id TEXT NOT NULL, actor_id INTEGER, reason TEXT NOT NULL, created_at TEXT NOT NULL,
+    UNIQUE(user_id, kind, reference_id)
+);
+CREATE TABLE IF NOT EXISTS subscription_cycles (
+    id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, user_id INTEGER NOT NULL,
+    plan_id INTEGER NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT,
+    traffic_limit INTEGER NOT NULL, traffic_used INTEGER NOT NULL DEFAULT 0,
+    entitlement_snapshot TEXT NOT NULL, source TEXT NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0
+);
 
 -- Balance top-up codes. Used rows intentionally outlive a deleted account.
 CREATE TABLE IF NOT EXISTS redeem_codes (
@@ -2132,6 +2149,149 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .execute(pool)
     .await?;
 
+    // Migration 60: traffic identities and their bytes commit atomically.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS traffic_batches (
+        group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+        batch_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        confirmed_at TEXT,
+        PRIMARY KEY (group_id, batch_id)
+    )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_traffic_batches_confirmed ON traffic_batches(confirmed_at)",
+    )
+    .execute(pool)
+    .await?;
+    // Migration 61: retain successful purchase intents with their orders. No
+    // user FK: deleting an account must not erase financial transaction ids.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS purchase_requests (
+        user_id INTEGER NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        created_at TEXT NOT NULL, PRIMARY KEY (user_id, request_id)
+    )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Migration 62: normalize historical over-limit active rules without
+    // deleting configurations or resuming anything manually paused.
+    sqlx::query("UPDATE forward_rules SET paused=1, auto_paused=1 WHERE id IN (
+        SELECT id FROM (
+            SELECT r.id, u.max_rules, ROW_NUMBER() OVER (PARTITION BY r.uid ORDER BY r.id) AS position
+            FROM forward_rules r JOIN users u ON u.id=r.uid
+            WHERE r.paused=0 AND u.admin=0 AND u.max_rules>0
+        ) ranked WHERE position>max_rules
+    )").execute(pool).await?;
+
+    // Canonicalize legacy announcement expiries accepted by the old API.
+    // Keep unreadable manually-written data intact for operator inspection.
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='announcements')",
+    )
+    .fetch_one(pool)
+    .await?
+    {
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id,expires_at FROM announcements WHERE expires_at IS NOT NULL")
+                .fetch_all(pool)
+                .await?;
+        for (id, raw) in rows {
+            match crate::service::announcements::parse_expiry(Some(&raw)) {
+                Ok(canonical) if canonical.as_deref() != Some(&raw) => {
+                    sqlx::query(
+                        "UPDATE announcements SET expires_at=? WHERE id=? AND expires_at=?",
+                    )
+                    .bind(canonical)
+                    .bind(id)
+                    .bind(raw)
+                    .execute(pool)
+                    .await?;
+                }
+                Err(_) => tracing::warn!(
+                    announcement_id = id,
+                    "Invalid legacy announcement expiry; review manually"
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    // Migration 63: durable financial ledger and immutable subscription cycles.
+    add_column_if_missing(pool, "users", "balance", "TEXT NOT NULL DEFAULT '0'").await?;
+    add_column_if_missing(pool, "users", "plan_id", "INTEGER REFERENCES plans(id)").await?;
+    add_column_if_missing(pool, "users", "traffic_used", "INTEGER NOT NULL DEFAULT 0").await?;
+    for (column, definition) in [
+        ("registration_plan_id", "INTEGER"),
+        ("subscription_id", "TEXT"),
+        ("current_cycle_id", "TEXT"),
+        ("plan_source", "TEXT NOT NULL DEFAULT 'legacy'"),
+    ] {
+        add_column_if_missing(pool, "users", column, definition).await?;
+    }
+    sqlx::query("CREATE TABLE IF NOT EXISTS balance_ledger (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, user_id INTEGER NOT NULL, kind TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL, balance_before TEXT NOT NULL, balance_after TEXT NOT NULL,
+        reference_id TEXT NOT NULL, actor_id INTEGER, reason TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(user_id, kind, reference_id)
+    )").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_balance_ledger_user_time ON balance_ledger(user_id, created_at, id)")
+        .execute(pool).await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS subscription_cycles (
+        id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, user_id INTEGER NOT NULL,
+        plan_id INTEGER NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT,
+        traffic_limit INTEGER NOT NULL, traffic_used INTEGER NOT NULL DEFAULT 0,
+        entitlement_snapshot TEXT NOT NULL, source TEXT NOT NULL,
+        cancelled INTEGER NOT NULL DEFAULT 0
+    )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscription_cycles_user_time ON subscription_cycles(user_id, subscription_id, starts_at, ends_at)")
+        .execute(pool).await?;
+    for (column, definition) in [
+        ("transaction_id", "TEXT"),
+        ("kind", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ("subscription_id", "TEXT"),
+        ("cycle_id", "TEXT"),
+        ("cycle_start", "TEXT"),
+        ("cycle_end", "TEXT"),
+        ("entitlement_snapshot", "TEXT"),
+        ("actor_id", "INTEGER"),
+        ("reason", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        add_column_if_missing(pool, "orders", column, definition).await?;
+    }
+    {
+        let users: Vec<(i64, String)> = sqlx::query_as("SELECT id,balance FROM users WHERE NOT EXISTS(SELECT 1 FROM balance_ledger l WHERE l.user_id=users.id)").fetch_all(pool).await?;
+        for (uid, balance) in users {
+            let amount = relay_shared::money::balance_to_cents(&balance).ok_or_else(|| {
+                sqlx::Error::Protocol("invalid opening balance; repair before migrating".into())
+            })?;
+            sqlx::query("INSERT OR IGNORE INTO balance_ledger (id,user_id,kind,amount_cents,balance_before,balance_after,reference_id,reason,created_at) VALUES (?,?,'opening',?,'0',?,'opening','Migration opening balance; historical movements are unknown',datetime('now'))")
+                .bind(uuid::Uuid::new_v4().to_string()).bind(uid).bind(amount).bind(balance).execute(pool).await?;
+        }
+        sqlx::query("UPDATE users SET plan_source='paid' WHERE plan_source='legacy' AND EXISTS(SELECT 1 FROM orders o WHERE o.user_id=users.id AND o.plan_id=users.plan_id AND o.kind='legacy')")
+            .execute(pool).await?;
+        // Only repair unambiguously unused, ungranted paid catalog selections.
+        // Never retract an existing usable/manual entitlement during upgrade.
+        // Minimal ancient schemas may not have the catalog at all. Production
+        // boot applies SCHEMA_SQL first; do not invent a catalog in a migration.
+        let has_catalog: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='plans')",
+        )
+        .fetch_one(pool)
+        .await?;
+        if has_catalog {
+            sqlx::query("UPDATE users SET registration_plan_id=plan_id,plan_id=NULL,plan_expire_at=NULL,plan_source='pending',plan_auto_renew=0,plan_auto_renew_price=NULL,plan_auto_renew_revision=NULL,plan_auto_renew_retry_at=NULL WHERE admin=0 AND plan_source='legacy' AND all_device_groups=0 AND traffic_used=0 AND EXISTS(SELECT 1 FROM plans p WHERE p.id=users.plan_id AND CAST(p.price AS NUMERIC)>0) AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.user_id=users.id) AND NOT EXISTS(SELECT 1 FROM user_device_groups g WHERE g.user_id=users.id) AND NOT EXISTS(SELECT 1 FROM forward_rules r WHERE r.uid=users.id)")
+                .execute(pool).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -2880,9 +3040,9 @@ mod tests {
         // Build an "old" DB with a duplicate listen_port (the very situation the
         // UNIQUE index is meant to prevent going forward).
         for stmt in [
-            r#"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, admin INTEGER DEFAULT 0)"#,
+            r#"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, admin INTEGER DEFAULT 0, max_rules INTEGER NOT NULL DEFAULT 5)"#,
             r#"CREATE TABLE device_groups (id INTEGER PRIMARY KEY, name TEXT, group_type TEXT, token TEXT UNIQUE, uid INTEGER)"#,
-            r#"CREATE TABLE forward_rules (id INTEGER PRIMARY KEY, name TEXT, uid INTEGER, listen_port INTEGER, protocol TEXT, device_group_in INTEGER, target_addr TEXT, target_port INTEGER)"#,
+            r#"CREATE TABLE forward_rules (id INTEGER PRIMARY KEY, name TEXT, uid INTEGER, listen_port INTEGER, protocol TEXT, device_group_in INTEGER, target_addr TEXT, target_port INTEGER, paused INTEGER NOT NULL DEFAULT 0)"#,
             "INSERT INTO users (id, username, password, admin) VALUES (1,'a','x',1)",
         ] {
             sqlx::query(stmt).execute(&pool).await.unwrap();

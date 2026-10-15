@@ -212,7 +212,11 @@ async fn connect_and_run(
         }
     }
 
-    let ws_result = connect_async(request).await;
+    let ws_result =
+        match tokio::time::timeout(Duration::from_secs(15), connect_async(request)).await {
+            Ok(result) => result,
+            Err(_) => return WsExit::Error("websocket handshake timed out after 15s".into()),
+        };
 
     let (mut ws_stream, _response) = match ws_result {
         Ok(c) => {

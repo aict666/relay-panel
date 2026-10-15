@@ -64,6 +64,7 @@ if [ "${1:-}" = "compose" ]; then
     case "$*" in
         *' ps -q caddy') echo 'caddy123'; exit 0 ;;
         *' ps -q postgres') echo 'pg123'; exit 0 ;;
+        *' ps -a -q panel') exit 0 ;;
         *' pull') printf 'PULL %s\n' "$*" >> "$log"; exit 0 ;;
         *' up -d'*)
             printf 'UP %s\n' "$*" >> "$log"
@@ -88,6 +89,8 @@ make_case_dir() {
     local dir="$1"
     mkdir -p "$dir"
     cp "$ROOT/deploy.sh" "$ROOT/docker-compose.release.yaml" "$ROOT/docker-compose.yaml" "$ROOT/Caddyfile" "$dir/"
+    mkdir -p "$dir/scripts"
+    cp "$ROOT/scripts/backup-before-upgrade.py" "$dir/scripts/"
 }
 
 assert_file_has() {

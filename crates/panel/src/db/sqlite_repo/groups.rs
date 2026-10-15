@@ -339,6 +339,12 @@ impl GroupRepository for SqliteRepository {
             sqlx::query("ROLLBACK").execute(&mut *conn).await?;
             return Err(DbError::GroupPlanInvariant { plans: plan_count });
         }
+        let paid_grants =
+            rollback_on_err!(super::billing::protected_cycle_grants(&mut conn, id).await);
+        if paid_grants > 0 && !matches!(effective_type, "in" | "both") {
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Err(DbError::GroupPlanInvariant { plans: paid_grants });
+        }
 
         let sql = match scope.owner_id() {
             None => format!("UPDATE device_groups SET {} WHERE id = ?", sets.join(", ")),
@@ -508,6 +514,8 @@ impl GroupRepository for SqliteRepository {
             .fetch_one(&mut *conn)
             .await
         );
+        let plan_count =
+            plan_count + try_!(super::billing::protected_cycle_grants(&mut conn, id).await);
         if rule_count > 0 || tunnel_count > 0 || fallback_group_count > 0 || plan_count > 0 {
             sqlx::query("ROLLBACK").execute(&mut *conn).await?;
             return Ok(GroupDeleteOutcome::InUse {

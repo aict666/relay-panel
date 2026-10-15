@@ -15,6 +15,79 @@ use crate::db::schema::SCHEMA_SQL;
 use relay_shared::protocol::TrafficEntry;
 use sqlx::sqlite::SqlitePoolOptions;
 
+#[tokio::test]
+async fn prepaid_downtime_and_suspension_contract() {
+    crate::db::billing_contract::prepaid_downtime_and_suspension_contract(&repo().await).await;
+}
+
+#[tokio::test]
+async fn prepaid_grants_and_financial_retention_contract() {
+    crate::db::billing_contract::prepaid_grants_and_financial_retention_contract(&repo().await)
+        .await;
+}
+
+#[tokio::test]
+async fn ledger_write_failure_contract() {
+    let db = repo().await;
+    sqlx::query("CREATE TRIGGER synthetic_ledger_failure BEFORE INSERT ON balance_ledger WHEN NEW.kind='purchase' BEGIN SELECT RAISE(ABORT,'synthetic ledger failure'); END")
+        .execute(&db.pool).await.unwrap();
+    crate::db::billing_contract::ledger_write_failure_contract(&db).await;
+}
+
+#[tokio::test]
+async fn monthly_prepayment_and_ledger_contract() {
+    let (db, path) = concurrent_repo("prepayment-ledger").await;
+    crate::db::billing_contract::monthly_prepayment_and_ledger_contract(&db).await;
+    cleanup_concurrent_repo(db, &path).await;
+}
+
+#[tokio::test]
+async fn registration_entitlement_contract() {
+    crate::db::billing_contract::registration_entitlement_contract(&repo().await).await;
+}
+
+#[tokio::test]
+async fn traffic_batch_identity_contract() {
+    let (db, path) = concurrent_repo("traffic-identity").await;
+    crate::db::billing_contract::traffic_batch_identity_contract(&db).await;
+    cleanup_concurrent_repo(db, &path).await;
+}
+
+#[tokio::test]
+async fn purchase_identity_contract() {
+    let (db, path) = concurrent_repo("purchase-identity").await;
+    crate::db::billing_contract::purchase_identity_contract(&db).await;
+    cleanup_concurrent_repo(db, &path).await;
+}
+
+#[tokio::test]
+async fn balance_compare_and_swap_contract() {
+    crate::db::billing_contract::balance_compare_and_swap_contract(&repo().await).await;
+}
+
+#[tokio::test]
+async fn downgrade_rule_limit_contract() {
+    crate::db::billing_contract::downgrade_rule_limit_contract(&repo().await).await;
+}
+
+#[tokio::test]
+async fn redeem_concurrency_and_expiry_contract() {
+    let (db, path) = concurrent_repo("redeem-concurrency").await;
+    crate::db::billing_contract::redeem_concurrency_and_expiry_contract(&db).await;
+    cleanup_concurrent_repo(db, &path).await;
+}
+
+#[tokio::test]
+async fn auto_renew_identity_and_account_state_contract() {
+    crate::db::billing_contract::auto_renew_identity_and_account_state_contract(&repo().await)
+        .await;
+}
+
+#[tokio::test]
+async fn purchase_quota_sentinel_and_reset_contract() {
+    crate::db::billing_contract::purchase_quota_sentinel_and_reset_contract(&repo().await).await;
+}
+
 /// Build a fresh in-memory DB wrapped in a SqliteRepository. The schema is
 /// created via SCHEMA_SQL so every table + seed row (admin user, plans,
 /// builtin tunnel profiles) is present.
@@ -5294,14 +5367,14 @@ async fn monthly_plan_lifecycle_invariants_and_type_change_disables_auto_renew()
         .await
         .unwrap();
     assert_eq!(
-        db.set_plan_auto_renew_guarded(alice, true, Some("9.00"), Some(initial_revision))
+        db.set_plan_auto_renew_guarded(alice, true, Some("9.00"), Some(initial_revision), None)
             .await
             .unwrap(),
         PlanAutoRenewUpdateOutcome::ContractChanged,
         "a stale displayed price must not authorize recurring billing"
     );
     assert_eq!(
-        db.set_plan_auto_renew_guarded(alice, true, Some("10.00"), Some(initial_revision))
+        db.set_plan_auto_renew_guarded(alice, true, Some("10.00"), Some(initial_revision), None)
             .await
             .unwrap(),
         PlanAutoRenewUpdateOutcome::Updated
@@ -5384,7 +5457,7 @@ async fn monthly_plan_lifecycle_invariants_and_type_change_disables_auto_renew()
 }
 
 #[tokio::test]
-async fn monthly_purchase_starts_fixed_cycle_and_resets_current_usage() {
+async fn monthly_prepayment_preserves_usage_until_cycle_boundary() {
     let db = repo().await;
     db.insert_user("alice", "h", 1).await.unwrap();
     let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
@@ -5464,7 +5537,7 @@ async fn monthly_purchase_starts_fixed_cycle_and_resets_current_usage() {
     .unwrap();
     assert_eq!(
         (balance.as_str(), limit, used, max_rules, auto),
-        ("90", 5_000, 0, 20, true)
+        ("90", 9_000, 800, 5, true)
     );
     assert!(
         expire.unwrap().starts_with("2100-"),
@@ -5475,16 +5548,28 @@ async fn monthly_purchase_starts_fixed_cycle_and_resets_current_usage() {
             .fetch_one(&db.pool)
             .await
             .unwrap(),
-        0
+        700
     );
     assert_eq!(db.list_orders_by_user(alice).await.unwrap().len(), 1);
-    sqlx::query("UPDATE users SET plan_expire_at='2026-08-01 00:00:00' WHERE id=?")
-        .bind(alice)
-        .execute(&db.pool)
+    assert!(db
+        .activate_subscription_cycle(alice, "2099-12-31 00:00:00")
         .await
-        .unwrap();
+        .unwrap());
+    assert!(!db
+        .activate_subscription_cycle(alice, "2099-12-31 00:00:00")
+        .await
+        .unwrap());
+    let activated = db.find_by_username("alice").await.unwrap().unwrap();
+    assert_eq!(
+        (
+            activated.traffic_limit,
+            activated.traffic_used,
+            activated.max_rules
+        ),
+        (5000, 0, 20)
+    );
     assert!(matches!(
-        db.renew_expired_monthly_plan(alice, "2026-08-19 12:00:00")
+        db.renew_expired_monthly_plan(alice, "2100-02-19 12:00:00")
             .await
             .unwrap(),
         MonthlyRenewalOutcome::Renewed { plan_id, .. } if plan_id == pid

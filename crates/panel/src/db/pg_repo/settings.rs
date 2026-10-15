@@ -452,6 +452,50 @@ impl PlanRepository for PgRepository {
         Ok(row.0)
     }
 
+    async fn list_due_subscription_user_ids(
+        &self,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<i64>, DbError> {
+        Ok(sqlx::query_scalar("SELECT DISTINCT u.id FROM users u JOIN subscription_cycles c ON c.user_id=u.id AND c.subscription_id=u.subscription_id WHERE c.cancelled=FALSE AND c.starts_at<=$1 AND (c.ends_at IS NULL OR c.ends_at>$1) AND c.id<>COALESCE(u.current_cycle_id,'') ORDER BY u.id LIMIT $2")
+            .bind(now).bind(limit.clamp(1,500)).fetch_all(&self.pool).await?)
+    }
+
+    async fn activate_subscription_cycle(&self, user_id: i64, now: &str) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        // Snapshot grants must be locked before the user (global lock order).
+        let snapshots: Vec<String> = sqlx::query_scalar("SELECT c.entitlement_snapshot FROM subscription_cycles c JOIN users u ON u.id=c.user_id AND u.subscription_id=c.subscription_id WHERE u.id=$1 AND c.cancelled=FALSE AND c.starts_at<=$2 AND (c.ends_at IS NULL OR c.ends_at>$2) AND c.id<>COALESCE(u.current_cycle_id,'')")
+            .bind(user_id).bind(now).fetch_all(&mut *tx).await?;
+        let mut groups = Vec::new();
+        for raw in &snapshots {
+            groups.extend(
+                crate::service::billing::EntitlementSnapshot::decode(raw)?.device_group_ids,
+            );
+        }
+        groups.sort_unstable();
+        groups.dedup();
+        for group in groups {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(group)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        // Re-read under the lock. A purchase may have added a different due
+        // snapshot while we waited: retry instead of activating unlocked grants.
+        let locked: Vec<String> = sqlx::query_scalar("SELECT c.entitlement_snapshot FROM subscription_cycles c JOIN users u ON u.id=c.user_id AND u.subscription_id=c.subscription_id WHERE u.id=$1 AND c.cancelled=FALSE AND c.starts_at<=$2 AND (c.ends_at IS NULL OR c.ends_at>$2) AND c.id<>COALESCE(u.current_cycle_id,'')")
+            .bind(user_id).bind(now).fetch_all(&mut *tx).await?;
+        if locked != snapshots {
+            return Ok(false);
+        }
+        let changed = super::billing::activate_paid_cycle(&mut tx, user_id, now).await?;
+        tx.commit().await?;
+        Ok(changed)
+    }
+
     async fn list_expired_monthly_auto_renew_user_ids(
         &self,
         now: &str,
@@ -459,7 +503,7 @@ impl PlanRepository for PgRepository {
     ) -> Result<Vec<i64>, DbError> {
         Ok(sqlx::query_scalar(
             "SELECT u.id FROM users u JOIN plans p ON p.id=u.plan_id \
-             WHERE u.admin=FALSE AND u.plan_auto_renew=TRUE AND p.plan_type='monthly' \
+             WHERE u.admin=FALSE AND u.banned=FALSE AND u.suspended=FALSE AND u.plan_auto_renew=TRUE AND p.plan_type='monthly' \
                AND u.plan_expire_at IS NOT NULL AND u.plan_expire_at<=$1 \
                AND (u.plan_auto_renew_retry_at IS NULL OR u.plan_auto_renew_retry_at<=$1) \
              ORDER BY COALESCE(u.plan_auto_renew_retry_at, u.plan_expire_at), u.id LIMIT $2",
@@ -540,7 +584,7 @@ impl PlanRepository for PgRepository {
             "SELECT balance, plan_id, admin, plan_auto_renew, plan_expire_at, \
                     plan_auto_renew_price, plan_auto_renew_revision, \
                     plan_auto_renew_retry_at \
-             FROM users WHERE id=$1 FOR UPDATE",
+              FROM users WHERE id=$1 AND banned=FALSE AND suspended=FALSE FOR UPDATE",
         )
         .bind(user_id)
         .fetch_optional(&mut *tx)
@@ -635,6 +679,26 @@ impl PlanRepository for PgRepository {
         .fetch_one(&mut *tx)
         .await?;
         let new_balance = relay_shared::money::cents_to_balance(balance_cents - price_cents);
+        let snapshot = crate::service::billing::EntitlementSnapshot {
+            plan_id: initial_plan_id,
+            plan_name: plan_name.clone(),
+            plan_type: "monthly".into(),
+            traffic_limit: traffic,
+            max_rules,
+            grant_all_groups,
+            device_group_ids: group_ids.clone(),
+            billing_revision,
+        };
+        let cycle = super::billing::replace_cycle(
+            &mut tx,
+            user_id,
+            now,
+            Some(&next_expire),
+            &snapshot,
+            "paid",
+            None,
+        )
+        .await?;
         sqlx::query(
             "UPDATE users SET balance=$1, traffic_limit=$2, traffic_used=0, max_rules=$3, \
              plan_expire_at=$4, plan_auto_renew_retry_at=NULL, all_device_groups=$5 \
@@ -720,14 +784,19 @@ impl PlanRepository for PgRepository {
             }
             resume.execute(&mut *tx).await?;
         }
-        sqlx::query(
-            "INSERT INTO orders (user_id, plan_id, plan_name, price) VALUES ($1, $2, $3, $4)",
+        super::enforce_rule_limit(&mut tx, user_id).await?;
+        super::billing::record_purchase(
+            &mut tx,
+            user_id,
+            &balance,
+            &new_balance,
+            &relay_shared::money::cents_to_balance(price_cents),
+            "auto_renew",
+            &cycle,
+            &snapshot,
+            None,
+            "Previously authorized automatic monthly renewal",
         )
-        .bind(user_id)
-        .bind(initial_plan_id)
-        .bind(&plan_name)
-        .bind(relay_shared::money::cents_to_balance(price_cents))
-        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(MonthlyRenewalOutcome::Renewed {
@@ -740,6 +809,20 @@ impl PlanRepository for PgRepository {
     // SELECT ... FOR UPDATE row lock is what prevents 防双花: a concurrent tx
     // trying to lock the same user row blocks until this commits, then reads
     // the post-deduction balance. The lock + the UPDATE run on the same tx.
+    async fn find_purchase_fingerprint(
+        &self,
+        user_id: i64,
+        request_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT fingerprint FROM purchase_requests WHERE user_id=$1 AND request_id=$2",
+        )
+        .bind(user_id)
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     async fn buy_plan_impl(
         &self,
         user_id: i64,
@@ -760,8 +843,29 @@ impl PlanRepository for PgRepository {
         require_visible: bool,
         check_plan_snapshot: bool,
         expected_current_plan_id: Option<Option<i64>>,
+        identity: Option<PurchaseIdentity<'_>>,
     ) -> Result<(), BuyPlanError> {
         let mut tx = self.pool.begin().await?;
+        if let Some(identity) = identity {
+            let inserted = sqlx::query("INSERT INTO purchase_requests (user_id, request_id, fingerprint, created_at) VALUES ($1, $2, $3, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')) ON CONFLICT (user_id, request_id) DO NOTHING")
+                .bind(user_id).bind(identity.request_id).bind(identity.fingerprint)
+                .execute(&mut *tx).await?.rows_affected();
+            if inserted == 0 {
+                let saved: String = sqlx::query_scalar(
+                    "SELECT fingerprint FROM purchase_requests WHERE user_id=$1 AND request_id=$2",
+                )
+                .bind(user_id)
+                .bind(identity.request_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                tx.rollback().await?;
+                return if saved == identity.fingerprint {
+                    Ok(())
+                } else {
+                    Err(BuyPlanError::IdempotencyConflict)
+                };
+            }
+        }
         let mut accepted_billing_price: Option<String> = None;
         let mut accepted_billing_revision: Option<i64> = None;
 
@@ -924,7 +1028,79 @@ impl PlanRepository for PgRepository {
         //             from max(now, current) + days.
         let is_switch = current_plan_id != Some(plan_id);
         let is_monthly = plan_type == "monthly";
-        let new_traffic_limit = if is_switch || is_monthly {
+        if is_monthly && auto_renew {
+            let unavailable: bool =
+                sqlx::query_scalar("SELECT banned OR suspended FROM users WHERE id=$1")
+                    .bind(user_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if unavailable {
+                tx.rollback().await?;
+                return Err(BuyPlanError::AutoRenewUnavailable);
+            }
+        }
+        let now = crate::service::billing::now();
+        let current_cycle = super::billing::ensure_cycle(&mut tx, user_id).await?;
+        let snapshot = crate::service::billing::EntitlementSnapshot {
+            plan_id,
+            plan_name: plan_name.into(),
+            plan_type: plan_type.into(),
+            traffic_limit: traffic_to_add,
+            max_rules: plan_max_rules,
+            grant_all_groups,
+            device_group_ids: device_group_ids.to_vec(),
+            billing_revision: accepted_billing_revision.unwrap_or(1),
+        };
+        if is_monthly
+            && !is_switch
+            && current_expire
+                .as_deref()
+                .is_some_and(|end| end > now.as_str())
+        {
+            let start = current_expire.as_deref().expect("checked expiry");
+            let end = crate::service::billing::add_days(start, duration_days)?;
+            let cycle = super::billing::insert_cycle(
+                &mut tx,
+                user_id,
+                current_cycle.as_ref().map(|c| c.subscription_id.as_str()),
+                start,
+                Some(&end),
+                0,
+                &snapshot,
+                "paid",
+            )
+            .await?;
+            sqlx::query("UPDATE users SET balance=$1,plan_expire_at=$2,plan_auto_renew=$3,plan_auto_renew_price=$4,plan_auto_renew_revision=$5,plan_auto_renew_retry_at=NULL WHERE id=$6")
+                .bind(&new_balance).bind(&end).bind(auto_renew)
+                .bind(auto_renew.then_some(accepted_billing_price).flatten())
+                .bind(auto_renew.then_some(accepted_billing_revision).flatten()).bind(user_id).execute(&mut *tx).await?;
+            super::billing::record_purchase(
+                &mut tx,
+                user_id,
+                &balance_str,
+                &new_balance,
+                &relay_shared::money::cents_to_balance(price_cents),
+                "prepayment",
+                &cycle,
+                &snapshot,
+                identity,
+                "Prepaid monthly period; current usage unchanged",
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        let prepaid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_cycles WHERE user_id=$1 AND cancelled=FALSE AND id<>COALESCE((SELECT current_cycle_id FROM users WHERE id=$1),'') AND (ends_at IS NULL OR ends_at>$2)")
+            .bind(user_id).bind(&now).fetch_one(&mut *tx).await?;
+        if prepaid > 0 {
+            return Err(BuyPlanError::PrepaidCyclesPresent);
+        }
+        let new_traffic_limit = if is_switch
+            || is_monthly
+            || reset_traffic
+            || traffic_to_add == 0
+            || current_traffic_limit == 0
+        {
             if traffic_to_add < 0 {
                 let _ = tx.rollback().await;
                 return Err(BuyPlanError::QuotaOverflow);
@@ -942,32 +1118,32 @@ impl PlanRepository for PgRepository {
 
         // Compute the new expiry. duration_days=0 → NULL. Canonical TEXT
         // 'YYYY-MM-DD HH:MM:SS' UTC (lexically comparable, same as created_at).
-        let new_expire: Option<String> = if duration_days <= 0 {
+        let new_expire = if duration_days <= 0 {
             None
-        } else if is_switch {
-            // Switch: fresh expiry = now + duration_days.
-            let row: (String,) = sqlx::query_as(
-                "SELECT to_char(now() AT TIME ZONE 'UTC' + make_interval(days => $1), \
-                   'YYYY-MM-DD HH24:MI:SS')",
-            )
-            .bind(duration_days)
-            .fetch_one(&mut *tx)
-            .await?;
-            Some(row.0)
         } else {
-            // Renew: base = max(now, current_expire) so remaining time stacks.
-            let row: (String,) = sqlx::query_as(
-                "SELECT to_char( \
-                   GREATEST(now() AT TIME ZONE 'UTC', \
-                            COALESCE($1::timestamptz, now() AT TIME ZONE 'UTC')) \
-                   + make_interval(days => $2), \
-                   'YYYY-MM-DD HH24:MI:SS')",
+            let base = if is_switch {
+                now.as_str()
+            } else {
+                current_expire.as_deref().unwrap_or(&now).max(&now)
+            };
+            Some(crate::service::billing::add_days(base, duration_days)?)
+        };
+        let mut effective_snapshot = snapshot.clone();
+        effective_snapshot.traffic_limit = new_traffic_limit;
+        let cycle = if is_switch || is_monthly || reset_traffic {
+            super::billing::replace_cycle(
+                &mut tx,
+                user_id,
+                &now,
+                new_expire.as_deref(),
+                &effective_snapshot,
+                "paid",
+                None,
             )
-            .bind(&current_expire)
-            .bind(duration_days)
-            .fetch_one(&mut *tx)
-            .await?;
-            Some(row.0)
+            .await?
+        } else {
+            super::billing::sync_cycle(&mut tx, user_id, new_expire.as_deref(), &effective_snapshot)
+                .await?
         };
 
         if is_switch || is_monthly {
@@ -999,7 +1175,7 @@ impl PlanRepository for PgRepository {
             .execute(&mut *tx)
             .await?;
         } else if reset_traffic {
-            // Renew + the plan's reset_traffic flag: stack quota, zero usage.
+            // Explicit reset replaces quota and zeros usage (no historical refund).
             sqlx::query(
                 "UPDATE users SET \
                  balance = $1, traffic_limit = $2, traffic_used = 0, \
@@ -1044,14 +1220,18 @@ impl PlanRepository for PgRepository {
         }
 
         let price_str = relay_shared::money::cents_to_balance(price_cents);
-        sqlx::query(
-            "INSERT INTO orders (user_id, plan_id, plan_name, price) VALUES ($1, $2, $3, $4)",
+        super::billing::record_purchase(
+            &mut tx,
+            user_id,
+            &balance_str,
+            &new_balance,
+            &price_str,
+            "purchase",
+            &cycle,
+            &effective_snapshot,
+            identity,
+            "Confirmed plan purchase",
         )
-        .bind(user_id)
-        .bind(plan_id)
-        .bind(plan_name)
-        .bind(&price_str)
-        .execute(&mut *tx)
         .await?;
 
         // v1.0.8: grant device-group authorization in the SAME tx (mirrors the
@@ -1189,6 +1369,7 @@ impl PlanRepository for PgRepository {
             }
         }
 
+        super::enforce_rule_limit(&mut tx, user_id).await?;
         tx.commit().await?;
         Ok(())
     }

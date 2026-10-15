@@ -43,11 +43,50 @@ const me: UserSelf = {
 };
 
 beforeEach(() => {
+  sessionStorage.clear();
   mockGet.mockReset();
   mockPost.mockReset();
 });
 
 describe('Shop purchase refresh', () => {
+  it('distinguishes prepaid orders and displays the purchased UTC period', async () => {
+    mockGet.mockImplementation((url: string) => Promise.resolve(ok(url === '/plans' ? [] : url === '/user/me' ? me : [{
+      id: 7, plan_name: 'Paid snapshot', price: '6', kind: 'prepayment',
+      cycle_start: '2026-11-01 00:00:00', cycle_end: '2026-12-01 00:00:00', created_at: '2026-10-15 00:00:00',
+    }])));
+    render(<Shop />);
+    expect(await screen.findByText('billingPrepayment')).toBeInTheDocument();
+    expect(screen.getByText('2026-11-01 00:00:00 UTC')).toBeInTheDocument();
+    expect(screen.getByText('→ 2026-12-01 00:00:00 UTC')).toBeInTheDocument();
+    expect(screen.queryByText('prepayment')).not.toBeInTheDocument();
+  });
+
+  it('replays the same transaction after a lost response and remount, even with a hidden product and lower balance', async () => {
+    let retrying = false;
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/plans') return Promise.resolve(ok(retrying ? [] : [plan]));
+      if (url === '/user/orders') return Promise.resolve(ok([]));
+      if (url === '/user/me') return Promise.resolve(ok(retrying ? { ...me, balance: '4.00', plan_id: 1 } : me));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    mockPost.mockRejectedValueOnce(new Error('ACK lost')).mockResolvedValueOnce(ok(null));
+    const first = render(<Shop />);
+    fireEvent.click(await screen.findByRole('button', { name: 'buyNow' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'confirmPurchase' }));
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'confirmPurchase' })).toBeEnabled());
+    const originalBody = mockPost.mock.calls[0][1];
+    first.unmount();
+    retrying = true;
+    render(<Shop />);
+    const confirm = await screen.findByRole('button', { name: 'confirmPurchase' });
+    expect(confirm).toBeEnabled();
+    fireEvent.click(confirm);
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(2));
+    expect(mockPost.mock.calls[1][1]).toEqual(originalBody);
+    await waitFor(() => expect(sessionStorage.length).toBe(0));
+  });
+
   it('keeps purchase buttons disabled until the refreshed balance arrives', async () => {
     let refreshing = false;
     const pendingRefresh = new Promise<never>(() => {});
@@ -73,7 +112,9 @@ describe('Shop purchase refresh', () => {
 
     await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
     expect(mockPost).toHaveBeenCalledWith('/user/buy-plan', {
+      request_id: expect.any(String),
       plan_id: 1,
+      expected_current_plan_id: 0,
       expected_price: '6.00',
       expected_revision: 'revision-1',
     });

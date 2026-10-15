@@ -1580,6 +1580,9 @@ pub async fn update_rule(
         Ok(0) => Err(UpdateRuleError::NotFound),
         Ok(_) => Ok(()),
         Err(DbError::UniqueViolation | DbError::PortConflict) => Err(UpdateRuleError::PortConflict),
+        Err(DbError::QuotaExceeded) => Err(UpdateRuleError::BadRequest(
+            "运行规则已达到当前套餐上限，请先暂停其他规则".into(),
+        )),
         Err(DbError::TunnelUnavailable) => Err(UpdateRuleError::BadRequest(
             "tunnel_id: tunnel was disabled or its path changed; refresh and retry".into(),
         )),

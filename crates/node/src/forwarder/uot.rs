@@ -50,6 +50,7 @@ struct EntrySession {
 }
 
 struct ExitSession {
+    _global_slot: OwnedSemaphorePermit,
     socket: Arc<UdpSocket>,
     last_ms: Arc<AtomicU64>,
     _session_slot: OwnedSemaphorePermit,
@@ -481,12 +482,16 @@ pub(crate) async fn serve_authenticated_egress(
                 continue;
             };
             let (idx, target) = resolve_udp_target(&targets, &selector).await?;
-            let socket = Arc::new(super::outbound::udp_outbound_socket(source_ipv4).await?);
+            let Ok(global_slot) = super::udp::global_udp_slots().try_acquire_owned() else {
+                continue;
+            };
+            let socket = Arc::new(super::outbound::udp_outbound_socket(source_ipv4, target).await?);
             socket.connect(target).await?;
             let last_ms = Arc::new(AtomicU64::new(now_millis()));
             sessions.insert(
                 frame.session_id,
                 ExitSession {
+                    _global_slot: global_slot,
                     socket: socket.clone(),
                     last_ms: last_ms.clone(),
                     _session_slot: session_slot,

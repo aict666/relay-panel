@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time;
 
 use super::limiter::RateLimit;
@@ -35,12 +35,17 @@ const UDP_BUF_SIZE: usize = 65535;
 /// file-descriptor limit.  Every native session owns one outbound socket and a
 /// reply task, so source-port churn must not be able to consume the whole node.
 const MAX_UDP_SESSIONS_PER_LISTENER: usize = 4096;
+pub(super) fn global_udp_slots() -> Arc<Semaphore> {
+    static SLOTS: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(1024))).clone()
+}
 /// How often the periodic sweeper runs. Sessions themselves expire on the
 /// shared UDP_SESSION_TIMEOUT; this just controls how quickly an idle node
 // converges back to 0 in the absence of new datagrams.
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 
 struct UdpSession {
+    _global_slot: OwnedSemaphorePermit,
     outbound: Arc<UdpSocket>,
     last_active: tokio::time::Instant,
     shutdown: Arc<ShutdownState>,
@@ -236,13 +241,6 @@ pub async fn serve_udp_listener(
             }
             // New session: bind an ephemeral outbound socket + pick/connect the
             // target, all WITHOUT holding any map guard.
-            let outbound = match super::outbound::udp_outbound_socket(source_ipv4).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("UDP port {}: failed to bind outbound: {}", port, e);
-                    continue;
-                }
-            };
             // Pick a target per the rule's load-balance strategy AND resolve it
             // now, through the 30s DNS cache, so a DDNS target follows IP
             // changes (see select_udp_target). UDP affinity: this happens once
@@ -252,6 +250,16 @@ pub async fn serve_udp_listener(
                 Some(t) => t,
                 None => {
                     tracing::warn!("UDP port {}: no resolvable target for session", port);
+                    continue;
+                }
+            };
+            let Ok(global_slot) = global_udp_slots().try_acquire_owned() else {
+                continue;
+            };
+            let outbound = match super::outbound::udp_outbound_socket(source_ipv4, target).await {
+                Ok(socket) => socket,
+                Err(error) => {
+                    tracing::debug!("UDP port {port}: outbound bind failed: {error}");
                     continue;
                 }
             };
@@ -279,6 +287,7 @@ pub async fn serve_udp_listener(
                 }
                 Entry::Vacant(e) => {
                     e.insert(UdpSession {
+                        _global_slot: global_slot,
                         outbound: outbound.clone(),
                         last_active: now,
                         shutdown: session_shutdown.clone(),
@@ -335,7 +344,11 @@ pub async fn serve_udp_listener(
                                 // v0.4.6: throttle target→client (download) bytes
                                 // through the shared per-rule limiter BEFORE
                                 // forwarding back to the client.
-                                rl_c.acquire_download(m as u64).await;
+                                tokio::select! {
+                                    _=reply_shutdown.cancelled()=>break,
+                                    _=session_shutdown_c.cancelled()=>break,
+                                    _=rl_c.acquire_download(m as u64)=>{},
+                                }
                                 if count_traffic {
                                     counter_c.add(rule_id, 0, m as u64).await;
                                 }
@@ -473,6 +486,7 @@ mod tests {
         sessions.insert(
             addr,
             UdpSession {
+                _global_slot: global_udp_slots().try_acquire_owned().unwrap(),
                 outbound: socket,
                 last_active: tokio::time::Instant::now() - Duration::from_secs(2),
                 shutdown,
@@ -497,6 +511,7 @@ mod tests {
         sessions.insert(
             addr,
             UdpSession {
+                _global_slot: global_udp_slots().try_acquire_owned().unwrap(),
                 outbound: replacement.clone(),
                 last_active: tokio::time::Instant::now(),
                 shutdown: ShutdownState::new(),

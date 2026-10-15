@@ -203,13 +203,12 @@ where
     let (mut ri, mut wi) = io::split(inbound);
     let (mut ro, mut wo) = outbound.into_split();
 
-    let counter_up = counter.clone();
-    let counter_down = counter.clone();
+    let counter_up = counter.handle(rule_id).await;
+    let counter_down = counter_up.clone();
     let rl_up = rate_limit.clone();
     let rl_down = rate_limit;
 
     let upload = Box::pin(async move {
-        let mut total = 0u64;
         let mut buf = [0u8; 16 * 1024];
         loop {
             let n = match ri.read(&mut buf).await {
@@ -218,16 +217,16 @@ where
                 Err(_) => break,
             };
             rl_up.acquire_upload(n as u64).await;
-            if wo.write_all(&buf[..n]).await.is_err() {
+            if super::meter::write_counted(&mut wo, &buf[..n], Some(&counter_up), true)
+                .await
+                .is_err()
+            {
                 break;
             }
-            total += n as u64;
         }
-        counter_up.add(rule_id, total, 0).await;
         let _ = wo.shutdown().await;
     });
     let download = Box::pin(async move {
-        let mut total = 0u64;
         let mut buf = [0u8; 16 * 1024];
         loop {
             let n = match ro.read(&mut buf).await {
@@ -236,12 +235,13 @@ where
                 Err(_) => break,
             };
             rl_down.acquire_download(n as u64).await;
-            if wi.write_all(&buf[..n]).await.is_err() {
+            if super::meter::write_counted(&mut wi, &buf[..n], Some(&counter_down), false)
+                .await
+                .is_err()
+            {
                 break;
             }
-            total += n as u64;
         }
-        counter_down.add(rule_id, 0, total).await;
         let _ = wi.shutdown().await;
     });
 

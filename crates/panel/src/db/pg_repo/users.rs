@@ -161,6 +161,7 @@ impl UserRepository for PgRepository {
             return Ok(UserProvisionOutcome::PlanNotAllowed);
         }
 
+        super::billing::lock_registration_plan(&mut tx, plan_id).await?;
         let inserted = sqlx::query(
             "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit, plan_expire_at) \
              SELECT $1, $2, $3, max_rules, traffic, speed_limit, ip_limit, \
@@ -178,6 +179,7 @@ impl UserRepository for PgRepository {
             tx.rollback().await?;
             return Ok(UserProvisionOutcome::PlanMissing(plan_id));
         }
+        super::billing::provision_registration(&mut tx, username, plan_id).await?;
         tx.commit().await?;
         Ok(UserProvisionOutcome::Created)
     }
@@ -197,6 +199,7 @@ impl UserRepository for PgRepository {
                 .fetch_optional(&mut *tx)
                 .await?
                 .unwrap_or(1);
+        super::billing::lock_registration_plan(&mut tx, plan_id).await?;
         let inserted = sqlx::query(
             "INSERT INTO users (username, password, plan_id, max_rules, traffic_limit, speed_limit, ip_limit, plan_expire_at) \
              SELECT $1, $2, $3, max_rules, traffic, speed_limit, ip_limit, \
@@ -214,6 +217,7 @@ impl UserRepository for PgRepository {
             tx.rollback().await?;
             return Ok(UserProvisionOutcome::PlanMissing(plan_id));
         }
+        super::billing::provision_registration(&mut tx, username, plan_id).await?;
         tx.commit().await?;
         Ok(UserProvisionOutcome::Created)
     }
@@ -340,7 +344,35 @@ impl UserRepository for PgRepository {
         }
         q = q.bind(id);
 
-        let result = q.execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        if let Some(after) = balance {
+            let before: Option<String> =
+                sqlx::query_scalar("SELECT balance FROM users WHERE id=$1 FOR UPDATE")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(before) = before {
+                super::billing::append_balance(
+                    &mut tx,
+                    crate::service::billing::BalanceChange {
+                        user_id: id,
+                        kind: "adjustment",
+                        before: &before,
+                        after,
+                        reference_id: &uuid::Uuid::new_v4().to_string(),
+                        actor_id: None,
+                        reason: "Explicit repository balance adjustment",
+                    },
+                )
+                .await?;
+            }
+        }
+        let result = q.execute(&mut *tx).await?;
+        if banned == Some(true) || suspended == Some(true) {
+            sqlx::query("UPDATE users SET plan_auto_renew=FALSE,plan_auto_renew_price=NULL,plan_auto_renew_revision=NULL,plan_auto_renew_retry_at=NULL WHERE id=$1")
+                .bind(id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -376,6 +408,11 @@ impl UserRepository for PgRepository {
             tx.rollback().await?;
             return Ok(AdminUserPlanEditOutcome::PlanChanged);
         }
+        let prepaid:i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_cycles WHERE user_id=$1 AND cancelled=FALSE AND id<>COALESCE((SELECT current_cycle_id FROM users WHERE id=$1),'') AND (ends_at IS NULL OR ends_at>to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS'))")
+            .bind(user_id).fetch_one(&mut *tx).await?;
+        if prepaid > 0 {
+            return Ok(AdminUserPlanEditOutcome::PrepaidCyclesPresent);
+        }
 
         if !clear {
             if !matches!(plan_type.as_deref(), Some("time" | "monthly")) {
@@ -386,6 +423,8 @@ impl UserRepository for PgRepository {
                 tx.rollback().await?;
                 return Ok(AdminUserPlanEditOutcome::ExpiryNotApplicable);
             }
+            sqlx::query("UPDATE subscription_cycles SET ends_at=$1 WHERE id=(SELECT current_cycle_id FROM users WHERE id=$2)")
+                .bind(plan_expire_at).bind(user_id).execute(&mut *tx).await?;
             sqlx::query("UPDATE users SET plan_expire_at = $1 WHERE id = $2")
                 .bind(plan_expire_at)
                 .bind(user_id)
@@ -395,11 +434,15 @@ impl UserRepository for PgRepository {
             return Ok(AdminUserPlanEditOutcome::Updated);
         }
 
+        sqlx::query("UPDATE subscription_cycles SET cancelled=TRUE WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE users SET plan_id = NULL, plan_expire_at = NULL, \
              plan_auto_renew = FALSE, plan_auto_renew_price = NULL, \
              plan_auto_renew_revision = NULL, plan_auto_renew_retry_at = NULL, \
-             all_device_groups = FALSE \
+              all_device_groups = FALSE,current_cycle_id=NULL,subscription_id=NULL,plan_source='none' \
              WHERE id = $1",
         )
         .bind(user_id)
@@ -426,6 +469,7 @@ impl UserRepository for PgRepository {
         enabled: bool,
         expected_price: Option<&str>,
         expected_revision: Option<i64>,
+        expected_plan_id: Option<i64>,
     ) -> Result<PlanAutoRenewUpdateOutcome, DbError> {
         let mut tx = self.pool.begin().await?;
         let initial: Option<(bool, Option<i64>)> =
@@ -457,12 +501,13 @@ impl UserRepository for PgRepository {
         } else {
             None
         };
-        let current: Option<(bool, Option<i64>)> =
-            sqlx::query_as("SELECT admin, plan_id FROM users WHERE id=$1 FOR UPDATE")
-                .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((admin, current_plan_id)) = current else {
+        let current: Option<(bool, Option<i64>, bool, bool)> = sqlx::query_as(
+            "SELECT admin, plan_id, banned, suspended FROM users WHERE id=$1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((admin, current_plan_id, banned, suspended)) = current else {
             tx.rollback().await?;
             return Ok(PlanAutoRenewUpdateOutcome::UserNotFound);
         };
@@ -483,8 +528,11 @@ impl UserRepository for PgRepository {
             _ => (None, None),
         };
         if enabled
-            && (expected_price.is_some() || expected_revision.is_some())
-            && (price.as_deref() != expected_price || revision != expected_revision)
+            && (banned
+                || suspended
+                || (expected_plan_id.is_some() && current_plan_id != expected_plan_id)
+                || ((expected_price.is_some() || expected_revision.is_some())
+                    && (price.as_deref() != expected_price || revision != expected_revision)))
         {
             tx.rollback().await?;
             return Ok(PlanAutoRenewUpdateOutcome::ContractChanged);
@@ -504,11 +552,14 @@ impl UserRepository for PgRepository {
     }
 
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE users SET traffic_used = traffic_used + $1 WHERE id = $2")
             .bind(delta)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        super::billing::sync_usage(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -526,6 +577,7 @@ impl UserRepository for PgRepository {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        super::billing::sync_usage(&mut tx, id).await?;
         tx.commit().await?;
         Ok(user.rows_affected())
     }

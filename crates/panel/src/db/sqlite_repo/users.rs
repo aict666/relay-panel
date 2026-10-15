@@ -191,6 +191,7 @@ impl UserRepository for SqliteRepository {
         if inserted.rows_affected() == 0 {
             reject!(UserProvisionOutcome::PlanMissing(plan_id));
         }
+        try_sql!(super::billing::provision_registration(&mut conn, username, plan_id).await);
         try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
         Ok(UserProvisionOutcome::Created)
     }
@@ -244,6 +245,7 @@ impl UserRepository for SqliteRepository {
         if inserted.rows_affected() == 0 {
             reject!(UserProvisionOutcome::PlanMissing(plan_id));
         }
+        try_sql!(super::billing::provision_registration(&mut conn, username, plan_id).await);
         try_sql!(sqlx::query("COMMIT").execute(&mut *conn).await);
         Ok(UserProvisionOutcome::Created)
     }
@@ -354,7 +356,34 @@ impl UserRepository for SqliteRepository {
         }
         q = q.bind(id);
 
-        let result = q.execute(&self.pool).await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(after) = balance {
+            let before: Option<String> = sqlx::query_scalar("SELECT balance FROM users WHERE id=?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if let Some(before) = before {
+                super::billing::append_balance(
+                    &mut tx,
+                    crate::service::billing::BalanceChange {
+                        user_id: id,
+                        kind: "adjustment",
+                        before: &before,
+                        after,
+                        reference_id: &uuid::Uuid::new_v4().to_string(),
+                        actor_id: None,
+                        reason: "Explicit repository balance adjustment",
+                    },
+                )
+                .await?;
+            }
+        }
+        let result = q.execute(&mut *tx).await?;
+        if banned == Some(true) || suspended == Some(true) {
+            sqlx::query("UPDATE users SET plan_auto_renew=0,plan_auto_renew_price=NULL,plan_auto_renew_revision=NULL,plan_auto_renew_retry_at=NULL WHERE id=?")
+                .bind(id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -412,14 +441,25 @@ impl UserRepository for SqliteRepository {
         if !clear && plan_type.as_deref() == Some("monthly") && plan_expire_at.is_none() {
             reject!(AdminUserPlanEditOutcome::ExpiryNotApplicable);
         }
+        let prepaid:i64 = try_sql!(sqlx::query_scalar("SELECT COUNT(*) FROM subscription_cycles WHERE user_id=? AND cancelled=0 AND id<>COALESCE((SELECT current_cycle_id FROM users WHERE id=?),'') AND (ends_at IS NULL OR ends_at>datetime('now'))")
+            .bind(user_id).bind(user_id).fetch_one(&mut *conn).await);
+        if prepaid > 0 {
+            reject!(AdminUserPlanEditOutcome::PrepaidCyclesPresent);
+        }
 
         if clear {
+            try_sql!(
+                sqlx::query("UPDATE subscription_cycles SET cancelled=1 WHERE user_id=?")
+                    .bind(user_id)
+                    .execute(&mut *conn)
+                    .await
+            );
             try_sql!(
                 sqlx::query(
                     "UPDATE users SET plan_id = NULL, plan_expire_at = NULL, \
                      plan_auto_renew = 0, plan_auto_renew_price = NULL, \
                      plan_auto_renew_revision = NULL, plan_auto_renew_retry_at = NULL, \
-                     all_device_groups = 0 WHERE id = ?",
+                      all_device_groups = 0,current_cycle_id=NULL,subscription_id=NULL,plan_source='none' WHERE id = ?",
                 )
                 .bind(user_id)
                 .execute(&mut *conn)
@@ -441,6 +481,8 @@ impl UserRepository for SqliteRepository {
                 .await
             );
         } else {
+            try_sql!(sqlx::query("UPDATE subscription_cycles SET ends_at=? WHERE id=(SELECT current_cycle_id FROM users WHERE id=?)")
+                .bind(plan_expire_at).bind(user_id).execute(&mut *conn).await);
             try_sql!(
                 sqlx::query("UPDATE users SET plan_expire_at = ? WHERE id = ?")
                     .bind(plan_expire_at)
@@ -460,16 +502,18 @@ impl UserRepository for SqliteRepository {
         enabled: bool,
         expected_price: Option<&str>,
         expected_revision: Option<i64>,
+        expected_plan_id: Option<i64>,
     ) -> Result<PlanAutoRenewUpdateOutcome, DbError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let row: Option<(bool, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
-            "SELECT u.admin, p.plan_type, p.price, p.billing_revision FROM users u \
+        let row: Option<(bool, Option<String>, Option<String>, Option<i64>, Option<i64>, bool, bool)> = sqlx::query_as(
+            "SELECT u.admin, p.plan_type, p.price, p.billing_revision, u.plan_id, u.banned, u.suspended FROM users u \
              LEFT JOIN plans p ON p.id=u.plan_id WHERE u.id=?",
         )
         .bind(user_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((admin, plan_type, price, billing_revision)) = row else {
+        let Some((admin, plan_type, price, billing_revision, plan_id, banned, suspended)) = row
+        else {
             tx.rollback().await?;
             return Ok(PlanAutoRenewUpdateOutcome::UserNotFound);
         };
@@ -478,8 +522,12 @@ impl UserRepository for SqliteRepository {
             return Ok(PlanAutoRenewUpdateOutcome::NotMonthly);
         }
         if enabled
-            && (expected_price.is_some() || expected_revision.is_some())
-            && (price.as_deref() != expected_price || billing_revision != expected_revision)
+            && (banned
+                || suspended
+                || (expected_plan_id.is_some() && plan_id != expected_plan_id)
+                || ((expected_price.is_some() || expected_revision.is_some())
+                    && (price.as_deref() != expected_price
+                        || billing_revision != expected_revision)))
         {
             tx.rollback().await?;
             return Ok(PlanAutoRenewUpdateOutcome::ContractChanged);
@@ -499,11 +547,14 @@ impl UserRepository for SqliteRepository {
     }
 
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("UPDATE users SET traffic_used = traffic_used + ? WHERE id = ?")
             .bind(delta)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        super::billing::sync_usage(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -521,6 +572,7 @@ impl UserRepository for SqliteRepository {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        super::billing::sync_usage(&mut tx, id).await?;
         tx.commit().await?;
         Ok(user.rows_affected())
     }

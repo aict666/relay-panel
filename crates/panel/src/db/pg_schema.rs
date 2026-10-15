@@ -73,7 +73,11 @@ CREATE TABLE IF NOT EXISTS users (
     plan_auto_renew_price TEXT,
     plan_auto_renew_revision BIGINT,
     plan_auto_renew_retry_at TEXT,
-    suspended BOOLEAN NOT NULL DEFAULT FALSE
+    suspended BOOLEAN NOT NULL DEFAULT FALSE,
+    registration_plan_id BIGINT,
+    subscription_id TEXT,
+    current_cycle_id TEXT,
+    plan_source TEXT NOT NULL DEFAULT 'legacy'
 );
 
 CREATE TABLE IF NOT EXISTS device_groups (
@@ -255,6 +259,19 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
 
+CREATE TABLE IF NOT EXISTS balance_ledger (
+    sequence BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, user_id BIGINT NOT NULL, kind TEXT NOT NULL,
+    amount_cents BIGINT NOT NULL, balance_before TEXT NOT NULL, balance_after TEXT NOT NULL,
+    reference_id TEXT NOT NULL, actor_id BIGINT, reason TEXT NOT NULL, created_at TEXT NOT NULL,
+    UNIQUE(user_id, kind, reference_id)
+);
+CREATE TABLE IF NOT EXISTS subscription_cycles (
+    id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, user_id BIGINT NOT NULL,
+    plan_id BIGINT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT,
+    traffic_limit BIGINT NOT NULL, traffic_used BIGINT NOT NULL DEFAULT 0,
+    entitlement_snapshot TEXT NOT NULL, source TEXT NOT NULL, cancelled BOOLEAN NOT NULL DEFAULT FALSE
+);
+
 CREATE TABLE IF NOT EXISTS redeem_codes (
     id BIGSERIAL PRIMARY KEY,
     code TEXT NOT NULL UNIQUE,
@@ -434,7 +451,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 44;
+pub const PG_SCHEMA_VERSION: i32 = 48;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1867,6 +1884,136 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 44: monthly billing contract and retry state present");
     }
 
+    if current < 45 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS traffic_batches (
+            group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+            batch_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            confirmed_at TEXT,
+            PRIMARY KEY (group_id, batch_id)
+        )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_traffic_batches_confirmed ON traffic_batches(confirmed_at)")
+            .execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (45) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    if current < 46 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS purchase_requests (
+            user_id BIGINT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL, PRIMARY KEY (user_id, request_id)
+        )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (46) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+    if current < 47 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("UPDATE forward_rules SET paused=TRUE, auto_paused=TRUE WHERE id IN (
+            SELECT id FROM (
+                SELECT r.id, u.max_rules, ROW_NUMBER() OVER (PARTITION BY r.uid ORDER BY r.id) AS position
+                FROM forward_rules r JOIN users u ON u.id=r.uid
+                WHERE r.paused=FALSE AND u.admin=FALSE AND u.max_rules>0
+            ) ranked WHERE position>max_rules
+        )").execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (47) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    if current < 48 {
+        let mut tx = pool.begin().await?;
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id,expires_at FROM announcements WHERE expires_at IS NOT NULL")
+                .fetch_all(&mut *tx)
+                .await?;
+        for (id, raw) in rows {
+            match crate::service::announcements::parse_expiry(Some(&raw)) {
+                Ok(canonical) if canonical.as_deref() != Some(&raw) => {
+                    sqlx::query(
+                        "UPDATE announcements SET expires_at=$1 WHERE id=$2 AND expires_at=$3",
+                    )
+                    .bind(canonical)
+                    .bind(id)
+                    .bind(raw)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                Err(_) => tracing::warn!(
+                    announcement_id = id,
+                    "Invalid legacy announcement expiry; review manually"
+                ),
+                _ => {}
+            }
+        }
+        for statement in [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS registration_plan_id BIGINT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_id TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_cycle_id TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_source TEXT NOT NULL DEFAULT 'legacy'",
+            "CREATE TABLE IF NOT EXISTS balance_ledger (
+                sequence BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, user_id BIGINT NOT NULL, kind TEXT NOT NULL,
+                amount_cents BIGINT NOT NULL, balance_before TEXT NOT NULL, balance_after TEXT NOT NULL,
+                reference_id TEXT NOT NULL, actor_id BIGINT, reason TEXT NOT NULL, created_at TEXT NOT NULL,
+                UNIQUE(user_id, kind, reference_id))",
+            "CREATE INDEX IF NOT EXISTS idx_balance_ledger_user_time ON balance_ledger(user_id, created_at, id)",
+            "CREATE TABLE IF NOT EXISTS subscription_cycles (
+                id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, user_id BIGINT NOT NULL,
+                plan_id BIGINT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT,
+                traffic_limit BIGINT NOT NULL, traffic_used BIGINT NOT NULL DEFAULT 0,
+                entitlement_snapshot TEXT NOT NULL, source TEXT NOT NULL, cancelled BOOLEAN NOT NULL DEFAULT FALSE)",
+            "CREATE INDEX IF NOT EXISTS idx_subscription_cycles_user_time ON subscription_cycles(user_id, subscription_id, starts_at, ends_at)",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS transaction_id TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'legacy'",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subscription_id TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cycle_id TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cycle_start TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cycle_end TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS entitlement_snapshot TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS actor_id BIGINT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT ''",
+        ] { sqlx::query(statement).execute(&mut *tx).await?; }
+        let users: Vec<(i64, String)> = sqlx::query_as("SELECT id,balance FROM users WHERE NOT EXISTS(SELECT 1 FROM balance_ledger l WHERE l.user_id=users.id)")
+            .fetch_all(&mut *tx).await?;
+        for (uid, balance) in users {
+            let amount = relay_shared::money::balance_to_cents(&balance).ok_or_else(|| {
+                sqlx::Error::Protocol("invalid opening balance; repair before migrating".into())
+            })?;
+            sqlx::query("INSERT INTO balance_ledger (id,user_id,kind,amount_cents,balance_before,balance_after,reference_id,reason,created_at) VALUES ($1,$2,'opening',$3,'0',$4,'opening','Migration opening balance; historical movements are unknown',to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')) ON CONFLICT DO NOTHING")
+                .bind(uuid::Uuid::new_v4().to_string()).bind(uid).bind(amount).bind(balance).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE users SET plan_source='paid' WHERE plan_source='legacy' AND EXISTS(SELECT 1 FROM orders o WHERE o.user_id=users.id AND o.plan_id=users.plan_id AND o.kind='legacy')")
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE users SET registration_plan_id=plan_id,plan_id=NULL,plan_expire_at=NULL,plan_source='pending',plan_auto_renew=FALSE,plan_auto_renew_price=NULL,plan_auto_renew_revision=NULL,plan_auto_renew_retry_at=NULL WHERE admin=FALSE AND plan_source='legacy' AND all_device_groups=FALSE AND traffic_used=0 AND EXISTS(SELECT 1 FROM plans p WHERE p.id=users.plan_id AND p.price::numeric>0) AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.user_id=users.id) AND NOT EXISTS(SELECT 1 FROM user_device_groups g WHERE g.user_id=users.id) AND NOT EXISTS(SELECT 1 FROM forward_rules r WHERE r.uid=users.id)")
+            .execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (48) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
     Ok(())
 }
 
@@ -1879,7 +2026,7 @@ mod tests {
         // Keep the early-return guard in run_pg_migrations aligned with the
         // highest ordered migration below. A lower value silently skips newer
         // migrations on existing PostgreSQL databases.
-        assert_eq!(PG_SCHEMA_VERSION, 44);
+        assert_eq!(PG_SCHEMA_VERSION, 48);
     }
 
     // A `;` inside a -- line comment must NOT split a statement. This is the

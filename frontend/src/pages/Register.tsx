@@ -170,6 +170,7 @@ export default function Register() {
               </Form.Item>
             )}
 
+            <p><Text type="secondary">{t('registrationEntitlementHint')}</Text></p>
             <Form.Item style={{ marginBottom: 12 }}>
               <Button type="primary" htmlType="submit" block loading={submitting}>
                 {t('register')}

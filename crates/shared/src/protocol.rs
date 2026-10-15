@@ -132,6 +132,10 @@ pub struct UpdateUserRequest {
     /// looks the same regardless of what the caller typed.
     #[serde(default)]
     pub balance: Option<String>,
+    /// Required when editing balance. A stale administrator form must not
+    /// overwrite a purchase or top-up committed since the form was opened.
+    #[serde(default)]
+    pub expected_balance: Option<String>,
     /// Max forwarding rules the user can create (advisory in single-admin mode).
     /// Clamped to 0..=100000 to prevent overflow / absurd values.
     #[serde(default)]
@@ -717,6 +721,15 @@ impl NodeTransport {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TrafficReport {
     pub reports: Vec<TrafficEntry>,
+    /// Stable across retries, including timeouts after a successful commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_batch_id: Option<String>,
+}
+
+pub fn valid_traffic_batch_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1418,9 +1431,15 @@ pub struct UpdatePlanRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BuyPlanRequest {
     pub plan_id: i64,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Zero explicitly means no current plan.
+    #[serde(default)]
+    pub expected_current_plan_id: Option<i64>,
     /// Price displayed in the confirmation dialog. The server canonicalizes
     /// and compares it before charging so a stale catalog cannot authorize a
-    /// newly-priced purchase. Optional for compatibility with older clients.
+    /// newly-priced purchase. Optional for deserialization only; HTTP requires
+    /// it so older clients fail safely instead of accepting an unconfirmed price.
     #[serde(default)]
     pub expected_price: Option<String>,
     /// Opaque revision returned by the plan catalog. Detects changes to quota,
@@ -1438,6 +1457,8 @@ pub struct BuyPlanRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdminBuyPlanRequest {
     pub plan_id: i64,
+    #[serde(default)]
+    pub request_id: Option<String>,
     /// User plan association displayed when the assignment was confirmed.
     /// Zero means the user had no plan. Required to prevent stale admin views
     /// from charging for and overwriting a newer assignment.
@@ -1457,6 +1478,8 @@ pub struct AdminBuyPlanRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SetPlanAutoRenewRequest {
     pub enabled: bool,
+    #[serde(default)]
+    pub expected_plan_id: Option<i64>,
     /// Exact price displayed in the confirmation dialog. Required when
     /// enabling so a stale page cannot authorize a different amount.
     #[serde(default)]

@@ -78,7 +78,7 @@ if [ "$PKG_MANAGER" != "apt" ]; then
 fi
 
 MISSING=""
-for cmd in git curl ca-certificates openssl; do
+for cmd in git curl ca-certificates openssl python3; do
     # ca-certificates is a package name, not a command - check differently
     if [ "$cmd" = "ca-certificates" ] || [ "$cmd" = "openssl" ]; then
         if [ "$cmd" = "ca-certificates" ] && [ ! -d /usr/share/ca-certificates ] && [ ! -d /etc/ssl/certs ]; then
@@ -97,13 +97,13 @@ if [ -n "$MISSING" ]; then
         apt)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
-            apt-get install -y -qq git curl ca-certificates openssl
+            apt-get install -y -qq git curl ca-certificates openssl python3
             ;;
         dnf)
-            dnf install -y git curl ca-certificates openssl
+            dnf install -y git curl ca-certificates openssl python3
             ;;
         yum)
-            yum install -y git curl ca-certificates openssl
+            yum install -y git curl ca-certificates openssl python3
             ;;
     esac
     info "Dependencies installed."

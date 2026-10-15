@@ -127,6 +127,32 @@ impl DeviceGroupAuthRepository for SqliteRepository {
         // target row is checked before child rows are touched. Banning keeps
         // the existing token-version revocation semantics; admins retain their
         // implicit all-groups flag regardless of the submitted value.
+        if let Some(after) = update.balance {
+            let current: String = sqlx::query_scalar("SELECT balance FROM users WHERE id=?")
+                .bind(user_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let expected = update
+                .expected_balance
+                .and_then(relay_shared::money::balance_to_cents);
+            if expected.is_none() || expected != relay_shared::money::balance_to_cents(&current) {
+                tx.rollback().await?;
+                return Err(DbError::BalanceConflict);
+            }
+            super::billing::append_balance(
+                &mut tx,
+                crate::service::billing::BalanceChange {
+                    user_id,
+                    kind: "admin_adjustment",
+                    before: &current,
+                    after,
+                    reference_id: &uuid::Uuid::new_v4().to_string(),
+                    actor_id: update.actor_id,
+                    reason: "Administrator explicitly adjusted account balance",
+                },
+            )
+            .await?;
+        }
         let user = sqlx::query(
             "UPDATE users SET \
              balance = COALESCE(?, balance), \
@@ -154,6 +180,10 @@ impl DeviceGroupAuthRepository for SqliteRepository {
             tx.rollback().await?;
             return Ok(None);
         }
+        if update.banned == Some(true) || update.suspended == Some(true) {
+            sqlx::query("UPDATE users SET plan_auto_renew=0, plan_auto_renew_price=NULL, plan_auto_renew_revision=NULL, plan_auto_renew_retry_at=NULL WHERE id=?")
+                .bind(user_id).execute(&mut *tx).await?;
+        }
 
         if let Some(group_ids) = &normalized_group_ids {
             sqlx::query("DELETE FROM user_device_groups WHERE user_id = ?")
@@ -173,7 +203,7 @@ impl DeviceGroupAuthRepository for SqliteRepository {
         }
 
         let authz_changed = update.all_device_groups.is_some() || normalized_group_ids.is_some();
-        let paused_rules = if authz_changed {
+        let mut paused_rules = if authz_changed {
             let (is_admin, all_groups): (bool, bool) =
                 sqlx::query_as("SELECT admin, all_device_groups FROM users WHERE id = ?")
                     .bind(user_id)
@@ -211,6 +241,7 @@ impl DeviceGroupAuthRepository for SqliteRepository {
             0
         };
 
+        paused_rules += super::enforce_rule_limit(&mut tx, user_id).await?;
         tx.commit().await?;
         Ok(Some(AdminUserUpdateOutcome { paused_rules }))
     }

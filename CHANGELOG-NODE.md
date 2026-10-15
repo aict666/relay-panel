@@ -13,6 +13,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.11] - 2026-10-15
+
+### Fixed
+
+- TCP、TLS、WebSocket 和 Linux splice 持续增量计量，长连接不再等关闭才入账；多跳仍只在收费入口计一次。
+- 流量批次及字节固定重试，丢 ACK、500、401 不换号；待确认批次发送前落盘并 fsync，重启后重放原交易。损坏的 outbox 拒绝启动，同一 outbox 禁止多个节点进程占用。
+- WebSocket 握手增加 15 秒超时；UDP/UOT 出站按目标选择 IPv4/IPv6，IPv4 固定出口不静默绕过；原生 UDP 与 UOT 出站共享 1024 会话预算，限速等待可被取消。
+- 更新 Rustls 等安全补丁，移除已停止维护的 rustls-pemfile，使用 rustls-pki-types 自带的 PEM 解析；私钥权限检查和证书热重载保留。
+- Compose 为节点状态增加持久卷。使用独立的 `RELAY_NODE_DATA_DIR` 保存 node-id、缓存与 outbox；更换面板地址或凭据不会把旧批次重放到新计费空间，旧文件保留供对账。
+
+### Compatibility
+
+- 先升级 Panel 1.4.0 与前端，再升级本节点；配置协议仍为 v11。
+- outbox 保证已封装待确认批次重放，不是逐字节磁盘日志；尚未封装的内存增量在硬退出时仍可能丢失。额度执行仍有上报与配置传播窗口。
+
 ## [1.3.10] - 2026-08-04
 
 ### Changed

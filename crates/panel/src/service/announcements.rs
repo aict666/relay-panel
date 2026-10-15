@@ -37,11 +37,9 @@ pub fn parse_expiry(raw: Option<&str>) -> Result<Option<String>, &'static str> {
     match raw.map(str::trim) {
         None | Some("") => Ok(None),
         Some(v) => {
-            if chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%d %H:%M:%S").is_err() {
-                Err("过期时间格式应为 YYYY-MM-DD HH:MM:SS (UTC)")
-            } else {
-                Ok(Some(v.to_string()))
-            }
+            let parsed = chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%d %H:%M:%S")
+                .map_err(|_| "过期时间格式应为 YYYY-MM-DD HH:MM:SS (UTC)")?;
+            Ok(Some(parsed.format("%Y-%m-%d %H:%M:%S").to_string()))
         }
     }
 }
@@ -83,6 +81,12 @@ mod tests {
         assert_eq!(
             parse_expiry(Some("2026-08-01 12:00:00")),
             Ok(Some("2026-08-01 12:00:00".to_string()))
+        );
+        // chrono accepts non-padded dates; retaining the input would make
+        // September sort after October in the repository's TEXT comparison.
+        assert_eq!(
+            parse_expiry(Some(" 2026-9-1 00:00:00 ")),
+            Ok(Some("2026-09-01 00:00:00".to_string()))
         );
         for bad in [
             "2026-08-01",

@@ -319,7 +319,7 @@ fn remove_cache_at_fail_closed(path: &std::path::Path) {
     }
 }
 
-fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let file_name = path
         .file_name()
@@ -348,6 +348,8 @@ fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result
         drop(file);
         std::fs::rename(&temporary, path)?;
         #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -360,7 +362,7 @@ fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result
     result
 }
 
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     std::env::var_os("RELAY_NODE_DATA_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)

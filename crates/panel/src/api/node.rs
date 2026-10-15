@@ -333,8 +333,35 @@ pub async fn report_traffic(
     // HTTP-status note (preserved): a rejection returns HTTP 200 with a business
     // `code` (403/400/500) INSIDE the JSON body — NOT a real HTTP error. Nodes
     // read the JSON `code` and ignore the HTTP status on these endpoints.
-    match crate::service::traffic::apply_traffic_report(state.db.as_ref(), group.id, &req.reports)
-        .await
+    for id in [req.batch_id.as_deref(), req.acked_batch_id.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if !relay_shared::protocol::valid_traffic_batch_id(id) {
+            return Json(ApiResponse {
+                code: 400,
+                message: "invalid traffic batch id".into(),
+                data: None,
+            });
+        }
+    }
+    if req.acked_batch_id.is_some() && req.batch_id.is_none() {
+        return Json(ApiResponse {
+            code: 400,
+            message: "batch id is required with acknowledgement".into(),
+            data: None,
+        });
+    }
+    // Only pre-commit rejections may return 400/401/403. An uncertain commit
+    // must be retried with the original id, so database failures remain 500.
+    match crate::service::traffic::apply_traffic_report_with_id(
+        state.db.as_ref(),
+        group.id,
+        req.batch_id.as_deref(),
+        req.acked_batch_id.as_deref(),
+        &req.reports,
+    )
+    .await
     {
         Ok(()) => Json(ApiResponse::success(())),
         Err(crate::service::traffic::TrafficReportError::Unavailable) => {
@@ -763,7 +790,59 @@ mod tests {
     fn report(_token: &str, entries: &[TrafficEntry]) -> TrafficReport {
         TrafficReport {
             reports: entries.to_vec(),
+            batch_id: None,
+            acked_batch_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn traffic_report_identity_is_validated_deduplicated_and_acknowledged_after_rule_deletion(
+    ) {
+        let (state, pool) = seeded_state().await;
+        crate::db::schema::run_migrations(&pool).await.unwrap();
+        let entries = [TrafficEntry {
+            rule_id: 100,
+            upload: 100,
+            download: 200,
+        }];
+        for _ in 0..2 {
+            let mut body = report("", &entries);
+            body.batch_id = Some("batch-1".into());
+            assert_eq!(
+                report_traffic(State(state.clone()), auth_headers("tok-A"), Json(body))
+                    .await
+                    .0
+                    .code,
+                0
+            );
+        }
+        let used: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(used, 300);
+        let mut invalid = report("", &entries);
+        invalid.batch_id = Some("invalid id".into());
+        assert_eq!(
+            report_traffic(State(state.clone()), auth_headers("tok-A"), Json(invalid))
+                .await
+                .0
+                .code,
+            400
+        );
+        sqlx::query("DELETE FROM forward_rules WHERE id=100")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut body = report("", &entries);
+        body.batch_id = Some("batch-1".into());
+        assert_eq!(
+            report_traffic(State(state), auth_headers("tok-A"), Json(body))
+                .await
+                .0
+                .code,
+            0
+        );
     }
 
     fn auth_headers(token: &str) -> HeaderMap {

@@ -1,8 +1,8 @@
 # ---- Build stage for the React frontend ----
-FROM node:20-alpine AS frontend-build
+FROM node:22-alpine AS frontend-build
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm install --no-audit --no-fund || npm install --no-audit --no-fund
+RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
@@ -11,35 +11,38 @@ RUN npm run build
 # its own crate (panel-build / node-build), so a panel-only release does not
 # compile relay-node and a node-only release does not compile relay-panel. The
 # runtime stages copy only their own binary.
-FROM rust:1-bookworm AS panel-build
+FROM rust:1.96.1-bookworm AS panel-build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/ ./crates/
-RUN cargo build --release -p relay-panel
+RUN cargo build --locked --release -p relay-panel
 
 # ---- Build stage for the Rust workspace (node only) ----
-FROM rust:1-bookworm AS node-build
+FROM rust:1.96.1-bookworm AS node-build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/ ./crates/
-RUN cargo build --release -p relay-node
+RUN cargo build --locked --release -p relay-node
 
 # ---- Panel runtime ----
 FROM debian:bookworm-slim AS panel
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gosu && \
+    rm -rf /var/lib/apt/lists/* && useradd --uid 10001 --user-group --no-create-home relay
 WORKDIR /app
 COPY --from=panel-build /app/target/release/relay-panel /app/relay-panel
 COPY --from=frontend-build /frontend/dist /app/public
+COPY scripts/panel-entrypoint.sh /usr/local/bin/panel-entrypoint
+RUN chmod 755 /usr/local/bin/panel-entrypoint
 VOLUME ["/app/data"]
 EXPOSE 18888
 ENV DATABASE_URL="sqlite:/app/data/data.db?mode=rwc" \
     LISTEN="0.0.0.0:18888" \
     PUBLIC_DIR="/app/public"
+ENTRYPOINT ["/usr/local/bin/panel-entrypoint"]
 CMD ["./relay-panel"]
 
 # ---- Node runtime ----
@@ -52,6 +55,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=node-build /app/target/release/relay-node /app/relay-node
+ENV RELAY_NODE_DATA_DIR="/app/data"
+VOLUME ["/app/data"]
 # ENTRYPOINT (not CMD) so `docker run image --version` appends the flag to the
 # binary instead of replacing it. With CMD, `docker run image --version` tries
 # to execute "--version" as a program (the release verify job hit this).
@@ -65,15 +70,18 @@ ENTRYPOINT ["./relay-node"]
 # produce `linux/amd64` and `linux/arm64` images from their respective native
 # runners without QEMU or cross-compilation toolchains.
 FROM debian:bookworm-slim AS panel-release
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gosu && \
+    rm -rf /var/lib/apt/lists/* && useradd --uid 10001 --user-group --no-create-home relay
 WORKDIR /app
 COPY release-dist/panel/relay-panel /app/relay-panel
 RUN chmod +x /app/relay-panel
 COPY release-dist/frontend /app/public
+COPY scripts/panel-entrypoint.sh /usr/local/bin/panel-entrypoint
+RUN chmod 755 /usr/local/bin/panel-entrypoint
 VOLUME ["/app/data"]
 EXPOSE 18888
 ENV DATABASE_URL="sqlite:/app/data/data.db?mode=rwc" \
     LISTEN="0.0.0.0:18888" \
     PUBLIC_DIR="/app/public"
+ENTRYPOINT ["/usr/local/bin/panel-entrypoint"]
 CMD ["./relay-panel"]

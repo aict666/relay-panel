@@ -28,6 +28,24 @@ pub fn spawn(state: AppState) {
 
 pub(crate) async fn tick(state: &AppState) {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut changed = false;
+    match state
+        .db
+        .list_due_subscription_user_ids(&now, BATCH_LIMIT)
+        .await
+    {
+        Ok(ids) => {
+            for id in ids {
+                match state.db.activate_subscription_cycle(id, &now).await {
+                    Ok(activated) => changed |= activated,
+                    Err(error) => {
+                        tracing::error!(user_id = id, "prepaid cycle activation failed: {error}")
+                    }
+                }
+            }
+        }
+        Err(error) => tracing::error!("prepaid cycle candidate scan failed: {error}"),
+    }
     let user_ids = match state
         .db
         .list_expired_monthly_auto_renew_user_ids(&now, BATCH_LIMIT)
@@ -40,7 +58,6 @@ pub(crate) async fn tick(state: &AppState) {
         }
     };
 
-    let mut changed = false;
     for user_id in user_ids {
         match state.db.renew_expired_monthly_plan(user_id, &now).await {
             Ok(MonthlyRenewalOutcome::Renewed { plan_id, plan_name }) => {

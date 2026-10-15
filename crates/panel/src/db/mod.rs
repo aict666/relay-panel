@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) mod billing_contract;
 pub mod error;
 pub mod init;
 pub mod pg_repo;

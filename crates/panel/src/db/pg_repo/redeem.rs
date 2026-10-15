@@ -71,7 +71,7 @@ impl RedeemRepository for PgRepository {
         // TEXT comparison is chronological: all timestamps are
         // 'YYYY-MM-DD HH:MM:SS' UTC.
         if let Some(exp) = expires_at.as_deref() {
-            if now > exp {
+            if crate::service::redeem::expiry_is_due(exp, now) {
                 let _ = tx.rollback().await;
                 return Err(RedeemCodeError::Expired);
             }
@@ -134,6 +134,19 @@ impl RedeemRepository for PgRepository {
             .execute(&mut *tx)
             .await?;
 
+        super::billing::append_balance(
+            &mut tx,
+            crate::service::billing::BalanceChange {
+                user_id,
+                kind: "redeem",
+                before: &balance_str,
+                after: &new_balance,
+                reference_id: &id.to_string(),
+                actor_id: Some(user_id),
+                reason: "Redeemed top-up code",
+            },
+        )
+        .await?;
         tx.commit().await?;
         Ok((amount, new_balance))
     }

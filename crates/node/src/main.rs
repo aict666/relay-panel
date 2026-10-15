@@ -169,7 +169,9 @@ async fn run() {
 
     use reporter::{spawn_public_ip_refresher, NodeMetrics};
 
-    let counter = Arc::new(TrafficCounter::new());
+    let counter = Arc::new(TrafficCounter::durable(&config).expect(
+        "Cannot open durable traffic outbox; refusing to forward with uncertain accounting",
+    ));
     let connections = Arc::new(ConnectionTracker::new());
     let mut manager_inner = ForwarderManager::new(counter.clone(), connections.clone());
     // v1.0.4: configure dual-stack listen and outbound source IP. A

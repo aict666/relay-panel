@@ -9,6 +9,8 @@ export default defineConfig({
   // vendor chunk (not every page). Pages themselves are split by the per-route
   // React.lazy() in router.tsx.
   build: {
+    // Keep fonts same-origin: our CSP intentionally rejects data: font URLs.
+    assetsInlineLimit: 0,
     rollupOptions: {
       output: {
         manualChunks: {

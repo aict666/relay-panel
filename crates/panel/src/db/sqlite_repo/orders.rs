@@ -8,9 +8,35 @@ use relay_shared::models::Order;
 
 #[async_trait]
 impl OrderRepository for SqliteRepository {
+    async fn list_balance_entries(
+        &self,
+        user_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::service::billing::BalanceEntry>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM balance_ledger WHERE user_id=? ORDER BY sequence DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(limit.clamp(1, 200))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+    async fn list_subscription_cycles(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<crate::service::billing::SubscriptionCycle>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription_cycles WHERE user_id=? ORDER BY starts_at DESC,id DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
     async fn list_orders_by_user(&self, user_id: i64) -> Result<Vec<Order>, DbError> {
         let orders: Vec<Order> = sqlx::query_as(
-            "SELECT id, user_id, plan_id, plan_name, price, created_at \
+            "SELECT * \
              FROM orders WHERE user_id = ? ORDER BY id DESC",
         )
         .bind(user_id)

@@ -17,6 +17,118 @@ use crate::db::repo::*;
 use relay_shared::protocol::TrafficEntry;
 use sqlx::postgres::PgPoolOptions;
 
+#[tokio::test]
+async fn pg_prepaid_downtime_and_suspension_contract() {
+    let Some(db) = repo("prepaid_downtime").await else {
+        return;
+    };
+    crate::db::billing_contract::prepaid_downtime_and_suspension_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_prepaid_grants_and_financial_retention_contract() {
+    let Some(db) = repo("prepaid_retention").await else {
+        return;
+    };
+    crate::db::billing_contract::prepaid_grants_and_financial_retention_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_ledger_write_failure_contract() {
+    let Some(db) = repo("ledger_failure").await else {
+        return;
+    };
+    sqlx::query("CREATE FUNCTION synthetic_ledger_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.kind='purchase' THEN RAISE EXCEPTION 'synthetic ledger failure'; END IF; RETURN NEW; END $$")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("CREATE TRIGGER synthetic_ledger_failure BEFORE INSERT ON balance_ledger FOR EACH ROW EXECUTE FUNCTION synthetic_ledger_failure()")
+        .execute(&db.pool).await.unwrap();
+    crate::db::billing_contract::ledger_write_failure_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_monthly_prepayment_and_ledger_contract() {
+    let Some(db) = repo("prepayment_ledger").await else {
+        return;
+    };
+    crate::db::billing_contract::monthly_prepayment_and_ledger_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_registration_entitlement_contract() {
+    let Some(db) = repo("registration_entitlement").await else {
+        return;
+    };
+    crate::db::billing_contract::registration_entitlement_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_traffic_batch_identity_contract() {
+    let Some(db) = repo("traffic_identity").await else {
+        return;
+    };
+    crate::db::billing_contract::traffic_batch_identity_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_purchase_identity_contract() {
+    let Some(db) = repo("purchase_identity").await else {
+        return;
+    };
+    crate::db::billing_contract::purchase_identity_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_balance_compare_and_swap_contract() {
+    let Some(db) = repo("balance_cas").await else {
+        return;
+    };
+    crate::db::billing_contract::balance_compare_and_swap_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_downgrade_rule_limit_contract() {
+    let Some(db) = repo("downgrade_limit").await else {
+        return;
+    };
+    crate::db::billing_contract::downgrade_rule_limit_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_redeem_concurrency_and_expiry_contract() {
+    let Some(db) = repo("redeem_concurrency").await else {
+        return;
+    };
+    crate::db::billing_contract::redeem_concurrency_and_expiry_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_auto_renew_identity_and_account_state_contract() {
+    let Some(db) = repo("auto_renew_identity").await else {
+        return;
+    };
+    crate::db::billing_contract::auto_renew_identity_and_account_state_contract(&db).await;
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_purchase_quota_sentinel_and_reset_contract() {
+    let Some(db) = repo("quota_sentinel").await else {
+        return;
+    };
+    crate::db::billing_contract::purchase_quota_sentinel_and_reset_contract(&db).await;
+    cleanup(&db).await;
+}
+
 /// Read TEST_PG_URL. Returns None if unset → tests skip.
 fn pg_url() -> Option<String> {
     let url = std::env::var("TEST_PG_URL").ok().filter(|s| !s.is_empty());
@@ -5587,14 +5699,14 @@ async fn pg_monthly_plan_lifecycle_invariants_and_type_change_disables_auto_rene
             .await
             .unwrap();
     assert_eq!(
-        db.set_plan_auto_renew_guarded(alice, true, Some("9.00"), Some(initial_revision))
+        db.set_plan_auto_renew_guarded(alice, true, Some("9.00"), Some(initial_revision), None)
             .await
             .unwrap(),
         PlanAutoRenewUpdateOutcome::ContractChanged,
         "a stale displayed price must not authorize recurring billing (PG)"
     );
     assert_eq!(
-        db.set_plan_auto_renew_guarded(alice, true, Some("10.00"), Some(initial_revision))
+        db.set_plan_auto_renew_guarded(alice, true, Some("10.00"), Some(initial_revision), None)
             .await
             .unwrap(),
         PlanAutoRenewUpdateOutcome::Updated
@@ -5681,7 +5793,7 @@ async fn pg_monthly_plan_lifecycle_invariants_and_type_change_disables_auto_rene
 }
 
 #[tokio::test]
-async fn pg_monthly_purchase_starts_fixed_cycle_and_resets_current_usage() {
+async fn pg_monthly_prepayment_preserves_usage_until_cycle_boundary() {
     let Some(db) = repo("monthly_purchase").await else {
         return;
     };
@@ -5763,7 +5875,7 @@ async fn pg_monthly_purchase_starts_fixed_cycle_and_resets_current_usage() {
     .unwrap();
     assert_eq!(
         (balance.as_str(), limit, used, max_rules, auto),
-        ("90", 5_000, 0, 20, true)
+        ("90", 9_000, 800, 5, true)
     );
     assert!(
         expire.unwrap().starts_with("2100-"),
@@ -5774,16 +5886,28 @@ async fn pg_monthly_purchase_starts_fixed_cycle_and_resets_current_usage() {
             .fetch_one(&db.pool)
             .await
             .unwrap(),
-        0
+        700
     );
     assert_eq!(db.list_orders_by_user(alice).await.unwrap().len(), 1);
-    sqlx::query("UPDATE users SET plan_expire_at='2026-08-01 00:00:00' WHERE id=$1")
-        .bind(alice)
-        .execute(&db.pool)
+    assert!(db
+        .activate_subscription_cycle(alice, "2099-12-31 00:00:00")
         .await
-        .unwrap();
+        .unwrap());
+    assert!(!db
+        .activate_subscription_cycle(alice, "2099-12-31 00:00:00")
+        .await
+        .unwrap());
+    let activated = db.find_by_username("alice").await.unwrap().unwrap();
+    assert_eq!(
+        (
+            activated.traffic_limit,
+            activated.traffic_used,
+            activated.max_rules
+        ),
+        (5000, 0, 20)
+    );
     assert!(matches!(
-        db.renew_expired_monthly_plan(alice, "2026-08-19 12:00:00")
+        db.renew_expired_monthly_plan(alice, "2100-02-19 12:00:00")
             .await
             .unwrap(),
         MonthlyRenewalOutcome::Renewed { plan_id, .. } if plan_id == pid

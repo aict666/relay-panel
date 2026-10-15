@@ -90,6 +90,7 @@ describe('Account monthly renewal consent', () => {
       enabled: true,
       expected_price: '10.00',
       expected_revision: 3,
+      expected_plan_id: account.plan_id,
     }));
   });
 });

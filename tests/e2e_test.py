@@ -44,8 +44,9 @@ E2E_PROFILE = os.environ.get("RELAY_E2E_PROFILE", "debug")
 if E2E_PROFILE not in ("debug", "release"):
     raise ValueError("RELAY_E2E_PROFILE must be 'debug' or 'release'")
 BIN_SUFFIX = ".exe" if sys.platform == "win32" else ""
-PANEL_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-panel" + BIN_SUFFIX)
-NODE_BIN = os.path.join(PROJECT_ROOT, "target", E2E_PROFILE, "relay-node" + BIN_SUFFIX)
+TARGET_DIR = os.environ.get("CARGO_TARGET_DIR", os.path.join(PROJECT_ROOT, "target"))
+PANEL_BIN = os.path.join(TARGET_DIR, E2E_PROFILE, "relay-panel" + BIN_SUFFIX)
+NODE_BIN = os.path.join(TARGET_DIR, E2E_PROFILE, "relay-node" + BIN_SUFFIX)
 
 
 def config_protocol_version():

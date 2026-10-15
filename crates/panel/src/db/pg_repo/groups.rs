@@ -308,6 +308,10 @@ impl GroupRepository for PgRepository {
             tx.rollback().await?;
             return Err(DbError::GroupPlanInvariant { plans: plan_count });
         }
+        let paid_grants = super::billing::protected_cycle_grants(&mut tx, id).await?;
+        if paid_grants > 0 && !matches!(effective_type, "in" | "both") {
+            return Err(DbError::GroupPlanInvariant { plans: paid_grants });
+        }
 
         let mut ph = 1;
         let sets_with_ph: Vec<String> = sets
@@ -479,6 +483,7 @@ impl GroupRepository for PgRepository {
                 .bind(id)
                 .fetch_one(&mut *tx)
                 .await?;
+        let plan_count = plan_count + super::billing::protected_cycle_grants(&mut tx, id).await?;
         if rule_count > 0 || tunnel_count > 0 || fallback_group_count > 0 || plan_count > 0 {
             tx.rollback().await?;
             return Ok(GroupDeleteOutcome::InUse {

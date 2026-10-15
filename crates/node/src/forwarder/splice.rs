@@ -99,7 +99,12 @@ fn shutdown_write(fd: RawFd) {
 /// Pump one direction, `src → dst`, with splice via a private pipe. Returns the
 /// total bytes moved. On return (EOF or error) the destination's write half is
 /// shut down so the peer sees EOF and the opposite pump can finish too.
-async fn pump(src: &TcpStream, dst: &TcpStream) -> io::Result<u64> {
+async fn pump(
+    src: &TcpStream,
+    dst: &TcpStream,
+    counter: Option<&crate::reporter::RuleCounterHandle>,
+    upload: bool,
+) -> io::Result<u64> {
     let pipe = Pipe::new()?;
     let src_fd = src.as_raw_fd();
     let dst_fd = dst.as_raw_fd();
@@ -133,6 +138,13 @@ async fn pump(src: &TcpStream, dst: &TcpStream) -> io::Result<u64> {
                     Ok(m) => {
                         left -= m;
                         total += m as u64;
+                        if let Some(counter) = counter {
+                            if upload {
+                                counter.add_upload(m as u64);
+                            } else {
+                                counter.add_download(m as u64);
+                            }
+                        }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(e) => return Err(e),
@@ -156,11 +168,19 @@ async fn pump(src: &TcpStream, dst: &TcpStream) -> io::Result<u64> {
 /// them concurrently (`readable`/`writable`/`try_io` take `&self`); the raw fds
 /// stay valid for the whole operation because the `Arc`s outlive both pumps.
 pub async fn zero_copy_bidirectional(a: TcpStream, b: TcpStream) -> io::Result<(u64, u64)> {
+    zero_copy_bidirectional_counted(a, b, None).await
+}
+
+pub async fn zero_copy_bidirectional_counted(
+    a: TcpStream,
+    b: TcpStream,
+    counter: Option<&crate::reporter::RuleCounterHandle>,
+) -> io::Result<(u64, u64)> {
     let a = Arc::new(a);
     let b = Arc::new(b);
     let (a_up, b_up) = (a.clone(), b.clone());
-    let ab = pump(&a_up, &b_up); // a → b
-    let ba = pump(&b, &a); // b → a
+    let ab = pump(&a_up, &b_up, counter, true); // a → b
+    let ba = pump(&b, &a, counter, false); // b → a
     let (r_ab, r_ba) = tokio::join!(ab, ba);
     Ok((r_ab?, r_ba?))
 }

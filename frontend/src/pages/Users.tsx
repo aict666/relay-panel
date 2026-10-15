@@ -5,12 +5,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import dayjs, { type Dayjs } from 'dayjs';
 import api from '../api/client';
+import BalanceHistory from '../components/BalanceHistory';
 import type { ApiEnvelope, User, Plan } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { makePasswordValidator } from '../utils/password';
 import { useAuth } from '../auth/useAuth';
 import { MAX_SAFE_TRAFFIC_GB, bytesToGb, gbToBytes, trafficGbChanged } from '../utils/traffic';
+import { clearPurchaseIntent, purchaseIntent, readPurchaseIntent, type PurchaseIntent } from '../utils/purchaseIntent';
 
 // traffic_limit is stored in BYTES in the database. The edit form works in GB
 // for usability (a raw byte count is meaningless to a human). Convert on the
@@ -66,6 +68,7 @@ export default function Users() {
   const [planChoice, setPlanChoice] = useState<number | undefined>(undefined);
   const [planExpire, setPlanExpire] = useState<Dayjs | null>(null);
   const [planAutoRenew, setPlanAutoRenew] = useState(false);
+  const [pendingPurchase, setPendingPurchase] = useState<PurchaseIntent | null>(null);
   const [planBusy, setPlanBusy] = useState(false);
   const userBusy = loading || loadFailed || saving || planBusy || actionBusyId !== null;
   const [form] = Form.useForm<UserFormValues>();
@@ -121,7 +124,7 @@ export default function Users() {
   const editingPlan = editing ? plans.find(p => p.id === editing.plan_id) : undefined;
   const hasExpiringPlan = editingPlan?.plan_type === 'time' || editingPlan?.plan_type === 'monthly';
   const isMonthlyPlan = editingPlan?.plan_type === 'monthly';
-  const selectedPlan = plans.find(plan => plan.id === planChoice);
+  const selectedPlan = pendingPurchase?.plan ?? plans.find(plan => plan.id === planChoice);
   const hasPlan = editing?.plan_id != null;
   // Selecting the user's current plan again is a RENEW (extend time / add
   // traffic), not a no-op — it's allowed. Show a hint so the admin knows the
@@ -136,23 +139,26 @@ export default function Users() {
   const handleBuyPlanForUser = () => {
     if (!editing || planChoice == null || userBusy) return;
     const target = editing;
-    const selectedPlan = plans.find(plan => plan.id === planChoice);
+    const selectedPlan = pendingPurchase?.plan ?? plans.find(plan => plan.id === planChoice);
     if (!selectedPlan) return;
     const doBuy = async () => {
       setPlanBusy(true);
       try {
-        const res = await api.post<unknown, ApiEnvelope<null>>(`/admin/users/${target.id}/buy-plan`, {
-          plan_id: selectedPlan.id,
-          expected_current_plan_id: target.plan_id ?? 0,
-          expected_price: selectedPlan.price,
-          expected_revision: selectedPlan.purchase_revision,
-          ...(selectedPlan.plan_type === 'monthly' ? { auto_renew: planAutoRenew } : {}),
-        });
+        const scope = `admin:${target.id}`;
+        const intent = purchaseIntent(scope, selectedPlan, target.plan_id, planAutoRenew);
+        setPendingPurchase(intent);
+        const res = await api.post<unknown, ApiEnvelope<null>>(`/admin/users/${target.id}/buy-plan`, intent.body);
         if (res.code !== 0) {
+          if ([400, 404, 409].includes(res.code)) {
+            clearPurchaseIntent(scope);
+            setPendingPurchase(null);
+          }
           message.error(res.message);
-          if (res.code === 409) await load();
+          if (res.code === 409) { setEditing(null); await load(); }
           return;
         }
+        clearPurchaseIntent(scope);
+        setPendingPurchase(null);
         message.success(t('planAssigned'));
         setEditing(null);
         await load();
@@ -161,10 +167,11 @@ export default function Users() {
       } finally { setPlanBusy(false); }
     };
     const isSwitch = target.plan_id != null && planChoice !== target.plan_id;
-    if (isSwitch) {
+    const resetsQuota = selectedPlan.reset_traffic && selectedPlan.plan_type !== 'monthly';
+    if ((isSwitch || resetsQuota) && !pendingPurchase) {
       Modal.confirm({
         title: t('switchPlanConfirmTitle'),
-        content: t('adminSwitchPlanWarning'),
+        content: t(isSwitch ? 'adminSwitchPlanWarning' : 'resetPurchaseHint'),
         okText: t('assignAndCharge'),
         cancelText: t('cancel'),
         onOk: doBuy,
@@ -229,11 +236,19 @@ export default function Users() {
   };
 
   const openEdit = (u: User) => {
+    let pending: PurchaseIntent | null;
+    try {
+      pending = readPurchaseIntent(`admin:${u.id}`);
+    } catch {
+      message.error(t('purchaseStateUnavailable'));
+      return;
+    }
+    setPendingPurchase(pending);
     setEditing(u);
     // v1.0.7: preload the embedded plan panel (assign choice + expiry picker).
-    setPlanChoice(undefined);
+    setPlanChoice(pending?.body.plan_id);
     setPlanExpire(u.plan_expire_at ? dayjs(u.plan_expire_at) : null);
-    setPlanAutoRenew(!!u.plan_auto_renew);
+    setPlanAutoRenew(pending ? !!pending.body.auto_renew : !!u.plan_auto_renew && !u.banned && !u.suspended);
     form.setFieldsValue({
       // InputNumber with stringMode wants a string. Existing rows already have
       // a canonical TEXT-form value (e.g. "12.30"); pass it through unchanged.
@@ -264,8 +279,9 @@ export default function Users() {
     if (trafficGbChanged(editing.traffic_limit, values.traffic_limit_gb)) {
       payload.traffic_limit = gbToBytes(values.traffic_limit_gb);
     }
-    if (balance !== '') {
+    if (balance !== '' && Number(balance) !== Number(editing.balance)) {
       payload.balance = balance;
+      payload.expected_balance = editing.balance;
     }
     // v1.0.8: device-group authorization is owned entirely by the user's plan
     // (buy_plan REPLACEs it). The manual controls were removed from this modal,
@@ -625,6 +641,8 @@ export default function Users() {
               plan purchase silently overwrote each other. */}
         </Form>
 
+        {editing && <BalanceHistory key={editing.id} userId={editing.id} />}
+
         {/* v1.0.7: plan management embedded in the edit-user modal (non-admin
             only). Assign a plan (charges balance), adjust expiry, or remove the
             plan. These act outside the form and refresh the list on success. */}
@@ -647,6 +665,8 @@ export default function Users() {
             </p>
 
             <div style={{ marginBottom: 4 }}><strong>{t('assignPlan')}</strong></div>
+            {pendingPurchase && <Alert type="warning" showIcon title={t('purchasePendingHint')}
+              description={`${pendingPurchase.plan.name} · ${pendingPurchase.body.expected_price}`} style={{ marginBottom: 8 }} />}
             <Space.Compact style={{ width: '100%' }}>
               <Select
                 style={{ flex: 1 }}
@@ -655,9 +675,9 @@ export default function Users() {
                 onChange={(value) => {
                   setPlanChoice(value);
                   const nextPlan = plans.find(plan => plan.id === value);
-                  setPlanAutoRenew(nextPlan?.plan_type === 'monthly' && value === editing.plan_id && !!editing.plan_auto_renew);
+                  setPlanAutoRenew(nextPlan?.plan_type === 'monthly' && value === editing.plan_id && !!editing.plan_auto_renew && !editing.banned && !editing.suspended);
                 }}
-                disabled={userBusy}
+                disabled={userBusy || !!pendingPurchase}
                 options={plans.map(p => ({
                   value: p.id,
                   label: `${p.name} · ${p.price} · ${p.plan_type === 'monthly' ? t('planTypeMonthly') : p.plan_type === 'time' ? `${p.duration_days}${t('days')}` : t('planTypeData')}`,
@@ -670,8 +690,9 @@ export default function Users() {
 
             {selectedPlan?.plan_type === 'monthly' && (
               <div style={{ marginTop: 10 }}>
-                <Switch checked={planAutoRenew} onChange={setPlanAutoRenew} disabled={userBusy} />
+                <Switch checked={planAutoRenew} onChange={setPlanAutoRenew} disabled={userBusy || !!pendingPurchase || editing.banned || !!editing.suspended} />
                 <span style={{ marginLeft: 8 }}>{t('enableAutoRenew')}</span>
+                {(editing.banned || editing.suspended) && <div>{t('suspensionAutoRenewHint')}</div>}
               </div>
             )}
 

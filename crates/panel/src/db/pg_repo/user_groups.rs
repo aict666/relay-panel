@@ -146,6 +146,37 @@ impl DeviceGroupAuthRepository for PgRepository {
             }
         }
 
+        if let Some(after) = update.balance {
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT balance FROM users WHERE id=$1 FOR UPDATE")
+                    .bind(user_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(current) = current else {
+                tx.rollback().await?;
+                return Ok(None);
+            };
+            let expected = update
+                .expected_balance
+                .and_then(relay_shared::money::balance_to_cents);
+            if expected.is_none() || expected != relay_shared::money::balance_to_cents(&current) {
+                tx.rollback().await?;
+                return Err(DbError::BalanceConflict);
+            }
+            super::billing::append_balance(
+                &mut tx,
+                crate::service::billing::BalanceChange {
+                    user_id,
+                    kind: "admin_adjustment",
+                    before: &current,
+                    after,
+                    reference_id: &uuid::Uuid::new_v4().to_string(),
+                    actor_id: update.actor_id,
+                    reason: "Administrator explicitly adjusted account balance",
+                },
+            )
+            .await?;
+        }
         let user = sqlx::query(
             "UPDATE users SET \
              balance = COALESCE($1, balance), \
@@ -173,6 +204,10 @@ impl DeviceGroupAuthRepository for PgRepository {
             tx.rollback().await?;
             return Ok(None);
         }
+        if update.banned == Some(true) || update.suspended == Some(true) {
+            sqlx::query("UPDATE users SET plan_auto_renew=FALSE, plan_auto_renew_price=NULL, plan_auto_renew_revision=NULL, plan_auto_renew_retry_at=NULL WHERE id=$1")
+                .bind(user_id).execute(&mut *tx).await?;
+        }
 
         if let Some(group_ids) = &normalized_group_ids {
             sqlx::query("DELETE FROM user_device_groups WHERE user_id = $1")
@@ -192,7 +227,7 @@ impl DeviceGroupAuthRepository for PgRepository {
         }
 
         let authz_changed = update.all_device_groups.is_some() || normalized_group_ids.is_some();
-        let paused_rules = if authz_changed {
+        let mut paused_rules = if authz_changed {
             let (is_admin, all_groups): (bool, bool) =
                 sqlx::query_as("SELECT admin, all_device_groups FROM users WHERE id = $1")
                     .bind(user_id)
@@ -229,6 +264,7 @@ impl DeviceGroupAuthRepository for PgRepository {
             0
         };
 
+        paused_rules += super::enforce_rule_limit(&mut tx, user_id).await?;
         tx.commit().await?;
         Ok(Some(AdminUserUpdateOutcome { paused_rules }))
     }

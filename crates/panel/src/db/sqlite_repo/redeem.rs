@@ -43,11 +43,9 @@ impl RedeemRepository for SqliteRepository {
         user_id: i64,
         now: &str,
     ) -> Result<(String, String), RedeemCodeError> {
-        // One DEFERRED transaction, same shape as buy_plan: the write lock is
-        // taken on the first write (the claim below), and SQLite serializes
-        // writers, so a concurrent redeemer either blocks briefly or gets
-        // SQLITE_BUSY — never a double credit.
-        let mut tx = self.pool.begin().await?;
+        // Reserve the writer before reads: distinct codes redeemed together
+        // must wait, not fail while upgrading a stale WAL snapshot.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // Read the code first so we can tell "expired" apart from "not
         // redeemable" — the user needs to know an expired card isn't a typo.
@@ -70,7 +68,7 @@ impl RedeemRepository for SqliteRepository {
         // 'YYYY-MM-DD HH:MM:SS' UTC, a format where lexicographic order IS
         // chronological order.
         if let Some(exp) = expires_at.as_deref() {
-            if now > exp {
+            if crate::service::redeem::expiry_is_due(exp, now) {
                 let _ = tx.rollback().await;
                 // Left 'unused' on purpose so an admin can extend the batch.
                 return Err(RedeemCodeError::Expired);
@@ -136,6 +134,19 @@ impl RedeemRepository for SqliteRepository {
             .execute(&mut *tx)
             .await?;
 
+        super::billing::append_balance(
+            &mut tx,
+            crate::service::billing::BalanceChange {
+                user_id,
+                kind: "redeem",
+                before: &balance_str,
+                after: &new_balance,
+                reference_id: &id.to_string(),
+                actor_id: Some(user_id),
+                reason: "Redeemed top-up code",
+            },
+        )
+        .await?;
         tx.commit().await?;
         Ok((amount, new_balance))
     }

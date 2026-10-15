@@ -13,6 +13,8 @@
 /// codes. Every Repository method returns `Result<T, DbError>`.
 #[derive(Debug)]
 pub enum DbError {
+    BalanceConflict,
+    QuotaExceeded,
     /// UNIQUE constraint violation. SQLite code "2067", PostgreSQL "23505".
     UniqueViolation,
     /// v0.4.11 PR4: a listen_port is already occupied on the rule's inbound
@@ -24,7 +26,10 @@ pub enum DbError {
     /// A tunnel entry replacement would strand bound rules whose ordinary
     /// owners are not authorized for the new inbound group. Computed inside
     /// the same write transaction as the path replacement.
-    TunnelEntryAuthorization { rules: i64, users: i64 },
+    TunnelEntryAuthorization {
+        rules: i64,
+        users: i64,
+    },
     /// A preset tunnel disappeared, was disabled while a rule was being
     /// attached, or its entry/exit changed after service-layer validation.
     /// Rechecked inside the rule write transaction to close the TOCTOU gap.
@@ -58,7 +63,10 @@ pub enum DbError {
     },
     /// Deleting a regular user would also delete one or more legacy
     /// user-owned device groups that are now part of administrator tunnels.
-    UserTunnelGroupConflict { groups: i64, tunnels: i64 },
+    UserTunnelGroupConflict {
+        groups: i64,
+        tunnels: i64,
+    },
     /// Deleting a regular user would remove legacy user-owned groups still
     /// referenced by other users' rules, another group's fallback, or a plan.
     /// Those references must be detached explicitly rather than cascaded or
@@ -70,7 +78,10 @@ pub enum DbError {
     },
     /// Historical regular-user-owned preset tunnels can be removed with the
     /// account only when no other user's rule remains bound to them.
-    UserOwnedTunnelConflict { tunnels: i64, rules: i64 },
+    UserOwnedTunnelConflict {
+        tunnels: i64,
+        rules: i64,
+    },
     /// FOREIGN KEY constraint violation. SQLite code "787", PostgreSQL "23503".
     ForeignKeyViolation,
     /// A plan update would produce an invalid cross-field state, currently a
@@ -87,7 +98,9 @@ pub enum DbError {
     UserDeviceGroupInvalid,
     /// A device group referenced by one or more plans cannot be changed to a
     /// non-inbound type while those plans still grant it.
-    GroupPlanInvariant { plans: i64 },
+    GroupPlanInvariant {
+        plans: i64,
+    },
     /// A non-empty ingress protocol policy cannot be stored on a group that is
     /// not currently ingress-capable. Checked under the same row/write lock as
     /// the group update so concurrent type/policy edits cannot violate it.
@@ -164,6 +177,8 @@ impl std::fmt::Display for DbError {
             DbError::GroupProtocolPolicyInvariant => {
                 write!(f, "protocol blocking requires an ingress-capable device group")
             }
+            DbError::BalanceConflict => write!(f, "balance changed; refresh before editing"),
+            DbError::QuotaExceeded => write!(f, "active rule quota exceeded"),
             DbError::NotFound => write!(f, "not found"),
             DbError::InvalidData(context) => write!(f, "invalid persisted data: {context}"),
             DbError::Other(e) => write!(f, "database error: {}", e),

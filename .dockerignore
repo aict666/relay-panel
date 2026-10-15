@@ -30,3 +30,8 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+backups/
+node-id
+config-cache.json
+traffic-outbox-*.json
+traffic-outbox-*.lock

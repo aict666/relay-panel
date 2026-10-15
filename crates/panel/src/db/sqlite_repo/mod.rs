@@ -11,6 +11,7 @@
 use sqlx::SqlitePool;
 
 mod announcements;
+mod billing;
 mod groups;
 mod kvs;
 mod orders;
@@ -34,6 +35,26 @@ impl SqliteRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+}
+
+/// Caller holds the writer reservation. Keep oldest active rules and preserve
+/// excess rules as auto-paused instead of deleting user work.
+async fn enforce_rule_limit(
+    conn: &mut sqlx::SqliteConnection,
+    uid: i64,
+) -> Result<u64, super::error::DbError> {
+    Ok(sqlx::query(
+        "UPDATE forward_rules SET paused=1, auto_paused=1 WHERE id IN (
+        SELECT r.id FROM forward_rules r JOIN users u ON u.id=r.uid
+        WHERE r.uid=? AND r.paused=0 AND u.admin=0 AND u.max_rules>0
+        ORDER BY r.id LIMIT -1 OFFSET (SELECT max_rules FROM users WHERE id=?)
+    )",
+    )
+    .bind(uid)
+    .bind(uid)
+    .execute(conn)
+    .await?
+    .rows_affected())
 }
 
 // ── Aggregate Repository ──

@@ -287,8 +287,8 @@ case "${RELAYPANEL_DB_MODE:-}" in
         # so the user doesn't need psql installed on the host.
         info "Verifying external PostgreSQL connectivity ..."
         if ! docker run --rm --network host \
-            postgres:16-alpine \
-            psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -c "SELECT 1" >/dev/null 2>&1; then
+            --env DATABASE_URL "${RELAYPANEL_PG_BACKUP_IMAGE:-postgres:16-alpine}" \
+            sh -c 'exec psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT 1"' >/dev/null 2>&1; then
             fail "Cannot connect to external PostgreSQL at $(redact_url "${DATABASE_URL}"). Check host, port, user, password, and database name."
         fi
         info "External PostgreSQL is reachable"
@@ -630,9 +630,7 @@ if [ "${RELAYPANEL_WITH_NODE:-0}" = "1" ]; then
     PROFILE_ARGS+=("--profile" "node")
     # Warn if NODE_TOKEN is still the placeholder — the node will 401.
     if [ "${NODE_TOKEN:-}" = "default-token" ] || [ "${NODE_TOKEN:-}" = "change-me-after-creating-a-group" ] || [ -z "${NODE_TOKEN:-}" ]; then
-        warn "NODE_TOKEN is not set or is still the placeholder. The node container"
-        warn "will get 401 Unauthorized. Create an inbound group in the panel UI,"
-        warn "copy its token into .env as NODE_TOKEN, then re-run deploy.sh."
+        fail "NODE_TOKEN is required when RELAYPANEL_WITH_NODE=1. Create an inbound group and set its real token before retrying."
     fi
 fi
 
@@ -676,6 +674,14 @@ PROFILE_DISPLAY=""
 if [ "${#PROFILE_ARGS[@]}" -gt 0 ]; then
     PROFILE_DISPLAY="${PROFILE_ARGS[*]}"
 fi
+compose_with_profiles config --quiet
+if [ "$COMPOSE_FLAGS" = "--build" ]; then
+    compose_with_profiles build
+    COMPOSE_FLAGS=""
+fi
+command -v python3 >/dev/null 2>&1 || fail "Python 3 is required for verified upgrade backups. Install python3 before retrying."
+info "Checking for an existing panel and taking a verified pre-upgrade backup ..."
+RELAYPANEL_DB_MODE="${RELAYPANEL_DB_MODE:-}" python3 "$REPO_DIR/scripts/backup-before-upgrade.py" "$COMPOSE_FILE" || fail "Backup failed; upgrade aborted. The original panel was restarted where possible."
 info "Starting services (docker compose -f $COMPOSE_FILE $PROFILE_DISPLAY up -d $COMPOSE_FLAGS) ..."
 compose_with_profiles up -d $COMPOSE_FLAGS
 
@@ -710,12 +716,14 @@ done
 #   - body contains a non-empty "version"
 # Anything else (HTML, 401, empty body, invalid JSON) fails the deploy.
 info "Verifying panel health (GET /api/v1/health) ..."
-health_code=$(curl -s -o /tmp/rp-health-body -w '%{http_code}' \
-    -D /tmp/rp-health-headers \
+health_dir=$(mktemp -d)
+health_code=$(curl -s -o "$health_dir/body" -w '%{http_code}' \
+    -D "$health_dir/headers" \
     http://127.0.0.1:18888/api/v1/health 2>/dev/null || echo '000')
-health_body=$(cat /tmp/rp-health-body 2>/dev/null || true)
-health_ct=$(grep -i '^content-type:' /tmp/rp-health-headers 2>/dev/null || true)
-rm -f /tmp/rp-health-body /tmp/rp-health-headers
+health_body=$(cat "$health_dir/body" 2>/dev/null || true)
+health_ct=$(grep -i '^content-type:' "$health_dir/headers" 2>/dev/null || true)
+rm -f "$health_dir/body" "$health_dir/headers"
+rmdir "$health_dir"
 
 health_ok=1
 [ "$health_code" = "200" ] || health_ok=0

@@ -166,31 +166,24 @@ impl CertReloader {
 /// Load cert + key, check permissions, build a TlsAcceptor. Shared by initial
 /// load and reload. Returns Err with a GENERIC message (no key content leaked).
 fn try_load(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor, String> {
-    use std::io::BufReader;
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
     // Check private-key permissions BEFORE loading (0600 required).
     check_key_permissions(key_path)?;
 
     // Read + parse cert chain.
-    let cert_file = std::fs::File::open(cert_path)
-        .map_err(|e| format!("cannot open cert file: {}", e.kind()))?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "cert file contains no valid PEM certificates".to_string())?;
+    let certs = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|_| "cannot open cert file".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "cert file contains no valid PEM certificates".to_string())?;
 
     if certs.is_empty() {
         return Err("cert file contains no valid PEM certificates".into());
     }
 
     // Read + parse key (PKCS#8/PKCS#1/SEC1 auto-detected).
-    let key_file =
-        std::fs::File::open(key_path).map_err(|e| format!("cannot open key file: {}", e.kind()))?;
-    let mut key_reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|_| "key file contains no valid PEM private key".to_string())?
-        .ok_or_else(|| "key file is empty".to_string())?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|_| "key file contains no valid PEM private key".to_string())?;
 
     // Build ServerConfig: TLS 1.2 + 1.3, no client auth. with_single_cert
     // verifies cert↔key match.

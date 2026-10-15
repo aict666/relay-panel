@@ -84,8 +84,11 @@ services:
       - PANEL_URL=http://127.0.0.1:18888
       # Set to a real inbound group token created in the panel UI. The node
       # refuses to start with an unset or "default-token" value.
-      - NODE_TOKEN=${NODE_TOKEN:?NODE_TOKEN must be set to a real inbound-group token from the panel UI}
+      - NODE_TOKEN=${NODE_TOKEN:-}
       - POLL_INTERVAL=10
+      - RELAY_NODE_DATA_DIR=/app/data
+    volumes:
+      - node_data:/app/data
     restart: unless-stopped
     depends_on:
       - panel
@@ -137,6 +140,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  node_data:
   panel_data:
   postgres_data:
   caddy_data:

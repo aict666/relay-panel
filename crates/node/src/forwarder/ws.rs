@@ -233,13 +233,12 @@ async fn handle_ws_connection(
     // Either side returning (peer closed / error) ends the session; we then
     // shut down the target write side and close the WS so both ends see a
     // clean teardown.
-    let counter_up = counter.clone();
-    let counter_down = counter.clone();
+    let counter_up = counter.handle(rule_id).await;
+    let counter_down = counter_up.clone();
     let rl_up = rate_limit.clone();
     let rl_down = rate_limit;
 
     let upload = Box::pin(async move {
-        let mut total: u64 = 0;
         let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
             while let Some(msg_result) = ws_stream.next().await {
                 let payload: Vec<u8> = match msg_result? {
@@ -268,15 +267,14 @@ async fn handle_ws_connection(
                 }
                 // v0.4.6: throttle ws→target (upload) bytes before forwarding.
                 rl_up.acquire_upload(payload.len() as u64).await;
-                target_write.write_all(&payload).await?;
-                total += payload.len() as u64;
+                super::meter::write_counted(&mut target_write, &payload, Some(&counter_up), true)
+                    .await?;
             }
             Ok(())
         }
         .await;
         // Shut down the target's write side so the download arm sees EOF.
         let _ = target_write.shutdown().await;
-        counter_up.add(rule_id, total, 0).await;
         result
     });
 
@@ -284,7 +282,6 @@ async fn handle_ws_connection(
         // Read target bytes and send them as Binary WS frames. 8 KiB is a
         // reasonable trade-off between syscall overhead and frame granularity.
         let mut buf = vec![0u8; 8 * 1024];
-        let mut total: u64 = 0;
         loop {
             match target_read.read(&mut buf).await {
                 Ok(0) => break, // target closed its side
@@ -298,7 +295,7 @@ async fn handle_ws_connection(
                         tracing::debug!("WS rule {}: send frame failed: {}", rule_id, e);
                         break;
                     }
-                    total += n as u64;
+                    counter_down.add_download(n as u64);
                 }
                 Err(e) => {
                     tracing::debug!("WS rule {}: target read failed: {}", rule_id, e);
@@ -308,7 +305,6 @@ async fn handle_ws_connection(
         }
         // Close the WebSocket cleanly so the client disconnects promptly.
         let _ = ws_sink.close().await;
-        counter_down.add(rule_id, 0, total).await;
     });
 
     let (up_res, ()) = tokio::join!(upload, download);
@@ -424,9 +420,12 @@ mod tests {
             other => panic!("expected Binary echo, got {:?}", other),
         }
 
-        // Close the client so the handler's pump arms see EOF and run their
-        // final traffic accounting. Without this the handler would stay in its
-        // read loop and never reach counter.add, so drain() would find nothing.
+        // Accounting must be visible BEFORE close, not on a session-final flush.
+        let snapshot = counter.snapshot().await;
+        assert_eq!(
+            (snapshot.entries[0].upload, snapshot.entries[0].download),
+            (payload.len() as u64, payload.len() as u64)
+        );
         let _ = ws_client.close(None).await;
         // Give the handler a beat to finish its join! arms after the close.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

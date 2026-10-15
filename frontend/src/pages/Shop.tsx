@@ -5,6 +5,8 @@ import api from '../api/client';
 import type { ApiEnvelope, Plan, Order, UserSelf } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
+import { clearPurchaseIntent, purchaseIntent, readPurchaseIntent, type PurchaseIntent } from '../utils/purchaseIntent';
+import BillingKind from '../components/BillingKind';
 
 const { Text } = Typography;
 
@@ -25,6 +27,7 @@ export default function Shop() {
   const [buying, setBuying] = useState<Plan | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [autoRenew, setAutoRenew] = useState(false);
+  const [pendingPurchase, setPendingPurchase] = useState<PurchaseIntent | null>(null);
   const [redeemOpen, setRedeemOpen] = useState(false);
   const [redeeming, setRedeeming] = useState(false);
   const [redeemForm] = Form.useForm();
@@ -45,13 +48,16 @@ export default function Shop() {
       setPlans(nextPlans);
       setOrders(ordersRes.data || []);
       setMe(meRes.data || null);
+      const pending = meRes.data ? readPurchaseIntent(`self:${meRes.data.id}`) : null;
+      setPendingPurchase(pending);
       // A refresh may change or remove the plan while its confirmation dialog
       // is open. Reconcile the dialog to the authoritative catalog so it never
       // displays an old price for a purchase that the server will charge at the
       // new price.
-      setBuying(current => current
+      setBuying(current => pending?.plan ?? (current
         ? (nextPlans.find(plan => plan.id === current.id) ?? null)
-        : null);
+        : null));
+      if (pending) setAutoRenew(!!pending.body.auto_renew);
       return true;
     } catch {
       if (requestId === loadGenerationRef.current) {
@@ -67,20 +73,24 @@ export default function Shop() {
   useEffect(() => { load(); }, [load]);
 
   const handleBuy = async () => {
-    if (!buying || loading || loadFailed || submitting) return;
+    if (!buying || !me || loading || loadFailed || submitting) return;
     setSubmitting(true);
     try {
-      const res = await api.post<unknown, ApiEnvelope<null>>('/user/buy-plan', {
-        plan_id: buying.id,
-        expected_price: buying.price,
-        expected_revision: buying.purchase_revision,
-        ...(buying.plan_type === 'monthly' ? { auto_renew: autoRenew } : {}),
-      });
+      const scope = `self:${me.id}`;
+      const intent = purchaseIntent(scope, buying, me.plan_id, autoRenew);
+      setPendingPurchase(intent);
+      const res = await api.post<unknown, ApiEnvelope<null>>('/user/buy-plan', intent.body);
       if (res.code !== 0) {
+        if ([400, 404, 409].includes(res.code)) {
+          clearPurchaseIntent(scope);
+          setPendingPurchase(null);
+        }
         message.error(res.message);
         if (res.code === 409) await load();
         return;
       }
+      clearPurchaseIntent(scope);
+      setPendingPurchase(null);
       message.success(t('purchaseSuccess'));
       setBuying(null);
       // Keep purchase controls locked until the new balance and order history
@@ -138,7 +148,11 @@ export default function Shop() {
   const orderColumns = [
     { title: t('orderId'), dataIndex: 'id', key: 'id', width: 70 },
     { title: t('planName'), dataIndex: 'plan_name', key: 'plan_name' },
+    { title: t('billingKind'), dataIndex: 'kind', key: 'kind', render: (kind?: string) => <BillingKind kind={kind} /> },
     { title: t('planPrice'), dataIndex: 'price', key: 'price', render: (v: string) => <span className="rp-mono">{v}</span> },
+    { title: t('billingCycle'), key: 'cycle', render: (_: unknown, order: Order) => order.cycle_start
+      ? <Space orientation="vertical" size={0}><span className="rp-mono">{order.cycle_start} UTC</span><span className="rp-mono">→ {order.cycle_end ? `${order.cycle_end} UTC` : t('unlimited')}</span></Space>
+      : '-' },
     { title: t('purchaseTime'), dataIndex: 'created_at', key: 'created_at', render: (v: string) => <span className="rp-mono">{v}</span> },
   ];
 
@@ -168,6 +182,9 @@ export default function Shop() {
       )}
 
       {/* Current balance. Purchase effects are shown in confirmation. */}
+      {pendingPurchase && <Alert type="warning" showIcon title={t('purchasePendingHint')}
+        action={<Button disabled={submitting || loading} onClick={() => setBuying(pendingPurchase.plan)}>{t('retry')}</Button>}
+        style={{ marginBottom: 16 }} />}
       {me && (
         <Card size="small" style={{ marginBottom: 16 }}>
           <Space wrap>
@@ -207,7 +224,7 @@ export default function Shop() {
               <div className="rp-plan-price">{p.price}</div>
               <div className="rp-plan-features">
                 <div>{t('planTraffic')}: {p.traffic > 0 ? formatBytes(p.traffic) : t('unlimited')}</div>
-                <div>{t('planMaxRules')}: {p.max_rules}</div>
+                <div>{t('planMaxRules')}: {p.max_rules > 0 ? p.max_rules : t('unlimited')}</div>
                 {p.duration_days > 0 && <div>{t('planDuration')}: {p.duration_days} {t('days')}</div>}
                 {/* v1.0.9: device groups this plan grants on purchase. Names are
                     resolved server-side (device_group_names) — the buyer isn't
@@ -222,9 +239,9 @@ export default function Shop() {
                 ) : (
                   <div>{t('planGrantGroups')}: <Text type="secondary">{t('planGrantNone')}</Text></div>
                 )}
-                {p.reset_traffic && <div><Tag color="green">{t('planResetTraffic')}</Tag></div>}
+                {p.reset_traffic && p.plan_type !== 'monthly' && <div><Tag color="green">{t('planResetTraffic')}</Tag></div>}
               </div>
-              <Button type="primary" block disabled={loading || submitting || !canAfford(p)} title={!canAfford(p) ? t('insufficientBalance') : undefined} style={{ marginTop: 16 }} onClick={() => { setAutoRenew(p.plan_type === 'monthly' && p.id === me?.plan_id && !!me.plan_auto_renew); setBuying(p); }}>
+              <Button type="primary" block disabled={loading || submitting || !!pendingPurchase || !canAfford(p)} title={!canAfford(p) ? t('insufficientBalance') : undefined} style={{ marginTop: 16 }} onClick={() => { setAutoRenew(p.plan_type === 'monthly' && p.id === me?.plan_id && !me.suspended && !!me.plan_auto_renew); setBuying(p); }}>
                 {t('buyNow')}
               </Button>
               {!canAfford(p) && <Text type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>{t('insufficientBalance')}</Text>}
@@ -255,7 +272,7 @@ export default function Shop() {
         okText={t('confirmPurchase')}
         cancelText={t('cancel')}
         confirmLoading={submitting}
-        okButtonProps={{ disabled: loading || loadFailed || (!!buying && !canAfford(buying)) }}
+        okButtonProps={{ disabled: loading || loadFailed || (!pendingPurchase && !!buying && !canAfford(buying)) }}
         title={t('purchaseConfirmTitle')}
       >
         {buying && (
@@ -269,16 +286,22 @@ export default function Shop() {
             {/* v1.0.9: buying a DIFFERENT plan is a switch — the current plan's
                 remaining traffic and expiry are wiped. Warn explicitly. Buying
                 the SAME plan (or having none) just renews/stacks. */}
+            {me?.plan_id != null && buying.id !== me.plan_id && buying.plan_type === 'monthly' && (
+              <Alert type="warning" showIcon style={{ marginTop: 8 }} title={t('shopSwitchPlanWarning')} />
+            )}
             {buying.plan_type === 'monthly' ? (
               <>
                 <Alert type="info" showIcon style={{ marginTop: 8 }} title={t('monthlyPurchaseHint')} />
-                <Checkbox checked={autoRenew} onChange={(event) => setAutoRenew(event.target.checked)} style={{ marginTop: 12 }}>
+                <Checkbox checked={autoRenew} disabled={!!pendingPurchase || !!me?.suspended} onChange={(event) => setAutoRenew(event.target.checked)} style={{ marginTop: 12 }}>
                   {t('enableAutoRenew')}
                 </Checkbox>
                 <div><Text type="secondary">{t('autoRenewChargeHint')}</Text></div>
+                {me?.suspended && <div><Text type="warning">{t('suspensionAutoRenewHint')}</Text></div>}
               </>
             ) : me?.plan_id != null && buying.id !== me.plan_id ? (
               <Alert type="warning" showIcon style={{ marginTop: 8 }} title={t('shopSwitchPlanWarning')} />
+            ) : buying.reset_traffic ? (
+              <Alert type="warning" showIcon style={{ marginTop: 8 }} title={t('resetPurchaseHint')} />
             ) : (
               <Alert type="info" showIcon style={{ marginTop: 8 }} title={t('shopTrafficStacksHint')} />
             )}
